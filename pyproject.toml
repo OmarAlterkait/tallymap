@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tallymap"
+dynamic = ["version"]
+description = "jax.vmap for divergent per-item loops whose results are sums (tallies): one JAX primitive, every transformation, a CUDA kernel on GPUs."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Omar Alterkait", email = "omar.alterkait@tufts.edu" }]
+# Version policy (docs/maintenance.md): a floor, no upper bound (tallymap warns once at import when JAX is newer than
+# the newest tested version, tallymap.TESTED_JAX); known-bad releases get `!=` exclusions here (none so far).
+dependencies = [
+    "jax>=0.5.3",
+    "numpy",
+]
+keywords = [
+    "jax", "monte-carlo", "gpu", "cuda", "automatic-differentiation", "gradient",
+    "histogram", "tally", "simulation", "particle-transport", "divergent-loops",
+]
+# `License :: OSI Approved :: Apache Software License` is deliberately absent: a License classifier next to the
+# SPDX `license` field above is an error since setuptools 77 (PEP 639).  MEASURED with setuptools 84.0.0:
+# "InvalidConfigError: License classifiers have been superseded by license expressions".
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Environment :: GPU :: NVIDIA CUDA :: 12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+[project.urls]
+Homepage = "https://github.com/OmarAlterkait/tallymap"
+Source = "https://github.com/OmarAlterkait/tallymap"
+Issues = "https://github.com/OmarAlterkait/tallymap/issues"
+Changelog = "https://github.com/OmarAlterkait/tallymap/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+# cuda backend: JAX's CUDA plugin, which already brings NVRTC for runtime compilation
+# (jax[cuda12] -> jax-cuda12-plugin[with-cuda] -> nvidia-cuda-nvrtc-cu12; MEASURED on 0.6.2 and 0.11.2),
+# and nvcc as a fallback if one is found.  A C++17 compiler is needed once, to build the jax.ffi launch shim
+# (tallymap/backends/cuda/shim.cc).
+cuda = [
+    "jax[cuda12]>=0.5.3",
+]
+# tests/run_all.py needs nothing beyond jax + numpy, except the jax.export cell (flatbuffers on some versions)
+test = ["flatbuffers"]
+
+[tool.setuptools.dynamic]
+version = { attr = "tallymap.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["tallymap*"]
+
+[tool.setuptools.package-data]
+"tallymap.backends.cuda" = ["*.cc"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+# E731 (lambda assignment) and E741 (l / I / O names) are deliberate style in the index arithmetic and small closures
+ignore = ["E731", "E741"]
+
+[tool.ruff.lint.per-file-ignores]
+# the tests and benchmarks configure JAX (x64, sys.path) before importing it
+"tests/*" = ["E402"]
+"benchmarks/*" = ["E402"]
+# the CUDA source template and the emitted C lines (re-wrapping them would change the generated kernels)
+"tallymap/backends/cuda/kernel.py" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["tallymap"]

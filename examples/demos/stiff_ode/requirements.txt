@@ -1,0 +1,6 @@
+# The incumbent, pinned to the versions these numbers were measured against.
+diffrax==0.7.2
+optimistix==0.1.0
+# diffrax 0.7.2 does not pin jax; this is the version the measurements used.
+jax==0.11.2
+matplotlib

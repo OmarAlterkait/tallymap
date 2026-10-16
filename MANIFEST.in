@@ -1,0 +1,13 @@
+# What the sdist carries beyond the package itself.  The wheel holds only `tallymap/`; the documented commands
+# (`python tests/run_all.py`, the examples, `benchmarks/perf.py`) come from the sdist or from a git clone.
+# setuptools adds pyproject.toml, README.md, LICENSE and NOTICE on its own (readme + license-files).
+include CHANGELOG.md
+include CONTRIBUTING.md
+include CITATION.cff
+graft tests
+graft examples
+graft benchmarks
+graft docs
+prune .github
+global-exclude *.py[cod]
+global-exclude __pycache__

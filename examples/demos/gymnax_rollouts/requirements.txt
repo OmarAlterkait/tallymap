@@ -1,0 +1,5 @@
+# The incumbent, pinned to the version these numbers were measured against.
+gymnax==1.0.0
+# gymnax 1.0.0 does not pin jax; this is the version the measurements used.
+jax==0.11.2
+matplotlib

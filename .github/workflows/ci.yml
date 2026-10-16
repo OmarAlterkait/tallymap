@@ -1,0 +1,67 @@
+name: ci
+
+# Every push and pull request, on CPU only.  The GPU cells and the full version matrix need hardware GitHub does
+# not provide; they run before each release (docs/maintenance.md).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  JAX_PLATFORMS: cpu
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check .
+
+  # The two ends of the supported range: the floor, and the newest JAX release.  `--only edge,reverse,examples`
+  # is the short set; the whole suite runs in the `full` job below.
+  quick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.10"
+            jax: "0.5.3"
+          - python: "3.12"
+            jax: "newest"
+    name: quick (py${{ matrix.python }}, jax ${{ matrix.jax }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[test]"
+      - name: pin jax
+        if: matrix.jax != 'newest'
+        run: pip install "jax==${{ matrix.jax }}"
+      - run: python -c "import jax, tallymap; print(jax.__version__, tallymap.__version__)"
+      - run: python tests/run_all.py --only edge,reverse,examples
+
+  # The whole CPU suite on the newest JAX release: edge, transforms, reverse, reverse_spawn and the examples.
+  full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[test]"
+      - run: python -c "import jax, tallymap; print(jax.__version__, tallymap.__version__)"
+      - run: python tests/run_all.py

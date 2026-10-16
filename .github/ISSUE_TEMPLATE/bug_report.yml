@@ -1,0 +1,65 @@
+name: Bug report
+description: Something is wrong, raises when it should not, or gives a number you did not expect.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Two things make a report quick to act on: the output of `tm.diagnostics()`, and whether the problem also
+        happens with `backend='lockstep'`. The lockstep backend is plain JAX and is the reference
+        implementation, so it tells us immediately whether the problem is in the CUDA emitter or in the
+        library's semantics.
+
+        Before filing a NaN gradient, please check the order in the README section "When a gradient is NaN,
+        check in this order": if `jvp` or `jacfwd` is NaN too, the cause is arithmetic in your own program, and
+        if `stats` shows a truncated item or a dropped spawn child, the NaN is deliberate.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: A reproducer
+      description: The smallest program that shows it. Include the `tm.vmap(...)` options you passed.
+      render: python
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Output of tm.diagnostics()
+      description: |
+        Run this and paste the whole output. It carries the tallymap, jax and jaxlib versions, the GPU, its
+        compute capability and driver, the CUDA compiler and cache directory, the reverse-mode counters, and the
+        last item jaxprs and generated kernels.
+      placeholder: |
+        import tallymap as tm
+        print(tm.diagnostics())
+      render: text
+    validations:
+      required: true
+
+  - type: dropdown
+    id: lockstep
+    attributes:
+      label: Does it also happen with backend='lockstep'?
+      options:
+        - "Yes, lockstep too"
+        - "No, only the cuda backend"
+        - "Not applicable (it raises before a backend is chosen)"
+        - "Not tried"
+    validations:
+      required: true
+
+  - type: input
+    id: stats
+    attributes:
+      label: Result.stats, if the call returned
+      description: "Copy it verbatim: n_truncated, dropped, dropped_emits and exact_overflow are often the answer."
+      placeholder: "{'n_truncated': 0.0, 'dropped': 0.0, 'dropped_emits': 0.0, 'exact_overflow': 0.0}"

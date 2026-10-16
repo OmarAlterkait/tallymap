@@ -1,0 +1,68 @@
+name: weekly
+
+# The full CPU suite on every minor release in tallymap.TESTED_JAX, plus a JAX nightly cell that is allowed to
+# fail.  The point of running the middle of the range, not only its ends, is that a JAX minor can break the
+# library between two releases that both pass (docs/maintenance.md, "Version policy").
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+env:
+  JAX_PLATFORMS: cpu
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  # One cell per entry of TESTED_JAX, with the newest Python that JAX minor supports a wheel for:
+  # 3.10 up to 0.6.2, 3.11 for 0.7 to 0.10, 3.12 from 0.11.
+  matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - jax: "0.5.3"
+            python: "3.10"
+          - jax: "0.6.2"
+            python: "3.10"
+          - jax: "0.7.2"
+            python: "3.11"
+          - jax: "0.8.3"
+            python: "3.11"
+          - jax: "0.9.2"
+            python: "3.11"
+          - jax: "0.10.2"
+            python: "3.11"
+          - jax: "0.11.2"
+            python: "3.12"
+    name: jax ${{ matrix.jax }} (py${{ matrix.python }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[test]"
+      - run: pip install "jax==${{ matrix.jax }}"
+      - run: python -c "import jax, tallymap; print(jax.__version__, tallymap.__version__)"
+      - run: python tests/run_all.py
+
+  # The early warning for the next JAX release.  Allowed to fail: a red nightly cell is a thing to look at, not a
+  # broken release.  `--canary` turns DeprecationWarning and FutureWarning into errors.
+  nightly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[test]"
+      - name: install the jax nightly
+        run: |
+          pip install -U --pre jax jaxlib \
+            -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax-public-nightly-artifacts-registry/simple/
+      - run: python -c "import jax, tallymap; print(jax.__version__, tallymap.__version__)"
+      - run: python tests/run_all.py
+      - run: python tests/run_all.py --canary

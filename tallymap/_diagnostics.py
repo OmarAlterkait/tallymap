@@ -1,0 +1,154 @@
+"""tm.diagnostics(): the ONE place to look when something is wrong (and what a bug report should contain).
+
+    tm.diagnostics()                       # environment + the host-side counters + the last programs / kernels
+    tm.diagnostics(f, *args)               # ... and what jax.jit(f).lower(*args) builds: item jaxprs, cuda kernels
+    tm.diagnostics(reset=True)             # read, then clear the counters and the history
+
+Keys:
+  versions   tallymap / jax / jaxlib / numpy / python
+  env        TALLYMAP_CUDA_CACHE, JAX_PLATFORMS, XLA_FLAGS, CUDA_VISIBLE_DEVICES (when set), machine
+  platform   jax.default_backend(), devices; on a GPU: name, compute capability, driver
+  cuda       compiler (NVRTC build or nvcc), cubin cache directory
+  reverse    host-side counters of the reverse-mode safety checks, filled only by tm.vmap(..., rev_stats=True)
+             calls (a host callback costs jax.jit's C++ fast path; a failed check makes the gradient NaN either way):
+               replay = {calls, mismatch, last}: adjoint calls whose replay did not reproduce the forward
+               trajectory, their mismatching items, the last such count;
+               tree   = stats of the last tree adjoint (reverse through spawn): generations, particles, launches,
+                        overflow, drop_risk, replay_mismatch, fwd_mismatch (any of the last four -> NaN gradient)
+  programs   the last item programs bound by tm.vmap: tag, item jaxpr (text)
+  kernels    the last cuda kernels used: tag, schedule, cubin hash, cached CUDA source (.cu), primitives
+With f: `programs` / `kernels` are those of f only (JAX's caches are cleared first so that everything is re-traced
+and re-lowered), plus `stablehlo_sha256` of the lowered program.
+
+tm.assert_arms_differ(f_a, f_b, *args) is the A/B rule for the library's own options: before comparing two arms
+(timings, numerics), assert that they compiled to different programs (different cuda kernels, or for the lockstep
+backend different StableHLO); raises AssertionError otherwise.
+"""
+import collections
+import contextlib
+import hashlib
+import os
+import platform
+import sys
+
+import jax
+import numpy as np
+
+HISTORY = 16
+PROGRAMS = collections.deque(maxlen=HISTORY)       # (tag, jaxpr text) of item programs bound by tm.vmap
+KERNELS = collections.deque(maxlen=HISTORY)        # dicts recorded by backends/cuda.kernel()
+_CAPTURE = []                                      # active diagnostics(f, ...) captures: dict(programs=, kernels=)
+
+
+def record_program(prog):
+    rec = dict(tag=prog.tag, jaxpr=str(prog.cj.jaxpr))
+    PROGRAMS.append(rec)
+    for c in _CAPTURE:
+        c["programs"].append(rec)
+
+
+def record_kernel(rec):
+    KERNELS.append(rec)
+    for c in _CAPTURE:
+        c["kernels"].append(rec)
+
+
+@contextlib.contextmanager
+def _capture():
+    c = dict(programs=[], kernels=[])
+    _CAPTURE.append(c)
+    try:
+        yield c
+    finally:
+        _CAPTURE.remove(c)
+
+
+def _versions():
+    import jaxlib
+
+    from . import __version__
+    return dict(tallymap=__version__, jax=jax.__version__, jaxlib=getattr(jaxlib, "__version__", "?"),
+                numpy=np.__version__, python=sys.version.split()[0])
+
+
+_PLATFORM = {}
+
+
+def _platform():
+    if _PLATFORM:
+        return dict(_PLATFORM)
+    d = dict(backend=jax.default_backend(), devices=[str(x) for x in jax.devices()])
+    if jax.default_backend() == "gpu":
+        dev = jax.devices()[0]
+        d.update(gpu=dev.device_kind, compute_capability=getattr(dev, "compute_capability", None))
+        try:
+            import subprocess
+            d["driver"] = subprocess.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+                                         capture_output=True, text=True, timeout=20).stdout.strip().splitlines()[0]
+        except Exception:
+            d["driver"] = None
+    _PLATFORM.update(d)
+    return d
+
+
+def _cuda():
+    try:
+        from .backends.cuda import compile as C
+        comp = C.compiler()
+        return dict(compiler=C.compiler_identity(comp), cache_dir=C.cache_dir())
+    except Exception as e:                                   # no CUDA toolchain on this machine
+        return dict(error=f"{type(e).__name__}: {e}")
+
+
+def _reverse():
+    from . import _reverse as R
+    from . import _reverse_spawn as RS
+    return dict(replay=R.replay_mismatch(), tree=RS.LAST[-1] if RS.LAST else None)
+
+
+def diagnostics(fn=None, *args, reset=False, **kwargs):
+    """-> dict (see the module docstring).  fn, args: also lower jax.jit(fn)(*args, **kwargs) and report its
+    programs / kernels.  reset: clear the counters and the history after reading them."""
+    d = dict(versions=_versions(), platform=_platform(), env=_env(),
+             cuda=_cuda() if jax.default_backend() == "gpu" else None, reverse=_reverse())
+    if fn is not None:
+        jax.clear_caches()
+        with _capture() as c:
+            low = jax.jit(fn).lower(*args, **kwargs)
+        txt = low.as_text()
+        d.update(programs=c["programs"], kernels=c["kernels"],
+                 stablehlo_sha256=hashlib.sha256(txt.encode()).hexdigest())
+    else:
+        d.update(programs=list(PROGRAMS), kernels=list(KERNELS))
+    if reset:
+        from . import _reverse as R
+        from . import _reverse_spawn as RS
+        R.REPLAY.update(calls=0, mismatch=0, last=None)
+        RS.LAST.clear()
+        PROGRAMS.clear()
+        KERNELS.clear()
+    return d
+
+
+def artifacts(fn, *args, **kwargs):
+    """(sorted cubin hashes of the cuda kernels, StableHLO sha256) that jax.jit(fn)(*args) compiles to."""
+    d = diagnostics(fn, *args, **kwargs)
+    return tuple(sorted(k["hash"] for k in d["kernels"])), d["stablehlo_sha256"]
+
+
+def assert_arms_differ(fn_a, fn_b, *args, **kwargs):
+    """The A/B rule: two arms of an option comparison must compile to different programs (else the comparison is
+    void).  cuda: the kernels' cubin hashes differ; lockstep (no kernels): the StableHLO differs.  -> the two
+    artifacts; raises AssertionError when they are identical."""
+    ka, ha = artifacts(fn_a, *args, **kwargs)
+    kb, hb = artifacts(fn_b, *args, **kwargs)
+    same = (ka == kb) if (ka or kb) else (ha == hb)
+    if same:
+        raise AssertionError("tallymap A/B rule: the two arms compiled to identical programs "
+                             f"(kernels {list(ka)}, StableHLO {ha[:12]}); the comparison would be void")
+    return (ka, ha), (kb, hb)
+
+
+def _env():                                                    # the environment variables that matter
+    keys = ("TALLYMAP_CUDA_CACHE", "JAX_PLATFORMS", "XLA_FLAGS", "CUDA_VISIBLE_DEVICES")
+    return {k: os.environ.get(k) for k in keys if os.environ.get(k) is not None} | {"machine": platform.machine()}

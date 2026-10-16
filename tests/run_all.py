@@ -1,0 +1,113 @@
+"""The ONE test entry point.
+
+    python tests/run_all.py            # CPU: lockstep backend
+    python tests/run_all.py --gpu      # GPU: lockstep AND cuda backends (tree adjoint and op parity on cuda)
+    python tests/run_all.py --x64      # with jax_enable_x64
+    python tests/run_all.py --unfused  # the two-node jvp design (what runs if JAX drops the partial-eval registries)
+    python tests/run_all.py --canary   # DeprecationWarning / FutureWarning are errors (the JAX-upgrade canary)
+    python tests/run_all.py --only reverse,reverse_spawn
+    env RUN_ALL="--gpu --x64" (same flags), TEST_LOG=<prefix> (full output of a failing suite -> <prefix>.<suite>.log)
+
+Suites: edge (edge cases), transforms (composability matrix), reverse (reverse mode), reverse_spawn (tree adjoint),
+ops (cuda op table vs jit(vmap(op)) and the host-exact result; --gpu only), equinox_compat (diffrax / optimistix /
+lineax / quadax solvers inside an item; skipped when those are not installed), examples (examples/*.py run as
+scripts).
+Each suite runs in its own process (fresh JAX state).  A suite passes iff its summary line was printed and every cell
+is PASS or an EXPECTED raise (RAISES-OK); anything else (FAIL, unexpected RAISE, crash, timeout) fails the run.
+Exit status 0 = all suites pass.  The full suite takes about 15 minutes on CPU.
+On GPU the suites run with XLA_PYTHON_CLIENT_PREALLOCATE=false unless you set it (see main()).
+"""
+import os
+import re
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+SUITES = ["edge", "transforms", "reverse", "reverse_spawn", "ops", "equinox_compat", "examples"]
+GPU_ONLY = {"ops"}
+OPTIONAL = {"equinox_compat"}      # needs a package the library does not depend on; prints 'SUITE SKIP' without it
+EXAMPLES = ["quickstart", "photon_toy", "shower_toy", "ensemble_toy", "walk_on_spheres",
+            "ode_ensemble", "gillespie", "interacting_particles", "particle_filter", "gradient_pitfall"]
+
+
+def verdict(name, out, rc):
+    if name in OPTIONAL and re.search(r"^SUITE SKIP", out, re.M):
+        return True, "skipped (optional dependency missing)"
+    if name in ("reverse_spawn", "ops", "examples"):
+        m = re.search(r"^ALL (PASS|FAIL) (\d+)/(\d+)", out, re.M)
+        if not m:
+            return False, f"no summary (exit {rc})"
+        return m.group(1) == "PASS" and rc == 0, f"{m.group(2)}/{m.group(3)} pass"
+    m = re.search(r"^TOTAL (\d+) PASS (\d+)(?: RAISES-OK (\d+))?", out, re.M)
+    if not m:
+        return False, f"no summary (exit {rc})"
+    tot, ok, exp = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+    return tot > 0 and ok + exp == tot and rc == 0, f"{ok} pass + {exp} expected raises of {tot}"
+
+
+def run(cmd, env, timeout):
+    try:
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
+        return r.stdout + r.stderr, r.returncode
+    except subprocess.TimeoutExpired as e:
+        return (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or ""), "timeout"
+
+
+def examples(env, timeout):
+    """each example must exit 0 and print '<NAME> OK'; -> (output, rc) with an 'ALL PASS k/n' summary."""
+    outs, ok = [], 0
+    names = [n for n in EXAMPLES if os.path.exists(os.path.join(ROOT, "examples", n + ".py"))]
+    for n in names:
+        out, rc = run([sys.executable, "-u", os.path.join(ROOT, "examples", n + ".py")], env, timeout)
+        good = rc == 0 and re.search(rf"^{n.upper()} OK", out, re.M) is not None
+        ok += good
+        outs.append(out + f"\n{n} {'PASS' if good else 'FAIL'} (exit {rc})\n")
+    s = "".join(outs) + f"ALL {'PASS' if ok == len(names) else 'FAIL'} {ok}/{len(names)}\n"
+    return s, 0
+
+
+def main(argv):
+    argv = list(argv) + os.environ.get("RUN_ALL", "").split()        # (batch jobs pass flags through the env)
+    gpu, x64, unfused, canary = "--gpu" in argv, "--x64" in argv, "--unfused" in argv, "--canary" in argv
+    only = next((a.split("=", 1)[1] if "=" in a else argv[argv.index(a) + 1] for a in argv if a.startswith("--only")),
+                None)
+    suites = [s for s in SUITES if (only is None or s in only.split(",")) and (gpu or s not in GPU_ONLY)]
+    env = dict(os.environ, PYTHONPATH=ROOT + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    env["BACKENDS"] = "lockstep,cuda" if gpu else "lockstep"
+    env["TREE_BACKEND"] = "cuda" if gpu else "lockstep"
+    # JAX preallocates 75% of the GPU; the forced-dense reverse cases launch a kernel whose per-thread local memory
+    # (~17 GiB on an L40S) the CUDA driver reserves outside that pool, so they need it off.  A value you set wins.
+    env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    if x64:
+        env["TEST_X64"] = "1"
+    if unfused:
+        env["TX_UNFUSED"] = "1"
+    if canary:      # every suite process: a deprecation in the APIs tallymap (or the tests) use fails the run
+        env["PYTHONWARNINGS"] = "error::DeprecationWarning,error::FutureWarning"
+    timeout = int(os.environ.get("TEST_TIMEOUT", 3600))
+    res = []
+    for s in suites:
+        t0 = time.time()
+        if s == "examples":
+            out, rc = examples(env, timeout)
+        else:
+            out, rc = run([sys.executable, "-u", os.path.join(HERE, f"{s}.py")], env, timeout)
+        ok, msg = verdict(s, out, rc)
+        bad = [l for l in out.splitlines() if re.match(r".*\s(FAIL|RAISE)\s", l) and "RAISES-OK" not in l][:10]
+        res.append((s, ok, msg, time.time() - t0))
+        print(f"{s:13s} {'PASS' if ok else 'FAIL'}  {msg}  [{time.time() - t0:.0f}s]", flush=True)
+        for l in bad if not ok else []:
+            print("    " + l[:200], flush=True)
+        if not ok and os.environ.get("TEST_LOG"):
+            open(f"{os.environ['TEST_LOG']}.{s}.log", "w").write(out)
+    import jax
+    print(f"ALL {'PASS' if all(r[1] for r in res) else 'FAIL'}  jax {jax.__version__} ({jax.__file__})"
+          f"  {'gpu' if gpu else 'cpu'}{' x64' if x64 else ''}{' unfused' if unfused else ''}"
+          f"{' canary' if canary else ''}", flush=True)
+    return 0 if all(r[1] for r in res) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
