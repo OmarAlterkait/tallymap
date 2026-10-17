@@ -291,6 +291,7 @@ def build_source(p, *, block=BLOCK, min_blocks=0, split=True, inplace=True, even
     em = Emitter()
     em.where = p.where
     em.inplace = inplace
+    em.events = bool(events)                 # also lowers every inner while loop with a cut (op_table._while_events)
     L = Layout()
     jx = p.cj.jaxpr
     nT, nP, nB = p.nT, p.nP, p.nB
