@@ -1169,6 +1169,30 @@ def _(b):
     return "3-way switch: fwd / jvp / per-item bitwise, grad per-item bitwise; loop-free program falls back"
 
 
+@case("jnp.linalg.solve / inv inside an item (lu, custom_linear_solve, triangular_solve): fwd, jvp, grad vs dense")
+def _(b):
+    def mk(n):
+        def item(t, x, th):
+            i = jnp.arange(n, dtype=F)
+            A = jnp.eye(n, dtype=F) * (2.0 + x) + th * jnp.cos(i[:, None] * x + i[None, :]) * 0.3
+            A = A[::-1] if n > 3 else A                    # needs pivoting
+            y = jnp.linalg.solve(A, jnp.sin(i * th + x))
+            z = jnp.linalg.inv(A) @ jnp.ones(n, F)
+            return t.add("Q", (x * 7).astype(jnp.int32) % NB, jnp.sum(y) + z[0] * th), y[0]
+        return item
+    out = []
+    for n in (3, 4, 12):
+        f, r = V(mk(n), b, in_axes=(0, None)), R(mk(n), in_axes=(0, None))
+        close(f(xs, TH).outputs["Q"], r(xs, TH).outputs["Q"], rtol=2e-4)
+        close(f(xs, TH).per_item, r(xs, TH).per_item, rtol=2e-4)
+        jv = lambda g: jax.jvp(lambda q: g(xs, q).outputs["Q"], (TH,), (F(1.0),))[1]
+        close(jv(f), jv(r), rtol=1e-3, what=f"jvp n={n}")
+        gr = lambda g: jax.grad(lambda q: jnp.sum(g(xs, q).outputs["Q"] ** 2) + jnp.sum(g(xs, q).per_item))(TH)
+        close(gr(f), gr(r), rtol=1e-3, what=f"grad n={n}")
+        out.append(n)
+    return f"n = {out}: forward, jvp and grad match the dense reference"
+
+
 print("\n================ SUMMARY", jax.__version__, "x64" if jax.config.jax_enable_x64 else "",
       jax.devices()[0].device_kind)
 for n, b, m in RES:
