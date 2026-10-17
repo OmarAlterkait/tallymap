@@ -199,6 +199,67 @@ def _split(cj):
                 nc=nc, nb=nb, invars=list(jx.invars), constvars=consts)
 
 
+def _neqns(jaxpr):
+    """equations in a jaxpr, counting sub-jaxprs recursively (the static cost proxy for choosing a cut)"""
+    from ..._jaxpr import subjaxprs
+    return sum(1 + sum(_neqns(s.jaxpr) for s in subjaxprs(e)) for e in jaxpr.eqns)
+
+
+def _cut(cj):
+    """Event scheduling: cut the STEP body at its most expensive top-level cond / switch into
+    head (body inputs -> [branch index] + cut state X), the branches (operands -> outs) and
+    tail (body inputs, X, branch outs -> body outputs).  A lane then waits at the cut holding X and its branch index,
+    and the warp chooses which branch to run each round, so a warp runs ONE branch at a time.  The per-item result is
+    unchanged: every lane runs exactly the equations of its own branch, in the same order.
+    -> None (no top-level cond with a dynamic index) or dict of closed jaxprs + wiring."""
+    import jax
+    from jax.extend.core import Literal
+
+    from ..._jaxpr import bind, cond_branches, is_dropvar, lit
+    jx = cj.jaxpr
+    cs = [i for i, e in enumerate(jx.eqns) if e.primitive.name == "cond" and not isinstance(e.invars[0], Literal)]
+    if not cs:
+        return None
+    c = max(cs, key=lambda i: sum(_neqns(b.jaxpr) for b in cond_branches(jx.eqns[i])))
+    ce = jx.eqns[c]
+    head_e, tail_e = jx.eqns[:c], jx.eqns[c + 1:]
+    defined = [v for e in head_e for v in e.outvars if not is_dropvar(v)]
+    used = {v for e in tail_e for v in e.invars if not isinstance(v, Literal)}
+    used |= {v for v in jx.outvars if not isinstance(v, Literal)}
+    used |= {v for v in ce.invars if not isinstance(v, Literal)}
+    X = [v for v in defined if v in used]
+    consts = dict(zip(jx.constvars, cj.consts))
+
+    def ev(eqns, env):
+        rd = lambda v: lit(v) if isinstance(v, Literal) else env[v]
+        for e in eqns:
+            for v, x in zip(e.outvars, bind(e, [rd(v) for v in e.invars])):
+                env[v] = x
+        return rd
+
+    def head(*a):
+        env = dict(consts)
+        env.update(zip(jx.invars, a))
+        rd = ev(head_e, env)
+        return [rd(ce.invars[0])] + [rd(v) for v in X]
+
+    def tail(*a):
+        n, nx = len(jx.invars), len(X)
+        env = dict(consts)
+        env.update(zip(jx.invars, a[:n]))
+        env.update(zip(X, a[n:n + nx]))
+        env.update((v, x) for v, x in zip(ce.outvars, a[n + nx:]) if not is_dropvar(v))
+        rd = ev(tail_e, env)
+        return [rd(v) for v in jx.outvars]
+    sds = lambda v: jax.ShapeDtypeStruct(v.aval.shape, v.aval.dtype)
+    in_av = [sds(v) for v in jx.invars]
+    br = cond_branches(ce)
+    return dict(head=jax.make_jaxpr(head)(*in_av),
+                tail=jax.make_jaxpr(tail)(*in_av, *[sds(v) for v in X], *[sds(v) for v in ce.outvars]),
+                branches=br, ops=list(ce.invars[1:]), X=X, invars=list(jx.invars), consts=consts,
+                cost=[_neqns(b.jaxpr) for b in br])
+
+
 BLOCK = 128          # threads per block (measured: 64 / 128 / 256 within 1%)
 PRIV_BYTES = 4096    # shared-memory budget for privatised sum tallies per block
 
@@ -218,7 +279,7 @@ def privatised(tallies, B=1, budget=PRIV_BYTES):
     return out
 
 
-def build_source(p, *, block=BLOCK, min_blocks=0, split=True, inplace=True):
+def build_source(p, *, block=BLOCK, min_blocks=0, split=True, inplace=True, events=False):
     """-> (CUDA source, Layout).  p: tallymap._api.ItemProgram.  Its jaxpr is first rewritten twice: the foreign
     primitives a backend has to lower itself (_foreign.expand_late, e.g. lineax's linear_solve, which may only be
     expanded now that every autodiff rule has been applied) and then the JAX sugar (canon.py)."""
@@ -293,6 +354,8 @@ def build_source(p, *, block=BLOCK, min_blocks=0, split=True, inplace=True):
 
     sp = _split(p.cj) if split else None
     L.mode = "step" if sp is not None else "item"
+    cut = _cut(sp["body"]) if (events and sp is not None and spawn is None) else None
+    L.cut = None
     decls = ""
     if sp is None:
         res, ospec = function("item", p.cj, [(None, v) for v in base_in])
@@ -346,7 +409,55 @@ def build_source(p, *, block=BLOCK, min_blocks=0, split=True, inplace=True):
         function("cond", sp["cond"], [(d, x) for d, x, _ in pc + pk])
         decls += "  bool sj_pr;\n"
         cargs = [a for _, _, a in pc + pk if a is not None]
-        bres, bspec = function("body", sp["body"], [(d, x) for d, x, _ in pb + pk])
+        bargs = [a for _, _, a in pb + pk if a is not None]
+        if cut is None:
+            bres, bspec = function("body", sp["body"], [(d, x) for d, x, _ in pb + pk])
+        else:
+            L.mode = "events"
+            bjx = sp["body"].jaxpr
+            # head: (body consts, carries) -> [branch index] + cut state X (persistent per lane: z<j>)
+            hres, hspec = function("head", cut["head"], [(d, x) for d, x, _ in pb + pk])
+            bmap = dict(zip(bjx.invars, [val_of(v) for v in bc] + kvals))
+            hargs, xvals, xbytes = [], [], 0
+            for j, (r, spc) in enumerate(zip(hres, hspec)):
+                if spc is None:
+                    xvals.append(r)                              # a tally stays virtual
+                    continue
+                decls += svar("sjz", j, spc)
+                hargs.append(f"sjz{j}")
+                xbytes += _size(spc[0]) * np.dtype(spc[1]).itemsize if j else 0
+                xvals.append(_val(f"sjz{j}", spc[0], spc[1], spc[2]))
+            if hspec[0] is None or hspec[0][0] != ():
+                raise CodegenError("event scheduling: the branch index must be a scalar")
+            bmap.update(zip(cut["X"], xvals[1:]))
+
+            def opval(v):
+                if type(v).__name__ == "Literal":
+                    return em.const_val(v.val, v.aval)
+                if v in bmap:
+                    return bmap[v]
+                return em.const_val(cut["consts"][v], v.aval)
+            # the branches: operands -> outs (one set of per-lane result variables r<j>, shared by all branches)
+            brs, rvals, rargs = [], None, []
+            for k, bj in enumerate(cut["branches"]):
+                pa = [as_param(opval(v), f"sja{j}") for j, v in enumerate(cut["ops"])]
+                res_k, spec_k = function(f"br{k}", bj, [(d, x) for d, x, _ in pa])
+                if rvals is None:
+                    rvals = []
+                    for j, (r, spc) in enumerate(zip(res_k, spec_k)):
+                        if spc is None:
+                            rvals.append(r)
+                            continue
+                        decls += svar("sjr", j, spc)
+                        rargs.append(f"sjr{j}")
+                        rvals.append(_val(f"sjr{j}", spc[0], spc[1], spc[2]))
+                brs.append(f"sj_br{k}({', '.join(base_arg + [a for _, _, a in pa if a is not None] + rargs)});")
+            px = [as_param(x, f"sjx{j}") for j, x in enumerate(xvals[1:])]
+            pr_ = [as_param(x, f"sjq{j}") for j, x in enumerate(rvals)]
+            bres, bspec = function("tail", cut["tail"], [(d, x) for d, x, _ in pb + pk + px + pr_])
+            targs = bargs + [a for _, _, a in px + pr_ if a is not None]
+            L.cut = dict(branches=len(brs), cost=cut["cost"], state_bytes=int(xbytes),
+                         n_state=len(cut["X"]))
         nargs, upd = [], []
         for j, spc in enumerate(bspec):
             if spc is None:
@@ -357,7 +468,6 @@ def build_source(p, *, block=BLOCK, min_blocks=0, split=True, inplace=True):
                 upd.append(f"k{j} = n{j};")
             else:
                 upd.append(f"for (int e = 0; e < {_size(spc[0])}; ++e) k{j}[e] = n{j}[e];")
-        bargs = [a for _, _, a in pb + pk if a is not None]
         # ---- post: (item inputs, persistent state, final carries) -> item outputs
         pq = [as_param(val_of(v), f"q{j}") for j, v in enumerate(sp["state"])]
         function("post", sp["post"], [(None, v) for v in base_in] + [(d, x) for d, x, _ in pq + pk])
@@ -367,6 +477,12 @@ def build_source(p, *, block=BLOCK, min_blocks=0, split=True, inplace=True):
         advance = (f"sj_cond({', '.join(base_arg + cargs + ['sj_pr'])});\n"
                    f"      if (sj_pr) {{ sj_body({', '.join(base_arg + bargs + nargs)}); {' '.join(upd)} }}\n"
                    f"      else {{ sj_post({', '.join(base_arg + post_args + ys_names)}); done = true; }}")
+        if cut is not None:
+            ev = dict(cond=f"sj_cond({', '.join(base_arg + cargs + ['sj_pr'])});",
+                      head=f"sj_head({', '.join(base_arg + bargs + hargs)}); sj_pc = (i32)sjz0;",
+                      post=f"sj_post({', '.join(base_arg + post_args + ys_names)});",
+                      disp="switch (sj_j) { " + " ".join(f"case {k}: {c} break;" for k, c in enumerate(brs)) + " }",
+                      tail=f"sj_tail({', '.join(base_arg + targs + nargs)}); {' '.join(upd)}", K=len(brs))
     L.consts = list(em.consts)
     base_const = nP + nB
     nin = base_const + len(L.consts)
@@ -548,9 +664,98 @@ extern "C" __global__ void {lb} sj_main(const SjParams P, const i64 n_items) {{
 {chr(10).join(acc_flush)}
 }}
 """
+    if L.mode == "events":
+        main = _events_main(L, lb, acc_decl, acc_flush, decls, claim, start, ywrite, ev)
     src.append(main)
     L.prims = sorted(em.prims)
     return "\n".join(src), L
+
+
+def _events_main(L, lb, acc_decl, acc_flush, decls, claim, start, ywrite, ev):
+    """The persistent loop under event scheduling (no spawn).  Every lane is, between rounds, either in transit
+    (fetching an item, or just past a branch: it runs cond and head lane-locally and lands at the cut) or WAITING at
+    the cut with its branch index sj_pc and its cut state.  Each round the warp votes, picks ONE branch j, and only the
+    lanes waiting at j run it (then tail, cond, head).  The choice is warp-uniform and online, from measured cost:
+      waste(k) = (lanes alive - lanes at k) * cost(k)     the idle lane-time of running k now
+      rent(k)  = idle lane-time the lanes at k have accumulated since k last ran
+      j        = argmax over waiting k of rent(k) - waste(k)
+    i.e. run the branch whose wait has cost more than running it now would waste (ski rental: no tuned constant, and
+    a waiting lane is always served, since its rent grows every round and waste is bounded).  cost(k) is an EMA of
+    the measured round time (clock64) of rounds that ran k; an unmeasured branch has cost 0, so it runs (and is
+    measured) the first time it has a waiting lane.  Lanes leave the warp's vote only by exiting (no items left)."""
+    import os
+    K = ev["K"]
+    dbg = bool(os.environ.get("TALLYMAP_EVENTS_DEBUG"))      # measurement only: round / lane counters, printed once
+    D = (lambda s: s) if dbg else (lambda s: "")
+    dbg_decl = D(f"__device__ unsigned long long sj_evd[{2 * K + 4}]; __device__ unsigned int sj_evw;\n")
+    dbg_end = D(f"""  if (sj_last) {{
+    for (int k = 0; k < {2 * K + 4}; ++k) atomicAdd(&sj_evd[k], d_[k]);
+    __threadfence();
+    if (atomicAdd(&sj_evw, 1u) + 1u == gridDim.x * (blockDim.x / 32)) {{
+      printf("EVDBG rounds_empty %llu alive_lane_rounds %llu rounds %llu active_lane_rounds %llu\\n", sj_evd[0], sj_evd[1], sj_evd[2], sj_evd[3]);
+      for (int k = 0; k < {K}; ++k) printf("EVDBG branch %d rounds %llu lanes %llu\\n", k, sj_evd[4 + 2 * k], sj_evd[5 + 2 * k]);
+      for (int k = 0; k < {2 * K + 4}; ++k) sj_evd[k] = 0; sj_evw = 0;
+    }}
+  }}""")
+    return dbg_decl + f"""
+extern "C" __global__ void {lb} sj_main(const SjParams P, const i64 n_items) {{
+  u64* const sj_ctr = (u64*)P.p[{L.r_ctr}];
+  const int lane = threadIdx.x & 31;
+  const u32 CH = (u32)max(1ll, min(16ll, n_items / (16ll * gridDim.x * blockDim.x)));
+{chr(10).join(acc_decl)}
+{decls}  u64 my_next = 0, my_stride = 0; u32 my_left = 0;
+  u64 t = 0; i64 item = 0; bool active = false, sj_ready = false; i32 sj_pc = -1;
+  unsigned sj_alive = 0xffffffffu;
+  float sj_cost[{K}], sj_rent[{K}];
+  for (int k = 0; k < {K}; ++k) {{ sj_cost[k] = 0.0f; sj_rent[k] = 0.0f; }}
+{D(f"  unsigned long long d_[{2 * K + 4}] = {{0}}; bool sj_last = false;")}
+  while (true) {{
+    bool sj_ex = false;
+    if (!active) {{
+      {claim}
+      t = my_next; my_next += my_stride; --my_left;
+      if (t >= (u64)n_items) sj_ex = true;
+      else {{ item = (i64)t; {start} active = true; sj_ready = true; }}
+    }}
+    if (sj_ready) {{                       // lane-local: from the loop condition to the next cut
+      sj_ready = false;
+      {ev["cond"]}
+      if (sj_pr) {{ {ev["head"]} }}
+      else {{ {ev["post"]}
+{ywrite}
+        active = false; sj_pc = -1; }}
+    }}
+    const unsigned sj_live = __ballot_sync(sj_alive, !sj_ex);
+    {D("sj_last = sj_live == 0u && lane == __ffs(sj_alive) - 1;")}
+    if (sj_ex) break;
+    sj_alive = sj_live;
+    int sj_n[{K}], sj_any = 0;
+    for (int k = 0; k < {K}; ++k) {{ sj_n[k] = __popc(__ballot_sync(sj_alive, sj_pc == k)); sj_any += sj_n[k]; }}
+    {D("d_[1] += __popc(sj_alive); if (!sj_any) ++d_[0];")}
+    if (!sj_any) continue;
+    const int sj_na = __popc(sj_alive);
+    int sj_j = -1; float sj_best = -3.0e38f;
+    for (int k = 0; k < {K}; ++k)
+      if (sj_n[k]) {{ const float sc = sj_rent[k] - (float)(sj_na - sj_n[k]) * sj_cost[k]; if (sc > sj_best) {{ sj_best = sc; sj_j = k; }} }}
+    {D("++d_[2]; d_[3] += sj_any; ++d_[4 + 2 * sj_j]; d_[5 + 2 * sj_j] += sj_n[sj_j];")}
+    const long long sj_t0 = clock64();
+    if (sj_pc == sj_j) {{
+      {ev["disp"]}
+      {ev["tail"]}
+      sj_pc = -1; sj_ready = true;
+    }}
+    __syncwarp(sj_alive);
+    float sj_dt = (float)(clock64() - sj_t0);
+    sj_dt = __shfl_sync(sj_alive, sj_dt, __ffs(sj_alive) - 1);
+    for (int k = 0; k < {K}; ++k) {{
+      if (k == sj_j) {{ sj_rent[k] = 0.0f; sj_cost[k] = sj_cost[k] == 0.0f ? sj_dt : 0.875f * sj_cost[k] + 0.125f * sj_dt; }}
+      else if (sj_n[k]) sj_rent[k] += (float)sj_n[k] * sj_dt;
+    }}
+  }}
+{dbg_end}
+{chr(10).join(acc_flush)}
+}}
+"""
 
 
 def _scratch(s):

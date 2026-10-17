@@ -231,7 +231,7 @@ _OPTS = {
     "rev_step_segments": "reverse mode: recompute each loop step in this many checkpointed segments (0 = off)",
     "rev_stats": "reverse mode: report replay mismatches / tree stats to the host (costs jit's fast path)",
     # PRIVATE (measurements / tests / negative controls; not API)
-    "_schedule": "cuda: 'step' | 'item' overrides the rule (step unless the program spawns)",
+    "_schedule": "cuda: 'step' | 'item' | 'events' overrides the rule (step unless the program spawns)",
     "_cuda_inplace": "cuda: False never updates a per-item array in place (A/B control of the aliasing analysis)",
     "_lanes": "'off' never dual lanes | 'force' ignore the local-memory guard | int: chunks of at most this many lanes",
     "_fold": "False: never fold a batch into the item axis",

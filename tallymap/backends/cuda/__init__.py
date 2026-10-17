@@ -41,10 +41,11 @@ MATH_OPTS = {"ieee": [], "approx": ["-DTALLYMAP_APPROX_DIVSQRT", "--prec-div=fal
 
 
 class Kernel:
-    def __init__(self, p, min_blocks=0, split=True, math="approx", inplace=True):
+    def __init__(self, p, min_blocks=0, split=True, math="approx", inplace=True, events=False):
         self.block = BLOCK
         try:
-            self.src, self.L = build_source(p, min_blocks=int(min_blocks), split=bool(split), inplace=bool(inplace))
+            self.src, self.L = build_source(p, min_blocks=int(min_blocks), split=bool(split), inplace=bool(inplace),
+                                            events=bool(events))
         except CodegenError as e:
             raise UnsupportedError(str(e)) from None
         if math not in MATH_OPTS:
@@ -59,7 +60,7 @@ def kernel(p, **opts):
         _KERNELS[k] = Kernel(p, **opts)
     kern = _KERNELS[k]
     from ..._diagnostics import record_kernel
-    record_kernel(dict(tag=p.tag, mode=kern.L.mode, hash=kern.info["hash"], cached=kern.info["cached"],
+    record_kernel(dict(tag=p.tag, mode=kern.L.mode, cut=kern.L.cut, hash=kern.info["hash"], cached=kern.info["cached"],
                        source=os.path.join(C.cache_dir(), kern.info["hash"] + ".cu"), prims=list(kern.L.prims),
                        options=dict(opts)))
     return kern
@@ -73,17 +74,22 @@ def run(p, pi, bc, cuda_math="approx", cuda_min_blocks=0, _schedule=None, _cuda_
     """Scheduling: a lane is refilled with a new item at STEP granularity (needs one top-level while loop;
     1.35x faster than whole items on a photon-transport item) unless the program spawns (whole items: 1.5x faster
     on a particle shower); private _schedule
-    'step' | 'item' overrides it (measurements and A/B checks only).  Private _cuda_inplace=False: never update a
+    'step' | 'item' overrides it (measurements and A/B checks only); 'events' cuts the step at its most expensive
+    top-level cond / switch and lets each warp run one branch at a time (kernel.build_source, _events_main).
+    Private _cuda_inplace=False: never update a
     per-item array in place (every dynamic_update_slice copies; the A/B control of the emitter's aliasing analysis).
     cuda_math: 'approx' (DEFAULT: div.full / sqrt.approx / rsqrt.approx, the PTX XLA:GPU itself emits for f32;
     measured 1.5x fwd / 1.65x jvp faster than ieee; validated by the pre-registered compare runs,
     docs/validation.md) |
     'ieee' (correctly rounded f32 div/sqrt: the portable reference)."""
     math = cuda_math or "approx"
-    if _schedule not in (None, "step", "item"):
-        raise ValueError("tallymap: _schedule must be 'step' or 'item'")
-    split = _schedule == "step" or (_schedule is None and p.spawn is None)
+    _schedule = _schedule or os.environ.get("TALLYMAP_SCHEDULE") or None    # (measurement only: A/B a whole program)
+    if _schedule not in (None, "step", "item", "events"):
+        raise ValueError("tallymap: _schedule must be 'step', 'item' or 'events'")
+    split = _schedule in ("step", "events") or (_schedule is None and p.spawn is None)
     extra = {} if _cuda_inplace else dict(inplace=False)        # (the default leaves the kernel key unchanged)
+    if _schedule == "events":
+        extra["events"] = True
     kern = kernel(p, min_blocks=cuda_min_blocks, split=split, math=math, **extra)
     L = kern.L
     N = int(pi[0].shape[0])
