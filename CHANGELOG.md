@@ -58,6 +58,13 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Changed
 
+- The cuda kernel claims ONE item per warp-aggregated claim. It used to claim a run of up to
+  `clamp(N / (16 * grid * block), 1, 16)` items per lane, which left the last claims holding several items each
+  — a tail the other lanes wait for. Measured over all 18 `benchmarks/vs_jax` forward and gradient cells on a
+  2080 Ti: one item per claim is 1.46x faster on random_walk forward, 1.14-1.18x on transport forward,
+  random_walk gradient and uniform gradient, and never slower (worst cell 1.002). Three fitted constants and
+  two kernel variables go with it.
+
 - The rule that decides whether `jax.vmap` over a tallymap call folds the batch into the item axis (one launch
   of B*N items) or falls back to `lax.map` (one launch per member). On cuda it was "fold while every privatised
   tally stays privatised"; it is now "fold while one member's N items cannot fill the device" (N below

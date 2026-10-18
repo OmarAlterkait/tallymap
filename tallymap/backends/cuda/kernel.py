@@ -573,20 +573,23 @@ def build_source(p, *, block=BLOCK, split=True, inplace=True, events=False):
          f"        for (int e = 0; e < {_size(sh)}; ++e) (({ctype(dt)}*)P.p[{L.r_ys[j]}])[t * {_size(sh)} + e] = y{j}[e];")
         for j, (sh, dt, _) in enumerate(yav))
     lb = f"__launch_bounds__({block})"
-    claim = """if (my_left == 0) {               // warp-aggregated claim of CH item slots per needy lane, interleaved
+    # ONE item per claim, warp-aggregated: the needy lanes of a warp take one contiguous run between them, so
+    # the counter sees one atomic per warp instead of one per lane.  Claiming a RUN of items per lane was
+    # measured and removed: it leaves the last claims holding several items each, which is a tail the other
+    # lanes wait for (2080 Ti, all 18 benchmarks/vs_jax cells: one item per claim is 1.46x faster on
+    # random_walk's forward pass, 1.14-1.18x on transport, uniform and ode, and never slower).
+    claim = """if (my_left == 0) {
           const unsigned m = __activemask();
           const int leader = __ffs(m) - 1;
           const unsigned rank = __popc(m & ((1u << lane) - 1u));
-          const u32 cnt = (u32)__popc(m);
           u64 base = 0;
-          if (lane == leader) base = atomicAdd((unsigned long long*)sj_ctr, (unsigned long long)(cnt * CH));
-          base = __shfl_sync(m, base, leader);
-          my_next = base + rank; my_stride = cnt; my_left = CH;
+          if (lane == leader) base = atomicAdd((unsigned long long*)sj_ctr, (unsigned long long)__popc(m));
+          my_next = __shfl_sync(m, base, leader) + rank; my_left = 1;
         }"""
     xdecl = "".join(svar("x", i, spc) for i, spc in enumerate(pav)) if spawn is not None else ""
     if spawn is None:
         fetch = f"""        {claim}
-        t = my_next; my_next += my_stride; --my_left;
+        t = my_next; --my_left;
         if (t >= (u64)n_items) break;"""
         finish = f"""{ywrite}"""
     else:
@@ -620,7 +623,7 @@ def build_source(p, *, block=BLOCK, split=True, inplace=True, events=False):
           {claim}
           t = my_next;
           if (t < (u64)n_items) {{
-            my_next += my_stride; --my_left;
+            --my_left;
             atomicAdd(&SJ_QCTL[4], 1u);
 {load_p}
           }} else {{
@@ -638,9 +641,8 @@ def build_source(p, *, block=BLOCK, split=True, inplace=True, events=False):
 extern "C" __global__ void {lb} sj_main(const SjParams P, const i64 n_items) {{
   u64* const sj_ctr = (u64*)P.p[{L.r_ctr}];
   const int lane = threadIdx.x & 31;
-  const u32 CH = (u32)max(1ll, min(16ll, n_items / (16ll * gridDim.x * blockDim.x)));
 {chr(10).join(acc_decl)}
-{decls}{xdecl}  u64 my_next = 0, my_stride = 0; u32 my_left = 0;
+{decls}{xdecl}  u64 my_next = 0; u32 my_left = 0;
   u64 t = 0; i64 item = 0; bool active = false, done = false, child = false; i32 n_ctr = 0;
   while (true) {{
     if (!active) {{
@@ -687,9 +689,8 @@ def _events_main(L, lb, acc_decl, acc_flush, decls, claim, start, ywrite, ev):
 extern "C" __global__ void {lb} sj_main(const SjParams P, const i64 n_items) {{
   u64* const sj_ctr = (u64*)P.p[{L.r_ctr}];
   const int lane = threadIdx.x & 31;
-  const u32 CH = (u32)max(1ll, min(16ll, n_items / (16ll * gridDim.x * blockDim.x)));
 {chr(10).join(acc_decl)}
-{decls}  u64 my_next = 0, my_stride = 0; u32 my_left = 0;
+{decls}  u64 my_next = 0; u32 my_left = 0;
   u64 t = 0; i64 item = 0; bool active = false, sj_ready = false; i32 sj_pc = -1;
   unsigned sj_alive = 0xffffffffu;
   float sj_cost[{K}], sj_rent[{K}];
@@ -698,7 +699,7 @@ extern "C" __global__ void {lb} sj_main(const SjParams P, const i64 n_items) {{
     bool sj_ex = false;
     if (!active) {{
       {claim}
-      t = my_next; my_next += my_stride; --my_left;
+      t = my_next; --my_left;
       if (t >= (u64)n_items) sj_ex = true;
       else {{ item = (i64)t; {start} active = true; sj_ready = true; }}
     }}

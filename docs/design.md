@@ -102,6 +102,14 @@ steps, 1M items, 2080 Ti -- it was 1.82x, 1.36x, 1.22x and 1.03x SLOWER than the
 was also what made `_schedule='events'` cost 3.1x in reverse mode (an adjoint program's three top-level loops
 were each event-scheduled): with it gone the gradient row above is a wash.
 
+A lane claims ONE item per claim, warp-aggregated: the needy lanes of a warp take one contiguous run of item
+indices between them, so the claim counter sees one atomic per warp rather than one per lane. Claiming a RUN of
+up to 16 items per lane (a chunk sized from the item count and the grid) was in the kernel and is removed: it
+leaves the last claims holding several items each, which is a tail every other lane waits for. Measured on a
+2080 Ti over all 18 `benchmarks/vs_jax` forward and gradient cells, one item per claim is 1.46x faster on
+random_walk's forward pass, 1.14 to 1.18x on transport forward, random_walk gradient and uniform gradient,
+1.09x on ode, and never slower (worst cell 1.002).
+
 `max_steps` is applied by re-tracing the item jaxpr: every top-level while loop gets a counter and the item
 returns `truncated` (`Result.truncated`, `stats['n_truncated']`). It is one rewrite, upstream of every backend and
 every automatic-differentiation transform, so the JVP, VJP and batched versions of the capped program are
