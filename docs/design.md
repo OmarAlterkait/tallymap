@@ -542,8 +542,18 @@ because the repository's own problems compile in seconds.
   the `compile_scaling` items and **2.2-15.2x** on `benchmarks/vs_jax` at 4M items (`transport` forward is the
   worst), with `-maxrregcount` recovering only a quarter of it. The one exception is an item whose kernel ptxas
   has ALREADY capped at 255 registers -- a 16x16 dense solve per step -- where the split costs **6.6%**, which is
-  this kernel's own regime and why the `__noinline__` arm above costs only 5-9% here. So the split pays only
-  where the source is large AND the kernel is register-starved; it is not in the library.
+  this kernel's own regime and why the `__noinline__` arm above costs only 5-9% here. The application's own
+  production kernels, compiled split (128-KB chunks, 32 processes) against monolithic on a 2080 Ti, fresh caches,
+  results bitwise equal between the arms: the 6-column `jacfwd` (255 registers either way) goes from a 4,126 s to a
+  264 s first call (144 units, 77 s compile) for **+5.2%** run time (0.634 -> 0.667 s); the 26-column one (255
+  either way) from 4,369 s to 302 s for **+17.2%** (1.919 -> 2.250 s); the forward kernel, which monolithic sits
+  at 213 registers, rises to 255 and pays **+53%** (0.169 -> 0.259 s). The split shrinks the frame (114,560 ->
+  81,616 bytes, 7.43 -> 5.29 GiB of driver reservation) but that buys no speed. One job per arm, so 5% against
+  17% is indicative, but it settles the rule: being at the register ceiling is necessary and not sufficient, and
+  no measurable property of the monolithic kernel predicts which side of 10% the split lands on without
+  compiling it the slow way first. So the split is not in the library; a 15x first-call saving against a run-time
+  cost of 5-53% is a trade only the application can make, and the persistent disk cache already pays the
+  monolithic compile once per kernel.
 - **Device LTO does not give the inlining back.** `-dlto` + `nvrtcGetLTOIR` + `nvJitLink -lto` moves the whole
   cost into one single-threaded link (371.1 s of the 4.16 MB kernel's 372.5 s compile, 1.22x against monolithic
   where `-rdc` gives 11.9x) and produces a kernel with the outlined arm's registers and frame, not the
