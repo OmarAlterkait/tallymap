@@ -72,8 +72,29 @@ it loses by up to 1.6x on uniform or interaction-bound items, and by 1-13% on th
 218k resident threads leave about one item each and there is nothing to refill.  No structural rule picks the
 faster mode on both GPUs, and a rule on items per resident thread would need a fitted threshold (occupancy and
 divergence both move it), so the rule stays: step refill unless the program spawns, which is right on the
-divergent workloads the library is for.  Event scheduling (`_schedule='events'`) is the same kernel as step
-refill unless the step has a top-level `cond` worth cutting, and stays opt-in for lopsided branches.
+divergent workloads the library is for.
+
+Event scheduling (`_schedule='events'`) is the same kernel as step refill unless the step has a top-level `cond`
+worth cutting; it then cuts the step there and lets each warp run ONE branch per round (`kernel._cut`,
+`_events_main`, and `op_table._while_events` for an inner loop).  No `benchmarks/vs_jax` problem has such a
+`cond`, so on all of them it compiles to the identical kernel; `benchmarks/events_bench.py` is the measurement
+of what it buys, on the item shape it is for -- a divergent loop whose body is a lopsided three-way switch, one
+branch W times more expensive and taken with probability P (2080 Ti, 4M items, median of 9 / min):
+
+| | `'step'` | `'events'` | `'item'` |
+|---|---|---|---|
+| forward, P = 0.2, W = 64 | 21.99 / 16.76 ms | **13.74 / 13.63** | 21.99 / 21.90 |
+| forward, P = 0.05, W = 256 | 47.68 / 47.28 ms | **14.45 / 13.84** | 48.50 / 48.13 |
+| gradient, P = 0.2, W = 64 | **176.7 ms** | 545.0 | 176.5 |
+| gradient, P = 0.05, W = 256 | **2981 ms** | 4344 | 2982 |
+
+So the rarer and costlier the branch, the bigger the win: 3.3x on the forward pass at P = 0.05, W = 256, and
+1.2-1.6x at P = 0.2, W = 64.  Reverse mode is the other way round, by 1.5 to 3.1x, because an adjoint program
+has three top-level while loops and so never gets the step split at all (section 6): it runs whole-item either
+way, and the event-scheduled forward kernel costs it registers and stack (210 registers / 880 bytes against
+160 / 800).  That is why event scheduling stays OPT-IN and is not a default: nothing in the item jaxpr says
+how lopsided a branch is at run time, and the right answer differs between the forward pass and the gradient of
+the same program.
 
 `max_steps` is applied by re-tracing the item jaxpr: every top-level while loop gets a counter and the item
 returns `truncated` (`Result.truncated`, `stats['n_truncated']`). It is one rewrite, upstream of every backend and

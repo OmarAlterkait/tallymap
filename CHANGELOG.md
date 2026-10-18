@@ -8,6 +8,12 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Added
 
+- `benchmarks/events_bench.py`: the measurement of event scheduling (`_schedule='events'`) against the default
+  step refill, on the item shape it is for (a divergent loop whose body is a lopsided switch). No `vs_jax`
+  problem has a top-level `cond` with a dynamic index in its step body, so on all of them the two schedules
+  compile to the same kernel and the mechanism's benefit was undocumented. It is 3.3x on the forward pass of
+  a rare, 256-times-more-expensive branch at 4M items on a 2080 Ti, and 1.5 to 3.1x SLOWER in reverse mode
+  (`docs/design.md`, section 1b).
 - `jnp.linalg.solve`, `inv`, `det` and `lu_factor` / `lu_solve` run inside an item on cuda: `lu`,
   `lu_pivots_to_permutation`, `custom_linear_solve` and `triangular_solve` are lowered after autodiff to JAX's own
   pure-JAX implementations (and a substitution loop), so the derivative is JAX's own. `supported_primitives()`
