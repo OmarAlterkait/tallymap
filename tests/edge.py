@@ -1280,7 +1280,24 @@ def _(b):
     """The A/B control of backends/lockstep.py's compaction (_lockstep_compact=False is the masked interpreter).
 
     The default widths need thousands of lanes, so the widths are forced here (8 and 5 lanes, the second one not
-    a divisor of N, which exercises the chunk clamping), and _lockstep_cond=True forces every cond to compact."""
+    a divisor of N, which exercises the chunk clamping), and _lockstep_cond=True forces every cond to compact.
+
+    Integer tallies, per-item integers and stats must be IDENTICAL on every platform.  Float tallies are bitwise
+    identical on a CPU, where a scatter-add runs in index order, but a GPU orders the updates of one scatter by
+    itself, so a different lane count sums them in a different order: there the contract is one ulp, which is
+    the same caveat the block width already carries (design.md 1d).  Measured on a 2080 Ti: forward bitwise, the
+    jvp 9.7e-08 relative."""
+    ftol = dict(rtol=1e-5, atol=0) if GPU else dict(rtol=0, atol=0)
+
+    def exact(a, bb, what):
+        """integer and bool leaves identical, float leaves to ftol."""
+        for x, y in zip(jax.tree_util.tree_leaves(a), jax.tree_util.tree_leaves(bb)):
+            if np.asarray(x).dtype.kind in "iub":
+                if not np.array_equal(np.asarray(x), np.asarray(y)):
+                    raise Fail(f"{what}: integer result differs")
+            else:
+                close(x, y, what=what, **ftol)
+
     def sw(t, x, key, th):
         """a batched switch with one expensive branch, inside a divergent loop"""
         def body(c):
@@ -1309,8 +1326,8 @@ def _(b):
         for opt in opts:
             f = tm.vmap(item, backend=b, in_axes=ax, **kw, **opt)
             A = f(*args)
-            close(A.outputs, base.outputs, rtol=0, atol=0, what=f"{name} {opt} outputs")
-            close(A.per_item, base.per_item, rtol=0, atol=0, what=f"{name} {opt} per-item")
+            exact(A.outputs, base.outputs, f"{name} {opt} outputs")
+            exact(A.per_item, base.per_item, f"{name} {opt} per-item")
             for k, v in base.stats.items():
                 if not np.array_equal(np.asarray(A.stats[k]), np.asarray(v)):
                     raise Fail(f"{name} {opt} stats[{k}] {A.stats[k]} != {v}")
@@ -1319,13 +1336,14 @@ def _(b):
             loss = lambda g, q: jnp.sum(g(*args[:-1], q).outputs["Q"] ** 2)
             th = args[-1]
             close(jax.grad(lambda q: loss(f, q))(th), jax.grad(lambda q: loss(ref, q))(th),
-                  rtol=0, atol=0, what=f"{name} {opt} grad")
+                  what=f"{name} {opt} grad", **ftol)
             close(jax.jvp(lambda q: loss(f, q), (th,), (F(1),))[1],
-                  jax.jvp(lambda q: loss(ref, q), (th,), (F(1),))[1], rtol=0, atol=0, what=f"{name} {opt} jvp")
+                  jax.jvp(lambda q: loss(ref, q), (th,), (F(1),))[1], what=f"{name} {opt} jvp", **ftol)
             close(jax.vmap(lambda q: loss(f, q))(jnp.stack([th, th * F(1.1)])),
                   jax.vmap(lambda q: loss(ref, q))(jnp.stack([th, th * F(1.1)])),
-                  rtol=0, atol=0, what=f"{name} {opt} vmap")
-    return f"{len(cases)} items x {len(opts)} widths: outputs, per-item, stats, grad, jvp and vmap all BITWISE"
+                  what=f"{name} {opt} vmap", **ftol)
+    return (f"{len(cases)} items x {len(opts)} widths: outputs, per-item, stats, grad, jvp and vmap "
+            + ("within 1e-5 (GPU scatter order)" if GPU else "all BITWISE"))
 
 
 print("\n================ SUMMARY", jax.__version__, "x64" if jax.config.jax_enable_x64 else "",

@@ -372,11 +372,15 @@ solves the same problem per thread. Here the lanes that need the work are gather
   76 ms), gradients 1.1 to 1.8x faster, and 0.94 to 1.01x -- within noise -- on the problems whose lanes stay
   active together (barrier, uniform, dense state, particle filter forward). Trace and compile time grows by up
   to 30%, because the loop body is instantiated once more.
-- **Results do not change.** Every benchmark problem and every test gives BITWISE identical tallies, per-item
-  results and stats with compaction on and off, in f32 and f64, forward, jvp, grad and vmap. That is not luck:
-  the gather is stable, so the live lanes keep their relative order, and the lanes that drop out contributed
-  nothing to the accumulator in the first place. `tests/edge.py` asserts it (`_lockstep_compact=False` is the
-  A/B control, with `_lockstep_cond` for the cond half).
+- **Results do not change.** On a CPU every benchmark problem and every test gives BITWISE identical tallies,
+  per-item results and stats with compaction on and off, in f32 and f64, forward, jvp, grad and vmap. That is
+  not luck: a scatter-add runs in index order there, the gather is stable so the live lanes keep their relative
+  order, and the lanes that drop out contributed nothing to the accumulator in the first place. On a GPU the
+  hardware orders the updates of one scatter itself, so a different lane count sums them differently: the
+  forward pass measured bitwise on a 2080 Ti and a jvp 9.7e-08 relative, which is the same one-ulp caveat the
+  block width already carries (section 1d). Integer tallies and stats are identical on both.
+  `tests/edge.py` asserts it (`_lockstep_compact=False` is the A/B control, with `_lockstep_cond` for the cond
+  half).
 - **Two designs measured and rejected.** (1) Chunking EVERY round into ceil(active / W) chunks, which is what
   the per-element cost model says to do: on a CPU an HLO operation costs a thread fork-join whatever its width,
   so chunked rounds cost 1.1 to 4.1x the masked loop on the problems whose lanes stay active, for about 2x on

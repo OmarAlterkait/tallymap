@@ -5,7 +5,7 @@ The arms (`run.py --arms` lists the ones each problem supports):
 | arm             | what it is                                                              | modes        |
 |-----------------|-------------------------------------------------------------------------|--------------|
 | `tm_cuda`       | tm.vmap, backend='cuda' (one persistent-thread kernel)                  | all          |
-| `tm_lockstep`   | tm.vmap, backend='lockstep' (the masked reference interpreter)          | all          |
+| `tm_lockstep`   | tm.vmap, backend='lockstep' (the reference interpreter)                 | all          |
 | `jax_while`     | jax.vmap of the same item in a lax.while_loop, then one .at[].add       | forward only |
 | `jax_scan`      | jax.vmap of the same item as a masked lax.scan padded to the OBSERVED   | all          |
 |                 | maximum trip count (an oracle: a real program cannot know it)           |              |
