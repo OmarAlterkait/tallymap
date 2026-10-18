@@ -95,7 +95,7 @@ deliberate: it is what makes an upgrade a bounded job.
 
 | constant | value | where | measured on |
 |---|---|---|---|
-| `MAX_LANES` | 32 | `_primitive.py` | L40S: `jacrev` of 256 outputs in chunks of 4 / 8 / 16 / 32 / 64 lanes: 229 / 191 / 175 / 176 / 325 ms; a 26-column photon-transport `jacfwd` 0.822 s as one kernel vs 0.943 s as 13 + 13 |
+| `MAX_LANES` | 16 | `_primitive.py` | L40S: `jacrev` of 256 outputs in chunks of 4 / 8 / 16 / 32 / 64 lanes: 229 / 191 / 175 / 176 / 325 ms |
 | `LANES_MAX_LOCAL` | 512 elements | `_primitive.py` | L40S: `jacfwd` lane counts; the toy `jacfwd(grad)` went from 95 ms to 2.3 ms once a 6 KB stack frame was split |
 | `FOLD_MAX_BC` | 4096 elements | `_primitive.py` | L40S: a folded batch against `lax.map`, 1.2 to 3.4x |
 | `BLOCK` (cuda) | 128 threads | `backends/cuda/kernel.py` | L40S: 64, 128 and 256 within 1% |

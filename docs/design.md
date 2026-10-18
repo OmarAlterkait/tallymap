@@ -167,7 +167,7 @@ ITEM function and binds the primitive again, so the rules recurse to any order o
 - **dual-lanes guard**: on CUDA, a `dual_lanes` program whose loop body carries a first-order intermediate of 512
   elements or more is split into chunks of fewer lanes, because the kernel keeps T copies of it in per-thread
   local memory. Measured on the toy walk at 1M items, `jax.hessian` went from 1629 ms to 13.5 ms with the guard.
-  At most MAX_LANES = 32 lanes go in one kernel: `jacrev` of the 256 outputs of the toy walk at 1M items took
+  At most MAX_LANES = 16 lanes go in one kernel: `jacrev` of the 256 outputs of the toy walk at 1M items took
   229 / 191 / 175 / 176 / 325 ms in chunks of 4 / 8 / 16 / 32 / 64 lanes, and 4.3 s with all 256 at once.
 - A `fused_jvp` node whose primal operands are unbatched is batched into ONE `dual_lanes` kernel that computes the
   primal once plus T tangent lanes (`dual_lanes_prog(shared=...)`). Before that fix, `jacfwd` ran two launches.

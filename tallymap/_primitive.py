@@ -24,7 +24,7 @@ they recurse to any order.  Node kinds:
                (or anything else linear) -> the generic vjp of its own item.
   batching     only linear operands batched (jacfwd, jacrev, vmap of jvp/vjp tangents; for a fused_jvp node: only its
                tangents) -> `dual_lanes`: T dual lanes per item, the primal computed once; on cuda in chunks of at
-               most MAX_LANES (32) lanes whose lane-dependent loop arrays stay < LANES_MAX_LOCAL (512) elements, one
+               most MAX_LANES (16) lanes whose lane-dependent loop arrays stay < LANES_MAX_LOCAL (512) elements, one
                launch per chunk.  Otherwise, when no spawn / exact outputs, every batched broadcast operand is small
                (<= FOLD_MAX_BC elements per member) and (cuda) no tally leaves shared memory -> `folded_batch`: ONE
                launch over B*N items; anything else -> lax.map over the batch (one launch per batch member).
@@ -655,10 +655,8 @@ LANES_MAX_LOCAL = 512
 # ... and at most MAX_LANES lanes per kernel (the guard sees the largest lane array, not the sum of many small lane
 # values).  Measured (L40S, toy walk 1M items, jacrev of 256 outputs = 256 cotangent lanes of the adjoint): one
 # kernel per chunk of 4 / 8 / 16 / 32 / 64 lanes 229 / 191 / 175 / 176 / 325 ms, all 256 at once 4.3 s, fold 533 ms;
-# hessian 8x8 (8 lanes) 83 ms vs fold 102 ms.  A photon-transport jacfwd of 10 parameters stays one kernel, and its
-# 26-column reconstruction jacfwd (L40S) took 0.822 s as ONE 26-lane kernel against 0.943 s as 13 + 13 (bitwise equal
-# Jacobians, stack frame 96 vs 91 KB): every chunk recomputes the primal, so the cap is where 16 and 32 measured equal.
-MAX_LANES = 32
+# hessian 8x8 (8 lanes) 83 ms vs fold 102 ms.  A photon-transport jacfwd of 10 parameters stays one kernel.
+MAX_LANES = 16
 
 
 def _balanced(size, cap):
