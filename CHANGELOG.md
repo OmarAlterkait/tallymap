@@ -39,6 +39,16 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   result: over C = 8, 16, 32, 64 the six problems now spread by at most 1.6x, against up to 20x before.
   Gradients are unchanged except for the float summation order of a cotangent accumulated by atomics, which
   already varies between runs; per-item cotangents are bitwise identical.
+- **The lockstep backend's cost now follows the ACTIVE lanes.** A `while_loop` used to run its body on all P
+  lanes until the last lane finished. A loop now hands its survivors to the same loop over a quarter as many
+  lanes as soon as they fit (`docs/design.md` section 10). Measured on one CPU node, both arms in one process, the `benchmarks/vs_jax`
+  problems at N = 65,536: forward 1.3 to 2.1x faster on the divergent problems, gradients 1.1 to 1.8x, and
+  within noise (0.92 to 1.04x) on the problems whose lanes stay active together. Trace and compile time grows by
+  up to 30%, except the shower's gradient (the tree adjoint's loop body), where it went from 75 to 219 s for
+  1.24x per call; peak memory grows by the W-wide copy of the loop carries (4 to 76 MB at N = 65,536). On a CPU
+  every tally, per-item result and stat is BITWISE unchanged, which `tests/edge.py` asserts; on a GPU the
+  hardware picks the order of a scatter-add, so a float tally can move by an ulp, exactly as the block width
+  already could. There is no new public option.
 
 ## 0.5.0 - first public release
 
