@@ -131,7 +131,8 @@ derivatives with spawn give children tangents for every float per-item leaf. Rev
   key contains it. One call takes fewer than 2^31 items.
 - `Sum(exact=True)`: int64 fixed point, `round(v * scale)`, with one scale per output. Unrepresentable values,
   meaning `|v * scale| >= 9.2e18`, are dropped AND counted (`stats['exact_overflow']`) on both backends. A fixed
-  2^32 scale was tried first and wraps silently for tangents of order 1e11, so the scale is per output.
+  2^32 scale was tried first and wraps silently for tangents of order 1e11, so the scale is per output.  A
+  tangent tally uses its primal output's scale; a separate `tangent_scale` was an unused knob and was removed.
 - Keys: tallymap invents no randomness. Typed and raw uint32 keys both work. Results do not depend on scheduling.
 - `n_active`: `f(*args, n_active=k)` runs only items `i < k`, so a fixed capacity with a varying count never
   recompiles.

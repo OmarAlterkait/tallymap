@@ -26,6 +26,10 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Removed
 
+- `tm.Sum(..., tangent_scale=)`, the fixed-point scale of the TANGENT tally of an `exact=True` output. Nothing
+  in the tests, benchmarks, examples or documentation ever set it and no number was ever recorded for it; a
+  tangent tally now always uses its primal output's `scale`, which is what every program that did not set it
+  already got, so no result changes. Passing it raises `TypeError`, as any unknown `tm.Sum` field does.
 - The public option `cuda_min_blocks` (the cuda `__launch_bounds__` minimum-blocks-per-SM register cap). Passing
   it now raises, like any unknown option. Re-measured on the toy walk at 4M items on a 2080 Ti: 0 / 1 / 2 / 4
   gave forward 6.22 / 6.25 / 6.22 / 6.17 ms and a JVP 7.16 / 7.25 / 7.28 / 7.17 ms, all inside rerun noise.
