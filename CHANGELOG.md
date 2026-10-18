@@ -11,8 +11,8 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 - `benchmarks/events_bench.py`: the measurement of event scheduling (`_schedule='events'`) against the default
   step refill, on the item shape it is for (a divergent loop whose body is a lopsided switch). No `vs_jax`
   problem has a top-level `cond` with a dynamic index in its step body, so on all of them the two schedules
-  compile to the same kernel and the mechanism's benefit was undocumented. It is 3.3x on the forward pass of
-  a rare, 256-times-more-expensive branch at 4M items on a 2080 Ti, and 1.5 to 3.1x SLOWER in reverse mode
+  compile to the same kernel and the mechanism's benefit was undocumented. It is 3.1x on the forward pass of
+  a rare, 256-times-more-expensive branch at 4M items on a 2080 Ti, and a wash in reverse mode
   (`docs/design.md`, section 1b).
 - `jnp.linalg.solve`, `inv`, `det` and `lu_factor` / `lu_solve` run inside an item on cuda: `lu`,
   `lu_pivots_to_permutation`, `custom_linear_solve` and `triangular_solve` are lowered after autodiff to JAX's own
@@ -26,6 +26,20 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Removed
 
+- The public option `rev_step_segments` (recompute each loop step in S checkpointed segments inside its VJP).
+  Passing it now raises, like any unknown option. Four independent measurements on a 2080 Ti found no benefit:
+  the six `benchmarks/vs_jax` gradient cells (0.98-1.05 at S = 4 and 8), the toy walk at 1M items
+  (6.32 / 6.36 / 6.45 / 6.43 ms at S = 0 / 4 / 8 / 16), a toy built to spill (168 registers, 1,328 bytes of
+  local memory per thread, grad/forward 8.1x: 32.4 / 31.2 / 32.1 ms at S = 0 / 2 / 4) and the diffrax ensemble
+  of `docs/equinox.md` (4,936 against 4,968 ms). `docs/design.md` section 6 already recorded that ptxas reports
+  zero spill bytes for every public adjoint kernel, so no rule could have set S either. -96 lines.
+- Event scheduling of INNER while loops. `_schedule='events'` now cuts only the step body of the outer loop
+  (`kernel._cut` / `kernel._events_main`); an inner `while` is lowered as a plain C loop again. On four toys
+  built to be the inner-loop scheduler's best case it was 1.82x / 1.36x / 1.22x / 1.03x slower than the plain
+  loop and never faster, and it never fired on any `benchmarks/vs_jax` problem. It was also the reason
+  `_schedule='events'` cost 3.1x in reverse mode (every top-level loop of an adjoint program was
+  event-scheduled); the gradient is now within 3% of the default, while the forward win (1.6-3.1x on
+  `benchmarks/events_bench.py`) is unchanged.
 - `tm.Sum(..., tangent_scale=)`, the fixed-point scale of the TANGENT tally of an `exact=True` output. Nothing
   in the tests, benchmarks, examples or documentation ever set it and no number was ever recorded for it; a
   tangent tally now always uses its primal output's `scale`, which is what every program that did not set it
