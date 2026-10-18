@@ -5,6 +5,16 @@ runs while ANY active lane needs it, and emits / spawns / per-item writes are ma
 Unlike jax.vmap, tallies are never per-lane: an emit is a masked scatter-add into ONE shared accumulator, so
 memory is O(P * state + outputs), not O(P * outputs).  Items are processed in blocks of P lanes; with spawn,
 children are queued in a ring buffer and run in later blocks (children first).
+
+COMPACTION (`_while`, `_cond_pool`): masking alone makes a while loop cost P * max(trip count), and a cond with
+a per-lane index cost the SUM of the branches on every lane.  So divergent control flow runs on the lanes that
+need it instead, gathered into a dense prefix of a NARROWER lane axis: a while loop hands its survivors to the
+same loop over P >> WSHIFT lanes once at most W of them are left, and a cond runs each branch on chunks of the
+lanes that take it.  Both are measured in REPORT.md; `docs/design.md` section 9 has the reasoning and the two
+designs that were measured and rejected.  The one number behind all of it, on a CPU (ns per element, 2^16 lanes,
+f32[4] rows, one milano node): `jnp.where` 0.20, dynamic_slice 0.17, dynamic_update_slice 0.13, gather 0.45,
+scatter 2.9, a permutation 6.0.  Moving a lane costs 3 to 30 times touching it, so lanes are moved once per
+level, never per round.
 """
 import jax
 import jax.numpy as jnp
@@ -12,9 +22,15 @@ from jax import lax
 from jax.extend.core import Literal
 
 from .._foreign import ad_advice, advice
-from .._jaxpr import bind, call_jaxpr, cond_branches, lit, located, scan_parts, while_parts
+from .._jaxpr import bind, call_jaxpr, cond_branches, lit, located, scan_parts, subjaxprs, while_parts
 
 BLOCK = 1 << 18
+WSHIFT = 2        # each narrowing divides the lane count by 2^WSHIFT
+WMIN = 1 << 10    # a lane count at or below this is never narrowed: too few lanes left to pay for the gather
+NARROW = 1        # how many times ONE loop narrows: each costs one more instantiation of the loop body
+# per-element cost of a gather and of a scatter, in units of one element of an elementwise operation (measured
+# above).  They decide ONE thing: whether compacting a cond's branches pays for moving its operands (_pays).
+GATHER, SCATTER = 5, 12
 
 
 class VT:
@@ -38,13 +54,33 @@ def _bc(v, P):
 
 
 class _St:
-    def __init__(self, p, P, accs, queue):
+    def __init__(self, p, P, accs, queue, compact=None, cond=None):
         self.p, self.P = p, P
         self.accs = accs                # slot -> array
         self.queue = queue              # None | dict(leaves, head, tail, spawned, dropped)
         self.ovf = jnp.int32(0)         # exact-output overflow count
         self.drops = jnp.int32(0)       # out-of-range (dropped) emit indices
         self.mask = None
+        self.compact = compact          # None: the rule | False: never compact | int: that chunk width
+        self.cond = cond                # None: the _pays rule | True: compact every batched cond | False: none
+        self.loop = 0                   # loop bodies the interpreter is inside (narrowing is top-level only)
+
+    def width(self, P):
+        """-> the narrower lane count to compact into, or None: stay at P lanes and mask."""
+        if self.compact is False:
+            return None
+        if self.compact is None:
+            return None if P <= WMIN else max(P >> WSHIFT, WMIN)
+        w = int(self.compact)
+        return None if w <= 0 or w >= P else w
+
+    def narrow(self, P, level):
+        """the same, for the survivors of a while loop.  A narrowing costs one more instantiation of that loop's
+        body, so only a loop the interpreter is not already inside a loop for narrows (`self.loop`), and only
+        NARROW times: the compiled program then grows with NARROW instead of exponentially with the loop
+        nesting (measured: the shower's reverse-mode program took 899 s to compile when every nested loop
+        narrowed, against 56 s masked and 0.87x the run time)."""
+        return None if self.loop or level >= NARROW else self.width(P)
 
     # ------------------------------------------------------------- state threaded through lax control flow
     def pack(self):
@@ -171,7 +207,60 @@ def _sel(m, new, old):
     return jnp.where(mm, new, old)
 
 
-def _while(st, e, ins):
+def _order(m, n, P):
+    """a permutation of the lane axis that puts the lanes of `m` first, in lane order, and the rest after it.
+
+    The stopped lanes follow in the suffix, so it is a full permutation and a prefix of it of any length is a
+    valid set of lanes to gather."""
+    i = jnp.arange(P, dtype=jnp.int32)
+    pos = jnp.where(m, jnp.cumsum(m, dtype=jnp.int32) - 1, n + jnp.cumsum(~m, dtype=jnp.int32) - 1)
+    return jnp.zeros((P,), jnp.int32).at[pos].set(i, mode="drop")
+
+
+def _while(st, e, ins, level=0):
+    """a while loop over the current lanes, then the SAME loop over its survivors on a NARROWER lane axis.
+
+    Masking alone costs P * max(trip count): every round runs on every lane, including the lanes that stopped
+    long ago.  So the masked loop stops as soon as at most W = P >> WSHIFT lanes are still running, gathers
+    those lanes into a W-wide lane axis and goes on there, where a round is 1 / 2^WSHIFT of the cost -- and
+    recursively, NARROW times.  A lane that stops never restarts (its carry is frozen, so its predicate stays
+    false), which is why nothing is ever gathered back: one gather per carry per level, and one scatter at the
+    end to put the survivors back where they came from.
+
+    Chunking EVERY round into ceil(active / W) chunks instead -- which is what the per-element cost model says
+    to do, and what the cuda backend does per thread -- was implemented and measured first, and rejected: on a
+    CPU an HLO operation costs a thread fork-join whatever its width, so chunked rounds cost 1.1 to 4.1x the
+    masked loop on the problems whose lanes stay active (barrier, uniform, particle_filter, interacting_md) for
+    2x on the divergent ones.  Narrowing instead pays nothing per round.  REPORT.md has both tables.
+    """
+    w = while_parts(e)
+    nc, nb = w.nc, w.nb
+    init = ins[nc + nb:]
+    P = st.P
+    isvt = [isinstance(a, VT) for a in init]
+
+    def carries(arr):
+        it = iter(arr)
+        return [a if v else B(next(it), True) for a, v in zip(init, isvt)]
+    W = st.narrow(P, level)
+    arr, m = _while_masked(st, e, ins, 0 if W is None else W)
+    if W is None:
+        return carries(arr)
+    n = jnp.sum(m, dtype=jnp.int32)
+    g = _order(m, n, P)[:W]                        # the lanes still running (at most W of them) come first
+    ops = [B(jnp.take(a.x, g, axis=0, mode="clip"), True) if not isinstance(a, VT) and a.b else a
+           for a in ins[:nc + nb]]
+    saved = st.P, st.mask
+    st.P, st.mask = W, jnp.arange(W, dtype=jnp.int32) < n
+    out = _while(st, e, ops + carries([jnp.take(a, g, axis=0, mode="clip") for a in arr]), level + 1)
+    st.P, st.mask = saved
+    it = iter([o for o, v in zip(out, isvt) if not v])
+    return carries([a.at[g].set(_bc(next(it), W).astype(a.dtype), mode="drop") for a in arr])
+
+
+def _while_masked(st, e, ins, floor=0):
+    """the masked loop: every round runs on all P lanes.  -> (carry arrays, the still-running mask) when at most
+    `floor` lanes are still running (floor = 0: when none is)."""
     w = while_parts(e)
     nc, nb = w.nc, w.nb
     cc, bc, init = ins[:nc], ins[nc:nc + nb], ins[nc + nb:]
@@ -189,20 +278,20 @@ def _while(st, e, ins):
         return _bc(r, P) & outer
 
     def cond_f(s):
-        return jnp.any(s[1])
+        return jnp.any(s[1]) if floor == 0 else jnp.sum(s[1], dtype=jnp.int32) > floor
 
     def body_f(s):
         arr, m, packed = s
         st.unpack(packed)
         saved = st.mask
-        st.mask = m
+        st.mask, st.loop = m, st.loop + 1
         out = _ev(st, w.body.jaxpr, w.body.consts, bc + carries(arr))
-        st.mask = saved
+        st.mask, st.loop = saved, st.loop - 1
         new = [_sel(m, _bc(o, P), a) for o, a in zip([o for o, v in zip(out, isvt) if not v], arr)]
         return new, pred(new), st.pack()
-    arr, _, packed = lax.while_loop(cond_f, body_f, (arr0, pred(arr0), st.pack()))
+    arr, m, packed = lax.while_loop(cond_f, body_f, (arr0, pred(arr0), st.pack()))
     st.unpack(packed)
-    return carries(arr)
+    return arr, m
 
 
 def _cond(st, e, ins):
@@ -239,8 +328,13 @@ def _cond(st, e, ins):
     if not idx.b:
         res, packed = lax.switch(jnp.clip(idx.x, 0, n - 1), [run_branch(k, st.mask) for k in range(n)], st.pack())
         st.unpack(packed)
+        it = iter(res)
+        return [vt if vt is not None else B(next(it), True) for vt in vts]
+    ii = jnp.clip(idx.x, 0, n - 1)
+    W = st.width(P) if (_pays(brs, ops, e, vts) if st.cond is None else st.cond) else None
+    if W is not None:
+        res = _cond_pool(st, brs, ops, e, vts, ii, W)
     else:
-        ii = jnp.clip(idx.x, 0, n - 1)
         outs = []
         for k in range(n):
             mk = st.mask & (ii == k)
@@ -255,6 +349,96 @@ def _cond(st, e, ins):
         res = [_select_n(ii, [o[j] for o in outs]) for j in range(len(outs[0]))]
     it = iter(res)
     return [vt if vt is not None else B(next(it), True) for vt in vts]
+
+
+def _size(aval, skip=0):
+    """elements of one lane's value: the aval of an item-level value, or a batched array minus its lane axis."""
+    n = 1
+    for d in getattr(aval, "shape", ())[skip:]:
+        n *= int(d)
+    return n
+
+
+def _cost(jaxpr, _memo=None):
+    """a per-lane cost for ONE evaluation of `jaxpr`, in units of one element of an elementwise operation: the
+    elements its equations produce, with the moves weighted as measured (GATHER / SCATTER) and a while loop
+    counted as a single trip, which is the conservative count (it can only UNDER-state what compaction saves)."""
+    _memo = {} if _memo is None else _memo
+    if id(jaxpr) in _memo:
+        return _memo[id(jaxpr)]
+    total = 0
+    for e in jaxpr.eqns:
+        sz = sum(_size(v.aval) for v in e.outvars) or 1
+        name = e.primitive.name
+        if name == "tallymap_emit":
+            total += SCATTER * _size(e.invars[1].aval)
+        elif name.startswith("scatter"):
+            total += SCATTER * sz
+        elif name in ("gather", "dynamic_slice", "dynamic_update_slice"):
+            total += GATHER * sz
+        elif name == "cond":
+            total += max(_cost(b.jaxpr, _memo) for b in cond_branches(e))
+        elif name == "scan":
+            sc = scan_parts(e)
+            total += sc.length * _cost(sc.body.jaxpr, _memo)
+        elif (s := subjaxprs(e)):
+            total += sum(_cost(x.jaxpr, _memo) for x in s)
+        else:
+            total += sz
+    _memo[id(jaxpr)] = total
+    return total
+
+
+def _pays(brs, ops, e, vts):
+    """-> does compacting this cond pay?  The masked interpreter runs EVERY branch that any lane takes on every
+    lane, so of the branch work it does, all but ONE lane's worth is thrown away; compacting runs each branch on
+    the lanes that take it, which costs the average branch instead of their sum, plus a gather of the
+    lane-varying operands and a scatter of the results.  So it pays when
+
+        sum(branches) - sum(branches) / nbranches  >  GATHER * operands + SCATTER * results
+
+    with everything estimated from the jaxpr (_cost), per lane.  The decision is static: it cannot depend on how
+    the lanes actually split, and an even split is the only assumption available.  Measured on a switch over K
+    phases (REPORT.md): compacting is 1.3 to 11.7x faster forward and 0.9 to 8.4x in reverse mode once a branch
+    does more than a handful of flops, and 1.5 to 1.7x SLOWER when the branches are two flops and no emit, which
+    is the case this rule declines."""
+    if len(brs) < 2:
+        return False
+    c = [_cost(b.jaxpr) for b in brs]
+    move = GATHER * sum(_size(o.x, 1) for o in ops if not isinstance(o, VT) and o.b) \
+        + SCATTER * sum(_size(v.aval) for v, vt in zip(e.outvars, vts) if vt is None)
+    return sum(c) - sum(c) // len(c) > move
+
+
+def _cond_pool(st, brs, ops, e, vts, ii, W):
+    """every branch on the lanes that TAKE it, gathered into chunks of W lanes.  -> the batched outputs."""
+    P = st.P
+    idx = jnp.arange(W, dtype=jnp.int32)
+    res = [jnp.zeros((P,) + tuple(v.aval.shape), v.aval.dtype) for v, vt in zip(e.outvars, vts) if vt is None]
+    outer = st.mask
+    for k in range(len(brs)):
+        mk = outer & (ii == k)
+        nk = jnp.sum(mk, dtype=jnp.int32)
+        g = _order(mk, nk, P)
+
+        def chunk(s, k=k):
+            cur, res, packed = s
+            st.unpack(packed)
+            start = jnp.minimum(cur, P - W)
+            sel = lax.dynamic_slice_in_dim(g, start, W, 0)
+            live = (idx >= cur - start) & (start + idx < nk)
+            st.P, st.mask = W, live
+            out = _ev(st, brs[k].jaxpr, brs[k].consts,
+                      [o if isinstance(o, VT) or not o.b else B(jnp.take(o.x, sel, axis=0, mode="clip"), True)
+                       for o in ops])
+            st.P, st.mask = P, outer
+            at = jnp.where(live, sel, P)                             # a lane outside the chunk is dropped
+            res = [r.at[at].set(_bc(o, W).astype(r.dtype), mode="drop")
+                   for r, o in zip(res, [o for o, vt in zip(out, vts) if vt is None])]
+            return cur + W, res, st.pack()
+        _, res, packed = lax.while_loop(lambda s: s[0] < nk, chunk, (jnp.int32(0), res, st.pack()))
+        st.unpack(packed)
+    return res
 
 
 def _select_n(ii, cases):
@@ -285,7 +469,9 @@ def _scan(st, e, ins):
         car = [a if v else B(next(it), True) for a, v in zip(init, isvt)]
         xi = iter(zip(x, xsb))
         xin = [a if v else B(*next(xi)) for a, v in zip(xs, xvt)]
+        st.loop += 1
         out = _ev(st, sc.body.jaxpr, sc.body.consts, consts + car + xin)
+        st.loop -= 1
         new = [_bc(o, P) for o, v in zip(out[:nk], isvt) if not v]
         yvt.update((j, o) for j, o in enumerate(out[nk:]) if isinstance(o, VT))
         return (new, st.pack()), [_bc(o, P) for o in out[nk:] if not isinstance(o, VT)]
@@ -298,7 +484,7 @@ def _scan(st, e, ins):
 
 
 # ------------------------------------------------------------------------------------------- driver
-def run(p, pi, bc, lockstep_block=None, **_):
+def run(p, pi, bc, lockstep_block=None, _lockstep_compact=None, _lockstep_cond=None, **_):
     """-> [sum tally arrays] + [stats int32[5]] + [per-item results [N, ...]]"""
     N = int(pi[0].shape[0])
     nT = p.nT
@@ -319,7 +505,7 @@ def run(p, pi, bc, lockstep_block=None, **_):
         pav = [v.aval for v in cj.jaxpr.invars[nT:nT + p.nP]]
         queue = dict(leaves=[jnp.zeros((Q,) + tuple(a.shape), a.dtype) for a in pav], head=jnp.int32(0),
                      tail=jnp.int32(0), spawned=jnp.int32(0), dropped=jnp.int32(0))
-    st = _St(p, P, accs, queue)
+    st = _St(p, P, accs, queue, _lockstep_compact, _lockstep_cond)
     lanes = jnp.arange(P, dtype=jnp.int32)
 
     def block_fn(ids, mask, lane_pi, ys, primary):

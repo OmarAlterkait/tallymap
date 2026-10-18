@@ -1274,6 +1274,60 @@ def _(b):
     return f"n = {out}: forward, jvp and grad match the dense reference"
 
 
+@case("compaction: a narrowed lane axis and a compacted cond give the masked interpreter's results exactly",
+      ["lockstep"])
+def _(b):
+    """The A/B control of backends/lockstep.py's compaction (_lockstep_compact=False is the masked interpreter).
+
+    The default widths need thousands of lanes, so the widths are forced here (8 and 5 lanes, the second one not
+    a divisor of N, which exercises the chunk clamping), and _lockstep_cond=True forces every cond to compact."""
+    def sw(t, x, key, th):
+        """a batched switch with one expensive branch, inside a divergent loop"""
+        def body(c):
+            k, y, t = c
+            i = (bits(key, k) % 3).astype(jnp.int32)
+            y, t = lax.switch(i, [lambda y, t: (y * 0.9 * th, t.add("Q", k % NB, y)),
+                                  lambda y, t: (y + 0.1, t.add("C", (k + 1) % NB, 1)),
+                                  lambda y, t: (y + 0.01 * jnp.sum(jnp.sin(jnp.arange(16, dtype=F) * y * th)),
+                                                t.add("Q", (k + 2) % NB, y))], y, t)
+            return k + 1, y, t
+        k, y, t = lax.while_loop(lambda c: (bits(key, c[0] + 7) % 4 != 0) & (c[0] < 9), body, (0, x, t))
+        return t, (y, k)
+
+    def spawner(t, gen, x):
+        t = t.add("Q", gen % NB, x).add("C", gen % NB, 1)
+        return t.spawn((gen + 1, x * 0.5), when=(gen < 3) & (x > 0.7))
+    outs = {"Q": tm.Sum((NB,), F), "C": tm.Sum((NB,), jnp.int32)}
+    g0 = jnp.zeros((N,), jnp.int32)
+    cases = [("walk", walk, AX, (xs, keys, tab, TH), dict(outputs={"Q": tm.Sum((NB,), F)})),
+             ("switch", sw, (0, 0, None), (xs, keys, TH), dict(outputs=outs)),
+             ("spawn", spawner, (0, 0), (g0, xs), dict(outputs=outs, spawn=tm.Queue(1 << 10)))]
+    opts = [dict(_lockstep_compact=8), dict(_lockstep_compact=8, _lockstep_cond=True), dict(_lockstep_compact=5)]
+    for name, item, ax, args, kw in cases:
+        ref = tm.vmap(item, backend=b, in_axes=ax, _lockstep_compact=False, **kw)
+        base = ref(*args)
+        for opt in opts:
+            f = tm.vmap(item, backend=b, in_axes=ax, **kw, **opt)
+            A = f(*args)
+            close(A.outputs, base.outputs, rtol=0, atol=0, what=f"{name} {opt} outputs")
+            close(A.per_item, base.per_item, rtol=0, atol=0, what=f"{name} {opt} per-item")
+            for k, v in base.stats.items():
+                if not np.array_equal(np.asarray(A.stats[k]), np.asarray(v)):
+                    raise Fail(f"{name} {opt} stats[{k}] {A.stats[k]} != {v}")
+            if name == "spawn":
+                continue                      # reverse mode through spawn is the tree adjoint (its own suite)
+            loss = lambda g, q: jnp.sum(g(*args[:-1], q).outputs["Q"] ** 2)
+            th = args[-1]
+            close(jax.grad(lambda q: loss(f, q))(th), jax.grad(lambda q: loss(ref, q))(th),
+                  rtol=0, atol=0, what=f"{name} {opt} grad")
+            close(jax.jvp(lambda q: loss(f, q), (th,), (F(1),))[1],
+                  jax.jvp(lambda q: loss(ref, q), (th,), (F(1),))[1], rtol=0, atol=0, what=f"{name} {opt} jvp")
+            close(jax.vmap(lambda q: loss(f, q))(jnp.stack([th, th * F(1.1)])),
+                  jax.vmap(lambda q: loss(ref, q))(jnp.stack([th, th * F(1.1)])),
+                  rtol=0, atol=0, what=f"{name} {opt} vmap")
+    return f"{len(cases)} items x {len(opts)} widths: outputs, per-item, stats, grad, jvp and vmap all BITWISE"
+
+
 print("\n================ SUMMARY", jax.__version__, "x64" if jax.config.jax_enable_x64 else "",
       jax.devices()[0].device_kind)
 for n, b, m in RES:

@@ -343,3 +343,41 @@ Everything in this section has a test.
   prints only their name, so a stale program could be reused. The CUDA operation table emitted
   `bitcast_convert_type` elementwise even between types of different widths, which changes the shape: silently
   wrong words, found by the first GPU run with 64-bit enabled.
+
+## 9. The lockstep backend: cost that follows the active lanes
+
+The lockstep backend is the reference implementation and the only backend off CUDA, and masking alone makes it
+pay for lanes that have nothing to do: a `while_loop` runs its body on all P lanes until the LAST lane finishes,
+so it costs P * max(trip count) rather than sum(trip counts), and a `cond` or `switch` with a per-lane index
+runs every branch that ANY lane takes on all P lanes, so a step costs the SUM of the branches. The cuda backend
+solves the same problem per thread. Here the lanes that need the work are gathered instead.
+
+- **A while loop narrows its lane axis.** The masked loop stops as soon as at most W = P >> 2 lanes are still
+  running, gathers those lanes into a W-wide lane axis (one gather per carry) and runs the SAME loop there,
+  where a round costs a quarter as much; at the end one scatter puts the survivors back. A lane that stops never
+  restarts, because its carry is frozen and its predicate stays false, so nothing is ever gathered back and the
+  bookkeeping is one `cumsum` per level, not per round. Nothing has to be known in advance: a loop whose lanes
+  all run to the end narrows once, near the end, and pays two gathers for it.
+- **A cond runs each branch on the lanes that take it**, in chunks of P >> 2 lanes with a dynamic chunk count,
+  when that pays: `_pays` compares the branch work the masked interpreter throws away (the sum of the branches
+  minus their average, since compaction costs the average branch) against the cost of gathering the operands and
+  scattering the results, both estimated from the jaxpr with the measured per-element cost of a gather and of a
+  scatter. Nothing in it depends on the problem.
+- **How much.** Both arms in one process on one milano node, JAX 0.5.3, the `benchmarks/vs_jax` problems at
+  N = 65,536 (the full table is in the lockstep REPORT): forward 1.3 to 2.1x faster on the divergent problems
+  (walk on spheres 264 -> 126 ms, transport 288 -> 156 ms, random walk 238 -> 137 ms, interacting md 100 ->
+  76 ms), gradients 1.1 to 1.8x faster, and 0.94 to 1.01x -- within noise -- on the problems whose lanes stay
+  active together (barrier, uniform, dense state, particle filter forward). Trace and compile time grows by up
+  to 30%, because the loop body is instantiated once more.
+- **Results do not change.** Every benchmark problem and every test gives BITWISE identical tallies, per-item
+  results and stats with compaction on and off, in f32 and f64, forward, jvp, grad and vmap. That is not luck:
+  the gather is stable, so the live lanes keep their relative order, and the lanes that drop out contributed
+  nothing to the accumulator in the first place. `tests/edge.py` asserts it (`_lockstep_compact=False` is the
+  A/B control, with `_lockstep_cond` for the cond half).
+- **Two designs measured and rejected.** (1) Chunking EVERY round into ceil(active / W) chunks, which is what
+  the per-element cost model says to do: on a CPU an HLO operation costs a thread fork-join whatever its width,
+  so chunked rounds cost 1.1 to 4.1x the masked loop on the problems whose lanes stay active, for about 2x on
+  the divergent ones. (2) Letting every nested loop narrow, and narrowing more than once: the compiled program
+  then grows with the loop nesting, and the shower's reverse-mode program took 899 s to compile instead of 56 s
+  for 1.3x per call. Hence the rule: only a loop the interpreter is not already inside a loop for narrows, and
+  only once.
