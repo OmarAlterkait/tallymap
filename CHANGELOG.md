@@ -8,6 +8,13 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Added
 
+- `benchmarks/compile_scaling.py`: NVRTC compile time, generated source size, registers and per-thread
+  local memory against the SIZE of one item, with and without `jacfwd` lanes. The cuda emitter inlines the
+  whole item into one kernel, so for a large item the compile time is the size of that one function, and
+  `docs/design.md` section 9 had only the private engine's numbers for it. On a 2080 Ti compile time grows
+  as source size to the power 1.8 to 2.3 between 99 KB and 706 KB of generated source
+  (18 s to 725 s).
+
 - `benchmarks/events_bench.py`: the measurement of event scheduling (`_schedule='events'`) against the default
   step refill, on the item shape it is for (a divergent loop whose body is a lopsided switch). No `vs_jax`
   problem has a top-level `cond` with a dynamic index in its step body, so on all of them the two schedules

@@ -534,6 +534,32 @@ because the repository's own problems compile in seconds.
   the number of branches; the one doubled case (2048 floats, 2 branches) is a compiler choice for that shape,
   which outlining happens to undo, and outlining costs run time (1-8%) and, at 8 branches, occupancy.
 
+- **How it scales, reproducibly.** `benchmarks/compile_scaling.py` is the same curve on a program this
+  repository can run: an item whose loop body is M stages of 8-element array arithmetic, so each stage
+  becomes straight-line code (2080 Ti, forward kernel, fresh cubin cache):
+
+  | stages | source | NVRTC | registers | local bytes |
+  |---|---|---|---|---|
+  | 25 | 98 KB | 17 s | 56 | 32 |
+  | 50 | 184 KB | 53 s | 56 | 32 |
+  | 100 | 354 KB | 178 s | 56 | 32 |
+  | 150 | 528 KB | 424 s | 53 | 32 |
+  | 200 | 706 KB | 825 s | 51 | 32 |
+
+  The same items as a 6-column `jacfwd` (one kernel, 6 dual lanes):
+
+  | stages | source | NVRTC | forward NVRTC | ratio | local bytes |
+  |---|---|---|---|---|---|
+  | 25 | 152 KB | 52 s | 17 s | 3.1x | 2528 |
+  | 50 | 252 KB | 164 s | 53 s | 3.1x | 4992 |
+  | 100 | 489 KB | 667 s | 178 s | 3.7x | 9792 |
+
+  Compile time grows as source size to the power 1.8 to 2.3 over that range, and the exponent rises with size:
+  the same superlinearity the `__noinline__` experiment above exposed from the other side. The `jacfwd` rows show
+  the other multiplier: 3.1 to 3.7 times the forward compile for 1.4 to 1.5 times the source, because `jax.vmap`
+  of the item makes every lane-dependent array T times longer and the emitter unrolls it -- which is also what
+  takes the per-thread local memory from 32 bytes to 9,792.
+
 What remains is the volume of straight-line code itself. A large item's stack frame and compile time are
 properties of the program; the levers that worked were in the program (fewer generic call sites, a static set of
 geometry types, a bounded stack depth), and on the library side the lazy-inline cap.
