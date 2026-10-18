@@ -4,12 +4,13 @@ JAX refuses to reverse-differentiate lax.while_loop (unknown trip count).  _rewr
 while loop (recursively) by a CHECKPOINTED LOOP (checkpointed_while): a custom_vjp loop whose forward stores only
 (consts, initial carry, trip count K) and whose VJP re-creates the states it needs from the initial carry:
 
-  Two checkpoint buffers of C states per item (option rev_checkpoints).  The forward stores the first C
-    states.  If K > C the backward pass first replays the loop once storing every m-th state (m = ceil(K/C), so
-    <= C checkpoints).  It then walks the segments from the last one: it refills a segment's (<= m) states from
-    its checkpoint into the second buffer and applies the VJP of one body step to each, newest first.
-    Work: K body steps + K step-VJPs for K <= C; ~3K + K VJPs for K <= C^2 (O(K)); K^2/(2C^2) + 3K beyond;
-    memory 2C+1 states per item.  No bound on K is needed in advance.  (The original O(K^2) replay-from-the-start
+  Two checkpoint buffers of C states per item (option rev_checkpoints).  The forward pass stores NOTHING: it
+    only counts the steps K.  The backward pass replays the loop once, storing every m-th state with a stride of
+    m = max(C, ceil(K/C)) (so at most C checkpoints, and the segment tape below is always full -- see bwd).  It
+    then walks the segments from the last one: it refills a segment's (<= m) states from its checkpoint into the
+    second buffer and applies the VJP of one body step to each, newest first.
+    Work: ~2K body steps + K step-VJPs for K <= C; ~3K + K VJPs for K <= C^2 (O(K)); K^2/(2C^2) + 3K beyond;
+    memory 2C states per item.  No bound on K is needed in advance.  (The original O(K^2) replay-from-the-start
     scheme was 3.4-13x slower everywhere it was measured and was removed.)
 
 Only ACTIVE float carries are differentiated in a step VJP: a carry is active if it can depend on a perturbed
@@ -293,24 +294,25 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None):
         return lax.while_loop(lambda c: cfn(cc, c), lambda c: bfn(bc, c), init)
 
     C = max(1, int(o.checkpoints))
-    likes_of = lambda c: [c[j] for j in s_idx]
 
     def fwd(cc, bc, init):
         pb = tuple(bool(x.perturbed) and not t for x, t in zip(bc, btal))
         pc = tuple(bool(x.perturbed) for x in init)
         cc, bc, init = [x.value for x in cc], [x.value for x in bc], [x.value for x in init]
-        # the forward also stores the first C states (slot C = scratch): K <= C needs no checkpoint pass
+        # the forward only counts the steps: with a checkpoint stride of C (see bwd) every state the backward
+        # pass reads is either a stride-C checkpoint or refilled from one, so storing states here would be a
+        # local-memory store per step that nothing reads
         def b_(s):
-            k, c, b = s
-            return k + 1, bfn(bc, c), _buf_set(b, jnp.minimum(k, C), likes_of(c))
-        k, out, buf = lax.while_loop(lambda s: cfn(cc, s[1]), b_, (jnp.int32(0), init, _buf_new(C + 1, likes_of(init))))
+            k, c = s
+            return k + 1, bfn(bc, c)
+        k, out = lax.while_loop(lambda s: cfn(cc, s[1]), b_, (jnp.int32(0), init))
         act = tuple(_active(bfn, bc, init, pb, pc, f_idx, w_idx))
         LAST.setdefault("loops", []).append(dict(checkpoints=o.checkpoints, n_state=len(s_idx),
                                                  n_float=len(f_idx), n_active=len(act), n_tok=len(w_idx)))
-        return out, (cc, bc, init, k, buf, _Static((pb, pc, act)))
+        return out, (cc, bc, init, k, _Static((pb, pc, act)))
 
     def bwd(res, ct):
-        cc, bc, init, K, fbuf, st = res
+        cc, bc, init, K, st = res
         pb, pc, act = st.v
         act = list(act)
         fb = [i for i, x in enumerate(bc) if pb[i] and isfloat(_dt(x))]
@@ -375,14 +377,21 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None):
             for j, v in zip(s_idx, vals):
                 c[j] = v
             return c
-        m = jnp.maximum(1, (K + C - 1) // C)            # checkpoint stride
+        # Checkpoint stride.  C, not ceil(K/C): a SEGMENT TAPE of C slots is allocated once per segment, and
+        # allocating it costs C stores whatever the segment's length is, so the sweep's local-memory traffic is
+        # ns * C states, not K.  ceil(K/C) makes ns = K for K <= C (one state per segment, C-1 slots wasted):
+        # measured on a 2080 Ti at 2^19 items, the transport adjoint (K ~ 16 = C) cost 15.6 ms at stride ceil(K/C)
+        # and 5.8 ms at rev_checkpoints=8, i.e. the waste, not the arithmetic, was most of the kernel.  A stride of
+        # C fills every tape: ns * C ~ K for every K, and ns <= C still holds (for K > C^2 the stride is ceil(K/C)
+        # again and the sub-chunk loop below splits a segment into ceil(m/C) tapes, which are also full).
+        m = jnp.maximum(C, (K + C - 1) // C)            # checkpoint stride
         ns = (K + m - 1) // m                           # segments (<= C)
-        # checkpoint pass (only when K > C; otherwise the forward already stored every state, m = 1)
+        # checkpoint pass: empty when K <= C (then ns = 1 and the only checkpoint is slot 0 = the initial state)
         def fill1(s, cb):
             c, b = cb
             c = adv(c, m)
             return c, _buf_set(b, s, state(c))
-        _, buf1 = lax.fori_loop(jnp.where(K <= C, ns, 1), ns, fill1, (lst, fbuf))
+        _, buf1 = lax.fori_loop(1, ns, fill1, (lst, _buf_set(_buf_new(C, likes), 0, state(init))))
 
         # (measured: ONE reverse loop with a select between the two buffers defeats the emitter's in-place
         # updates and is 2-5x slower than these nested loops; L40S toy bench)

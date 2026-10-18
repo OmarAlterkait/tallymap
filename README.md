@@ -235,7 +235,9 @@ Two costs to know:
   magnitude where the forward margin is two.
 - `rev_checkpoints` trades recomputation against per-item state, and it is not monotone. On that solver,
   raising it from the default 16 to 32 made `grad` 3x slower. Measure it per item rather than deriving it from
-  the trip count.
+  the trip count. (Those numbers predate the checkpoint-stride fix, which made C far less sensitive everywhere it
+  was re-measured: on the `benchmarks/vs_jax` problems the spread between C = 8, 16, 32 and 64 is now within a
+  factor of 1.6, against up to 20 before. The advice stands, but try fewer values.)
 
 ## A plain-JAX pitfall tallymap avoids: `cond` around a loop under `vmap`
 
@@ -426,7 +428,7 @@ item jaxprs and generated kernels. `tm.diagnostics(f, *args)` reports what `jax.
 | `cuda_math` | `'approx'` | cuda f32 division, sqrt and rsqrt. `'approx'`: the PTX XLA:GPU itself emits, so it is the arithmetic a plain JAX program on the same GPU gets. `'ieee'`: correctly rounded, the portable reference, about 1.5x slower. |
 | `cuda_min_blocks` | `0` | cuda `__launch_bounds__` minimum blocks per multiprocessor, which caps registers. Performance only; the best value is per kernel. |
 | `lockstep_block` | `2**18` | lockstep backend: lanes per block, which bounds its memory. |
-| `rev_checkpoints` | `16` | reverse mode: checkpoint buffer size C. O(K) work for loops of K <= C^2 steps; 2C+1 states of memory per item. |
+| `rev_checkpoints` | `16` | reverse mode: checkpoint buffer size C. O(K) work for loops of K <= C^2 steps; 2C states of memory per item. |
 | `rev_step_segments` | `0` | reverse mode: recompute each loop step in S checkpointed segments inside its VJP. Helps when a step's residuals spill out of the register file; costs recomputation otherwise. |
 | `rev_stats` | `False` | reverse mode: report replay mismatches and tree-adjoint counts to the host. Off by default because a host callback takes `jax.jit` off its C++ fast path, which can cost an order of magnitude. |
 

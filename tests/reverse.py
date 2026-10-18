@@ -211,6 +211,29 @@ def _(b):
     return f"per-item x differs in {nd}/{dx.size} (max {np.abs(dx).max():.2g}); " + close(g1, g2, "slots 16 vs 3")
 
 
+@case("walk K~40: per-item cotangents are bitwise equal for slots 4 / 16 / 64 (C changes work, not values)")
+def _(b):
+    # The checkpoint stride is C (not ceil(K/C)), so C decides which states are stored and which are refilled
+    # from a checkpoint.  A refilled state runs the identical body on the identical input, so it is bitwise the
+    # stored one: changing C must not move a single per-item cotangent.  K ~ 40 spans the three regimes here
+    # (K > C^2 at C=4, K > C at C=16, K < C at C=64).
+    ref, out = None, []
+    for C in (4, 16, 64):
+        g, _, info, _ = walk_case(b, 64, 40, rev_checkpoints=C)
+        if info["loops"][0]["checkpoints"] != C:
+            raise Fail(f"instrument: slots {info['loops']}")
+        x = np.asarray(g["x"])
+        if ref is None:
+            ref = x
+            continue
+        nd = int((x != ref).sum())
+        if b == "cuda" and nd:
+            raise Fail(f"cuda: slots {C} moved {nd}/{x.size} per-item cotangents against slots 4 "
+                       f"(max {np.abs(x - ref).max():.3g})")
+        out.append(f"C={C}: {nd}/{x.size} differ")
+    return "; ".join(out) or "bitwise equal"
+
+
 for C in (1, 3, 7):
     @case(f"walk K~200 slots={C} (K > C^2: sub-segment replay path)")
     def _(b, C=C):
