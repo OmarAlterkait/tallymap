@@ -50,6 +50,10 @@ exactly ONE top-level while loop is split into pre / cond / body / post
 is the faster of the two, by about half again, so the rule is: step refill unless the program spawns. (A warp is
 the group of 32 GPU threads that execute together on NVIDIA hardware.)
 
+That rule rests on the one production measurement. On five of the `benchmarks/vs_jax` problems at 262,144 items
+(L40S), whole-item mode was equal to or faster than step refill, forward and gradient alike (transport 0.90 vs
+0.96 ms forward), so the rule is due to be re-derived from a wider measurement rather than trusted.
+
 `max_steps` is applied by re-tracing the item jaxpr: every top-level while loop gets a counter and the item
 returns `truncated` (`Result.truncated`, `stats['n_truncated']`). It is one rewrite, upstream of every backend and
 every automatic-differentiation transform, so the JVP, VJP and batched versions of the capped program are

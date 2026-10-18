@@ -151,6 +151,16 @@ def _triangular_solve(a, b, *, left_side, lower, transpose_a, conjugate_a, unit_
     return jnp.swapaxes(x, -1, -2) if not left_side else x
 
 
+def _custom_linear_solve(*args, **params):
+    """lax.custom_linear_solve's primal, as JAX's own impl computes it: the `solve` jaxpr applied to b (the matvec
+    and transpose jaxprs exist only for its autodiff rules, which have already been applied)."""
+    from jax.extend.core import jaxpr_as_fun
+
+    from ._jaxpr import linear_solve_parts
+    solve, consts, nb = linear_solve_parts(params)
+    return jaxpr_as_fun(solve)(*args[consts], *args[nb:])
+
+
 _GENERIC = None
 
 
@@ -158,7 +168,8 @@ def _generic():
     global _GENERIC
     if _GENERIC is None:
         from ._compat import jax_generic_linalg
-        _GENERIC = dict(jax_generic_linalg(), triangular_solve=_triangular_solve)
+        _GENERIC = dict(jax_generic_linalg(), custom_linear_solve=_custom_linear_solve,
+                        triangular_solve=_triangular_solve)
     return _GENERIC
 
 

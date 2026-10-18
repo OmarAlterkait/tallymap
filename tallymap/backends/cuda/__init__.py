@@ -83,7 +83,6 @@ def run(p, pi, bc, cuda_math="approx", cuda_min_blocks=0, _schedule=None, _cuda_
     docs/validation.md) |
     'ieee' (correctly rounded f32 div/sqrt: the portable reference)."""
     math = cuda_math or "approx"
-    _schedule = _schedule or os.environ.get("TALLYMAP_SCHEDULE") or None    # (measurement only: A/B a whole program)
     if _schedule not in (None, "step", "item", "events"):
         raise ValueError("tallymap: _schedule must be 'step', 'item' or 'events'")
     split = _schedule in ("step", "events") or (_schedule is None and p.spawn is None)

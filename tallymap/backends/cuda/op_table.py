@@ -1273,10 +1273,10 @@ def _while_events(em, w, cc, bc, cars, vals, pt, cut):
     """Event scheduling of ONE while loop at any depth (kernel._events_main is the same rule for the step loop of a
     persistent kernel, with refill).  The lanes that enter the loop together form its warp group; each lane waits at
     the body's cut (kernel._cut) holding its cut state X and its branch index, and each round the group votes and runs
-    ONE branch, or ALL of them; lanes whose loop condition fails leave the vote.  Every lane runs exactly its own
+    ONE branch, chosen by the same rule as kernel._events_main; lanes that have not yet reached a cut (index K) run
+    along in every round, and lanes whose loop condition fails leave the vote.  Every lane runs exactly its own
     equations in order, so per-item results equal the plain loop's."""
     K = len(cut["branches"])
-    G = K + 1                                            # groups: K branches + START (needs cond + head);  G = ALL
     bjx = w.body.jaxpr
     bmap = dict(zip(bjx.invars, bc + vals))
     # head: (body consts, carries) -> [branch index] + X, emitted into a buffer so X's kinds are known
@@ -1305,29 +1305,23 @@ def _while_events(em, w, cc, bc, cars, vals, pt, cut):
     pc, al = em.fresh("epc"), em.fresh("eal")
     cost, rent, nn = em.fresh("ecost"), em.fresh("erent"), em.fresh("en")
     em.line(f"int {pc} = {K}; unsigned {al} = __activemask();")
-    em.line(f"float {cost}[{G + 1}], {rent}[{G}];")
-    em.line(f"for (int e = 0; e <= {G}; ++e) {cost}[e] = 0.0f;")
-    em.line(f"for (int e = 0; e < {G}; ++e) {rent}[e] = 0.0f;")
+    em.line(f"float {cost}[{K}], {rent}[{K}];")
+    em.line(f"for (int e = 0; e < {K}; ++e) {{ {cost}[e] = 0.0f; {rent}[e] = 0.0f; }}")
     em.open("while (true)")
     em.cf_depth += 1
     lv = em.fresh("elv")
     em.line(f"const unsigned {lv} = __ballot_sync({al}, {pc} >= 0);")
     em.line(f"if ({pc} < 0) break;")
     em.line(f"{al} = {lv};")
-    j, na, best, rall, wall, grp, t0, dt = (em.fresh(p) for p in ("ej", "ena", "ebest", "erall", "ewall", "egrp",
-                                                                    "et0", "edt"))
-    em.line(f"int {nn}[{G}], {grp} = 0;")
-    em.line(f"for (int e = 0; e < {G}; ++e) {{ {nn}[e] = __popc(__ballot_sync({al}, {pc} == e)); "
-            f"{grp} += e < {K} && {nn}[e] > 0; }}")
+    j, na, best, t0, dt = (em.fresh(p) for p in ("ej", "ena", "ebest", "et0", "edt"))
+    em.line(f"int {nn}[{K}];")
+    em.line(f"for (int e = 0; e < {K}; ++e) {nn}[e] = __popc(__ballot_sync({al}, {pc} == e));")
     em.line(f"const int {na} = __popc({al});")
-    em.line(f"int {j} = -1; float {best} = -3.0e38f, {rall} = 0.0f, {wall} = (float){na} * {cost}[{G}];")
+    em.line(f"int {j} = {K}; float {best} = -3.0e38f;")
     em.line(f"for (int e = 0; e < {K}; ++e) if ({nn}[e]) {{ const float sc = {rent}[e] - (float)({na} - {nn}[e]) * "
-            f"{cost}[e]; if (sc > {best}) {{ {best} = sc; {j} = e; }} {rall} += {rent}[e]; "
-            f"{wall} -= (float){nn}[e] * {cost}[e]; }}")
-    em.line(f"if ({grp} > 1 && {rall} - {wall} >= {best}) {j} = {G};")
-    em.line(f"if ({j} < 0) {j} = {K};")
+            f"{cost}[e]; if (sc > {best}) {{ {best} = sc; {j} = e; }} }}")
     em.line(f"const long long {t0} = clock64();")
-    em.open(f"if ({pc} == {j} || {j} == {G} || {pc} == {K})")
+    em.open(f"if ({pc} == {j} || {pc} == {K})")
     # [branch pc -> r; tail -> new carries]
     em.open(f"if ({pc} < {K})")
     em.open(f"switch ({pc})")
@@ -1359,9 +1353,8 @@ def _while_events(em, w, cc, bc, cars, vals, pt, cut):
     em.close()
     em.line(f"__syncwarp({al});")
     em.line(f"float {dt} = (float)(clock64() - {t0}); {dt} = __shfl_sync({al}, {dt}, __ffs({al}) - 1);")
-    em.line(f"{cost}[{j}] = {cost}[{j}] == 0.0f ? {dt} : 0.875f * {cost}[{j}] + 0.125f * {dt};")
-    em.line(f"for (int e = 0; e < {K}; ++e) {{ if (e == {j} || {j} == {G}) {rent}[e] = 0.0f; "
-            f"else if ({nn}[e]) {rent}[e] += (float){nn}[e] * {dt}; }}")
+    em.line(f"for (int e = 0; e < {K}; ++e) {{ if (e == {j}) {{ {rent}[e] = 0.0f; {cost}[e] = {cost}[e] == 0.0f ? "
+            f"{dt} : 0.875f * {cost}[e] + 0.125f * {dt}; }} else if ({nn}[e]) {rent}[e] += (float){nn}[e] * {dt}; }}")
     em.cf_depth -= 1
     em.close()
 

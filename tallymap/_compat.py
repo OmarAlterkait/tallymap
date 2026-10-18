@@ -151,10 +151,5 @@ def jax_generic_linalg():
             lambda swaps, permutation_size: L._generic_lu_pivots_to_permutation(swaps, permutation_size))
     except (ImportError, AttributeError):            # pragma: no cover
         pass
-    try:
-        from jax._src.lax.control_flow import solves as S
-        out["custom_linear_solve"] = S._custom_linear_solve_impl
-    except (ImportError, AttributeError):            # pragma: no cover
-        pass
     return out
 
