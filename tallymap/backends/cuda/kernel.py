@@ -673,46 +673,29 @@ extern "C" __global__ void {lb} sj_main(const SjParams P, const i64 n_items) {{
 
 
 def _events_main(L, lb, acc_decl, acc_flush, decls, claim, start, ywrite, ev):
-    """The persistent loop under event scheduling (no spawn).  Between rounds a lane is in one GROUP: waiting at the
-    cut on branch k (0 <= k < K, holding its cut state), or START (G = K: it fetched an item and ran pre, and still
-    needs cond + head).  Each round the warp votes and runs ONE group, or ALL of them (each lane its own branch, as step
-    mode does).  START lanes take part in every round: they skip branch and tail and join the chosen lanes at cond,
-    where those lanes are anyway.  A lane that runs does [branch k, tail,] cond, then head (to its next cut) or post
-    (item done: it fetches the next item before the next vote), all inside the timed round, so a group's measured
-    round time includes the work it shares with the others.  The choice is warp-uniform and online, from measured round times T:
-      waste(o) = lanes alive * T(o) - sum over the groups g that o runs of n_g * T(g)
-                 (one group: (alive - n_g) * T(g), the idle lane-time; ALL: the lane-time lost to serialising)
-      rent(o)  = idle lane-time its waiting lanes have accumulated since they last ran (ALL: the sum over groups)
-      o        = argmax of rent(o) - waste(o)      (ties go to ALL)
-    i.e. run what has waited longer than running it now would waste (ski rental: no tuned constant, and every waiting
-    lane is served, since its rent grows every round while waste is bounded).  T of an unmeasured option is 0, so it
-    runs, and is measured, the first time it is eligible.  Lanes leave the warp's vote only by exiting."""
+    """The persistent loop under event scheduling (no spawn).  Every lane is, between rounds, either in transit
+    (fetching an item, or just past a branch: it runs cond and head lane-locally and lands at the cut) or WAITING at
+    the cut with its branch index sj_pc and its cut state.  Each round the warp votes, picks ONE branch j, and only the
+    lanes waiting at j run it (then tail, cond, head).  The choice is warp-uniform and online, from measured cost:
+      waste(k) = (lanes alive - lanes at k) * cost(k)     the idle lane-time of running k now
+      rent(k)  = idle lane-time the lanes at k have accumulated since k last ran
+      j        = argmax over waiting k of rent(k) - waste(k)
+    i.e. run the branch whose wait has cost more than running it now would waste (ski rental: no tuned constant, and
+    a waiting lane is always served, since its rent grows every round and waste is bounded).  cost(k) is an EMA of
+    the measured round time (clock64) of rounds that ran k; an unmeasured branch has cost 0, so it runs (and is
+    measured) the first time it has a waiting lane.  Lanes leave the warp's vote only by exiting (no items left)."""
     import os
     K = ev["K"]
-    G = K + 1                                  # groups: K branches + START;  option G = ALL
     dbg = bool(os.environ.get("TALLYMAP_EVENTS_DEBUG"))      # measurement only: round / lane counters, printed once
-    # the ALL rule; default off (measured best for lopsided branches, the case events is for); measurement knob:
-    # tie (ALL wins ties) | strict | similar (every waiting group costs >= T(ALL)/2) | off
-    rule = os.environ.get("TALLYMAP_EVENTS_ALL", "off")
-    if os.environ.get("TALLYMAP_EVENTS_NOALL"):
-        rule = "off"
-    all_rule = {
-        "tie": f"if (sj_groups > 1 && sj_rall - sj_wall >= sj_best) sj_j = {G};",
-        "strict": f"if (sj_groups > 1 && sj_rall - sj_wall > sj_best) sj_j = {G};",
-        "similar": (f"{{ bool sim = sj_groups > 1; for (int k = 0; k < {K}; ++k) if (sj_n[k] && sj_cost[k] < 0.5f * "
-                    f"sj_cost[{G}]) sim = false; if (sim && sj_rall - sj_wall >= sj_best) sj_j = {G}; }}"),
-        "off": "",
-    }[rule]
     D = (lambda s: s) if dbg else (lambda s: "")
-    nd = 2 * (G + 1) + 4
-    dbg_decl = D(f"__device__ unsigned long long sj_evd[{nd}]; __device__ unsigned int sj_evw;\n")
+    dbg_decl = D(f"__device__ unsigned long long sj_evd[{2 * K + 4}]; __device__ unsigned int sj_evw;\n")
     dbg_end = D(f"""  if (sj_last) {{
-    for (int k = 0; k < {nd}; ++k) atomicAdd(&sj_evd[k], d_[k]);
+    for (int k = 0; k < {2 * K + 4}; ++k) atomicAdd(&sj_evd[k], d_[k]);
     __threadfence();
     if (atomicAdd(&sj_evw, 1u) + 1u == gridDim.x * (blockDim.x / 32)) {{
-      printf("EVDBG rounds_empty %llu alive_lane_rounds %llu rounds %llu waiting_lane_rounds %llu\\n", sj_evd[0], sj_evd[1], sj_evd[2], sj_evd[3]);
-      for (int k = 0; k <= {G}; ++k) printf("EVDBG option %d rounds %llu lanes %llu\\n", k, sj_evd[4 + 2 * k], sj_evd[5 + 2 * k]);
-      for (int k = 0; k < {nd}; ++k) sj_evd[k] = 0; sj_evw = 0;
+      printf("EVDBG rounds_empty %llu alive_lane_rounds %llu rounds %llu active_lane_rounds %llu\\n", sj_evd[0], sj_evd[1], sj_evd[2], sj_evd[3]);
+      for (int k = 0; k < {K}; ++k) printf("EVDBG branch %d rounds %llu lanes %llu\\n", k, sj_evd[4 + 2 * k], sj_evd[5 + 2 * k]);
+      for (int k = 0; k < {2 * K + 4}; ++k) sj_evd[k] = 0; sj_evw = 0;
     }}
   }}""")
     return dbg_decl + f"""
@@ -722,57 +705,51 @@ extern "C" __global__ void {lb} sj_main(const SjParams P, const i64 n_items) {{
   const u32 CH = (u32)max(1ll, min(16ll, n_items / (16ll * gridDim.x * blockDim.x)));
 {chr(10).join(acc_decl)}
 {decls}  u64 my_next = 0, my_stride = 0; u32 my_left = 0;
-  u64 t = 0; i64 item = 0; bool active = false; i32 sj_pc = -1;
+  u64 t = 0; i64 item = 0; bool active = false, sj_ready = false; i32 sj_pc = -1;
   unsigned sj_alive = 0xffffffffu;
-  float sj_cost[{G + 1}], sj_rent[{G}];
-  for (int k = 0; k <= {G}; ++k) sj_cost[k] = 0.0f;
-  for (int k = 0; k < {G}; ++k) sj_rent[k] = 0.0f;
-{D(f"  unsigned long long d_[{nd}] = {{0}}; bool sj_last = false;")}
+  float sj_cost[{K}], sj_rent[{K}];
+  for (int k = 0; k < {K}; ++k) {{ sj_cost[k] = 0.0f; sj_rent[k] = 0.0f; }}
+{D(f"  unsigned long long d_[{2 * K + 4}] = {{0}}; bool sj_last = false;")}
   while (true) {{
     bool sj_ex = false;
-    if (!active) {{                         // lane-local: fetch the next item and run pre; it then waits in START
+    if (!active) {{
       {claim}
       t = my_next; my_next += my_stride; --my_left;
       if (t >= (u64)n_items) sj_ex = true;
-      else {{ item = (i64)t; {start} active = true; sj_pc = {K}; }}
+      else {{ item = (i64)t; {start} active = true; sj_ready = true; }}
     }}
-    const unsigned sj_live = __ballot_sync(sj_alive, !sj_ex);
-    {D("sj_last = sj_live == 0u && lane == __ffs(sj_alive) - 1;")}
-    if (sj_ex) break;
-    sj_alive = sj_live;
-    int sj_n[{G}], sj_any = 0, sj_groups = 0;       // groups 0..K-1 compete; START lanes ride along every round
-    for (int k = 0; k < {G}; ++k) {{ sj_n[k] = __popc(__ballot_sync(sj_alive, sj_pc == k)); sj_any += sj_n[k]; sj_groups += k < {K} && sj_n[k] > 0; }}
-    {D("d_[1] += __popc(sj_alive); if (!sj_any) ++d_[0];")}
-    if (!sj_any) continue;
-    const int sj_na = __popc(sj_alive);
-    int sj_j = -1; float sj_best = -3.0e38f, sj_rall = 0.0f, sj_wall = (float)sj_na * sj_cost[{G}];
-    for (int k = 0; k < {K}; ++k)
-      if (sj_n[k]) {{
-        const float sc = sj_rent[k] - (float)(sj_na - sj_n[k]) * sj_cost[k];
-        if (sc > sj_best) {{ sj_best = sc; sj_j = k; }}
-        sj_rall += sj_rent[k]; sj_wall -= (float)sj_n[k] * sj_cost[k];
-      }}
-    {all_rule}
-    if (sj_j < 0) sj_j = {K};                    // only START lanes are waiting
-    {D(f"++d_[2]; d_[3] += sj_any; ++d_[4 + 2 * sj_j]; d_[5 + 2 * sj_j] += sj_j == {G} ? sj_any : sj_n[sj_j];")}
-    const long long sj_t0 = clock64();
-    if (sj_pc >= 0 && (sj_pc == sj_j || sj_j == {G} || sj_pc == {K})) {{
-      if (sj_pc < {K}) {{
-        {ev["disp"]}
-        {ev["tail"]}
-      }}
+    if (sj_ready) {{                       // lane-local: from the loop condition to the next cut
+      sj_ready = false;
       {ev["cond"]}
       if (sj_pr) {{ {ev["head"]} }}
       else {{ {ev["post"]}
 {ywrite}
         active = false; sj_pc = -1; }}
     }}
+    const unsigned sj_live = __ballot_sync(sj_alive, !sj_ex);
+    {D("sj_last = sj_live == 0u && lane == __ffs(sj_alive) - 1;")}
+    if (sj_ex) break;
+    sj_alive = sj_live;
+    int sj_n[{K}], sj_any = 0;
+    for (int k = 0; k < {K}; ++k) {{ sj_n[k] = __popc(__ballot_sync(sj_alive, sj_pc == k)); sj_any += sj_n[k]; }}
+    {D("d_[1] += __popc(sj_alive); if (!sj_any) ++d_[0];")}
+    if (!sj_any) continue;
+    const int sj_na = __popc(sj_alive);
+    int sj_j = -1; float sj_best = -3.0e38f;
+    for (int k = 0; k < {K}; ++k)
+      if (sj_n[k]) {{ const float sc = sj_rent[k] - (float)(sj_na - sj_n[k]) * sj_cost[k]; if (sc > sj_best) {{ sj_best = sc; sj_j = k; }} }}
+    {D("++d_[2]; d_[3] += sj_any; ++d_[4 + 2 * sj_j]; d_[5 + 2 * sj_j] += sj_n[sj_j];")}
+    const long long sj_t0 = clock64();
+    if (sj_pc == sj_j) {{
+      {ev["disp"]}
+      {ev["tail"]}
+      sj_pc = -1; sj_ready = true;
+    }}
     __syncwarp(sj_alive);
     float sj_dt = (float)(clock64() - sj_t0);
     sj_dt = __shfl_sync(sj_alive, sj_dt, __ffs(sj_alive) - 1);
-    sj_cost[sj_j] = sj_cost[sj_j] == 0.0f ? sj_dt : 0.875f * sj_cost[sj_j] + 0.125f * sj_dt;
     for (int k = 0; k < {K}; ++k) {{
-      if (k == sj_j || sj_j == {G}) sj_rent[k] = 0.0f;
+      if (k == sj_j) {{ sj_rent[k] = 0.0f; sj_cost[k] = sj_cost[k] == 0.0f ? sj_dt : 0.875f * sj_cost[k] + 0.125f * sj_dt; }}
       else if (sj_n[k]) sj_rent[k] += (float)sj_n[k] * sj_dt;
     }}
   }}
