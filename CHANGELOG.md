@@ -6,7 +6,26 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ## Unreleased
 
+### Added
+
+- `jnp.linalg.solve`, `inv`, `det` and `lu_factor` / `lu_solve` run inside an item on cuda: `lu`,
+  `lu_pivots_to_permutation`, `custom_linear_solve` and `triangular_solve` are lowered after autodiff to JAX's own
+  pure-JAX implementations (and a substitution loop), so the derivative is JAX's own. `supported_primitives()`
+  lists them as `expanded`.
+- `tm.diagnostics()["kernels"]` reports each kernel's compile time and, once it has run, its measured
+  resources: registers and local memory per thread, resident blocks per SM, and the local memory the CUDA driver
+  reserves outside JAX's pool (what an out-of-memory error at launch is about).
+- A program that fails to lower because a `custom_jvp` closes over a traced value (a JAX staging limit) gets an
+  error that names the cause and the fix (pass the value as an argument).
+
 ### Changed
+
+- cuda compile time: lazily inlined element expressions are capped at 32 nodes (was 256). On a large
+  photon-transport item this took the forward compile from 1543 to 834 s and the run from 9.04 to 6.87 s on a
+  2080 Ti, with bitwise identical results.
+- `jacfwd` / `jacrev` with more tangent lanes than one kernel takes split them evenly across kernels (26 lanes:
+  13 + 13, not 16 + 16 with 6 padded); every chunk recomputes the primal, so padding cost a primal's worth of
+  lanes.
 
 - Reverse mode: the checkpoint stride of a `checkpointed_while` is now `max(C, ceil(K/C))` rather than
   `ceil(K/C)`, and the forward pass of the checkpointed loop no longer stores states. The backward sweep
