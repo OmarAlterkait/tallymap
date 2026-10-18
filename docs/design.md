@@ -526,7 +526,31 @@ because the repository's own problems compile in seconds.
   4 equations or more gave 416 s. On the GPU node, end to end (2080 Ti, compile s / run s): base forward 842 /
   6.78, `jacfwd` 1005 / 7.07; phases not inlined 793 / 7.23 and 893 / 7.68; phases plus call bodies of 16 or more
   equations 799 / 7.12 and 902 / 7.60. Compile time drops 5-11% and run time rises 5-9%. A kernel is compiled once
-  and then called many times, so neither is the default, and the mechanism is not in the library.
+  and then called many times, so neither is the default, and the mechanism is not in the library. Note that this
+  needs the `__noinline__` attribute written out: merely dropping `__forceinline__` changes nothing on that
+  kernel (430.0 s against 431.4 s, identical cubin size, 255 registers and an 89,920-byte frame either way),
+  because a function with one call site is inlined straight back.
+- **Several TRANSLATION UNITS, compiled in parallel, is a much bigger lever -- and costs occupancy.** The
+  superlinearity is per translation unit, not per function, so compiling the item's functions *apart* beats
+  `__noinline__`, which only hides them inside the same module. Measured on one `milano` node with the generated
+  source split by hand, NVRTC `-rdc=true` per unit in separate processes and `nvJitLink` without LTO: the 4.16 MB
+  forward kernel takes **38.2 s as 40 units in 32 processes against 456 s monolithic (11.9x**, and 189 s of CPU
+  against 452 s), `compile_scaling` at 200 stages goes 485 s -> 6.5 s as 34 units in 16 processes (74x), and the
+  link itself is free (0.00 s). The units must be separate PROCESSES: in threads NVRTC inflates the CPU time 5x
+  and recovers little wall. What it costs is registers -- each unit is allocated on its own, so the kernel's
+  register count rises (56 -> 94, 72 -> 165, 64 -> 254) and occupancy goes with it: **1.8-2.7x of run time** on
+  the `compile_scaling` items and **2.2-15.2x** on `benchmarks/vs_jax` at 4M items (`transport` forward is the
+  worst), with `-maxrregcount` recovering only a quarter of it. The one exception is an item whose kernel ptxas
+  has ALREADY capped at 255 registers -- a 16x16 dense solve per step -- where the split costs **6.6%**, which is
+  this kernel's own regime and why the `__noinline__` arm above costs only 5-9% here. So the split pays only
+  where the source is large AND the kernel is register-starved; it is not in the library.
+- **Device LTO does not give the inlining back.** `-dlto` + `nvrtcGetLTOIR` + `nvJitLink -lto` moves the whole
+  cost into one single-threaded link (371.1 s of the 4.16 MB kernel's 372.5 s compile, 1.22x against monolithic
+  where `-rdc` gives 11.9x) and produces a kernel with the outlined arm's registers and frame, not the
+  monolithic arm's. NVRTC's own `--split-compile=N` does nothing here (it splits the backend per function, and
+  the kernel is one function), and `--split-compile-extended` is not accepted through the NVRTC API even in 12.9.
+  NVRTC **12.9 does compile the same source 1.19-1.21x faster than 12.1** for an unchanged run time, and
+  `compile.nvrtc()` already prefers the `nvidia-cuda-nvrtc-cu12` wheel when it is importable: that one is free.
 - **Branch stack frames do not add up.** The concern behind outlining branches was that NVVM keeps every branch's
   local arrays in the caller's frame at once. A switch whose branches each fill their own array with dynamic
   indexing (2080 Ti, local bytes per thread, inlined / outlined): 512 floats, 2 branches 4,176 / 4,496, 8 branches
