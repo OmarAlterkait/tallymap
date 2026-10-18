@@ -585,7 +585,7 @@ def _dual_lanes(args, dims, node, fused):
         bpi = tuple(b or l for b, l in zip(bpi, lin_pi))
     shared = (fwd.prog.nT, fwd.prog.nY) if fused else (0, 0)
     gpu = mode == "auto" and _gpu(node)
-    T = min(size, mode) if isinstance(mode, int) else min(size, MAX_LANES) if gpu else size
+    T = _balanced(size, min(size, mode) if isinstance(mode, int) else min(size, MAX_LANES) if gpu else size)
     q, lt, ly = dual_lanes_prog(p, T, bpi, bbc, shared)
     if _foreign.lanes_unsafe(q.cj):     # a batched foreign primitive: one lane at a time (see lanes_unsafe)
         return None
@@ -597,6 +597,7 @@ def _dual_lanes(args, dims, node, fused):
             T = min(T - 1, (LANES_MAX_LOCAL - 1) * T // m)
             if T < 2:
                 return None
+            T = _balanced(size, T)
             q, lt, ly = dual_lanes_prog(p, T, bpi, bbc, shared)
             if _taint_max(q.cj.jaxpr, list(lt) + list(bpi) + list(bbc), False)[0] >= LANES_MAX_LOCAL:
                 return None
@@ -656,6 +657,14 @@ LANES_MAX_LOCAL = 512
 # kernel per chunk of 4 / 8 / 16 / 32 / 64 lanes 229 / 191 / 175 / 176 / 325 ms, all 256 at once 4.3 s, fold 533 ms;
 # hessian 8x8 (8 lanes) 83 ms vs fold 102 ms.  A photon-transport jacfwd of 10 parameters stays one kernel.
 MAX_LANES = 16
+
+
+def _balanced(size, cap):
+    """lanes per chunk: the fewest chunks of at most `cap` lanes, sized evenly (26 lanes, cap 16 -> 13 + 13, not
+    16 + 16 with 6 zero-padded: every chunk recomputes the primal, so padding costs a primal's worth of lanes).
+    MEASURED (LUCiD recon jacfwd, L40S): one chunk costs the primal plus ~12 ms per column, and 20 or 26 columns
+    cost the same two 16-lane passes."""
+    return -(-size // -(-size // max(1, cap)))
 
 
 def _gpu(node):
