@@ -334,7 +334,7 @@ emitted value AT THE SPAWN STEP, inside the parent's ordinary replay adjoint. No
 
 ## 5. Fewer knobs
 
-Unknown option names raise. The public options are the eight in the README; every measurement and
+Unknown option names raise. The public options are the six in the README; every measurement and
 negative-control switch is a private option whose name starts with an underscore (they are listed in
 `_api._OPTS`), part of the node and of every cache key, never global state.
 
@@ -342,8 +342,12 @@ Removed, with their measurements: 20 environment switches; the replay-from-start
 slower wherever it was measured); turning activity analysis off; the CUDA block size, shared-memory budget and
 schedule options (fixed rules instead: a block of 128 threads is within 1% of 64 and 256, and step refill unless
 the program spawns); the replay-check raise mode; the tree adjoint's own capacity, depth and on-mismatch
-options; and the two reverse-mode cost-decomposition options (`_rev_phase`, `_tree_phase`), which produced wrong
-gradients on purpose and which no test used -- the decompositions they produced are quoted in section 6. The fold rule calls the CUDA kernel's own privatisation rule rather than duplicating its logic.
+options; `cuda_min_blocks` (at most 1.08x on any cell measured) and `rev_step_segments` (nothing on four
+independent workloads), both covered below; `Sum(tangent_scale=)`, which nothing ever set; the inner-loop half
+of event scheduling (never faster, up to 1.82x slower, section 1b); and the two reverse-mode
+cost-decomposition options (`_rev_phase`, `_tree_phase`), which produced wrong gradients on purpose and which no
+test used -- the decompositions they produced are quoted in section 6. The fold rule is one comparison against
+the device's resident-thread count and no longer consults the kernel's privatisation rule at all (section 2).
 
 Dual-lanes chunking, measured on the shower-shaped program: one kernel with T lanes cost 1.34, 1.99, 2.27 and
 2.57 times the forward pass for T = 1 to 4, but 14, 23 and 32 times for T = 6, 8 and 10. Chunking into the
