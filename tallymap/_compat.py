@@ -157,3 +157,4 @@ def jax_generic_linalg():
     except (ImportError, AttributeError):            # pragma: no cover
         pass
     return out
+

@@ -277,7 +277,16 @@ def _lowering(platform):
     def rule(ctx, *args, node):
         if any(_varying(a) for a in list(ctx.avals_in) + list(ctx.avals_out)):
             ctx = ctx.replace(avals_in=[_plain(a) for a in ctx.avals_in], avals_out=[_plain(a) for a in ctx.avals_out])
-        return low(ctx, *args, node=node)
+        try:
+            return low(ctx, *args, node=node)
+        except UnsupportedError:
+            raise
+        except Exception as e:
+            from . import _foreign
+            if _foreign.holds_tracer(node.prog.cj):
+                raise UnsupportedError(f"tallymap: cannot lower this item program.{_foreign.CLOSED_TRACER}\n"
+                                       f"{type(e).__name__}: {str(e)[:300]}") from None
+            raise
     return rule
 
 

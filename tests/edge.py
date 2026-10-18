@@ -1241,7 +1241,13 @@ def _(b):
     want = jax.vmap(lambda x: jax.jvp(lambda q: jnp.sin(x) + 0 * q, (TH,), (F(1.0),))[1] +
                     jnp.sum(jnp.stack([x, x * 2.0, x + 1.0])) * jnp.cos(TH * x) * x)(xs).sum()
     close(jv(mk(True))[0], want, rtol=1e-4)
-    return "leak: " + m.split(".")[1][:60] + "...; explicit argument: jvp matches"
+
+    def outer(q, w):                                 # NOT a leak: the item closes over the LIVE outer jit's w
+        it = lambda t, x: (t.add("Q", 0, x * w * q), x * w)
+        return V(it, b)(xs).outputs["Q"]
+    close(jax.jit(outer)(TH, F(2.0))[0], TH * 2.0 * xs.sum(), rtol=1e-5)
+    close(jax.jit(jax.grad(lambda q, w: outer(q, w).sum()))(TH, F(2.0)), 2.0 * xs.sum(), rtol=1e-5)
+    return "leak: " + m.split(".")[1][:60] + "...; explicit argument: jvp matches; outer-jit closure runs"
 
 
 @case("jnp.linalg.solve / inv inside an item (lu, custom_linear_solve, triangular_solve): fwd, jvp, grad vs dense")
