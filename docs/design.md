@@ -303,6 +303,14 @@ exists.
   prototype this came from was faster because its FORWARD kernel wrote the checkpoints, so it had no replay phase
   at all; that needs a residual output of the forward node, which is O(N * C * state) and so is the one thing the
   chunking cannot bound.
+- **Refuted: let the forward store the checkpoints.** With a stride of C the forward pass of a checkpointed loop
+  can store the stride-C states itself (slot C as a scratch sink makes the store unconditional), which removes
+  the backward pass's checkpoint pass entirely while K <= C^2. It does remove it -- the replay phase
+  (`_rev_phase='skip'`) drops from 3.23 to 2.81 ms on transport -- but it costs one local store per step and
+  takes per-item memory back to 2C+1 states, and the gradient is faster on only two of the six problems
+  (walk-on-spheres 4.07 -> 3.61 ms, barrier 13.6 -> 12.3) and slower on three (transport 6.03 -> 6.84, toy walk
+  1.44 -> 1.51, particle filter 15.1 -> 15.7), with the adjoint kernel's stack frame back up from 544 to 832
+  bytes. Which side wins depends on K, which is not known at trace time, so there is no rule that would pick it.
 - **Refuted here: automatic step segmentation.** `rev_step_segments` removes step-VJP spills, and a rule could
   read the spill bytes out of the compiled kernel and pick S. There is nothing to pick on this benchmark set:
   ptxas reports ZERO spill bytes for the adjoint kernel of all six problems (stack frames 400 to 832 bytes, which
