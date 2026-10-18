@@ -227,11 +227,13 @@ GPU by themselves. Measured on the toy walk, B=8, 2080 Ti (68 multiprocessors, s
 | 1,048,576 | 256 | `lax.map` 13.7 | `lax.map` 13.6 | both `lax.map` |
 | 1,048,576 | 1,024 | `lax.map` 13.6 | `lax.map` 13.6 | both `lax.map` |
 | 1,048,576 | 4,096 | fold 34.5 | **`lax.map` 13.9** | 2.48x faster |
+| 4,194,304 | 64 | fold 277.6 | **`lax.map` 40.5** | 6.85x faster |
+| 4,194,304 | 4,096 | fold 282.6 | **`lax.map` 48.4** | 5.83x faster |
 
 The old rule refused the 2.2x at 65k items and 1,024 bins (that tally never fits shared memory, so folding
-could not change its status) and allowed a 2.5x loss at a million items (a 64-bin tally is privatised folded
-or not, so it passed). The new rule removes both, and gives up 1.35 to 1.37x at 262k items, which is inside
-the bar. On lockstep there is no occupancy and no such reversal -- folding is one masked pass over B*N lanes
+could not change its status) and allowed a loss that grows with N -- 2.5x at a million items and 5.8 to 6.9x
+at four million (a 64-bin tally is privatised folded or not, so it passed the old rule at every N). The new
+rule removes both, and gives up 1.35 to 1.37x at 262k items, which is inside the bar. On lockstep there is no occupancy and no such reversal -- folding is one masked pass over B*N lanes
 instead of B passes, 1.27 to 1.44 times faster at 16k and 65k items (CPU, 8 cores) -- so there it is always
 taken.
 

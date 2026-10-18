@@ -65,7 +65,8 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   Folding costs B copies of every per-item operand and buys one saturated launch, which has nothing to do with
   the tally size. Measured on the toy walk at B=8 on a 2080 Ti: at 65,536 items the new rule folds two more
   cells and is 1.32x and 2.21x faster (256 and 1,024 bins); at a million items it stops folding two cells and
-  is 2.46x and 2.48x faster (64 and 4,096 bins); at 262,144 items it gives up 1.35 to 1.37x. `lax.map` cells
+  is 2.46x and 2.48x faster (64 and 4,096 bins) and at four million 6.85x and 5.83x; at 262,144 items it gives
+  up 1.35 to 1.37x. `lax.map` cells
   and lockstep are unchanged (`docs/design.md` section 2). `kernel.privatised()` loses its `B=` parameter.
 
 - cuda compile time: lazily inlined element expressions are capped at 32 nodes (was 256). On a large
