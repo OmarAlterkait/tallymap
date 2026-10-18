@@ -72,8 +72,43 @@ it loses by up to 1.6x on uniform or interaction-bound items, and by 1-13% on th
 218k resident threads leave about one item each and there is nothing to refill.  No structural rule picks the
 faster mode on both GPUs, and a rule on items per resident thread would need a fitted threshold (occupancy and
 divergence both move it), so the rule stays: step refill unless the program spawns, which is right on the
-divergent workloads the library is for.  Event scheduling (`_schedule='events'`) is the same kernel as step
-refill unless the step has a top-level `cond` worth cutting, and stays opt-in for lopsided branches.
+divergent workloads the library is for.
+
+Event scheduling (`_schedule='events'`) is the same kernel as step refill unless the STEP BODY has a top-level
+`cond` worth cutting; it then cuts the step there and lets each warp run ONE branch per round (`kernel._cut`,
+`kernel._events_main`).  No `benchmarks/vs_jax` problem has such a `cond`, so on all of them it compiles to the
+identical kernel; `benchmarks/events_bench.py` is the measurement of what it buys, on the item shape it is for
+-- a divergent loop whose body is a lopsided three-way switch, one branch W times more expensive and taken with
+probability P (2080 Ti, 4M items, median of 9 / min):
+
+| | `'step'` | `'events'` | `'item'` |
+|---|---|---|---|
+| forward, P = 0.2, W = 64 | 21.91 / 16.45 ms | **13.73 / 11.89** | 22.00 / 21.94 |
+| forward, P = 0.05, W = 256 | 45.64 / 44.98 ms | **14.60 / 12.68** | 46.27 / 46.11 |
+| gradient, P = 0.2, W = 64 | 176.4 ms | 170.5 | 176.4 |
+| gradient, P = 0.05, W = 256 | 2978 ms | 2943 | 2978 |
+
+So the rarer and costlier the branch, the bigger the win: 3.1x on the forward pass at P = 0.05, W = 256, and
+1.6x at P = 0.2, W = 64; the gradient is unchanged (1.01-1.03), because an adjoint program has three top-level
+while loops and so never gets the step split at all (section 6) -- it runs whole-item either way.  Event
+scheduling nevertheless stays OPT-IN and is not a default: nothing in the item jaxpr says how lopsided a branch
+is at run time, and a short branch gains nothing (a toy with a 256-step branch: 0.90 ms step against 0.86
+events at P = 0.14, 0.93 against 1.07 at P = 0.5).
+
+Only the step loop is cut.  Event-scheduling an INNER while loop (at any depth, by the same ski-rental rule) was
+implemented and is removed: it never fires on any `benchmarks/vs_jax` problem either, and on four toys built to
+be its best case -- a lopsided switch inside an inner while loop of 8 or 64 trips, long branch 256 or 2048
+steps, 1M items, 2080 Ti -- it was 1.82x, 1.36x, 1.22x and 1.03x SLOWER than the plain loop, never faster.  It
+was also what made `_schedule='events'` cost 3.1x in reverse mode (an adjoint program's three top-level loops
+were each event-scheduled): with it gone the gradient row above is a wash.
+
+A lane claims ONE item per claim, warp-aggregated: the needy lanes of a warp take one contiguous run of item
+indices between them, so the claim counter sees one atomic per warp rather than one per lane. Claiming a RUN of
+up to 16 items per lane (a chunk sized from the item count and the grid) was in the kernel and is removed: it
+leaves the last claims holding several items each, which is a tail every other lane waits for. Measured on a
+2080 Ti over all 18 `benchmarks/vs_jax` forward and gradient cells, one item per claim is 1.46x faster on
+random_walk's forward pass, 1.14 to 1.18x on transport forward, random_walk gradient and uniform gradient,
+1.09x on ode, and never slower (worst cell 1.002).
 
 `max_steps` is applied by re-tracing the item jaxpr: every top-level while loop gets a counter and the item
 returns `truncated` (`Result.truncated`, `stats['n_truncated']`). It is one rewrite, upstream of every backend and
@@ -110,7 +145,8 @@ derivatives with spawn give children tangents for every float per-item leaf. Rev
   key contains it. One call takes fewer than 2^31 items.
 - `Sum(exact=True)`: int64 fixed point, `round(v * scale)`, with one scale per output. Unrepresentable values,
   meaning `|v * scale| >= 9.2e18`, are dropped AND counted (`stats['exact_overflow']`) on both backends. A fixed
-  2^32 scale was tried first and wraps silently for tangents of order 1e11, so the scale is per output.
+  2^32 scale was tried first and wraps silently for tangents of order 1e11, so the scale is per output.  A
+  tangent tally uses its primal output's scale; a separate `tangent_scale` was an unused knob and was removed.
 - Keys: tallymap invents no randomness. Typed and raw uint32 keys both work. Results do not depend on scheduling.
 - `n_active`: `f(*args, n_active=k)` runs only items `i < k`, so a fixed capacity with a varying count never
   recompiles.
@@ -145,8 +181,10 @@ ITEM function and binds the primitive again, so the rules recurse to any order o
   vmap-of-JVP case, the result is a `dual_lanes` node: one kernel with T dual lanes per item. Otherwise it is a
   `folded_batch` node, which runs B*N items in ONE launch with member b's emits offset to the slice
   `[b*S, (b+1)*S)` by a retrace emit hook. Folding requires that there is no spawn and no exact output, that
-  every batched broadcast operand is small (at most 4096 elements per member) and, on CUDA, that no tally leaves
-  shared-memory privatisation. Otherwise it falls back to `lax.map`, one launch per member.
+  every batched broadcast operand is small (at most 4096 elements per member) and, on CUDA, that ONE member's
+  launch of N items could not fill the device by itself (N below the multiprocessor count times 1024, the
+  smallest maximum-resident-threads-per-multiprocessor of any tested architecture, so the bound is a floor).
+  Otherwise it falls back to `lax.map`, one launch per member.
 - **lowering** is per platform: `'cuda'` goes to the CUDA backend for `backend='auto'` and `'cuda'`, every other
   platform to lockstep. `backend='cuda'` lowered for another platform raises.
 - **impl** (eager, outside `jit`): one `jax.jit` per node STRUCTURE, in a 64-entry cache, so repeated eager calls
@@ -174,10 +212,38 @@ ITEM function and binds the primitive again, so the rules recurse to any order o
 
 Measured on the toy walk, 1M items, 256 bins, against the old `custom_jvp` / `custom_vjp` integration: forward
 0.62 vs 0.63 ms; JVP with primal 0.68 ms in one launch, against 1.22 ms in two launches unfused; `jacfwd` with
-T=8 4.58 vs 4.70 ms; `grad` 4.16 vs 4.30 ms. Tracing one call takes 5.9 ms instead of 21 ms. Folding against
-`lax.map` at B=8: folding is 1.2 to 2.3 times faster at 65k items on CUDA and 3.4 times on lockstep, equal at 1M
-items with 4096 bins or more, and 4.5 times SLOWER when it pushes a tally out of shared memory, which the rule
-above excludes.
+T=8 4.58 vs 4.70 ms; `grad` 4.16 vs 4.30 ms. Tracing one call takes 5.9 ms instead of 21 ms.
+
+The fold rule used to be "fold while every privatised tally stays privatised", and it got both ends wrong,
+because what folding costs and buys has nothing to do with the tally: it makes B copies of every per-item
+operand and runs ONE launch of B*N items, which is a win exactly while one member's N items cannot fill the
+GPU by themselves. Measured on the toy walk, B=8, 2080 Ti (68 multiprocessors, so the rule folds below
+69,632 items), each cell timed in the same position of the same script under the old and the new rule
+(`vmap over theta B=8`, minimum of 7, ms):
+
+| items | bins | old rule | new rule | |
+|---|---|---|---|---|
+| 65,536 | 64 | fold 1.21 | fold 1.22 | both fold |
+| 65,536 | 256 | `lax.map` 3.05 | **fold 2.31** | 1.32x faster |
+| 65,536 | 1,024 | `lax.map` 3.03 | **fold 1.37** | 2.21x faster |
+| 65,536 | 4,096 | fold 1.20 | fold 1.20 | both fold |
+| 262,144 | 64 | fold 3.72 | `lax.map` 5.08 | 1.37x slower |
+| 262,144 | 256 | `lax.map` 5.10 | `lax.map` 5.09 | both `lax.map` |
+| 262,144 | 1,024 | `lax.map` 5.20 | `lax.map` 5.15 | both `lax.map` |
+| 262,144 | 4,096 | fold 3.76 | `lax.map` 5.07 | 1.35x slower |
+| 1,048,576 | 64 | fold 33.3 | **`lax.map` 13.6** | 2.46x faster |
+| 1,048,576 | 256 | `lax.map` 13.7 | `lax.map` 13.6 | both `lax.map` |
+| 1,048,576 | 1,024 | `lax.map` 13.6 | `lax.map` 13.6 | both `lax.map` |
+| 1,048,576 | 4,096 | fold 34.5 | **`lax.map` 13.9** | 2.48x faster |
+| 4,194,304 | 64 | fold 277.6 | **`lax.map` 40.5** | 6.85x faster |
+| 4,194,304 | 4,096 | fold 282.6 | **`lax.map` 48.4** | 5.83x faster |
+
+The old rule refused the 2.2x at 65k items and 1,024 bins (that tally never fits shared memory, so folding
+could not change its status) and allowed a loss that grows with N -- 2.5x at a million items and 5.8 to 6.9x
+at four million (a 64-bin tally is privatised folded or not, so it passed the old rule at every N). The new
+rule removes both, and gives up 1.35 to 1.37x at 262k items, which is inside the bar. On lockstep there is no occupancy and no such reversal -- folding is one masked pass over B*N lanes
+instead of B passes, 1.27 to 1.44 times faster at 16k and 65k items (CPU, 8 cores) -- so there it is always
+taken.
 
 `tests/transforms.py` is the composability matrix: a big function with pre- and post-processing, two chained
 calls, and calls inside `scan`, `fori_loop`, `cond` and `while_loop`, every cell compared against the same
@@ -276,15 +342,20 @@ emitted value AT THE SPAWN STEP, inside the parent's ordinary replay adjoint. No
 
 ## 5. Fewer knobs
 
-Unknown option names raise. The public options are the eight in the README; every measurement and
+Unknown option names raise. The public options are the six in the README; every measurement and
 negative-control switch is a private option whose name starts with an underscore (they are listed in
 `_api._OPTS`), part of the node and of every cache key, never global state.
 
 Removed, with their measurements: 20 environment switches; the replay-from-start reverse scheme (3.4 to 13 times
 slower wherever it was measured); turning activity analysis off; the CUDA block size, shared-memory budget and
 schedule options (fixed rules instead: a block of 128 threads is within 1% of 64 and 256, and step refill unless
-the program spawns); the replay-check raise mode; and the tree adjoint's own capacity, depth and on-mismatch
-options. The fold rule calls the CUDA kernel's own privatisation rule rather than duplicating its logic.
+the program spawns); the replay-check raise mode; the tree adjoint's own capacity, depth and on-mismatch
+options; `cuda_min_blocks` (at most 1.08x on any cell measured) and `rev_step_segments` (nothing on four
+independent workloads), both covered below; `Sum(tangent_scale=)`, which nothing ever set; the inner-loop half
+of event scheduling (never faster, up to 1.82x slower, section 1b); and the two reverse-mode
+cost-decomposition options (`_rev_phase`, `_tree_phase`), which produced wrong gradients on purpose and which no
+test used -- the decompositions they produced are quoted in section 6. The fold rule is one comparison against
+the device's resident-thread count and no longer consults the kernel's privatisation rule at all (section 2).
 
 Dual-lanes chunking, measured on the shower-shaped program: one kernel with T lanes cost 1.34, 1.99, 2.27 and
 2.57 times the forward pass for T = 1 to 4, but 14, 23 and 32 times for T = 6, 8 and 10. Chunking into the
@@ -298,11 +369,11 @@ exists.
   linearisation and transposition. Beyond the register file they spill to local memory, at low occupancy. For a
   single step the ratio of VJP to forward was about 3 for a transport-shaped step and about 12 for a
   shower-shaped one (800-odd residuals, several kilobytes per item); the same step vmapped by plain XLA costs
-  about 1.2. The remedy is `rev_step_segments=S`, which recomputes the step in S checkpointed segments, cutting
-  at small live sets, saving loop, branch and call outputs (recomputing a geometry walk doubled the cost in one
-  case). On the toy walk it took the ratio from 31x to 4.2x at S=8. On the shower-shaped step it went from 10.4x
-  to 5.2x at S=16, with the spills gone. On the transport-shaped one it was slightly worse, because there were
-  few spills to remove and only recomputation to add. Hence it is opt-in, default 0.
+  about 1.2. There was an opt-in remedy, `rev_step_segments=S`, which recomputed the step in S checkpointed
+  segments, cutting at small live sets and saving loop, branch and call outputs; it is REMOVED, because no
+  public workload reproduces a benefit (see "Refuted: step segmentation" below). The only evidence for it was
+  the two engines (a shower-shaped step 10.4x to 5.2x at S=16, with the spills gone; a transport-shaped one
+  slightly worse), which is not reproducible here.
 - **Refuted levers**: contention on parameter-cotangent atomics; raising occupancy through launch bounds (the
   extra spills offset the occupancy); carrying one segment buffer instead of allocating a fresh one per segment
   (slower); a flat K <= C sweep under a `lax.cond` (slower). One real bug was found while measuring these:
@@ -327,16 +398,23 @@ exists.
 - **Refuted: let the forward store the checkpoints.** With a stride of C the forward pass of a checkpointed loop
   can store the stride-C states itself (slot C as a scratch sink makes the store unconditional), which removes
   the backward pass's checkpoint pass entirely while K <= C^2. It does remove it -- the replay phase
-  (`_rev_phase='skip'`) drops from 3.23 to 2.81 ms on transport -- but it costs one local store per step and
+  (measured with a temporary phase-skip instrumentation) drops from 3.23 to 2.81 ms on transport -- but it costs one local store per step and
   takes per-item memory back to 2C+1 states, and the gradient is faster on only two of the six problems
   (walk-on-spheres 4.07 -> 3.61 ms, barrier 13.6 -> 12.3) and slower on three (transport 6.03 -> 6.84, toy walk
   1.44 -> 1.51, particle filter 15.1 -> 15.7), with the adjoint kernel's stack frame back up from 544 to 832
   bytes. Which side wins depends on K, which is not known at trace time, so there is no rule that would pick it.
-- **Refuted here: automatic step segmentation.** `rev_step_segments` removes step-VJP spills, and a rule could
-  read the spill bytes out of the compiled kernel and pick S. There is nothing to pick on this benchmark set:
-  ptxas reports ZERO spill bytes for the adjoint kernel of all six problems (stack frames 400 to 832 bytes, which
-  is the checkpoint buffers, not spills), so any such rule would choose S = 1 everywhere and the option stays
-  what it is -- opt-in, for the shower-shaped steps that do spill (section 6, first item).
+- **Refuted: step segmentation.** Recomputing each loop step in S checkpointed segments inside its VJP was an
+  option (`rev_step_segments`) and is gone. A rule could have read the spill bytes out of the compiled kernel
+  and picked S, but there was nothing to pick: ptxas reports ZERO spill bytes for the adjoint kernel of all six
+  problems (stack frames 400 to 832 bytes, which is the checkpoint buffers, not spills). Four independent
+  re-measurements on a 2080 Ti then found no benefit anywhere, and the option is removed:
+  the six `benchmarks/vs_jax` gradient cells at their sweep sizes, S = 0 / 4 / 8, were within 1.00-1.05
+  (job 41231627); the toy walk at 1M items, S = 0 / 4 / 8 / 16, gave 6.32 / 6.36 / 6.45 / 6.43 ms
+  (job 41231673); a toy built to spill -- a step holding 128 live nonlinear intermediates, 168 registers and
+  1,328 bytes of local memory per thread, grad/forward 8.1x -- gave 32.4 / 31.2 / 32.1 ms at S = 0 / 2 / 4
+  (job 41232260); and the diffrax ensemble of `docs/equinox.md` gave 4,936 ms at S = 0 against 4,968 at S = 4.
+  A step that really spills may still exist (the two engines), but nothing public shows one, and an option
+  cannot be kept on evidence nobody can rerun.
 - **Where the adjoint time goes**, decomposed on a transport workload whose adjoint kernel cost about 8 times its
   forward: scheduling 1.26x, halving the warp occupancy 1.37 to 1.46x, and the rest split between the forward
   replay with its local buffer, sweeping the primal steps, and the transposes, in roughly equal thirds with the
@@ -344,9 +422,10 @@ exists.
   reverse kernel does step refill over active carries only) was about twice as fast as the library's adjoint. It
   is not in the library: it needs the K > C path and a residual output of the forward node at partial-evaluation
   time.
-- **The same decomposition on the public problems** (`benchmarks/vs_jax` at its sweep sizes, 2080 Ti, with the
-  private `_rev_phase` options: `skip` is the replay and the checkpoint pass with no sweep, `primal` runs one
-  PRIMAL body step in place of each step VJP). Reading it as replay / sweep / transposes:
+- **The same decomposition on the public problems** (`benchmarks/vs_jax` at its sweep sizes, 2080 Ti, measured
+  with a temporary phase instrumentation that is no longer in the library: `skip` is the replay and the
+  checkpoint pass with no sweep, `primal` runs one PRIMAL body step in place of each step VJP; both give wrong
+  gradients, so they were a measurement and not an option). Reading it as replay / sweep / transposes:
 
   | problem | K (mean) | forward | grad | grad/fwd | `skip` | `primal` |
   |---|---|---|---|---|---|---|
@@ -387,9 +466,11 @@ from it are worth recording, because they are reproducible here:
   NVIDIA's assembly-level intermediate language) that XLA:GPU itself emits for f32 division, square root and
   reciprocal square root, closes it, and became the default after a pre-registered validation
   (`docs/validation.md`). The `ieee` mode costs about 1.5 times the forward pass and 1.65 times a JVP.
-- `cuda_min_blocks`, the `__launch_bounds__` minimum-blocks-per-multiprocessor register cap, is worth single-digit
-  percentages and the best value is per kernel, which is why it is an option with a default of 0 rather than a
-  fixed rule. Block size 64, 128 and 256 are within 1% of each other, which is why that one is fixed.
+- The `__launch_bounds__` minimum-blocks-per-multiprocessor register cap was an option (`cuda_min_blocks`) and is
+  gone: re-measured on the toy walk at 4M items on a 2080 Ti, values 0 / 1 / 2 / 4 gave forward 6.22 / 6.25 /
+  6.22 / 6.17 ms and a JVP 7.16 / 7.25 / 7.28 / 7.17 ms, i.e. nothing outside rerun noise, which matches the
+  single-digit percentages it was worth when it was added. Block size 64, 128 and 256 are within 1% of each
+  other, which is why that one is fixed too.
 
 ## 8. The maintenance pass
 
@@ -452,6 +533,32 @@ because the repository's own problems compile in seconds.
   4,176 / 4,528; 2048 floats, 2 branches 32,800 / 16,464, 8 branches 16,416 / 16,496. The frame does not grow with
   the number of branches; the one doubled case (2048 floats, 2 branches) is a compiler choice for that shape,
   which outlining happens to undo, and outlining costs run time (1-8%) and, at 8 branches, occupancy.
+
+- **How it scales, reproducibly.** `benchmarks/compile_scaling.py` is the same curve on a program this
+  repository can run: an item whose loop body is M stages of 8-element array arithmetic, so each stage
+  becomes straight-line code (2080 Ti, forward kernel, fresh cubin cache):
+
+  | stages | source | NVRTC | registers | local bytes |
+  |---|---|---|---|---|
+  | 25 | 98 KB | 17 s | 56 | 32 |
+  | 50 | 184 KB | 53 s | 56 | 32 |
+  | 100 | 354 KB | 178 s | 56 | 32 |
+  | 150 | 528 KB | 424 s | 53 | 32 |
+  | 200 | 706 KB | 825 s | 51 | 32 |
+
+  The same items as a 6-column `jacfwd` (one kernel, 6 dual lanes):
+
+  | stages | source | NVRTC | forward NVRTC | ratio | local bytes |
+  |---|---|---|---|---|---|
+  | 25 | 152 KB | 52 s | 17 s | 3.1x | 2528 |
+  | 50 | 252 KB | 164 s | 53 s | 3.1x | 4992 |
+  | 100 | 489 KB | 667 s | 178 s | 3.7x | 9792 |
+
+  Compile time grows as source size to the power 1.8 to 2.3 over that range, and the exponent rises with size:
+  the same superlinearity the `__noinline__` experiment above exposed from the other side. The `jacfwd` rows show
+  the other multiplier: 3.1 to 3.7 times the forward compile for 1.4 to 1.5 times the source, because `jax.vmap`
+  of the item makes every lane-dependent array T times longer and the emitter unrolls it -- which is also what
+  takes the per-thread local memory from 32 bytes to 9,792.
 
 What remains is the volume of straight-line code itself. A large item's stack frame and compile time are
 properties of the program; the levers that worked were in the program (fewer generic call sites, a static set of

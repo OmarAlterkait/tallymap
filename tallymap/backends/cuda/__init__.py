@@ -4,7 +4,7 @@ Float semantics (cuda_math=): 'approx' (DEFAULT) = XLA:GPU's own f32 div/sqrt/rs
 rsqrt.approx), everything else IEEE round-to-nearest without FMA contraction; 'ieee' = correctly rounded div/sqrt as
 well: the portable reference.
 
-run(prog, pi, bc, cuda_math=None, cuda_min_blocks=0) -> [sum tallies] + [stats i32[5]] + [per-item results]
+run(prog, pi, bc, cuda_math=None) -> [sum tallies] + [stats i32[5]] + [per-item results]
 Unsupported constructs raise tallymap.UnsupportedError (backend='auto' too, unless allow_fallback=True).
 """
 import hashlib
@@ -17,7 +17,7 @@ import numpy as np
 from ..._api import UnsupportedError
 from ..._compat import key_impl
 from . import compile as C
-from .codegen import FOLD, CodegenError, is_key_dtype
+from .codegen import CodegenError, is_key_dtype
 from .kernel import BLOCK, build_source
 
 _KERNELS = {}
@@ -28,7 +28,8 @@ def _const_sig(c):
         a = np.asarray(c)
         return (a.shape, str(a.dtype), a.tobytes())
     a = np.asarray(c)
-    return (a.shape, str(a.dtype)) + ((hashlib.sha1(a.tobytes()).hexdigest(),) if FOLD else ())
+    # the VALUE is part of the key: constant folding bakes closed-over arrays into the generated source
+    return (a.shape, str(a.dtype), hashlib.sha1(a.tobytes()).hexdigest())
 
 
 def _key(p, opts):
@@ -41,11 +42,10 @@ MATH_OPTS = {"ieee": [], "approx": ["-DTALLYMAP_APPROX_DIVSQRT", "--prec-div=fal
 
 
 class Kernel:
-    def __init__(self, p, min_blocks=0, split=True, math="approx", inplace=True, events=False):
+    def __init__(self, p, split=True, math="approx", inplace=True, events=False):
         self.block = BLOCK
         try:
-            self.src, self.L = build_source(p, min_blocks=int(min_blocks), split=bool(split), inplace=bool(inplace),
-                                            events=bool(events))
+            self.src, self.L = build_source(p, split=bool(split), inplace=bool(inplace), events=bool(events))
         except CodegenError as e:
             raise UnsupportedError(str(e)) from None
         if math not in MATH_OPTS:
@@ -71,7 +71,7 @@ def _phys_in(x):
     return jax.random.key_data(x) if is_key_dtype(x.dtype) else x
 
 
-def run(p, pi, bc, cuda_math="approx", cuda_min_blocks=0, _schedule=None, _cuda_inplace=True, **_):
+def run(p, pi, bc, cuda_math="approx", _schedule=None, _cuda_inplace=True, **_):
     """Scheduling: a lane is refilled with a new item at STEP granularity (needs one top-level while loop;
     1.35x faster than whole items on a photon-transport item) unless the program spawns (whole items: 1.5x faster
     on a particle shower); private _schedule
@@ -90,7 +90,7 @@ def run(p, pi, bc, cuda_math="approx", cuda_min_blocks=0, _schedule=None, _cuda_
     extra = {} if _cuda_inplace else dict(inplace=False)        # (the default leaves the kernel key unchanged)
     if _schedule == "events":
         extra["events"] = True
-    kern = kernel(p, min_blocks=cuda_min_blocks, split=split, math=math, **extra)
+    kern = kernel(p, split=split, math=math, **extra)
     L = kern.L
     N = int(pi[0].shape[0])
     consts = []

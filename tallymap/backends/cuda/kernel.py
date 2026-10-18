@@ -264,22 +264,20 @@ BLOCK = 128          # threads per block (measured: 64 / 128 / 256 within 1%)
 PRIV_BYTES = 4096    # shared-memory budget for privatised sum tallies per block
 
 
-def privatised(tallies, B=1, budget=PRIV_BYTES):
-    """indices of the sum tallies the kernel keeps in shared memory (in order, while they fit in `budget`); B: the
-    tallies made B times longer (a batch folded into the item axis).  The ONE rule, used by build_source and by the
-    fold heuristic (_primitive._can_fold)."""
+def privatised(tallies, budget=PRIV_BYTES):
+    """indices of the sum tallies the kernel keeps in shared memory (in order, while they fit in `budget`)."""
     out = []
     for k, s in enumerate(tallies):
         if s.kind != "sum":
             continue
-        nbytes = int(np.prod(s.lead, dtype=np.int64)) * s.S * B * (8 if _acc_t(s) in ("u64", "double") else 4)
+        nbytes = int(np.prod(s.lead, dtype=np.int64)) * s.S * (8 if _acc_t(s) in ("u64", "double") else 4)
         if 0 < nbytes <= budget:
             budget -= nbytes
             out.append(k)
     return out
 
 
-def build_source(p, *, block=BLOCK, min_blocks=0, split=True, inplace=True, events=False):
+def build_source(p, *, block=BLOCK, split=True, inplace=True, events=False):
     """-> (CUDA source, Layout).  p: tallymap._api.ItemProgram.  Its jaxpr is first rewritten twice: the foreign
     primitives a backend has to lower itself (_foreign.expand_late, e.g. lineax's linear_solve, which may only be
     expanded now that every autodiff rule has been applied) and then the JAX sugar (canon.py)."""
@@ -291,7 +289,6 @@ def build_source(p, *, block=BLOCK, min_blocks=0, split=True, inplace=True, even
     em = Emitter()
     em.where = p.where
     em.inplace = inplace
-    em.events = bool(events)                 # also lowers every inner while loop with a cut (op_table._while_events)
     L = Layout()
     jx = p.cj.jaxpr
     nT, nP, nB = p.nT, p.nP, p.nB
@@ -575,21 +572,24 @@ def build_source(p, *, block=BLOCK, min_blocks=0, split=True, inplace=True, even
         (f"        (({ctype(dt)}*)P.p[{L.r_ys[j]}])[t] = y{j};" if sh == () else
          f"        for (int e = 0; e < {_size(sh)}; ++e) (({ctype(dt)}*)P.p[{L.r_ys[j]}])[t * {_size(sh)} + e] = y{j}[e];")
         for j, (sh, dt, _) in enumerate(yav))
-    lb = f"__launch_bounds__({block}, {min_blocks})" if min_blocks else f"__launch_bounds__({block})"
-    claim = """if (my_left == 0) {               // warp-aggregated claim of CH item slots per needy lane, interleaved
+    lb = f"__launch_bounds__({block})"
+    # ONE item per claim, warp-aggregated: the needy lanes of a warp take one contiguous run between them, so
+    # the counter sees one atomic per warp instead of one per lane.  Claiming a RUN of items per lane was
+    # measured and removed: it leaves the last claims holding several items each, which is a tail the other
+    # lanes wait for (2080 Ti, all 18 benchmarks/vs_jax cells: one item per claim is 1.46x faster on
+    # random_walk's forward pass, 1.14-1.18x on transport, uniform and ode, and never slower).
+    claim = """if (my_left == 0) {
           const unsigned m = __activemask();
           const int leader = __ffs(m) - 1;
           const unsigned rank = __popc(m & ((1u << lane) - 1u));
-          const u32 cnt = (u32)__popc(m);
           u64 base = 0;
-          if (lane == leader) base = atomicAdd((unsigned long long*)sj_ctr, (unsigned long long)(cnt * CH));
-          base = __shfl_sync(m, base, leader);
-          my_next = base + rank; my_stride = cnt; my_left = CH;
+          if (lane == leader) base = atomicAdd((unsigned long long*)sj_ctr, (unsigned long long)__popc(m));
+          my_next = __shfl_sync(m, base, leader) + rank; my_left = 1;
         }"""
     xdecl = "".join(svar("x", i, spc) for i, spc in enumerate(pav)) if spawn is not None else ""
     if spawn is None:
         fetch = f"""        {claim}
-        t = my_next; my_next += my_stride; --my_left;
+        t = my_next; --my_left;
         if (t >= (u64)n_items) break;"""
         finish = f"""{ywrite}"""
     else:
@@ -623,7 +623,7 @@ def build_source(p, *, block=BLOCK, min_blocks=0, split=True, inplace=True, even
           {claim}
           t = my_next;
           if (t < (u64)n_items) {{
-            my_next += my_stride; --my_left;
+            --my_left;
             atomicAdd(&SJ_QCTL[4], 1u);
 {load_p}
           }} else {{
@@ -641,9 +641,8 @@ def build_source(p, *, block=BLOCK, min_blocks=0, split=True, inplace=True, even
 extern "C" __global__ void {lb} sj_main(const SjParams P, const i64 n_items) {{
   u64* const sj_ctr = (u64*)P.p[{L.r_ctr}];
   const int lane = threadIdx.x & 31;
-  const u32 CH = (u32)max(1ll, min(16ll, n_items / (16ll * gridDim.x * blockDim.x)));
 {chr(10).join(acc_decl)}
-{decls}{xdecl}  u64 my_next = 0, my_stride = 0; u32 my_left = 0;
+{decls}{xdecl}  u64 my_next = 0; u32 my_left = 0;
   u64 t = 0; i64 item = 0; bool active = false, done = false, child = false; i32 n_ctr = 0;
   while (true) {{
     if (!active) {{
@@ -673,7 +672,8 @@ extern "C" __global__ void {lb} sj_main(const SjParams P, const i64 n_items) {{
 
 
 def _events_main(L, lb, acc_decl, acc_flush, decls, claim, start, ywrite, ev):
-    """The persistent loop under event scheduling (no spawn).  Every lane is, between rounds, either in transit
+    """The persistent loop under event scheduling of the STEP loop (no spawn; inner loops are never event
+    scheduled -- measured slower on every toy built for it, see docs/design.md section 1b).  Every lane is, between rounds, either in transit
     (fetching an item, or just past a branch: it runs cond and head lane-locally and lands at the cut) or WAITING at
     the cut with its branch index sj_pc and its cut state.  Each round the warp votes, picks ONE branch j, and only the
     lanes waiting at j run it (then tail, cond, head).  The choice is warp-uniform and online, from measured cost:
@@ -689,9 +689,8 @@ def _events_main(L, lb, acc_decl, acc_flush, decls, claim, start, ywrite, ev):
 extern "C" __global__ void {lb} sj_main(const SjParams P, const i64 n_items) {{
   u64* const sj_ctr = (u64*)P.p[{L.r_ctr}];
   const int lane = threadIdx.x & 31;
-  const u32 CH = (u32)max(1ll, min(16ll, n_items / (16ll * gridDim.x * blockDim.x)));
 {chr(10).join(acc_decl)}
-{decls}  u64 my_next = 0, my_stride = 0; u32 my_left = 0;
+{decls}  u64 my_next = 0; u32 my_left = 0;
   u64 t = 0; i64 item = 0; bool active = false, sj_ready = false; i32 sj_pc = -1;
   unsigned sj_alive = 0xffffffffu;
   float sj_cost[{K}], sj_rent[{K}];
@@ -700,7 +699,7 @@ extern "C" __global__ void {lb} sj_main(const SjParams P, const i64 n_items) {{
     bool sj_ex = false;
     if (!active) {{
       {claim}
-      t = my_next; my_next += my_stride; --my_left;
+      t = my_next; --my_left;
       if (t >= (u64)n_items) sj_ex = true;
       else {{ item = (i64)t; {start} active = true; sj_ready = true; }}
     }}

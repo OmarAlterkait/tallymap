@@ -97,9 +97,9 @@ deliberate: it is what makes an upgrade a bounded job.
 |---|---|---|---|
 | `MAX_LANES` | 16 | `_primitive.py` | L40S: `jacrev` of 256 outputs in chunks of 4 / 8 / 16 / 32 / 64 lanes: 229 / 191 / 175 / 176 / 325 ms |
 | `LANES_MAX_LOCAL` | 512 elements | `_primitive.py` | L40S: `jacfwd` lane counts; the toy `jacfwd(grad)` went from 95 ms to 2.3 ms once a 6 KB stack frame was split |
-| `FOLD_MAX_BC` | 4096 elements | `_primitive.py` | L40S: a folded batch against `lax.map`, 1.2 to 3.4x |
+| `FOLD_MAX_BC` | 4096 elements | `_primitive.py` | L40S: a folded batch against `lax.map`, 1.2 to 3.4x (the fold rule itself is the device's resident-thread count, not a constant: `docs/design.md` section 2) |
 | `BLOCK` (cuda) | 128 threads | `backends/cuda/kernel.py` | L40S: 64, 128 and 256 within 1% |
-| `PRIV_BYTES` | 4096 bytes per block | `backends/cuda/kernel.py` | L40S: folding against `lax.map` with a 256-bin tally, 21 ms against 4.6 ms once a tally leaves shared memory |
+| `PRIV_BYTES` | 4096 bytes per block | `backends/cuda/kernel.py` | 2080 Ti: random walk 7.9 ms against 36.4 and barrier 14.4 against 56.6 (forward, 4M items) with privatisation off |
 | `UNROLL` / `MAX_LOCAL` | 32 / 16384 elements | `backends/cuda/codegen.py` | L40S and 2080 Ti: compile time against local memory |
 | `FOLD_MIN`, `LAZY_GATHER` | 16 elements | `codegen.py`, `op_table.py` | L40S: small-table gathers |
 | `rev_checkpoints` default | 16 | `_reverse.py` | L40S and 2080 Ti; with the stride-C fix the six `vs_jax` problems are within 1.6x over C = 8..64 |

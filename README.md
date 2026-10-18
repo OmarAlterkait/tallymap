@@ -426,10 +426,8 @@ item jaxprs and generated kernels. `tm.diagnostics(f, *args)` reports what `jax.
 | `backend` | `'auto'` | `'auto'`: cuda on a GPU, where a program the cuda emitter cannot compile raises `tm.UnsupportedError`; lockstep elsewhere, with a one-time warning. `'cuda'`: cuda or raise. `'lockstep'`: always the plain-JAX interpreter, slow by design, the reference. |
 | `allow_fallback` | `False` | with `backend='auto'` on a GPU, run lockstep with a warning instead of raising. It is about 100x slower, which is why it is not the default. |
 | `cuda_math` | `'approx'` | cuda f32 division, sqrt and rsqrt. `'approx'`: the PTX XLA:GPU itself emits, so it is the arithmetic a plain JAX program on the same GPU gets. `'ieee'`: correctly rounded, the portable reference, about 1.5x slower. |
-| `cuda_min_blocks` | `0` | cuda `__launch_bounds__` minimum blocks per multiprocessor, which caps registers. Performance only; the best value is per kernel. |
 | `lockstep_block` | `2**18` | lockstep backend: lanes per block, which bounds its memory. |
 | `rev_checkpoints` | `16` | reverse mode: checkpoint buffer size C. O(K) work for loops of K <= C^2 steps; 2C states of memory per item. |
-| `rev_step_segments` | `0` | reverse mode: recompute each loop step in S checkpointed segments inside its VJP. Helps when a step's residuals spill out of the register file; costs recomputation otherwise. |
 | `rev_stats` | `False` | reverse mode: report replay mismatches and tree-adjoint counts to the host. Off by default because a host callback takes `jax.jit` off its C++ fast path, which can cost an order of magnitude. |
 
 Any other option name raises. Options starting with `_` are private measurement and negative-control switches

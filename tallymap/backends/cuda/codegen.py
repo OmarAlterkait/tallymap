@@ -250,8 +250,7 @@ def elem(v, idx):
 
 
 # ----------------------------------------------------------------------------- constant folding
-FOLD = 1             # evaluate constant subexpressions at trace time; results of >= FOLD_MIN elements become tables
-FOLD_MIN = 16
+FOLD_MIN = 16        # constant-folded results of at least this many elements become pooled constant tables
 _NOFOLD = ("custom_lin",)
 
 
@@ -500,9 +499,9 @@ class Emitter:
                 consts.append(self.const_val(c, v.aval))
             else:
                 dc = self.dyn_const(fn, k, v.aval)
-                if FOLD and not isinstance(c, jax.core.Tracer) and not is_key_dtype(v.aval.dtype):
+                if not isinstance(c, jax.core.Tracer) and not is_key_dtype(v.aval.dtype):
                     try:
-                        dc.cnp = np.asarray(c)          # value is in ItemProgram.key() when FOLD is on
+                        dc.cnp = np.asarray(c)          # known value: foldable downstream (and in the kernel key)
                     except Exception:
                         pass
                 consts.append(dc)
@@ -587,7 +586,7 @@ class Emitter:
         so the bits are what XLA computes) and hoist results with >= FOLD_MIN elements as constant tables.
         XLA folds/fuses these constant-only subgraphs; per item they would otherwise be recomputed every step
         into per-thread local arrays (PROD: 15+ 255-element quantile grids per step).  -> list of Vals or None"""
-        if not FOLD or eqn.effects or eqn.primitive.name.startswith("random") or eqn.primitive.name in _NOFOLD:
+        if eqn.effects or eqn.primitive.name.startswith("random") or eqn.primitive.name in _NOFOLD:
             return None
         vals = []
         for x in ins:

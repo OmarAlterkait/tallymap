@@ -296,8 +296,8 @@ Read that as: the gradient is **1.7x to 23x** faster than `jax.vmap` at **19x to
 you want depends on the ensemble, not just on the item**.  The default is 6.9x off at the narrow spread and
 N = 65,536; C = 4 is 6.2x off at the wide spread and the same N, where the stiffest items run a long loop and
 quadratic recomputation dominates.  Peak memory does not move with C at these sizes (64-68 MB throughout), so the
-measurement is purely of time.  `rev_step_segments` did not help either way (4,968 ms at S = 4 against 4,936 at
-S = 0).
+measurement is purely of time.  Recomputing each step in checkpointed segments inside its VJP did not help
+either way (4,968 ms at S = 4 against 4,936 at S = 0); that option is gone (docs/design.md section 6).
 
 Two or three values of C on your own ensemble is the whole tuning procedure.
 

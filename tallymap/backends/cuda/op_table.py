@@ -442,8 +442,6 @@ _FOLD = {"add": np.add, "sub": np.subtract, "mul": np.multiply, "neg": np.negati
 
 
 _LAZY_EW = ("add", "sub", "mul", "neg", "max", "min", "convert_element_type")
-LAZY_FUSE = 1
-LAZY_FUSE_MAXUSE = 1   # >1: recompute instead of storing
 
 
 def _ew_rule(em, eqn, ins, **p):
@@ -481,7 +479,7 @@ def _ew_rule(em, eqn, ins, **p):
     if (LAZY_GATHER and impl is None and _size(shape) > LAZY_GATHER
             and all(isinstance(v, (Lazy, Table, Scalar, Local, View)) for v in ins)
             and ((name in _LAZY_EW and any(isinstance(v, (Lazy, View, Table)) and v.size > LAZY_GATHER for v in ins))
-                 or (LAZY_FUSE and 1 <= ou[0] <= LAZY_FUSE_MAXUSE))):
+                 or ou[0] == 1)):
         # (a) one-use large elementwise results are FUSED into their single consumer (XLA loop fusion: a
         #     128-point per-step quadrature chain is evaluated inside the reduction instead of through ~20
         #     128-element per-thread local arrays); (b) cheap ops on a large lazy table gather stay lazy.
@@ -1221,13 +1219,6 @@ def _while(em, eqn, ins, **p):
     cars = _carry_vars(em, init, pt)
     vals = [_carry_val(c) if not p_ else c for c, p_ in zip(cars, pt)]
     em.freeze(cc + bc + [c for c, p_ in zip(cars, pt) if p_])     # re-read every iteration: never in place
-    if getattr(em, "events", False):
-        from .kernel import _cut
-        cut = _cut(w.body)
-        if cut is not None:
-            _while_events(em, w, cc, bc, cars, vals, pt, cut)
-            em.unfreeze()
-            return vals
     em.open("while (true)")
     em.cf_depth += 1
     em.freeze(vals)                                                 # the predicate must not consume a carry
@@ -1240,123 +1231,6 @@ def _while(em, eqn, ins, **p):
     em.close()
     em.unfreeze()
     return vals
-
-
-def _buffered(em, fn):
-    """run fn() with em's output redirected into a fresh line buffer -> (lines, fn's result)"""
-    saved, ind = em.lines, em.ind
-    em.lines = []
-    em.cf_depth += 1
-    try:
-        r = fn()
-    finally:
-        em.cf_depth -= 1
-        lines, em.lines, em.ind = em.lines, saved, ind
-    return lines, r
-
-
-def _persist(em, x, prefix):
-    """a per-lane variable declared before a loop that holds x across rounds (None for a virtual tally)"""
-    if isinstance(x, VTally):
-        return None
-    if x.shape == ():
-        n = em.fresh(prefix)
-        em.line(f"{ctype(x.dtype)} {n};")
-        c = Local(n, (), x.dtype)
-    else:
-        c = em.declare(x.shape, x.dtype, prefix)
-    c.key_impl = getattr(x, "key_impl", None)
-    return c
-
-
-def _while_events(em, w, cc, bc, cars, vals, pt, cut):
-    """Event scheduling of ONE while loop at any depth (kernel._events_main is the same rule for the step loop of a
-    persistent kernel, with refill).  The lanes that enter the loop together form its warp group; each lane waits at
-    the body's cut (kernel._cut) holding its cut state X and its branch index, and each round the group votes and runs
-    ONE branch, chosen by the same rule as kernel._events_main; lanes that have not yet reached a cut (index K) run
-    along in every round, and lanes whose loop condition fails leave the vote.  Every lane runs exactly its own
-    equations in order, so per-item results equal the plain loop's."""
-    K = len(cut["branches"])
-    bjx = w.body.jaxpr
-    bmap = dict(zip(bjx.invars, bc + vals))
-    # head: (body consts, carries) -> [branch index] + X, emitted into a buffer so X's kinds are known
-    em.freeze(vals)
-    hlines, hres = _buffered(em, lambda: em.run_closed(cut["head"], bc + vals))
-    em.unfreeze()
-    xs = [_persist(em, x, "ex") for x in hres[1:]]
-    xvals = [x if p is None else _carry_val(p) for x, p in zip(hres[1:], xs)]
-    bmap.update(zip(cut["X"], xvals))
-
-    def opval(v):
-        if type(v).__name__ == "Literal":
-            return em.const_val(v.val, v.aval)
-        if v in bmap:
-            return bmap[v]
-        return em.const_val(cut["consts"][v], v.aval)
-    ops = [opval(v) for v in cut["ops"]]
-    em.freeze(vals + [x for x in xs if x is not None])
-    brs = [_buffered(em, lambda b=b: em.run_closed(b, ops)) for b in cut["branches"]]
-    em.unfreeze()
-    rs = []
-    for j in range(len(brs[0][1])):
-        vt = next((b[1][j] for b in brs if isinstance(b[1][j], VTally)), None)
-        rs.append(vt if vt is not None else _persist(em, brs[0][1][j], "er"))
-    rvals = [r if isinstance(r, VTally) else _carry_val(r) for r in rs]
-    pc, al = em.fresh("epc"), em.fresh("eal")
-    cost, rent, nn = em.fresh("ecost"), em.fresh("erent"), em.fresh("en")
-    em.line(f"int {pc} = {K}; unsigned {al} = __activemask();")
-    em.line(f"float {cost}[{K}], {rent}[{K}];")
-    em.line(f"for (int e = 0; e < {K}; ++e) {{ {cost}[e] = 0.0f; {rent}[e] = 0.0f; }}")
-    em.open("while (true)")
-    em.cf_depth += 1
-    lv = em.fresh("elv")
-    em.line(f"const unsigned {lv} = __ballot_sync({al}, {pc} >= 0);")
-    em.line(f"if ({pc} < 0) break;")
-    em.line(f"{al} = {lv};")
-    j, na, best, t0, dt = (em.fresh(p) for p in ("ej", "ena", "ebest", "et0", "edt"))
-    em.line(f"int {nn}[{K}];")
-    em.line(f"for (int e = 0; e < {K}; ++e) {nn}[e] = __popc(__ballot_sync({al}, {pc} == e));")
-    em.line(f"const int {na} = __popc({al});")
-    em.line(f"int {j} = {K}; float {best} = -3.0e38f;")
-    em.line(f"for (int e = 0; e < {K}; ++e) if ({nn}[e]) {{ const float sc = {rent}[e] - (float)({na} - {nn}[e]) * "
-            f"{cost}[e]; if (sc > {best}) {{ {best} = sc; {j} = e; }} }}")
-    em.line(f"const long long {t0} = clock64();")
-    em.open(f"if ({pc} == {j} || {pc} == {K})")
-    # [branch pc -> r; tail -> new carries]
-    em.open(f"if ({pc} < {K})")
-    em.open(f"switch ({pc})")
-    for k, (lines, res) in enumerate(brs):
-        em.line(f"case {k}: {{")
-        em.lines.extend(lines)
-        for r, x in zip(rs, res):
-            if r is not None and not isinstance(r, VTally):
-                em.assign(r, x)
-        em.line("break; }")
-    em.close()
-    outs = em.run_closed(cut["tail"], bc + vals + xvals + rvals)
-    _update_carries(em, cars, outs, pt)
-    em.close()
-    # cond -> head (to the next cut) or leave the loop
-    em.freeze(vals)
-    pred = em.run_closed(w.cond, cc + vals)[0]
-    em.unfreeze()
-    em.open(f"if (!({elem(pred, [])}))")
-    em.line(f"{pc} = -1;")
-    em.close("} else {")
-    em.ind += 1
-    em.lines.extend(hlines)
-    for x, h in zip(xs, hres[1:]):
-        if x is not None:
-            em.assign(x, h)
-    em.line(f"{pc} = (int)({elem(hres[0], [])});")
-    em.close()
-    em.close()
-    em.line(f"__syncwarp({al});")
-    em.line(f"float {dt} = (float)(clock64() - {t0}); {dt} = __shfl_sync({al}, {dt}, __ffs({al}) - 1);")
-    em.line(f"for (int e = 0; e < {K}; ++e) {{ if (e == {j}) {{ {rent}[e] = 0.0f; {cost}[e] = {cost}[e] == 0.0f ? "
-            f"{dt} : 0.875f * {cost}[e] + 0.125f * {dt}; }} else if ({nn}[e]) {rent}[e] += (float){nn}[e] * {dt}; }}")
-    em.cf_depth -= 1
-    em.close()
 
 
 def _branch(em, br, ops):

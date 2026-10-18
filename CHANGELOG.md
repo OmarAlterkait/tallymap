@@ -8,6 +8,19 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Added
 
+- `benchmarks/compile_scaling.py`: NVRTC compile time, generated source size, registers and per-thread
+  local memory against the SIZE of one item, with and without `jacfwd` lanes. The cuda emitter inlines the
+  whole item into one kernel, so for a large item the compile time is the size of that one function, and
+  `docs/design.md` section 9 had only the private engine's numbers for it. On a 2080 Ti compile time grows
+  as source size to the power 1.8 to 2.3 between 99 KB and 706 KB of generated source
+  (18 s to 725 s).
+
+- `benchmarks/events_bench.py`: the measurement of event scheduling (`_schedule='events'`) against the default
+  step refill, on the item shape it is for (a divergent loop whose body is a lopsided switch). No `vs_jax`
+  problem has a top-level `cond` with a dynamic index in its step body, so on all of them the two schedules
+  compile to the same kernel and the mechanism's benefit was undocumented. It is 3.1x on the forward pass of
+  a rare, 256-times-more-expensive branch at 4M items on a 2080 Ti, and a wash in reverse mode
+  (`docs/design.md`, section 1b).
 - `jnp.linalg.solve`, `inv`, `det` and `lu_factor` / `lu_solve` run inside an item on cuda: `lu`,
   `lu_pivots_to_permutation`, `custom_linear_solve` and `triangular_solve` are lowered after autodiff to JAX's own
   pure-JAX implementations (and a substitution loop), so the derivative is JAX's own. `supported_primitives()`
@@ -18,7 +31,57 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 - A program that fails to lower because a `custom_jvp` closes over a traced value (a JAX staging limit) gets an
   error that names the cause and the fix (pass the value as an argument).
 
+### Removed
+
+- The public option `rev_step_segments` (recompute each loop step in S checkpointed segments inside its VJP).
+  Passing it now raises, like any unknown option. Four independent measurements on a 2080 Ti found no benefit:
+  the six `benchmarks/vs_jax` gradient cells (0.98-1.05 at S = 4 and 8), the toy walk at 1M items
+  (6.32 / 6.36 / 6.45 / 6.43 ms at S = 0 / 4 / 8 / 16), a toy built to spill (168 registers, 1,328 bytes of
+  local memory per thread, grad/forward 8.1x: 32.4 / 31.2 / 32.1 ms at S = 0 / 2 / 4) and the diffrax ensemble
+  of `docs/equinox.md` (4,936 against 4,968 ms). `docs/design.md` section 6 already recorded that ptxas reports
+  zero spill bytes for every public adjoint kernel, so no rule could have set S either. -96 lines.
+- Event scheduling of INNER while loops. `_schedule='events'` now cuts only the step body of the outer loop
+  (`kernel._cut` / `kernel._events_main`); an inner `while` is lowered as a plain C loop again. On four toys
+  built to be the inner-loop scheduler's best case it was 1.82x / 1.36x / 1.22x / 1.03x slower than the plain
+  loop and never faster, and it never fired on any `benchmarks/vs_jax` problem. It was also the reason
+  `_schedule='events'` cost 3.1x in reverse mode (every top-level loop of an adjoint program was
+  event-scheduled); the gradient is now within 3% of the default, while the forward win (1.6-3.1x on
+  `benchmarks/events_bench.py`) is unchanged.
+- `tm.Sum(..., tangent_scale=)`, the fixed-point scale of the TANGENT tally of an `exact=True` output. Nothing
+  in the tests, benchmarks, examples or documentation ever set it and no number was ever recorded for it; a
+  tangent tally now always uses its primal output's `scale`, which is what every program that did not set it
+  already got, so no result changes. Passing it raises `TypeError`, as any unknown `tm.Sum` field does.
+- The public option `cuda_min_blocks` (the cuda `__launch_bounds__` minimum-blocks-per-SM register cap). Passing
+  it now raises, like any unknown option. Re-measured on the toy walk at 4M items on a 2080 Ti: 0 / 1 / 2 / 4
+  gave forward 6.22 / 6.25 / 6.22 / 6.17 ms and a JVP 7.16 / 7.25 / 7.28 / 7.17 ms, all inside rerun noise.
+  Every kernel is now compiled with `__launch_bounds__(128)` alone.
+- Three private kill-switches of the cuda emitter that were permanently on and that nothing set:
+  `codegen.FOLD` (constant folding), `op_table.LAZY_FUSE` and `op_table.LAZY_FUSE_MAXUSE` (one-use lazy
+  fusion). The generated CUDA source and the cubins are unchanged.
+- The two private reverse-mode cost-decomposition options, `_rev_phase` (`'primal'` | `'skip'`) and
+  `_tree_phase` (`'fwd'` | `'roots'` | `'children'`). Both deliberately computed WRONG gradients to attribute the
+  adjoint's cost to its phases; no test used either, and the decompositions they produced are recorded in
+  `docs/design.md` section 6. No behaviour change on any supported option value.
+
 ### Changed
+
+- The cuda kernel claims ONE item per warp-aggregated claim. It used to claim a run of up to
+  `clamp(N / (16 * grid * block), 1, 16)` items per lane, which left the last claims holding several items each
+  — a tail the other lanes wait for. Measured over all 18 `benchmarks/vs_jax` forward and gradient cells on a
+  2080 Ti: one item per claim is 1.46x faster on random_walk forward, 1.14-1.18x on transport forward,
+  random_walk gradient and uniform gradient, and never slower (worst cell 1.002). Three fitted constants and
+  two kernel variables go with it.
+
+- The rule that decides whether `jax.vmap` over a tallymap call folds the batch into the item axis (one launch
+  of B*N items) or falls back to `lax.map` (one launch per member). On cuda it was "fold while every privatised
+  tally stays privatised"; it is now "fold while one member's N items cannot fill the device" (N below
+  multiprocessors x 1024, the smallest maximum-resident-threads-per-multiprocessor of any tested architecture).
+  Folding costs B copies of every per-item operand and buys one saturated launch, which has nothing to do with
+  the tally size. Measured on the toy walk at B=8 on a 2080 Ti: at 65,536 items the new rule folds two more
+  cells and is 1.32x and 2.21x faster (256 and 1,024 bins); at a million items it stops folding two cells and
+  is 2.46x and 2.48x faster (64 and 4,096 bins) and at four million 6.85x and 5.83x; at 262,144 items it gives
+  up 1.35 to 1.37x. `lax.map` cells
+  and lockstep are unchanged (`docs/design.md` section 2). `kernel.privatised()` loses its `B=` parameter.
 
 - cuda compile time: lazily inlined element expressions are capped at 32 nodes (was 256). On a large
   photon-transport item this took the forward compile from 1543 to 834 s and the run from 9.04 to 6.87 s on a

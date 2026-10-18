@@ -53,13 +53,12 @@ def _call_site(fallback=None):
 class Sum:
     """A commutative (sum) output.  exact=True accumulates round(v * scale) in int64: bitwise order-independent
     (needs jax_enable_x64 on the lockstep backend).  |v * scale| >= 9.2e18 cannot be represented: such emits are
-    DROPPED and counted in Result.stats['exact_overflow'] (check it!).  tangent_scale: scale of the jvp tangent
-    of this output (default: scale)."""
+    DROPPED and counted in Result.stats['exact_overflow'] (check it!).  A jvp / vjp tangent tally of this output
+    uses the same scale."""
     shape: Any
     dtype: Any = jnp.float32
     exact: bool = False
     scale: float = 2.0 ** 32
-    tangent_scale: Any = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -98,7 +97,6 @@ class TSpec:
     exact: bool = False
     kind: str = "sum"      # 'sum' | 'spawn' | 'discard'
     scale: float = 2.0 ** 32
-    tscale: Any = None
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -189,8 +187,7 @@ def jvp_prog(p, pert_pi, pert_bc):
     from ._reverse import forward_tangents
     with forward_tangents():        # (sparse table reads of an adjoint program: see _reverse.tread)
         cj = _mk(J, [_sds(a) for a in avals])
-    tl = list(p.tallies) + [dataclasses.replace(p.tallies[i], name=p.tallies[i].name + "'",
-                                                scale=p.tallies[i].tscale or p.tallies[i].scale) for i in tf]
+    tl = list(p.tallies) + [dataclasses.replace(p.tallies[i], name=p.tallies[i].name + "'") for i in tf]
     return ItemProgram(cj, tuple(tl), nP + len(ip), nB + len(ib), p.trunc, p.spawn, p.tag + "+jvp", where=p.where)
 
 
@@ -225,10 +222,8 @@ _OPTS = {
                       "UnsupportedError when the cuda backend cannot compile the program (default False; it is "
                       "only ever suggested for programs the lockstep backend can actually run)",
     "cuda_math": "cuda backend, f32 div/sqrt: 'approx' (default) | 'ieee'",
-    "cuda_min_blocks": "cuda backend: __launch_bounds__ minimum blocks per SM",
     "lockstep_block": "lockstep backend: lanes per block",
     "rev_checkpoints": "reverse mode: checkpoint buffer size C",
-    "rev_step_segments": "reverse mode: recompute each loop step in this many checkpointed segments (0 = off)",
     "rev_stats": "reverse mode: report replay mismatches / tree stats to the host (costs jit's fast path)",
     # PRIVATE (measurements / tests / negative controls; not API)
     "_schedule": "cuda: 'step' | 'item' | 'events' overrides the rule (step unless the program spawns)",
@@ -238,11 +233,9 @@ _OPTS = {
     "_fold": "False: never fold a batch into the item axis",
     "_rev_sparse_min": "smallest table (elements) that gets sparse emitted cotangents (default 32)",
     "_adj_math": "NEGATIVE CONTROL: compile the adjoint with this cuda_math (replay check must fire)",
-    "_rev_phase": "COST DECOMPOSITION (gradients wrong): 'primal' | 'skip' replaces the step VJPs",
     "_rev_nodense": "NEGATIVE CONTROL: drop the dense detection of mixed-use tables",
     "_rev_gen_capacity": "tree adjoint: largest generation (default Queue capacity; memory lever)",
     "_tree_neg": "NEGATIVE CONTROL of the tree adjoint: 'detach' | 'replay'",
-    "_tree_phase": "COST DECOMPOSITION of the tree adjoint (gradients wrong): 'fwd' | 'roots' | 'children'",
 }
 BACKENDS = ("auto", "cuda", "lockstep")
 
@@ -263,13 +256,9 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
     opts:      allow_fallback     backend='auto' on a GPU: fall back to lockstep (warning) instead of raising.
                cuda_math          cuda f32 div/sqrt: 'approx' (default; XLA:GPU's own PTX) | 'ieee' (correctly
                                   rounded: the portable reference).
-               cuda_min_blocks    cuda __launch_bounds__ minimum blocks per SM (register cap; performance only;
-                                  0 = compiler).  The best value is per kernel.
                lockstep_block     lockstep backend: lanes per block (default 2^18; bounds its memory).
                rev_checkpoints    reverse mode: states per checkpoint buffer C (default 16).  O(K) work for loops
                                   of K <= C^2 steps, 2C+1 states of per-item memory.
-               rev_step_segments  reverse mode: recompute each loop step in S checkpointed segments inside its VJP
-                                  (default 0 = off; helps when a step's residuals spill, costs recomputation).
                rev_stats          reverse mode: report replay mismatches and tree-adjoint stats to the host
                                   (tallymap.diagnostics()['reverse']).  Off by default: a host callback takes jax.jit
                                   off its C++ fast path.  A failed check makes the gradient NaN either way.
@@ -340,8 +329,7 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
         shapes = {n: (outs_spec[n].shape,) if isinstance(outs_spec[n].shape, int) else tuple(outs_spec[n].shape)
                   for n in names}
         tspecs = [TSpec(n, int(np.prod(shapes[n], dtype=np.int64)), np.dtype(outs_spec[n].dtype), (),
-                        bool(outs_spec[n].exact), "sum", float(outs_spec[n].scale), outs_spec[n].tangent_scale)
-                  for n in names]
+                        bool(outs_spec[n].exact), "sum", float(outs_spec[n].scale)) for n in names]
         if spawn is not None:
             tspecs.append(TSpec("__spawn__", 1, np.dtype(np.int32), (), False, "spawn"))
         nT = len(tspecs)

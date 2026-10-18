@@ -181,7 +181,9 @@ def _(b):
 def _(b):
     f = lambda t, x: t.add("Q", 0, x)
     for kw in (dict(math="ieee"), dict(min_blocks=4), dict(block=8), dict(rev_slots=4), dict(rev_remat=2),
-               dict(ad="forward"), dict(bogus=1), dict(_occ_cap=2), dict(_replay_check=False)):
+               dict(ad="forward"), dict(bogus=1), dict(_occ_cap=2), dict(_replay_check=False),
+               dict(cuda_min_blocks=2), dict(_rev_phase="skip"), dict(_tree_phase="fwd"),
+               dict(rev_step_segments=8)):
         raises(ValueError, lambda: V(f, b, **kw), "unknown option")
     raises(ValueError, lambda: tm.vmap(f, outputs={"Q": tm.Sum((NB,), F)}, backend="xla"), "unknown backend")
     from tallymap import _tally
@@ -764,7 +766,7 @@ def _(b):
 def _(b):
     g = lambda **o: (lambda x, k, t, th: V(walk, b, in_axes=AX, **o)(x, k, t, th).outputs["Q"])
     if b == "cuda":
-        same, diff = (dict(cuda_min_blocks=0), dict()), (dict(_schedule="step"), dict(_schedule="item"))
+        same, diff = (dict(cuda_math="approx"), dict()), (dict(_schedule="step"), dict(_schedule="item"))
     else:
         same, diff = (dict(cuda_math="ieee"), dict()), (dict(lockstep_block=8), dict())
     raises(AssertionError, lambda: tm.assert_arms_differ(g(**same[0]), g(**same[1]), xs, keys, tab, TH), "identical")
@@ -1174,54 +1176,6 @@ def _(b):
     pe = tm.vmap(plain, outputs={"Q": tm.Sum((NB,), F)}, backend=b, _schedule="events")(xs)
     close(pe.outputs["Q"], R(plain)(xs).outputs["Q"])
     return "3-way switch: fwd / jvp / per-item bitwise, grad per-item bitwise; loop-free program falls back"
-
-
-@case("event scheduling of inner / sequential while loops (whole-item mode): == step bitwise (fwd, jvp, per-item grad)",
-      ["cuda"])
-def _(b):
-    def item(t, x0, key, th):                      # two top-level loops (-> whole-item mode); the first nests a loop
-        def inner(c):                              # whose body holds a skewed switch
-            j, y, t = c
-            u = jax.random.uniform(jax.random.fold_in(key, 100 + j))
-            idx = (u < 0.25).astype(jnp.int32)
-            y, t = lax.switch(idx, [lambda y, t: (y * 0.95 + th * u, t.add("Q", j % NB, y)),
-                                    lambda y, t: (lax.fori_loop(0, 32, lambda i, z: jnp.sin(z) * th, y),
-                                                  t.add("Q", (j * 5) % NB, y * th))], y, t)
-            return j + 1, y, t
-
-        def outer(c):
-            k, x, t = c
-            _, x, t = lax.while_loop(lambda c: c[0] < 2 + (x0 * 5).astype(jnp.int32) + k, inner, (0, x, t))
-            return k + 1, x, t
-        k, x, t = lax.while_loop(lambda c: c[0] < 3, outer, (0, x0, t))
-
-        def second(c):
-            k, x, t = c
-            x, t = lax.cond(x > th, lambda x, t: (x - 0.3, t.add("Q", 0, x)), lambda x, t: (x * 1.1 + 0.1, t), x, t)
-            return k + 1, x, t
-        k, x, t = lax.while_loop(lambda c: c[0] < 4 + (x0 * 3).astype(jnp.int32), second, (0, x, t))
-        return t, x * th
-
-    out = {"Q": tm.Sum((NB,), F, exact=True)}
-    f = {s: tm.vmap(item, outputs=out, in_axes=(0, 0, None), backend=b, _schedule=s) for s in ("step", "events")}
-    ys = xs * 1.3 % 1.0
-    r = {s: jax.jit(lambda q: f[s](ys, keys, q))(TH) for s in f}
-    jv = {s: jax.jvp(lambda q: f[s](ys, keys, q).outputs["Q"], (TH,), (F(1.0),)) for s in f}
-    for a_, b_, what in ((r["step"].outputs, r["events"].outputs, "tallies"), (r["step"].per_item, r["events"].per_item,
-                         "per-item"), (jv["step"], jv["events"], "jvp")):
-        for x, y in zip(jax.tree_util.tree_leaves(a_), jax.tree_util.tree_leaves(b_)):
-            if not np.array_equal(np.asarray(x), np.asarray(y), equal_nan=True):
-                raise Fail(f"events != step ({what})")
-    if "__ballot_sync" not in open([k for k in tm.diagnostics()["kernels"] if k["options"].get("events")][-1]
-                                   ["source"]).read():
-        raise Fail("no loop was event-scheduled")
-    g = {s: jax.grad(lambda xx: jnp.sum(f[s](xx, keys, TH).per_item ** 2))(ys) for s in f}
-    if not np.array_equal(np.asarray(g["step"]), np.asarray(g["events"])):
-        raise Fail("grad per-item events != step")
-    fo = {"Q": tm.Sum((NB,), F)}
-    close(tm.vmap(item, outputs=fo, in_axes=(0, 0, None), backend=b, _schedule="events")(ys, keys, TH).outputs["Q"],
-          R(item, outputs=fo, in_axes=(0, 0, None))(ys, keys, TH).outputs["Q"], rtol=1e-4)
-    return "nested + sequential loops: fwd / jvp / per-item grad bitwise; matches the dense reference"
 
 
 @case("custom_jvp rule closing over an item-computed value: a clear UnsupportedError (JAX's staging limit); the "
