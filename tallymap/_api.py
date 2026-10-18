@@ -53,13 +53,12 @@ def _call_site(fallback=None):
 class Sum:
     """A commutative (sum) output.  exact=True accumulates round(v * scale) in int64: bitwise order-independent
     (needs jax_enable_x64 on the lockstep backend).  |v * scale| >= 9.2e18 cannot be represented: such emits are
-    DROPPED and counted in Result.stats['exact_overflow'] (check it!).  tangent_scale: scale of the jvp tangent
-    of this output (default: scale)."""
+    DROPPED and counted in Result.stats['exact_overflow'] (check it!).  A jvp / vjp tangent tally of this output
+    uses the same scale."""
     shape: Any
     dtype: Any = jnp.float32
     exact: bool = False
     scale: float = 2.0 ** 32
-    tangent_scale: Any = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -98,7 +97,6 @@ class TSpec:
     exact: bool = False
     kind: str = "sum"      # 'sum' | 'spawn' | 'discard'
     scale: float = 2.0 ** 32
-    tscale: Any = None
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -189,8 +187,7 @@ def jvp_prog(p, pert_pi, pert_bc):
     from ._reverse import forward_tangents
     with forward_tangents():        # (sparse table reads of an adjoint program: see _reverse.tread)
         cj = _mk(J, [_sds(a) for a in avals])
-    tl = list(p.tallies) + [dataclasses.replace(p.tallies[i], name=p.tallies[i].name + "'",
-                                                scale=p.tallies[i].tscale or p.tallies[i].scale) for i in tf]
+    tl = list(p.tallies) + [dataclasses.replace(p.tallies[i], name=p.tallies[i].name + "'") for i in tf]
     return ItemProgram(cj, tuple(tl), nP + len(ip), nB + len(ib), p.trunc, p.spawn, p.tag + "+jvp", where=p.where)
 
 
@@ -334,8 +331,7 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
         shapes = {n: (outs_spec[n].shape,) if isinstance(outs_spec[n].shape, int) else tuple(outs_spec[n].shape)
                   for n in names}
         tspecs = [TSpec(n, int(np.prod(shapes[n], dtype=np.int64)), np.dtype(outs_spec[n].dtype), (),
-                        bool(outs_spec[n].exact), "sum", float(outs_spec[n].scale), outs_spec[n].tangent_scale)
-                  for n in names]
+                        bool(outs_spec[n].exact), "sum", float(outs_spec[n].scale)) for n in names]
         if spawn is not None:
             tspecs.append(TSpec("__spawn__", 1, np.dtype(np.int32), (), False, "spawn"))
         nT = len(tspecs)
