@@ -1274,13 +1274,13 @@ def _(b):
     return f"n = {out}: forward, jvp and grad match the dense reference"
 
 
-@case("compaction: a narrowed lane axis and a compacted cond give the masked interpreter's results exactly",
+@case("lockstep narrowing: a while loop on a narrowed lane axis gives the masked interpreter's results exactly",
       ["lockstep"])
 def _(b):
-    """The A/B control of backends/lockstep.py's compaction (_lockstep_compact=False is the masked interpreter).
+    """The A/B control of backends/lockstep.py's narrowing (_lockstep_compact=False is the masked interpreter).
 
     The default widths need thousands of lanes, so the widths are forced here (8 and 5 lanes, the second one not
-    a divisor of N, which exercises the chunk clamping), and _lockstep_cond=True forces every cond to compact.
+    a divisor of N).
 
     Integer tallies, per-item integers and stats must be IDENTICAL on every platform.  Float tallies are bitwise
     identical on a CPU, where a scatter-add runs in index order, but a GPU orders the updates of one scatter by
@@ -1319,7 +1319,7 @@ def _(b):
     cases = [("walk", walk, AX, (xs, keys, tab, TH), dict(outputs={"Q": tm.Sum((NB,), F)})),
              ("switch", sw, (0, 0, None), (xs, keys, TH), dict(outputs=outs)),
              ("spawn", spawner, (0, 0), (g0, xs), dict(outputs=outs, spawn=tm.Queue(1 << 10)))]
-    opts = [dict(_lockstep_compact=8), dict(_lockstep_compact=8, _lockstep_cond=True), dict(_lockstep_compact=5)]
+    opts = [dict(_lockstep_compact=8), dict(_lockstep_compact=5)]
     for name, item, ax, args, kw in cases:
         ref = tm.vmap(item, backend=b, in_axes=ax, _lockstep_compact=False, **kw)
         base = ref(*args)

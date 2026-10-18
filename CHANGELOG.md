@@ -9,10 +9,8 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 ### Changed
 
 - **The lockstep backend's cost now follows the ACTIVE lanes.** A `while_loop` used to run its body on all P
-  lanes until the last lane finished, and a `cond` / `switch` with a per-lane index used to run every branch
-  any lane took on all P lanes. A loop now hands its survivors to the same loop over a quarter as many lanes as
-  soon as they fit, and a cond runs each branch on the lanes that take it when that is cheaper than moving them
-  (`docs/design.md` section 9). Measured on one CPU node, both arms in one process, the `benchmarks/vs_jax`
+  lanes until the last lane finished. A loop now hands its survivors to the same loop over a quarter as many
+  lanes as soon as they fit (`docs/design.md` section 10). Measured on one CPU node, both arms in one process, the `benchmarks/vs_jax`
   problems at N = 65,536: forward 1.3 to 2.1x faster on the divergent problems, gradients 1.1 to 1.8x, and
   within noise (0.92 to 1.04x) on the problems whose lanes stay active together. Trace and compile time grows by
   up to 30%, except the shower's gradient (the tree adjoint's loop body), where it went from 75 to 219 s for
