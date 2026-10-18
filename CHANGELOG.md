@@ -14,9 +14,12 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   soon as they fit, and a cond runs each branch on the lanes that take it when that is cheaper than moving them
   (`docs/design.md` section 9). Measured on one CPU node, both arms in one process, the `benchmarks/vs_jax`
   problems at N = 65,536: forward 1.3 to 2.1x faster on the divergent problems, gradients 1.1 to 1.8x, and
-  within noise (0.94 to 1.01x) on the problems whose lanes stay active together. Trace and compile time grows by
-  up to 30%. Tallies, per-item results and stats are BITWISE unchanged, which `tests/edge.py` asserts; there is
-  no new public option.
+  within noise (0.92 to 1.04x) on the problems whose lanes stay active together. Trace and compile time grows by
+  up to 30%, except the shower's gradient (the tree adjoint's loop body), where it went from 75 to 219 s for
+  1.24x per call; peak memory grows by the W-wide copy of the loop carries (4 to 76 MB at N = 65,536). On a CPU
+  every tally, per-item result and stat is BITWISE unchanged, which `tests/edge.py` asserts; on a GPU the
+  hardware picks the order of a scatter-add, so a float tally can move by an ulp, exactly as the block width
+  already could. There is no new public option.
 
 ## 0.5.0 - first public release
 

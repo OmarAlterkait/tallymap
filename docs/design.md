@@ -366,12 +366,14 @@ solves the same problem per thread. Here the lanes that need the work are gather
   per-element cost of each operation, in units of one add. Nothing in it depends on the problem. On a switch over
   K phases inside a divergent loop it is 1.3 to 9.9x faster forward and 1.0 to 6.3x in reverse mode; the case it
   declines is branches of two flops and no emit, where compacting measured 1.3 to 1.5x SLOWER.
-- **How much.** Both arms in one process on one milano node, JAX 0.5.3, the `benchmarks/vs_jax` problems at
-  N = 65,536 (the full table is in the lockstep REPORT): forward 1.3 to 2.1x faster on the divergent problems
-  (walk on spheres 264 -> 126 ms, transport 288 -> 156 ms, random walk 238 -> 137 ms, interacting md 100 ->
-  76 ms), gradients 1.1 to 1.8x faster, and 0.94 to 1.01x -- within noise -- on the problems whose lanes stay
-  active together (barrier, uniform, dense state, particle filter forward). Trace and compile time grows by up
-  to 30%, because the loop body is instantiated once more.
+- **How much.** Both arms in one process on one milano node (two jobs of the same code measured up to 30%
+  apart), JAX 0.5.3, the `benchmarks/vs_jax` problems at N = 65,536: forward 1.3 to 2.1x faster on the divergent
+  problems (walk on spheres 329 -> 155 ms, transport 356 -> 193 ms, random walk 300 -> 179 ms, shower
+  803 -> 492 ms, gillespie 21.0 -> 14.7 s, interacting md 119 -> 91 ms), gradients 1.1 to 1.8x faster, and 0.92
+  to 1.04x -- within noise -- on the problems whose lanes stay active together (barrier, uniform, dense state,
+  ode ensemble, small n, trajectory, particle filter forward). Trace and compile time grows by 0 to 30% on all of them except the
+  shower's gradient, where the loop body is the tree adjoint's and the extra instantiation cost 75 -> 219 s for
+  1.24x per call. Peak resident memory grows by 4 to 76 MB at N = 65,536, the W-wide copy of the carries.
 - **Results do not change.** On a CPU every benchmark problem and every test gives BITWISE identical tallies,
   per-item results and stats with compaction on and off, in f32 and f64, forward, jvp, grad and vmap. That is
   not luck: a scatter-add runs in index order there, the gather is stable so the live lanes keep their relative
