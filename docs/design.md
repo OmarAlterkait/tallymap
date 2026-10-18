@@ -173,8 +173,10 @@ ITEM function and binds the primitive again, so the rules recurse to any order o
   vmap-of-JVP case, the result is a `dual_lanes` node: one kernel with T dual lanes per item. Otherwise it is a
   `folded_batch` node, which runs B*N items in ONE launch with member b's emits offset to the slice
   `[b*S, (b+1)*S)` by a retrace emit hook. Folding requires that there is no spawn and no exact output, that
-  every batched broadcast operand is small (at most 4096 elements per member) and, on CUDA, that no tally leaves
-  shared-memory privatisation. Otherwise it falls back to `lax.map`, one launch per member.
+  every batched broadcast operand is small (at most 4096 elements per member) and, on CUDA, that ONE member's
+  launch of N items could not fill the device by itself (N below the multiprocessor count times 1024, the
+  smallest maximum-resident-threads-per-multiprocessor of any tested architecture, so the bound is a floor).
+  Otherwise it falls back to `lax.map`, one launch per member.
 - **lowering** is per platform: `'cuda'` goes to the CUDA backend for `backend='auto'` and `'cuda'`, every other
   platform to lockstep. `backend='cuda'` lowered for another platform raises.
 - **impl** (eager, outside `jit`): one `jax.jit` per node STRUCTURE, in a 64-entry cache, so repeated eager calls
@@ -202,10 +204,36 @@ ITEM function and binds the primitive again, so the rules recurse to any order o
 
 Measured on the toy walk, 1M items, 256 bins, against the old `custom_jvp` / `custom_vjp` integration: forward
 0.62 vs 0.63 ms; JVP with primal 0.68 ms in one launch, against 1.22 ms in two launches unfused; `jacfwd` with
-T=8 4.58 vs 4.70 ms; `grad` 4.16 vs 4.30 ms. Tracing one call takes 5.9 ms instead of 21 ms. Folding against
-`lax.map` at B=8: folding is 1.2 to 2.3 times faster at 65k items on CUDA and 3.4 times on lockstep, equal at 1M
-items with 4096 bins or more, and 4.5 times SLOWER when it pushes a tally out of shared memory, which the rule
-above excludes.
+T=8 4.58 vs 4.70 ms; `grad` 4.16 vs 4.30 ms. Tracing one call takes 5.9 ms instead of 21 ms.
+
+The fold rule used to be "fold while every privatised tally stays privatised", and it got both ends wrong,
+because what folding costs and buys has nothing to do with the tally: it makes B copies of every per-item
+operand and runs ONE launch of B*N items, which is a win exactly while one member's N items cannot fill the
+GPU by themselves. Measured on the toy walk, B=8, 2080 Ti (68 multiprocessors, so the rule folds below
+69,632 items), each cell timed in the same position of the same script under the old and the new rule
+(`vmap over theta B=8`, minimum of 7, ms):
+
+| items | bins | old rule | new rule | |
+|---|---|---|---|---|
+| 65,536 | 64 | fold 1.21 | fold 1.22 | both fold |
+| 65,536 | 256 | `lax.map` 3.05 | **fold 2.31** | 1.32x faster |
+| 65,536 | 1,024 | `lax.map` 3.03 | **fold 1.37** | 2.21x faster |
+| 65,536 | 4,096 | fold 1.20 | fold 1.20 | both fold |
+| 262,144 | 64 | fold 3.72 | `lax.map` 5.08 | 1.37x slower |
+| 262,144 | 256 | `lax.map` 5.10 | `lax.map` 5.09 | both `lax.map` |
+| 262,144 | 1,024 | `lax.map` 5.20 | `lax.map` 5.15 | both `lax.map` |
+| 262,144 | 4,096 | fold 3.76 | `lax.map` 5.07 | 1.35x slower |
+| 1,048,576 | 64 | fold 33.3 | **`lax.map` 13.6** | 2.46x faster |
+| 1,048,576 | 256 | `lax.map` 13.7 | `lax.map` 13.6 | both `lax.map` |
+| 1,048,576 | 1,024 | `lax.map` 13.6 | `lax.map` 13.6 | both `lax.map` |
+| 1,048,576 | 4,096 | fold 34.5 | **`lax.map` 13.9** | 2.48x faster |
+
+The old rule refused the 2.2x at 65k items and 1,024 bins (that tally never fits shared memory, so folding
+could not change its status) and allowed a 2.5x loss at a million items (a 64-bin tally is privatised folded
+or not, so it passed). The new rule removes both, and gives up 1.35 to 1.37x at 262k items, which is inside
+the bar. On lockstep there is no occupancy and no such reversal -- folding is one masked pass over B*N lanes
+instead of B passes, 1.27 to 1.44 times faster at 16k and 65k items (CPU, 8 cores) -- so there it is always
+taken.
 
 `tests/transforms.py` is the composability matrix: a big function with pre- and post-processing, two chained
 calls, and calls inside `scan`, `fori_loop`, `cond` and `while_loop`, every cell compared against the same

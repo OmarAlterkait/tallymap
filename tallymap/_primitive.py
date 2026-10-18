@@ -26,8 +26,8 @@ they recurse to any order.  Node kinds:
                tangents) -> `dual_lanes`: T dual lanes per item, the primal computed once; on cuda in chunks of at
                most MAX_LANES (32) lanes whose lane-dependent loop arrays stay < LANES_MAX_LOCAL (512) elements, one
                launch per chunk.  Otherwise, when no spawn / exact outputs, every batched broadcast operand is small
-               (<= FOLD_MAX_BC elements per member) and (cuda) no tally leaves shared memory -> `folded_batch`: ONE
-               launch over B*N items; anything else -> lax.map over the batch (one launch per batch member).
+               (<= FOLD_MAX_BC elements per member) and (cuda) one member's N items cannot fill the device
+               -> `folded_batch`: ONE launch over B*N items; anything else -> lax.map (one launch per member).
   lowering     per PLATFORM: on 'cuda' the cuda backend (backend='auto'|'cuda'), elsewhere the lockstep backend.
   impl         eager calls go through a jax.jit cached on the node's structure.
 
@@ -759,13 +759,38 @@ def _can_fold(node, args, dims, bat, size):
         if bat[k] and int(np.prod(args[k].shape, dtype=np.int64)) // max(size, 1) > FOLD_MAX_BC:
             return False        # a large batched table would be indexed per item (lockstep backend: gathered per lane)
     if _gpu(node):
-        # the cuda kernel privatises small tallies in shared memory; a fold that pushes a tally out of shared memory
-        # turns block-local atomics into contended global ones (measured, L40S, 1M items, 256 bins, B=8: fold 21 ms
-        # vs lax.map 4.6 ms).  Fold only when every privatised tally stays privatised (the kernel's own rule).
-        from .backends.cuda.kernel import privatised
-        if privatised(p.tallies) != privatised(p.tallies, B=size):
+        # Folding costs B copies of every per-item operand and runs ONE launch of B*N items, so it pays only while
+        # one member's launch of N items cannot fill the device by itself.  MEASURED (2080 Ti, 68 SMs = 69,632
+        # resident threads, B = 8, toy walk, fold against lax.map, 64 / 256 / 1024 / 4096 bins): at N = 65,536
+        # fold is 1.26x to 2.4x faster; at N = 262,144 it is 0.37x to 1.42x; at N = 1M and 4M it is 0.18x to
+        # 0.31x, i.e. up to 5.6x SLOWER.  The rule is therefore the device, not the tally size: the earlier rule
+        # (fold only while shared-memory privatisation is preserved) blocked the 2.3x at 65k and allowed the
+        # 5.6x loss at 4M, because a tally too big to privatise at all passed it at every N.
+        rt = _resident_threads()
+        if rt and _item_count(args, dims, bat, p.nP) >= rt:
             return False
     return True
+
+
+def _resident_threads():
+    """A lower bound on the GPU's resident threads: multiprocessors x 1024, where 1024 is the SMALLEST
+    maximum-threads-per-multiprocessor of any architecture this library is tested on (compute capability 7.5 has
+    1024, 8.9 has 1536, 8.0 has 2048), so the bound never overestimates.  0 when the count is unavailable."""
+    try:
+        return int(getattr(jax.devices()[0], "core_count", 0) or 0) * 1024
+    except Exception:          # pragma: no cover (no device)
+        return 0
+
+
+def _item_count(args, dims, bat, nP):
+    """N, the item count of ONE batch member: the length of a per-item operand's item axis (vmap inserted the
+    batch axis at dims[k], so the item axis moved only if the batch axis went in front of it)."""
+    for k in range(nP):
+        sh = args[k].shape
+        if not bat[k]:
+            return int(sh[0])
+        return int(sh[1] if dims[k] == 0 else sh[0])
+    return 0
 
 
 def fold_prog(p, B, bbc):

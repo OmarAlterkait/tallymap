@@ -58,6 +58,16 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Changed
 
+- The rule that decides whether `jax.vmap` over a tallymap call folds the batch into the item axis (one launch
+  of B*N items) or falls back to `lax.map` (one launch per member). On cuda it was "fold while every privatised
+  tally stays privatised"; it is now "fold while one member's N items cannot fill the device" (N below
+  multiprocessors x 1024, the smallest maximum-resident-threads-per-multiprocessor of any tested architecture).
+  Folding costs B copies of every per-item operand and buys one saturated launch, which has nothing to do with
+  the tally size. Measured on the toy walk at B=8 on a 2080 Ti: at 65,536 items the new rule folds two more
+  cells and is 1.32x and 2.21x faster (256 and 1,024 bins); at a million items it stops folding two cells and
+  is 2.46x and 2.48x faster (64 and 4,096 bins); at 262,144 items it gives up 1.35 to 1.37x. `lax.map` cells
+  and lockstep are unchanged (`docs/design.md` section 2). `kernel.privatised()` loses its `B=` parameter.
+
 - cuda compile time: lazily inlined element expressions are capped at 32 nodes (was 256). On a large
   photon-transport item this took the forward compile from 1543 to 834 s and the run from 9.04 to 6.87 s on a
   2080 Ti, with bitwise identical results.

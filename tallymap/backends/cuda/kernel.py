@@ -264,15 +264,13 @@ BLOCK = 128          # threads per block (measured: 64 / 128 / 256 within 1%)
 PRIV_BYTES = 4096    # shared-memory budget for privatised sum tallies per block
 
 
-def privatised(tallies, B=1, budget=PRIV_BYTES):
-    """indices of the sum tallies the kernel keeps in shared memory (in order, while they fit in `budget`); B: the
-    tallies made B times longer (a batch folded into the item axis).  The ONE rule, used by build_source and by the
-    fold heuristic (_primitive._can_fold)."""
+def privatised(tallies, budget=PRIV_BYTES):
+    """indices of the sum tallies the kernel keeps in shared memory (in order, while they fit in `budget`)."""
     out = []
     for k, s in enumerate(tallies):
         if s.kind != "sum":
             continue
-        nbytes = int(np.prod(s.lead, dtype=np.int64)) * s.S * B * (8 if _acc_t(s) in ("u64", "double") else 4)
+        nbytes = int(np.prod(s.lead, dtype=np.int64)) * s.S * (8 if _acc_t(s) in ("u64", "double") else 4)
         if 0 < nbytes <= budget:
             budget -= nbytes
             out.append(k)
