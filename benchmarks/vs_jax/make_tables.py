@@ -512,7 +512,11 @@ def main():
                          ["tm_cuda", "jax_ckpt2x", "diffrax"], field="peak_mb", unit="peak MB"))
     doc.append("\n## Other platforms\n\n"
                "The same `fwd` and `grad` rows on every machine measured. The CPU rows have only the lockstep "
-               "backend: the cuda backend needs a GPU, and `tm.vmap` says so.\n")
+               "backend: the cuda backend needs a GPU, and `tm.vmap` says so.\n\n"
+               "A CPU row is a shared machine: 16 cores of a 64-core node, with other jobs on the rest of it. "
+               "Every arm of one problem is measured in the same job, one cell after another, so a RATIO within "
+               "a problem is sound, but the same code measured in two jobs has come out up to 2.6x apart, so a "
+               "CPU ratio should not be compared against the same ratio from an earlier run of this table.\n")
     for pl in plats[1:]:
         doc.append(f"\n### {pl[0]}, JAX {pl[1]}\n")
         doc.append(headline(rows, pl))
