@@ -3,11 +3,12 @@
 Generated from `tallymap.supported_primitives()` by
 `tallymap.backends.cuda.census.primitives_table()` (a test checks that this file is current).
 `how`: `rule` = one emission rule in `backends/cuda/op_table.py`; `canonicalised` = rewritten into rule
-primitives by `backends/cuda/canon.py` before emission; `tally` = tallymap's own emit / spawn.
+primitives by `backends/cuda/canon.py` before emission; `expanded` = JAX's own pure-JAX implementation,
+substituted after autodiff (`_foreign.expand_late`); `tally` = tallymap's own emit / spawn.
 Any other primitive raises `tm.UnsupportedError` on cuda; the lockstep backend runs every JAX
 primitive.
 
-155 names (135 rules, 18 canonicalised).
+156 names (132 rules, 18 canonicalised, 4 expanded).
 
 | primitive | how |
 |---|---|
@@ -49,6 +50,7 @@ primitive.
 | `cumsum` | rule |
 | `custom_jvp_call` | rule |
 | `custom_lin` | rule |
+| `custom_linear_solve` | expanded |
 | `custom_vjp_call` | rule |
 | `custom_vjp_call_jaxpr` | rule |
 | `device_put` | canonicalised |
@@ -87,8 +89,8 @@ primitive.
 | `logistic` | rule |
 | `lt` | rule |
 | `lt_to` | canonicalised |
-| `lu` | rule |
-| `lu_pivots_to_permutation` | rule |
+| `lu` | expanded |
+| `lu_pivots_to_permutation` | expanded |
 | `max` | rule |
 | `min` | rule |
 | `mul` | rule |
@@ -162,7 +164,7 @@ primitive.
 | `tanh` | rule |
 | `threefry2x32` | rule |
 | `transpose` | rule |
-| `triangular_solve` | rule |
+| `triangular_solve` | expanded |
 | `unstack` | canonicalised |
 | `while` | rule |
 | `xor` | rule |

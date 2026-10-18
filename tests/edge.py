@@ -981,7 +981,8 @@ def _(b):
 
     from tallymap.backends.cuda import canon, census, op_table
     jaxnames = {v.name for v in vars(P).values() if isinstance(v, Primitive)}
-    ours = set(op_table.RULES) | set(canon.SUGAR)
+    from tallymap import _foreign
+    ours = set(op_table.RULES) | set(canon.SUGAR) | set(_foreign._generic())
     bad = sorted(ours - jaxnames - set(census.NOT_IN_JAX_EXTEND))
     if bad:
         raise Fail(f"op-table names that are neither in jax.extend.core.primitives nor explained: {bad} "
@@ -993,7 +994,7 @@ def _(b):
     if keys != {"name", "how"}:
         raise Fail(f"supported_primitives() rows have keys {sorted(keys)}, want name and how only")
     hows = {r["how"] for r in rows}
-    if hows - {"rule", "canonicalised", "tally"}:
+    if hows - {"rule", "canonicalised", "expanded", "tally"}:
         raise Fail(f"unknown 'how' values {sorted(hows)}")
     doc = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "primitives.md")
     if open(doc).read() != census.primitives_table():

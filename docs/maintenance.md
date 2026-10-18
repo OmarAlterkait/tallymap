@@ -65,7 +65,9 @@ warning.
 | private | `aval.dtype._impl` of a typed pseudo-random key (with a name lookup as the fallback); the jaxpr equation parameters read by `_jaxpr.py` | `_compat`, `_jaxpr` |
 | jaxlib / XLA | the foreign-function-interface C++ headers (api_version 4), hashed into the shim's cache key | `backends/cuda/shim.cc`, `compile.py` |
 
-No `jax._src` import is left. Every interface that differs between tested versions goes through
+One `jax._src` import is left, guarded: `_compat.jax_generic_linalg` takes JAX's own pure-JAX LU (`_lu_python`,
+`_generic_lu_pivots_to_permutation`) for the cuda lowering of `jnp.linalg.solve`; if a release removes them, `lu`
+raises `UnsupportedError` on cuda instead of breaking the import. Every other interface that differs between tested versions goes through
 `tallymap/_compat.py` (version shims) or `tallymap/_jaxpr.py` (jaxpr structure). Keeping it to two modules is
 deliberate: it is what makes an upgrade a bounded job.
 

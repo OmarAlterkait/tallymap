@@ -331,7 +331,8 @@ Everything in this section has a test.
   (`docs/validation.md`).
 - **The JAX surface in two modules**: `_compat.py` holds every version shim (batching registration, dropped
   variables, typed-key pseudo-random generators through the public implementation methods, the version policy)
-  and `_jaxpr.py` is the only reader of control-flow and call equation parameters. No `jax._src` import is left.
+  and `_jaxpr.py` is the only reader of control-flow and call equation parameters. One guarded `jax._src` import
+  is left: JAX's own pure-JAX LU, for the cuda lowering of `jnp.linalg.solve` (`_compat.jax_generic_linalg`).
 - **The operation table is measurable, not smaller.** No emission rule was deleted: real programs reach complex
   arithmetic, sorting, cumulative sums and `argmin`, and the programs that automatic differentiation derives
   reach operations the forward pass never emits. Sugar primitives are rewritten by a canonicalisation pre-pass
