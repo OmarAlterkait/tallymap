@@ -215,8 +215,11 @@ class Lazy(Val):
         self.shape, self.dtype, self.fn, self.cval, self.cost = tuple(shape), np.dtype(dtype), fn, cval, cost
 
 
-# inlined lazy nodes per element; above it a lazy result is computed into a local array (env: measurement only)
-LAZY_MAX_COST = int(os.environ.get("TALLYMAP_LAZY_MAX_COST", 256))
+# inlined lazy nodes per element; above it a lazy result is computed into a local array (env: measurement only).
+# MEASURED (LUCiD recon item, 2080 Ti, forward; compile s / run s):  256: 1543 / 9.04   128: 1209 / 8.15
+# 64: 839 / 7.24   32: 834 / 6.87   16: 1557 / 6.86.  85% of compile time is NVRTC's C++ -> PTX front end, and long
+# inlined expressions are what it chokes on.  Results bitwise identical at every cap; perf net unchanged.
+LAZY_MAX_COST = int(os.environ.get("TALLYMAP_LAZY_MAX_COST", 32))
 
 
 def lazy_cost(v):
