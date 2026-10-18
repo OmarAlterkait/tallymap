@@ -20,6 +20,9 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Removed
 
+- Three private kill-switches of the cuda emitter that were permanently on and that nothing set:
+  `codegen.FOLD` (constant folding), `op_table.LAZY_FUSE` and `op_table.LAZY_FUSE_MAXUSE` (one-use lazy
+  fusion). The generated CUDA source and the cubins are unchanged.
 - The two private reverse-mode cost-decomposition options, `_rev_phase` (`'primal'` | `'skip'`) and
   `_tree_phase` (`'fwd'` | `'roots'` | `'children'`). Both deliberately computed WRONG gradients to attribute the
   adjoint's cost to its phases; no test used either, and the decompositions they produced are recorded in

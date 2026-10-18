@@ -17,7 +17,7 @@ import numpy as np
 from ..._api import UnsupportedError
 from ..._compat import key_impl
 from . import compile as C
-from .codegen import FOLD, CodegenError, is_key_dtype
+from .codegen import CodegenError, is_key_dtype
 from .kernel import BLOCK, build_source
 
 _KERNELS = {}
@@ -28,7 +28,8 @@ def _const_sig(c):
         a = np.asarray(c)
         return (a.shape, str(a.dtype), a.tobytes())
     a = np.asarray(c)
-    return (a.shape, str(a.dtype)) + ((hashlib.sha1(a.tobytes()).hexdigest(),) if FOLD else ())
+    # the VALUE is part of the key: constant folding bakes closed-over arrays into the generated source
+    return (a.shape, str(a.dtype), hashlib.sha1(a.tobytes()).hexdigest())
 
 
 def _key(p, opts):

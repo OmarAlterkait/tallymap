@@ -442,8 +442,6 @@ _FOLD = {"add": np.add, "sub": np.subtract, "mul": np.multiply, "neg": np.negati
 
 
 _LAZY_EW = ("add", "sub", "mul", "neg", "max", "min", "convert_element_type")
-LAZY_FUSE = 1
-LAZY_FUSE_MAXUSE = 1   # >1: recompute instead of storing
 
 
 def _ew_rule(em, eqn, ins, **p):
@@ -481,7 +479,7 @@ def _ew_rule(em, eqn, ins, **p):
     if (LAZY_GATHER and impl is None and _size(shape) > LAZY_GATHER
             and all(isinstance(v, (Lazy, Table, Scalar, Local, View)) for v in ins)
             and ((name in _LAZY_EW and any(isinstance(v, (Lazy, View, Table)) and v.size > LAZY_GATHER for v in ins))
-                 or (LAZY_FUSE and 1 <= ou[0] <= LAZY_FUSE_MAXUSE))):
+                 or ou[0] == 1)):
         # (a) one-use large elementwise results are FUSED into their single consumer (XLA loop fusion: a
         #     128-point per-step quadrature chain is evaluated inside the reduction instead of through ~20
         #     128-element per-thread local arrays); (b) cheap ops on a large lazy table gather stay lazy.
