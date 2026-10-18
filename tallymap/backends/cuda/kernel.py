@@ -691,6 +691,18 @@ def _events_main(L, lb, acc_decl, acc_flush, decls, claim, start, ywrite, ev):
     K = ev["K"]
     G = K + 1                                  # groups: K branches + START;  option G = ALL
     dbg = bool(os.environ.get("TALLYMAP_EVENTS_DEBUG"))      # measurement only: round / lane counters, printed once
+    # the ALL rule; default off (measured best for lopsided branches, the case events is for); measurement knob:
+    # tie (ALL wins ties) | strict | similar (every waiting group costs >= T(ALL)/2) | off
+    rule = os.environ.get("TALLYMAP_EVENTS_ALL", "off")
+    if os.environ.get("TALLYMAP_EVENTS_NOALL"):
+        rule = "off"
+    all_rule = {
+        "tie": f"if (sj_groups > 1 && sj_rall - sj_wall >= sj_best) sj_j = {G};",
+        "strict": f"if (sj_groups > 1 && sj_rall - sj_wall > sj_best) sj_j = {G};",
+        "similar": (f"{{ bool sim = sj_groups > 1; for (int k = 0; k < {K}; ++k) if (sj_n[k] && sj_cost[k] < 0.5f * "
+                    f"sj_cost[{G}]) sim = false; if (sim && sj_rall - sj_wall >= sj_best) sj_j = {G}; }}"),
+        "off": "",
+    }[rule]
     D = (lambda s: s) if dbg else (lambda s: "")
     nd = 2 * (G + 1) + 4
     dbg_decl = D(f"__device__ unsigned long long sj_evd[{nd}]; __device__ unsigned int sj_evw;\n")
@@ -740,7 +752,7 @@ extern "C" __global__ void {lb} sj_main(const SjParams P, const i64 n_items) {{
         if (sc > sj_best) {{ sj_best = sc; sj_j = k; }}
         sj_rall += sj_rent[k]; sj_wall -= (float)sj_n[k] * sj_cost[k];
       }}
-    if (sj_groups > 1 && sj_rall - sj_wall >= sj_best) sj_j = {G};
+    {all_rule}
     if (sj_j < 0) sj_j = {K};                    // only START lanes are waiting
     {D(f"++d_[2]; d_[3] += sj_any; ++d_[4 + 2 * sj_j]; d_[5 + 2 * sj_j] += sj_j == {G} ? sj_any : sj_n[sj_j];")}
     const long long sj_t0 = clock64();
