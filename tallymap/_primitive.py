@@ -761,11 +761,11 @@ def _can_fold(node, args, dims, bat, size):
     if _gpu(node):
         # Folding costs B copies of every per-item operand and runs ONE launch of B*N items, so it pays only while
         # one member's launch of N items cannot fill the device by itself.  MEASURED (2080 Ti, 68 SMs = 69,632
-        # resident threads, B = 8, toy walk, fold against lax.map, 64 / 256 / 1024 / 4096 bins): at N = 65,536
-        # fold is 1.26x to 2.4x faster; at N = 262,144 it is 0.37x to 1.42x; at N = 1M and 4M it is 0.18x to
-        # 0.31x, i.e. up to 5.6x SLOWER.  The rule is therefore the device, not the tally size: the earlier rule
-        # (fold only while shared-memory privatisation is preserved) blocked the 2.3x at 65k and allowed the
-        # 5.6x loss at 4M, because a tally too big to privatise at all passed it at every N.
+        # resident threads, B = 8, toy walk, 64 / 256 / 1024 / 4096 bins, docs/design.md section 2): folding is
+        # 1.3x to 2.5x faster at N = 65,536, 1.0x to 1.4x at N = 262,144, 2.5x SLOWER at 1M and 5.8 to 6.9x
+        # slower at 4M.  The rule is therefore the device, not the tally size: the earlier rule (fold only while
+        # shared-memory privatisation is preserved) refused the 2.2x at 65k items and 1024 bins and allowed the
+        # 6.9x loss at 4M items, because a tally privatised at every B, or at none, passed it at every N.
         rt = _resident_threads()
         if rt and _item_count(args, dims, bat, p.nP) >= rt:
             return False
@@ -783,14 +783,12 @@ def _resident_threads():
 
 
 def _item_count(args, dims, bat, nP):
-    """N, the item count of ONE batch member: the length of a per-item operand's item axis (vmap inserted the
-    batch axis at dims[k], so the item axis moved only if the batch axis went in front of it)."""
-    for k in range(nP):
-        sh = args[k].shape
-        if not bat[k]:
-            return int(sh[0])
-        return int(sh[1] if dims[k] == 0 else sh[0])
-    return 0
+    """N, the item count of ONE batch member, read off the first per-item operand: vmap inserted the batch axis
+    at dims[0], so the item axis is still axis 0 unless the batch axis went in front of it."""
+    if not nP:                                 # (unreachable: tallymap.vmap needs a mapped argument)
+        return 0
+    sh = args[0].shape
+    return int(sh[1] if (bat[0] and dims[0] == 0) else sh[0])
 
 
 def fold_prog(p, B, bbc):
