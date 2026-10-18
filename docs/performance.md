@@ -17,6 +17,12 @@ Every row records the device, the JAX version and the git commit it was measured
 public release carry commit hashes from the private pre-release history, which do not resolve in this
 repository.
 
+Every GRADIENT row here was measured before the checkpoint stride of a reverse-differentiable loop was fixed to C
+(`docs/design.md` section 3), so for a problem whose loop is shorter than `rev_checkpoints` steps the recorded
+tallymap gradient is an upper bound on today's: re-measured on a 2080 Ti, transport went from 15.7 to 6.1 ms and
+walk-on-spheres from 10.0 to 4.1 ms at 2^19 items, while the two problems with ~220-step loops did not move. The
+tables are regenerated from a full sweep, not patched, so they will carry the old numbers until the next one.
+
 ## The arms
 
 | arm | what it is | modes |
