@@ -49,19 +49,18 @@ LAST = {}          # what the last vjp_prog / checkpointed_while built (instrume
 class RevOpts:
     checkpoints: int = 16      # C: states per checkpoint buffer (public option rev_checkpoints)
     sparse_min: int = 32       # tables with >= this many elements get sparse (emitted) cotangents (private)
-    phase: str = ""            # private COST DECOMPOSITION: 'primal' | 'skip' replaces the step VJPs (gradients wrong)
     step_segments: int = 0     # > 1: the step VJP recomputes the step in this many checkpointed segments (public
                                # option rev_step_segments; _segments)
 
 
 def rev_opts(opts=None):
-    """RevOpts from the tallymap.vmap options rev_checkpoints / rev_step_segments (public) and _rev_sparse_min /
-    _rev_phase (private)."""
+    """RevOpts from the tallymap.vmap options rev_checkpoints / rev_step_segments (public) and _rev_sparse_min
+    (private)."""
     if isinstance(opts, RevOpts):
         return opts
     opts = dict(opts or {})
     r = RevOpts(checkpoints=int(opts.get("rev_checkpoints", 16)), sparse_min=int(opts.get("_rev_sparse_min", 32)),
-                phase=str(opts.get("_rev_phase", "")), step_segments=int(opts.get("rev_step_segments", 0)))
+                step_segments=int(opts.get("rev_step_segments", 0)))
     if r.checkpoints < 1:
         raise ValueError("tallymap: rev_checkpoints must be >= 1")
     return r
@@ -354,17 +353,6 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None):
 
         def adv(c, steps):
             return lax.fori_loop(0, steps, lambda i, c: bfn(bc, c), c)
-
-        if o.phase == "primal":      # COST DECOMPOSITION ONLY (gradients are wrong): the reverse sweep runs one
-            #                          PRIMAL body step per state instead of a step VJP
-            def vjp_step(c, acc, _real=vjp_step):
-                ctd, ctw, ctb = acc
-                out = bfn(bc, list(c))
-                z = sum((jnp.sum(out[j]) * 0.0 for j in f_idx), jnp.float32(0.0))
-                return [a + z.astype(a.dtype) for a in ctd], list(ctw), list(ctb)
-        elif o.phase == "skip":      # no reverse sweep at all (forward + checkpoint overhead only)
-            def vjp_step(c, acc, _real=vjp_step):
-                return acc
 
         lst = list(init)
         likes = [init[j] for j in s_idx]

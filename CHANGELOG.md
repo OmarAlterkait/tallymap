@@ -18,6 +18,13 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 - A program that fails to lower because a `custom_jvp` closes over a traced value (a JAX staging limit) gets an
   error that names the cause and the fix (pass the value as an argument).
 
+### Removed
+
+- The two private reverse-mode cost-decomposition options, `_rev_phase` (`'primal'` | `'skip'`) and
+  `_tree_phase` (`'fwd'` | `'roots'` | `'children'`). Both deliberately computed WRONG gradients to attribute the
+  adjoint's cost to its phases; no test used either, and the decompositions they produced are recorded in
+  `docs/design.md` section 6. No behaviour change on any supported option value.
+
 ### Changed
 
 - cuda compile time: lazily inlined element expressions are capped at 32 nodes (was 256). On a large

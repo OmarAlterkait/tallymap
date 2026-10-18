@@ -41,8 +41,7 @@ Capacities are derived from the Queue capacity Q (the user sets nothing): the tr
 particles (exactly the bound under which the forward provably dropped nothing), a generation up to Q (private
 option _rev_gen_capacity lowers it to save memory; a larger generation then poisons: stats 'overflow'), depth up to
 Q.  Generation launches use capacity buckets Cg, Cg/2, Cg/4, ... (>= 256) so a small generation does not pay for Cg
-idle items.  Private _tree_neg ('detach' | 'replay': negative controls) and _tree_phase ('fwd' | 'roots' |
-'children': cost decomposition, gradients WRONG).
+idle items.  Private _tree_neg ('detach' | 'replay') are the negative controls.
 Stats of the last tree adjoint (host side, via jax.debug.callback, OPT-IN: rev_stats=True -- a host callback takes
 jax.jit off its C++ dispatch path): tallymap.diagnostics()['reverse']['tree'] (= _reverse_spawn.LAST[-1]).
 Second order through this adjoint raises (the recorded payloads are bit-cast, they carry no tangent).
@@ -415,18 +414,8 @@ def tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N):
         gtg, dx, m = _bucketed(n, Cg, one)
         return g - 1, dx, [a + b_ for a, b_ in zip(gt, gtg)], mm + m
     cy_root = [_inst(cts[len(ot) + 1 + j], (N,) + tuple(ya[j].shape), ya[j].dtype) for j in yf]
-    phase = o.get("_tree_phase", "")     # COST DECOMPOSITION ONLY (gradients wrong unless ""):
-    #   fwd = no adjoint launches; roots = root adjoint only; children = generation adjoints only
-    if phase in ("fwd", "roots"):
-        gt, mm, Gc = gt0, jnp.float32(0), Gc0
-    else:
-        _, Gc, gt, mm = lax.while_loop(r_cond, r_body, (G - 1, Gc0, gt0, jnp.float32(0)))
-    if phase in ("fwd", "children"):
-        gtr = [jnp.zeros_like(x) for x in gt0]
-        dxr = [jnp.zeros((N,) + tuple(pav[i].shape), pav[i].dtype) + jnp.sum(Gc[k]) * 0 for k, i in enumerate(R.fl)]
-        mr = jnp.float32(0)
-    else:
-        gtr, dxr, mr = adj_gen(list(pi), nc0, h0, N, jnp.int32(N), Gc, cy_root)
+    _, Gc, gt, mm = lax.while_loop(r_cond, r_body, (G - 1, Gc0, gt0, jnp.float32(0)))
+    gtr, dxr, mr = adj_gen(list(pi), nc0, h0, N, jnp.int32(N), Gc, cy_root)
     gt = [a + b_ for a, b_ in zip(gt, gtr)]
     mm = mm + mr
 

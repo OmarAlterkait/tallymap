@@ -283,8 +283,9 @@ negative-control switch is a private option whose name starts with an underscore
 Removed, with their measurements: 20 environment switches; the replay-from-start reverse scheme (3.4 to 13 times
 slower wherever it was measured); turning activity analysis off; the CUDA block size, shared-memory budget and
 schedule options (fixed rules instead: a block of 128 threads is within 1% of 64 and 256, and step refill unless
-the program spawns); the replay-check raise mode; and the tree adjoint's own capacity, depth and on-mismatch
-options. The fold rule calls the CUDA kernel's own privatisation rule rather than duplicating its logic.
+the program spawns); the replay-check raise mode; the tree adjoint's own capacity, depth and on-mismatch
+options; and the two reverse-mode cost-decomposition options (`_rev_phase`, `_tree_phase`), which produced wrong
+gradients on purpose and which no test used -- the decompositions they produced are quoted in section 6. The fold rule calls the CUDA kernel's own privatisation rule rather than duplicating its logic.
 
 Dual-lanes chunking, measured on the shower-shaped program: one kernel with T lanes cost 1.34, 1.99, 2.27 and
 2.57 times the forward pass for T = 1 to 4, but 14, 23 and 32 times for T = 6, 8 and 10. Chunking into the
@@ -327,7 +328,7 @@ exists.
 - **Refuted: let the forward store the checkpoints.** With a stride of C the forward pass of a checkpointed loop
   can store the stride-C states itself (slot C as a scratch sink makes the store unconditional), which removes
   the backward pass's checkpoint pass entirely while K <= C^2. It does remove it -- the replay phase
-  (`_rev_phase='skip'`) drops from 3.23 to 2.81 ms on transport -- but it costs one local store per step and
+  (measured with a temporary phase-skip instrumentation) drops from 3.23 to 2.81 ms on transport -- but it costs one local store per step and
   takes per-item memory back to 2C+1 states, and the gradient is faster on only two of the six problems
   (walk-on-spheres 4.07 -> 3.61 ms, barrier 13.6 -> 12.3) and slower on three (transport 6.03 -> 6.84, toy walk
   1.44 -> 1.51, particle filter 15.1 -> 15.7), with the adjoint kernel's stack frame back up from 544 to 832

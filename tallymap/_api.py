@@ -237,11 +237,9 @@ _OPTS = {
     "_fold": "False: never fold a batch into the item axis",
     "_rev_sparse_min": "smallest table (elements) that gets sparse emitted cotangents (default 32)",
     "_adj_math": "NEGATIVE CONTROL: compile the adjoint with this cuda_math (replay check must fire)",
-    "_rev_phase": "COST DECOMPOSITION (gradients wrong): 'primal' | 'skip' replaces the step VJPs",
     "_rev_nodense": "NEGATIVE CONTROL: drop the dense detection of mixed-use tables",
     "_rev_gen_capacity": "tree adjoint: largest generation (default Queue capacity; memory lever)",
     "_tree_neg": "NEGATIVE CONTROL of the tree adjoint: 'detach' | 'replay'",
-    "_tree_phase": "COST DECOMPOSITION of the tree adjoint (gradients wrong): 'fwd' | 'roots' | 'children'",
 }
 BACKENDS = ("auto", "cuda", "lockstep")
 
