@@ -102,7 +102,7 @@ deliberate: it is what makes an upgrade a bounded job.
 | `PRIV_BYTES` | 4096 bytes per block | `backends/cuda/kernel.py` | L40S: folding against `lax.map` with a 256-bin tally, 21 ms against 4.6 ms once a tally leaves shared memory |
 | `UNROLL` / `MAX_LOCAL` | 32 / 16384 elements | `backends/cuda/codegen.py` | L40S and 2080 Ti: compile time against local memory |
 | `FOLD_MIN`, `LAZY_GATHER` | 16 elements | `codegen.py`, `op_table.py` | L40S: small-table gathers |
-| `rev_checkpoints` default | 16 | `_reverse.py` | L40S and 2080 Ti |
+| `rev_checkpoints` default | 16 | `_reverse.py` | L40S and 2080 Ti; with the stride-C fix the six `vs_jax` problems are within 1.6x over C = 8..64 |
 | `sparse_min` | 32 elements | `_reverse.py` | L40S, toy walk |
 | `MIN_BUCKET` (tree adjoint) | 256 | `_reverse_spawn.py` | L40S |
 | lockstep `BLOCK` | 2^18 lanes | `backends/lockstep.py` | CPU and L40S, memory bound |

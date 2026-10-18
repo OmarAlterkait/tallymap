@@ -4,6 +4,23 @@ All notable changes. Versions follow [SemVer](https://semver.org/) 0.x: until 1.
 API, and only after one minor release in which the old form still works and warns. Patch releases never change
 the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
+## Unreleased
+
+### Changed
+
+- Reverse mode: the checkpoint stride of a `checkpointed_while` is now `max(C, ceil(K/C))` rather than
+  `ceil(K/C)`, and the forward pass of the checkpointed loop no longer stores states. The backward sweep
+  allocates one segment buffer of C states per segment, and that costs C stores whatever the segment's length is,
+  so a stride of `ceil(K/C)` -- one state per segment for every loop with K <= C steps -- spent most of the
+  adjoint kernel zeroing slots it never read. MEASURED on a 2080 Ti at the `benchmarks/vs_jax` sizes,
+  `jax.grad` wall time: transport 15.6 -> 6.07 ms, walk on spheres 9.91 -> 4.14 ms, particle filter 22.5 ->
+  17.0 ms, toy walk at K=100 2.9 -> 2.5x its forward pass; barrier and the ode ensemble, whose loops run about
+  220 steps and so already filled their buffers, are unchanged (13.4 -> 13.4 ms, 24.8 -> 25.3 ms). Peak memory
+  is unchanged, and per-item memory drops from 2C+1 to 2C states. `rev_checkpoints` is much less sensitive as a
+  result: over C = 8, 16, 32, 64 the six problems now spread by at most 1.6x, against up to 20x before.
+  Gradients are unchanged except for the float summation order of a cotangent accumulated by atomics, which
+  already varies between runs; per-item cotangents are bitwise identical.
+
 ## 0.5.0 - first public release
 
 tallymap runs divergent per-item Monte Carlo loops as a single JAX primitive. You write one ordinary JAX function

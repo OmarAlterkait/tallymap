@@ -301,6 +301,12 @@ S = 0).
 
 Two or three values of C on your own ensemble is the whole tuning procedure.
 
+The table above was measured BEFORE the checkpoint stride was fixed to C (`docs/design.md` section 3). That fix
+removes most of what made C so sharply non-monotone -- the sweep used to allocate a C-slot segment buffer per
+segment and fill one slot of it -- so the diffrax numbers here are an upper bound on today's spread and have not
+been re-measured. On the six `benchmarks/vs_jax` problems, which were, C = 8, 16, 32 and 64 now lie within a
+factor of 1.6 of each other, where before the spread reached 20.
+
 ### What running diffrax inside the item costs, against writing the stepper yourself
 
 MEASURED like-for-like: the same problem, the same `Kvaerno3` tableau, the same `VeryChord` root finder, the same

@@ -166,13 +166,22 @@ error) turn every affected cell into a failure, which is how the matrix is known
 ## 3. Reverse mode (`_reverse.py`)
 
 - **Checkpointed loops.** `retrace(rev=...)` replaces every while loop by `checkpointed_while`. The forward pass
-  stores the first C = `rev_checkpoints` (default 16) states; if the trip count K exceeds C, a checkpoint pass
-  stores every m-th state with m = ceil(K/C); the backward pass walks segments newest first, refilling a buffer
-  of at most C states from each segment's checkpoint. That is O(K) work for K <= C^2 and 2C+1 states of memory
-  per item, with no bound on K required anywhere. Toy walk at 65k items, the ratio of grad to forward: 3.5x at
-  K=100 and 3.8x at K=1000. The scheme this replaced, replaying from the start for every step, was 13x at K=100
-  and over 100x at K=1000. A single fused reverse loop (one VJP instance for the whole loop) was also tried and
-  was 2 to 5 times slower, because it defeats in-place updates; it was reverted.
+  stores nothing and only counts the steps K; the backward pass replays the loop once storing every m-th state,
+  then walks the segments newest first, refilling a buffer of at most C = `rev_checkpoints` (default 16) states
+  from each segment's checkpoint. That is O(K) work for K <= C^2 and 2C states of memory per item, with no bound
+  on K required anywhere. Toy walk at 65k items, the ratio of grad to forward: 3.0x at K=100. The scheme this
+  replaced, replaying from the start for every step, was 13x at K=100 and over 100x at K=1000. A single fused
+  reverse loop (one VJP instance for the whole loop) was also tried and was 2 to 5 times slower, because it
+  defeats in-place updates; it was reverted.
+- **The checkpoint stride is C, not ceil(K/C).** The segment buffer is allocated once per segment and that costs
+  C stores whatever the segment's length turns out to be, so the sweep's local-memory traffic is (number of
+  segments) x C states, not K. A stride of ceil(K/C) gives one state per segment whenever K <= C, which wastes
+  C-1 slots of every buffer; a stride of C fills every buffer, keeps the number of segments at most C, and falls
+  back to ceil(K/C) only beyond K = C^2, where the sub-segment path splits a segment into full buffers too. So
+  the traffic is ~K states for every K. Measured on a 2080 Ti at the `benchmarks/vs_jax` sizes, this took the
+  gradient of transport from 15.6 to 7.4 ms, walk-on-spheres from 9.9 to 5.0 ms, and the toy walk at K=100 from
+  1.70 to 1.47 ms, with no problem slower. It is also why `rev_checkpoints` used to look so sharply
+  non-monotone: at C = 32 the same transport gradient cost 44.9 ms before and 10.7 ms after.
 - **Activity.** Only float loop carries that can depend on a perturbed constant, carry or table token are
   differentiated in a step VJP. The set is a fixpoint probed with symbolic zeros. On a production
   photon-transport workload it removed half of the float carries and about a quarter of the reverse-mode time.
@@ -277,6 +286,36 @@ exists.
   extra spills offset the occupancy); carrying one segment buffer instead of allocating a fresh one per segment
   (slower); a flat K <= C sweep under a `lax.cond` (slower). One real bug was found while measuring these:
   uniform-constant folding was allocating pools of tens of megabytes of zeros.
+- **Refuted: one kernel per phase, with a bounded global buffer.** Every adjoint program has exactly three
+  top-level while loops (the replay, the checkpoint pass, the sweep), so the step split, which needs exactly one,
+  never applies to an adjoint: it always runs whole-item and always gets one register allocation for all three
+  phases. Cutting the adjoint jaxpr at its top-level loops into one ItemProgram per loop, with the values that
+  cross a cut as per-item results of one piece and per-item operands of the next (items in chunks of M, so the
+  buffer is O(M * crossing state), 584 bytes per item on the toy walk), was implemented and measured on a
+  2080 Ti. Each phase does get its own registers, and the sweep's drop sharply (63 to 50), but the gradient was
+  SLOWER on every one of the six problems: toy 2.47 against 1.66 ms, transport 24.0 against 15.6, walk-on-spheres
+  14.2 against 10.2, ode 34.3 against 25.4, barrier 19.3 against 15.4, particle filter 31.0 against 22.1, at 20
+  times the peak memory (264 MB against 12 MB on transport). Two reasons, both measured: the crossing state is a
+  write and a read of the whole checkpoint buffer per item through global memory, plus a copy of it in the piece
+  that updates it; and under the step split the buffer becomes per-lane state that lives in the main kernel,
+  where ptxas puts it in registers -- phases 0 and 1 compiled to 248-255 registers with spills, and forcing
+  whole-item pieces instead (which costs the scheduling the split was for) only brought them back to 64. The
+  prototype this came from was faster because its FORWARD kernel wrote the checkpoints, so it had no replay phase
+  at all; that needs a residual output of the forward node, which is O(N * C * state) and so is the one thing the
+  chunking cannot bound.
+- **Refuted: let the forward store the checkpoints.** With a stride of C the forward pass of a checkpointed loop
+  can store the stride-C states itself (slot C as a scratch sink makes the store unconditional), which removes
+  the backward pass's checkpoint pass entirely while K <= C^2. It does remove it -- the replay phase
+  (`_rev_phase='skip'`) drops from 3.23 to 2.81 ms on transport -- but it costs one local store per step and
+  takes per-item memory back to 2C+1 states, and the gradient is faster on only two of the six problems
+  (walk-on-spheres 4.07 -> 3.61 ms, barrier 13.6 -> 12.3) and slower on three (transport 6.03 -> 6.84, toy walk
+  1.44 -> 1.51, particle filter 15.1 -> 15.7), with the adjoint kernel's stack frame back up from 544 to 832
+  bytes. Which side wins depends on K, which is not known at trace time, so there is no rule that would pick it.
+- **Refuted here: automatic step segmentation.** `rev_step_segments` removes step-VJP spills, and a rule could
+  read the spill bytes out of the compiled kernel and pick S. There is nothing to pick on this benchmark set:
+  ptxas reports ZERO spill bytes for the adjoint kernel of all six problems (stack frames 400 to 832 bytes, which
+  is the checkpoint buffers, not spills), so any such rule would choose S = 1 everywhere and the option stays
+  what it is -- opt-in, for the shower-shaped steps that do spill (section 6, first item).
 - **Where the adjoint time goes**, decomposed on a transport workload whose adjoint kernel cost about 8 times its
   forward: scheduling 1.26x, halving the warp occupancy 1.37 to 1.46x, and the rest split between the forward
   replay with its local buffer, sweeping the primal steps, and the transposes, in roughly equal thirds with the
@@ -284,6 +323,23 @@ exists.
   reverse kernel does step refill over active carries only) was about twice as fast as the library's adjoint. It
   is not in the library: it needs the K > C path and a residual output of the forward node at partial-evaluation
   time.
+- **The same decomposition on the public problems** (`benchmarks/vs_jax` at its sweep sizes, 2080 Ti, with the
+  private `_rev_phase` options: `skip` is the replay and the checkpoint pass with no sweep, `primal` runs one
+  PRIMAL body step in place of each step VJP). Reading it as replay / sweep / transposes:
+
+  | problem | K (mean) | forward | grad | grad/fwd | `skip` | `primal` |
+  |---|---|---|---|---|---|---|
+  | toy walk, K=100, 65k | 100 | 0.49 | 1.47 | 3.0x | 0.80 | 1.05 |
+  | transport, 2^19 | 16 | 0.97 | 6.07 | 6.3x | 3.36 | 4.71 |
+  | walk on spheres, 2^19 | 8.8 | 0.75 | 4.14 | 5.5x | 2.81 | 4.00 |
+  | ode ensemble, 2^18 | 227 | 3.48 | 25.3 | 7.3x | 15.3 | 21.4 |
+  | barrier, 2^19 | 222 | 3.75 | 13.4 | 3.6x | 6.65 | 14.2 |
+  | particle filter, 2^16 | 45 | 5.36 | 17.0 | 3.2x | 11.3 | 15.1 |
+
+  The replay and the checkpoint pass are half of the adjoint and the transposes about a third; on barrier and the
+  particle filter a primal step costs as much as the step VJP, so `primal` is not below `grad` there and the
+  transposes are free. The replay alone is 3 to 4 times the forward kernel for the same arithmetic, because the
+  adjoint runs whole items where the forward refills lanes at step granularity.
 - **Case taxonomy** (cost per item, with the forward pass as 1):
 
   | the parameter enters as | what it costs, and what to use |
