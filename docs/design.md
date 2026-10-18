@@ -358,11 +358,14 @@ solves the same problem per thread. Here the lanes that need the work are gather
   restarts, because its carry is frozen and its predicate stays false, so nothing is ever gathered back and the
   bookkeeping is one `cumsum` per level, not per round. Nothing has to be known in advance: a loop whose lanes
   all run to the end narrows once, near the end, and pays two gathers for it.
-- **A cond runs each branch on the lanes that take it**, in chunks of P >> 2 lanes with a dynamic chunk count,
-  when that pays: `_pays` compares the branch work the masked interpreter throws away (the sum of the branches
-  minus their average, since compaction costs the average branch) against the cost of gathering the operands and
-  scattering the results, both estimated from the jaxpr with the measured per-element cost of a gather and of a
-  scatter. Nothing in it depends on the problem.
+- **A cond runs each branch on the lanes that take it.** One permutation sorts the lanes by branch, then each
+  branch runs on its own contiguous range in chunks of P >> 2 lanes with a dynamic chunk count -- when that
+  pays: `_pays` compares the branch work the masked interpreter throws away (the sum of the branches minus their
+  average, since compaction costs the average branch) against what moving the lanes costs (the permutation, the
+  gather of the operands, the scatter of the results), both estimated from the jaxpr with the measured
+  per-element cost of each operation, in units of one add. Nothing in it depends on the problem. On a switch over
+  K phases inside a divergent loop it is 1.3 to 9.9x faster forward and 1.0 to 6.3x in reverse mode; the case it
+  declines is branches of two flops and no emit, where compacting measured 1.3 to 1.5x SLOWER.
 - **How much.** Both arms in one process on one milano node, JAX 0.5.3, the `benchmarks/vs_jax` problems at
   N = 65,536 (the full table is in the lockstep REPORT): forward 1.3 to 2.1x faster on the divergent problems
   (walk on spheres 264 -> 126 ms, transport 288 -> 156 ms, random walk 238 -> 137 ms, interacting md 100 ->
