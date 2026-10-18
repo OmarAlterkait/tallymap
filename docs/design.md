@@ -388,9 +388,11 @@ from it are worth recording, because they are reproducible here:
   NVIDIA's assembly-level intermediate language) that XLA:GPU itself emits for f32 division, square root and
   reciprocal square root, closes it, and became the default after a pre-registered validation
   (`docs/validation.md`). The `ieee` mode costs about 1.5 times the forward pass and 1.65 times a JVP.
-- `cuda_min_blocks`, the `__launch_bounds__` minimum-blocks-per-multiprocessor register cap, is worth single-digit
-  percentages and the best value is per kernel, which is why it is an option with a default of 0 rather than a
-  fixed rule. Block size 64, 128 and 256 are within 1% of each other, which is why that one is fixed.
+- The `__launch_bounds__` minimum-blocks-per-multiprocessor register cap was an option (`cuda_min_blocks`) and is
+  gone: re-measured on the toy walk at 4M items on a 2080 Ti, values 0 / 1 / 2 / 4 gave forward 6.22 / 6.25 /
+  6.22 / 6.17 ms and a JVP 7.16 / 7.25 / 7.28 / 7.17 ms, i.e. nothing outside rerun noise, which matches the
+  single-digit percentages it was worth when it was added. Block size 64, 128 and 256 are within 1% of each
+  other, which is why that one is fixed too.
 
 ## 8. The maintenance pass
 

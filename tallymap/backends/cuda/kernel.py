@@ -279,7 +279,7 @@ def privatised(tallies, B=1, budget=PRIV_BYTES):
     return out
 
 
-def build_source(p, *, block=BLOCK, min_blocks=0, split=True, inplace=True, events=False):
+def build_source(p, *, block=BLOCK, split=True, inplace=True, events=False):
     """-> (CUDA source, Layout).  p: tallymap._api.ItemProgram.  Its jaxpr is first rewritten twice: the foreign
     primitives a backend has to lower itself (_foreign.expand_late, e.g. lineax's linear_solve, which may only be
     expanded now that every autodiff rule has been applied) and then the JAX sugar (canon.py)."""
@@ -575,7 +575,7 @@ def build_source(p, *, block=BLOCK, min_blocks=0, split=True, inplace=True, even
         (f"        (({ctype(dt)}*)P.p[{L.r_ys[j]}])[t] = y{j};" if sh == () else
          f"        for (int e = 0; e < {_size(sh)}; ++e) (({ctype(dt)}*)P.p[{L.r_ys[j]}])[t * {_size(sh)} + e] = y{j}[e];")
         for j, (sh, dt, _) in enumerate(yav))
-    lb = f"__launch_bounds__({block}, {min_blocks})" if min_blocks else f"__launch_bounds__({block})"
+    lb = f"__launch_bounds__({block})"
     claim = """if (my_left == 0) {               // warp-aggregated claim of CH item slots per needy lane, interleaved
           const unsigned m = __activemask();
           const int leader = __ffs(m) - 1;

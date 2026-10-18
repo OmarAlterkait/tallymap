@@ -181,7 +181,8 @@ def _(b):
 def _(b):
     f = lambda t, x: t.add("Q", 0, x)
     for kw in (dict(math="ieee"), dict(min_blocks=4), dict(block=8), dict(rev_slots=4), dict(rev_remat=2),
-               dict(ad="forward"), dict(bogus=1), dict(_occ_cap=2), dict(_replay_check=False)):
+               dict(ad="forward"), dict(bogus=1), dict(_occ_cap=2), dict(_replay_check=False),
+               dict(cuda_min_blocks=2), dict(_rev_phase="skip"), dict(_tree_phase="fwd")):
         raises(ValueError, lambda: V(f, b, **kw), "unknown option")
     raises(ValueError, lambda: tm.vmap(f, outputs={"Q": tm.Sum((NB,), F)}, backend="xla"), "unknown backend")
     from tallymap import _tally
@@ -764,7 +765,7 @@ def _(b):
 def _(b):
     g = lambda **o: (lambda x, k, t, th: V(walk, b, in_axes=AX, **o)(x, k, t, th).outputs["Q"])
     if b == "cuda":
-        same, diff = (dict(cuda_min_blocks=0), dict()), (dict(_schedule="step"), dict(_schedule="item"))
+        same, diff = (dict(cuda_math="approx"), dict()), (dict(_schedule="step"), dict(_schedule="item"))
     else:
         same, diff = (dict(cuda_math="ieee"), dict()), (dict(lockstep_block=8), dict())
     raises(AssertionError, lambda: tm.assert_arms_differ(g(**same[0]), g(**same[1]), xs, keys, tab, TH), "identical")

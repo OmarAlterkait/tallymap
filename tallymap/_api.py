@@ -225,7 +225,6 @@ _OPTS = {
                       "UnsupportedError when the cuda backend cannot compile the program (default False; it is "
                       "only ever suggested for programs the lockstep backend can actually run)",
     "cuda_math": "cuda backend, f32 div/sqrt: 'approx' (default) | 'ieee'",
-    "cuda_min_blocks": "cuda backend: __launch_bounds__ minimum blocks per SM",
     "lockstep_block": "lockstep backend: lanes per block",
     "rev_checkpoints": "reverse mode: checkpoint buffer size C",
     "rev_step_segments": "reverse mode: recompute each loop step in this many checkpointed segments (0 = off)",
@@ -260,8 +259,6 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
     opts:      allow_fallback     backend='auto' on a GPU: fall back to lockstep (warning) instead of raising.
                cuda_math          cuda f32 div/sqrt: 'approx' (default; XLA:GPU's own PTX) | 'ieee' (correctly
                                   rounded: the portable reference).
-               cuda_min_blocks    cuda __launch_bounds__ minimum blocks per SM (register cap; performance only;
-                                  0 = compiler).  The best value is per kernel.
                lockstep_block     lockstep backend: lanes per block (default 2^18; bounds its memory).
                rev_checkpoints    reverse mode: states per checkpoint buffer C (default 16).  O(K) work for loops
                                   of K <= C^2 steps, 2C+1 states of per-item memory.
