@@ -414,9 +414,10 @@ exists.
   reverse kernel does step refill over active carries only) was about twice as fast as the library's adjoint. It
   is not in the library: it needs the K > C path and a residual output of the forward node at partial-evaluation
   time.
-- **The same decomposition on the public problems** (`benchmarks/vs_jax` at its sweep sizes, 2080 Ti, with the
-  private `_rev_phase` options: `skip` is the replay and the checkpoint pass with no sweep, `primal` runs one
-  PRIMAL body step in place of each step VJP). Reading it as replay / sweep / transposes:
+- **The same decomposition on the public problems** (`benchmarks/vs_jax` at its sweep sizes, 2080 Ti, measured
+  with a temporary phase instrumentation that is no longer in the library: `skip` is the replay and the
+  checkpoint pass with no sweep, `primal` runs one PRIMAL body step in place of each step VJP; both give wrong
+  gradients, so they were a measurement and not an option). Reading it as replay / sweep / transposes:
 
   | problem | K (mean) | forward | grad | grad/fwd | `skip` | `primal` |
   |---|---|---|---|---|---|---|
