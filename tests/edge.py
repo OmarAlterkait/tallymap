@@ -182,7 +182,8 @@ def _(b):
     f = lambda t, x: t.add("Q", 0, x)
     for kw in (dict(math="ieee"), dict(min_blocks=4), dict(block=8), dict(rev_slots=4), dict(rev_remat=2),
                dict(ad="forward"), dict(bogus=1), dict(_occ_cap=2), dict(_replay_check=False),
-               dict(cuda_min_blocks=2), dict(_rev_phase="skip"), dict(_tree_phase="fwd")):
+               dict(cuda_min_blocks=2), dict(_rev_phase="skip"), dict(_tree_phase="fwd"),
+               dict(rev_step_segments=8)):
         raises(ValueError, lambda: V(f, b, **kw), "unknown option")
     raises(ValueError, lambda: tm.vmap(f, outputs={"Q": tm.Sum((NB,), F)}, backend="xla"), "unknown backend")
     from tallymap import _tally

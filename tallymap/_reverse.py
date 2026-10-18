@@ -49,18 +49,14 @@ LAST = {}          # what the last vjp_prog / checkpointed_while built (instrume
 class RevOpts:
     checkpoints: int = 16      # C: states per checkpoint buffer (public option rev_checkpoints)
     sparse_min: int = 32       # tables with >= this many elements get sparse (emitted) cotangents (private)
-    step_segments: int = 0     # > 1: the step VJP recomputes the step in this many checkpointed segments (public
-                               # option rev_step_segments; _segments)
 
 
 def rev_opts(opts=None):
-    """RevOpts from the tallymap.vmap options rev_checkpoints / rev_step_segments (public) and _rev_sparse_min
-    (private)."""
+    """RevOpts from the tallymap.vmap option rev_checkpoints (public) and _rev_sparse_min (private)."""
     if isinstance(opts, RevOpts):
         return opts
     opts = dict(opts or {})
-    r = RevOpts(checkpoints=int(opts.get("rev_checkpoints", 16)), sparse_min=int(opts.get("_rev_sparse_min", 32)),
-                step_segments=int(opts.get("rev_step_segments", 0)))
+    r = RevOpts(checkpoints=int(opts.get("rev_checkpoints", 16)), sparse_min=int(opts.get("_rev_sparse_min", 32)))
     if r.checkpoints < 1:
         raise ValueError("tallymap: rev_checkpoints must be >= 1")
     return r
@@ -181,98 +177,6 @@ def _active(bfn, bc, init, pb, pc, cand, w_idx):
         act |= nz
 
 
-# ------------------------------------------------------------------------------------------- step-internal remat
-_SAVE = ("while", "scan", "cond", "custom_vjp_call", "custom_vjp_call_jaxpr", "custom_jvp_call", "pjit")
-
-
-def _remat_policy(prim, *_, **__):
-    """recompute straight-line arithmetic; SAVE the outputs of loops / branches / calls (an inner loop -- e.g. a
-    geometry walk -- costs a whole step to recompute; measured: recomputing one engine's geometry walk doubles its
-    step VJP)"""
-    return prim.name in _SAVE
-
-
-def _segments(fn, S, args):
-    """fn(*flat) -> flat list, split into S consecutive checkpointed segments (jax.checkpoint, nothing saveable).
-
-    Under jax.vjp each segment's residuals are recomputed right before that segment is transposed, so a thread
-    holds ONE segment's residuals (+ the values live across the segment boundaries) instead of the whole step's.
-    MEASURED: a per-thread step VJP whose residuals exceed the register file spills them to local
-    memory (a shower step of 804 residuals / 4.5 KB -> 12x the forward step; toy: 2.2x -> 15.8x when the residuals
-    grow 4x).  Cuts are placed near S equal splits of the equation list where the bytes live across the cut are
-    smallest (arrays > 256 elements are tables / virtual tallies, not per-thread storage: not counted)."""
-    from jax.extend.core import Literal
-
-    from ._jaxpr import bind, lit
-    cj = jax.make_jaxpr(fn)(*args)
-    jx = cj.jaxpr
-    eqns = list(jx.eqns)
-    n = len(eqns)
-    S = max(1, min(int(S), n))
-    if S == 1:
-        return fn
-    dfn = {v: -1 for v in list(jx.invars) + list(jx.constvars)}
-    for k, e in enumerate(eqns):
-        for v in e.outvars:
-            dfn[v] = k
-    last = {}
-    for k, e in enumerate(eqns):
-        for v in e.invars:
-            if not isinstance(v, Literal):
-                last[v] = k
-    for v in jx.outvars:
-        if not isinstance(v, Literal):
-            last[v] = n
-
-    def nbytes(v):
-        a = v.aval
-        m = int(np.prod(a.shape)) if hasattr(a, "shape") else 1
-        try:
-            isz = np.dtype(a.dtype).itemsize
-        except TypeError:                     # typed PRNG key: its key data (2 x uint32 for threefry)
-            isz = 8
-        return 0 if m > 256 else m * isz
-    delta = np.zeros(n + 2, np.int64)          # live bytes at cut c (between eqn c-1 and eqn c), c = 0..n
-    for v, d in dfn.items():
-        if v in last and last[v] > d:
-            delta[d + 1] += nbytes(v)
-            delta[last[v] + 1] -= nbytes(v)
-    live = np.cumsum(delta)[:n + 1]
-    w = max(1, n // (4 * S))
-    cuts = [0]
-    for i in range(1, S):
-        t = round(i * n / S)
-        lo, hi = max(cuts[-1] + 1, t - w), min(n - 1, t + w)
-        if lo > hi:
-            continue
-        cuts.append(int(lo + np.argmin(live[lo:hi + 1])))
-    cuts.append(n)
-    consts = dict(zip(jx.constvars, cj.consts))
-    LAST.setdefault("remat", []).append(dict(n_eqns=n, cuts=cuts, live_bytes=[int(live[c]) for c in cuts[1:-1]]))
-
-    def live_at(c):
-        return [v for v in dfn if dfn[v] < c and last.get(v, -2) >= c and v not in consts]
-
-    def run(*flat):
-        env = dict(consts)
-        env.update(zip(jx.invars, flat))
-        for a, b in zip(cuts[:-1], cuts[1:]):
-            ins = live_at(a)
-            outs = live_at(b) if b < n else [v for v in jx.outvars if not isinstance(v, Literal)]
-
-            def seg(*vals, a=a, b=b, ins=ins, outs=outs):
-                e2 = dict(consts)
-                e2.update(zip(ins, vals))
-                rd = lambda v: lit(v) if isinstance(v, Literal) else e2[v]
-                for e in eqns[a:b]:
-                    for v, x in zip(e.outvars, bind(e, [rd(v) for v in e.invars])):
-                        e2[v] = x
-                return [e2[v] for v in outs]
-            env.update(zip(outs, jax.checkpoint(seg, policy=_remat_policy)(*[env[v] for v in ins])))
-        return [lit(v) if isinstance(v, Literal) else env[v] for v in jx.outvars]
-    return run
-
-
 # ------------------------------------------------------------------------------------------- checkpointed_while
 def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None):
     """cfn(cc, carry) -> bool, bfn(bc, carry) -> carry (lists).
@@ -323,14 +227,6 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None):
         acc0 = ([inst(ct[j], init[j]) for j in act], [inst(ct[j], init[j]) for j in w_idx],
                 [jnp.zeros_like(bc[i]) for i in fb])
 
-        bstep = bfn
-        if o.step_segments > 1:                 # step-internal checkpointing (see _segments)
-            nb_ = len(bc)
-            sds = lambda x: jax.ShapeDtypeStruct(jnp.shape(x), _dt(x))
-            segf = _segments(lambda *xs: list(bfn(list(xs[:nb_]), list(xs[nb_:]))), o.step_segments,
-                             [sds(x) for x in bc] + [sds(x) for x in init])
-            bstep = lambda b, c: list(segf(*b, *c))
-
         def vjp_step(c, acc):
             ctd, ctw, ctb = acc
 
@@ -344,7 +240,7 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None):
                     cf[j] = v
                 for i, v in zip(fb, bv):
                     b[i] = v
-                out = bstep(b, cf)
+                out = bfn(b, cf)
                 return [out[j] for j in act], [out[j] for j in o_idx], [out[j] for j in w_idx]
             _, vjp = jax.vjp(f, [c[j] for j in act], [bc[i] for i in fb], [c[j] for j in o_idx],
                              [c[j] for j in w_idx])

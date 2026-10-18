@@ -224,7 +224,6 @@ _OPTS = {
     "cuda_math": "cuda backend, f32 div/sqrt: 'approx' (default) | 'ieee'",
     "lockstep_block": "lockstep backend: lanes per block",
     "rev_checkpoints": "reverse mode: checkpoint buffer size C",
-    "rev_step_segments": "reverse mode: recompute each loop step in this many checkpointed segments (0 = off)",
     "rev_stats": "reverse mode: report replay mismatches / tree stats to the host (costs jit's fast path)",
     # PRIVATE (measurements / tests / negative controls; not API)
     "_schedule": "cuda: 'step' | 'item' | 'events' overrides the rule (step unless the program spawns)",
@@ -259,8 +258,6 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                lockstep_block     lockstep backend: lanes per block (default 2^18; bounds its memory).
                rev_checkpoints    reverse mode: states per checkpoint buffer C (default 16).  O(K) work for loops
                                   of K <= C^2 steps, 2C+1 states of per-item memory.
-               rev_step_segments  reverse mode: recompute each loop step in S checkpointed segments inside its VJP
-                                  (default 0 = off; helps when a step's residuals spill, costs recomputation).
                rev_stats          reverse mode: report replay mismatches and tree-adjoint stats to the host
                                   (tallymap.diagnostics()['reverse']).  Off by default: a host callback takes jax.jit
                                   off its C++ fast path.  A failed check makes the gradient NaN either way.

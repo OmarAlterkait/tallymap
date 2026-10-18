@@ -327,11 +327,11 @@ exists.
   linearisation and transposition. Beyond the register file they spill to local memory, at low occupancy. For a
   single step the ratio of VJP to forward was about 3 for a transport-shaped step and about 12 for a
   shower-shaped one (800-odd residuals, several kilobytes per item); the same step vmapped by plain XLA costs
-  about 1.2. The remedy is `rev_step_segments=S`, which recomputes the step in S checkpointed segments, cutting
-  at small live sets, saving loop, branch and call outputs (recomputing a geometry walk doubled the cost in one
-  case). On the toy walk it took the ratio from 31x to 4.2x at S=8. On the shower-shaped step it went from 10.4x
-  to 5.2x at S=16, with the spills gone. On the transport-shaped one it was slightly worse, because there were
-  few spills to remove and only recomputation to add. Hence it is opt-in, default 0.
+  about 1.2. There was an opt-in remedy, `rev_step_segments=S`, which recomputed the step in S checkpointed
+  segments, cutting at small live sets and saving loop, branch and call outputs; it is REMOVED, because no
+  public workload reproduces a benefit (see "Refuted: step segmentation" below). The only evidence for it was
+  the two engines (a shower-shaped step 10.4x to 5.2x at S=16, with the spills gone; a transport-shaped one
+  slightly worse), which is not reproducible here.
 - **Refuted levers**: contention on parameter-cotangent atomics; raising occupancy through launch bounds (the
   extra spills offset the occupancy); carrying one segment buffer instead of allocating a fresh one per segment
   (slower); a flat K <= C sweep under a `lax.cond` (slower). One real bug was found while measuring these:
@@ -361,11 +361,18 @@ exists.
   (walk-on-spheres 4.07 -> 3.61 ms, barrier 13.6 -> 12.3) and slower on three (transport 6.03 -> 6.84, toy walk
   1.44 -> 1.51, particle filter 15.1 -> 15.7), with the adjoint kernel's stack frame back up from 544 to 832
   bytes. Which side wins depends on K, which is not known at trace time, so there is no rule that would pick it.
-- **Refuted here: automatic step segmentation.** `rev_step_segments` removes step-VJP spills, and a rule could
-  read the spill bytes out of the compiled kernel and pick S. There is nothing to pick on this benchmark set:
-  ptxas reports ZERO spill bytes for the adjoint kernel of all six problems (stack frames 400 to 832 bytes, which
-  is the checkpoint buffers, not spills), so any such rule would choose S = 1 everywhere and the option stays
-  what it is -- opt-in, for the shower-shaped steps that do spill (section 6, first item).
+- **Refuted: step segmentation.** Recomputing each loop step in S checkpointed segments inside its VJP was an
+  option (`rev_step_segments`) and is gone. A rule could have read the spill bytes out of the compiled kernel
+  and picked S, but there was nothing to pick: ptxas reports ZERO spill bytes for the adjoint kernel of all six
+  problems (stack frames 400 to 832 bytes, which is the checkpoint buffers, not spills). Four independent
+  re-measurements on a 2080 Ti then found no benefit anywhere, and the option is removed:
+  the six `benchmarks/vs_jax` gradient cells at their sweep sizes, S = 0 / 4 / 8, were within 1.00-1.05
+  (job 41231627); the toy walk at 1M items, S = 0 / 4 / 8 / 16, gave 6.32 / 6.36 / 6.45 / 6.43 ms
+  (job 41231673); a toy built to spill -- a step holding 128 live nonlinear intermediates, 168 registers and
+  1,328 bytes of local memory per thread, grad/forward 8.1x -- gave 32.4 / 31.2 / 32.1 ms at S = 0 / 2 / 4
+  (job 41232260); and the diffrax ensemble of `docs/equinox.md` gave 4,936 ms at S = 0 against 4,968 at S = 4.
+  A step that really spills may still exist (the two engines), but nothing public shows one, and an option
+  cannot be kept on evidence nobody can rerun.
 - **Where the adjoint time goes**, decomposed on a transport workload whose adjoint kernel cost about 8 times its
   forward: scheduling 1.26x, halving the warp occupancy 1.37 to 1.46x, and the rest split between the forward
   replay with its local buffer, sweeping the primal steps, and the transposes, in roughly equal thirds with the
