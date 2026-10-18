@@ -61,6 +61,7 @@ def kernel(p, **opts):
     kern = _KERNELS[k]
     from ..._diagnostics import record_kernel
     record_kernel(dict(tag=p.tag, mode=kern.L.mode, cut=kern.L.cut, hash=kern.info["hash"], cached=kern.info["cached"],
+                       kid=kern.kid, compile_s=round(kern.info["seconds"], 1),
                        source=os.path.join(C.cache_dir(), kern.info["hash"] + ".cu"), prims=list(kern.L.prims),
                        options=dict(opts)))
     return kern

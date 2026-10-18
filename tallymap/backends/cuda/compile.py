@@ -229,6 +229,22 @@ def shim():
         return lib
 
 
+def kernel_info(kid):
+    """-> the resources of a registered kernel's sj_main once it has been launched (regs, local_bytes per thread,
+    shared_bytes per block, blocks_per_sm, the local memory the driver reserves for every resident thread in GiB),
+    or None (not launched yet, or no shim in this process)."""
+    if not _SHIM:
+        return None
+    out = (ctypes.c_longlong * 7)()
+    lib = _SHIM[0]
+    lib.tallymap_kernel_info.argtypes = [ctypes.c_int64, ctypes.POINTER(ctypes.c_longlong)]
+    if not lib.tallymap_kernel_info(ctypes.c_int64(kid), out):
+        return None
+    regs, local, shared, occ, sms, per_sm, block = list(out)
+    return dict(regs=regs, local_bytes=local, shared_bytes=shared, blocks_per_sm=occ,
+                resident_threads=occ * block * sms, local_reserved_gib=round(local * per_sm * sms / 2 ** 30, 3))
+
+
 def register_kernel(cubin):
     kid = int.from_bytes(hashlib.sha256(cubin).digest()[:8], "little", signed=True)
     shim().tallymap_register(ctypes.c_int64(kid), cubin, len(cubin))

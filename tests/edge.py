@@ -748,6 +748,12 @@ def _(b):
         raise Fail(f"kernels recorded: {d['kernels']}")
     if b == "cuda" and not os.path.exists(d["kernels"][0]["source"]):
         raise Fail(f"cached .cu missing: {d['kernels'][0]['source']}")
+    if b == "cuda":                      # once a kernel has run, its measured resources are reported
+        jax.block_until_ready(f(xs, keys, tab, TH).outputs["Q"])
+        res = [k.get("resources") for k in tm.diagnostics()["kernels"]]
+        if not any(r_ and r_["regs"] > 0 and r_["blocks_per_sm"] >= 1 and r_["local_reserved_gib"] >= 0
+                   for r_ in res):
+            raise Fail(f"no kernel resources after a run: {res}")
     r = tm.diagnostics()["reverse"]
     if set(r) != {"replay", "tree"} or set(r["replay"]) != {"calls", "mismatch", "last"}:
         raise Fail(f"reverse counters {r}")

@@ -16,7 +16,10 @@ Keys:
                tree   = stats of the last tree adjoint (reverse through spawn): generations, particles, launches,
                         overflow, drop_risk, replay_mismatch, fwd_mismatch (any of the last four -> NaN gradient)
   programs   the last item programs bound by tm.vmap: tag, item jaxpr (text)
-  kernels    the last cuda kernels used: tag, schedule, cubin hash, cached CUDA source (.cu), primitives
+  kernels    the last cuda kernels used: tag, schedule, cubin hash, cached CUDA source (.cu), primitives, compile
+             seconds, and once a kernel has run `resources`: registers and local memory per thread, static shared
+             memory, resident blocks per SM, and the local memory the CUDA driver reserves for every resident
+             thread outside JAX's pool (local_reserved_gib: what an out-of-memory error at launch is about)
 With f: `programs` / `kernels` are those of f only (JAX's caches are cleared first so that everything is re-traced
 and re-lowered), plus `stablehlo_sha256` of the lowered program.
 
@@ -120,6 +123,7 @@ def diagnostics(fn=None, *args, reset=False, **kwargs):
                  stablehlo_sha256=hashlib.sha256(txt.encode()).hexdigest())
     else:
         d.update(programs=list(PROGRAMS), kernels=list(KERNELS))
+    d["kernels"] = [_with_resources(k) for k in d["kernels"]]
     if reset:
         from . import _reverse as R
         from . import _reverse_spawn as RS
@@ -128,6 +132,16 @@ def diagnostics(fn=None, *args, reset=False, **kwargs):
         PROGRAMS.clear()
         KERNELS.clear()
     return d
+
+
+def _with_resources(rec):
+    """a kernel record plus sj_main's measured resources (registers, local memory, occupancy, the driver's
+    local-memory reservation) once the kernel has run; the record is not modified."""
+    if "kid" not in rec:
+        return rec
+    from .backends.cuda.compile import kernel_info
+    info = kernel_info(rec["kid"])
+    return dict(rec, resources=info) if info is not None else rec
 
 
 def artifacts(fn, *args, **kwargs):

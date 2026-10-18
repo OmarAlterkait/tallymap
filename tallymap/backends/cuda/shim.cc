@@ -88,6 +88,7 @@ struct Loaded {
   CUmodule mod = nullptr;
   CUfunction main = nullptr, prep = nullptr, post = nullptr;
   int sms = 0, occ = 0;
+  int regs = -1, local = -1, shared = -1, per_sm = 0, block = 0;   // sj_main's resources (tallymap_kernel_info)
 };
 
 // A launch that fails with CUDA_ERROR_OUT_OF_MEMORY is, in practice, the per-thread LOCAL memory (large per-item
@@ -132,6 +133,19 @@ extern "C" int tallymap_register(int64_t id, const char* data, size_t n) {
   return 0;
 }
 
+// sj_main's resources once the kernel has been loaded (by its first launch) in some context: out = registers per
+// thread, local memory bytes per thread, static shared bytes per block, resident blocks per SM at the launch block
+// size, SMs, max resident threads per SM, block size.  -> 1, or 0 when the kernel has not been loaded yet.
+extern "C" int tallymap_kernel_info(int64_t id, long long* out) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto it = g_reg.find(id);
+  if (it == g_reg.end() || it->second.loaded.empty()) return 0;
+  const Loaded& L = it->second.loaded.begin()->second;
+  const long long v[7] = {L.regs, L.local, L.shared, L.occ, L.sms, L.per_sm, L.block};
+  for (int i = 0; i < 7; ++i) out[i] = v[i];
+  return 1;
+}
+
 static ffi::Error SjLaunchImpl(cudaStream_t stream, ffi::RemainingArgs args, ffi::RemainingRets rets,
                                int64_t kernel_id, int32_t block, int32_t n_zero, int32_t flags, int32_t grid,
                                int64_t n_items) {
@@ -162,6 +176,13 @@ static ffi::Error SjLaunchImpl(cudaStream_t stream, ffi::RemainingArgs args, ffi
       d.DeviceGetAttribute(&n.sms, 16 /*CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT*/, dev);
       d.Occupancy(&n.occ, n.main, block, 0);
       if (n.occ < 1) n.occ = 1;
+      if (d.FuncGetAttribute) {
+        d.FuncGetAttribute(&n.regs, 4 /*CU_FUNC_ATTRIBUTE_NUM_REGS*/, n.main);
+        d.FuncGetAttribute(&n.local, 3 /*CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES*/, n.main);
+        d.FuncGetAttribute(&n.shared, 1 /*CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES*/, n.main);
+      }
+      d.DeviceGetAttribute(&n.per_sm, 39 /*MAX_THREADS_PER_MULTIPROCESSOR*/, dev);
+      n.block = block;
       lt = e.loaded.emplace(ctx, n).first;
     }
     L = lt->second;
