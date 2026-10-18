@@ -446,10 +446,12 @@ because the repository's own problems compile in seconds.
   6.78, `jacfwd` 1005 / 7.07; phases not inlined 793 / 7.23 and 893 / 7.68; phases plus call bodies of 16 or more
   equations 799 / 7.12 and 902 / 7.60. Compile time drops 5-11% and run time rises 5-9%. A kernel is compiled once
   and then called many times, so neither is the default, and the mechanism is not in the library.
-- **Branch stack frames already overlap.** The concern behind outlining branches was that NVVM keeps every branch's
-  local arrays in the caller's frame at once. A switch of 2 or 8 branches, each filling its own 512-float array
-  with dynamic indexing, compiled to the same 4,176 bytes of local memory per thread (2080 Ti): the frames
-  overlap. Outlining the branches gave 4,528 bytes and an 8% slower kernel.
+- **Branch stack frames do not add up.** The concern behind outlining branches was that NVVM keeps every branch's
+  local arrays in the caller's frame at once. A switch whose branches each fill their own array with dynamic
+  indexing (2080 Ti, local bytes per thread, inlined / outlined): 512 floats, 2 branches 4,176 / 4,496, 8 branches
+  4,176 / 4,528; 2048 floats, 2 branches 32,800 / 16,464, 8 branches 16,416 / 16,496. The frame does not grow with
+  the number of branches; the one doubled case (2048 floats, 2 branches) is a compiler choice for that shape,
+  which outlining happens to undo, and outlining costs run time (1-8%) and, at 8 branches, occupancy.
 
 What remains is the volume of straight-line code itself. A large item's stack frame and compile time are
 properties of the program; the levers that worked were in the program (fewer generic call sites, a static set of
