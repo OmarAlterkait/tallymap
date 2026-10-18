@@ -400,3 +400,36 @@ Everything in this section has a test.
   prints only their name, so a stale program could be reused. The CUDA operation table emitted
   `bitcast_convert_type` elementwise even between types of different widths, which changes the shape: silently
   wrong words, found by the first GPU run with 64-bit enabled.
+
+## 9. Compile time and code size
+
+The cuda emitter inlines the whole item into one kernel: call bodies (`pjit`, `custom_jvp`), `cond` branches and
+loop bodies are emitted in place, and arrays of up to 32 elements become straight-line code. For a large item this
+is what compile time is made of. The measurements are on the photon-transport engine's reconstruction item
+(forward: 24,407 jaxpr equations, counting sub-jaxprs; 4.2 MB of CUDA; the `jacfwd` program with 6 lanes: 5.1 MB),
+because the repository's own problems compile in seconds.
+
+- **Where the time goes.** About 85% is NVRTC's front end (C++ to PTX), and ptxas most of the rest. Long lazily
+  inlined expressions were the first cause found: capping the inlined lazy nodes per element at 32
+  (`codegen.LAZY_MAX_COST`, was 256) took that forward kernel from 1543 to 834 s of compile on a 2080 Ti and
+  from 9.04 to 6.87 s of run time, with bitwise identical outputs.
+- **Repeated sub-programs are not the bulk.** Call bodies hold 10,333 of the 24,407 equations when every call site
+  is counted, and 2,630 when each distinct body is counted once. Emitting each distinct body ONCE, as a
+  `__noinline__` device function called from every site (deduplicated on the generated text), was built and
+  measured: 134 call sites became 25 functions, but the source shrank only 13% (4.16 to 3.64 MB), because most of
+  the source is straight-line element code, not repeated calls.
+- **Splitting does make NVRTC faster, and costs as much at run time.** NVRTC is superlinear in function size:
+  making only the kernel's four phase functions (`sj_pre` / `sj_cond` / `sj_body` / `sj_post`) `__noinline__`
+  took the forward compile from 550 to 406 s on a CPU node, with identical source, and outlining every call body of
+  4 equations or more gave 416 s. On the GPU node, end to end (2080 Ti, compile s / run s): base forward 842 /
+  6.78, `jacfwd` 1005 / 7.07; phases not inlined 793 / 7.23 and 893 / 7.68; phases plus call bodies of 16 or more
+  equations 799 / 7.12 and 902 / 7.60. Compile time drops 5-11% and run time rises 5-9%. A kernel is compiled once
+  and then called many times, so neither is the default, and the mechanism is not in the library.
+- **Branch stack frames already overlap.** The concern behind outlining branches was that NVVM keeps every branch's
+  local arrays in the caller's frame at once. A switch of 2 or 8 branches, each filling its own 512-float array
+  with dynamic indexing, compiled to the same 4,176 bytes of local memory per thread (2080 Ti): the frames
+  overlap. Outlining the branches gave 4,528 bytes and an 8% slower kernel.
+
+What remains is the volume of straight-line code itself. A large item's stack frame and compile time are
+properties of the program; the levers that worked were in the program (fewer generic call sites, a static set of
+geometry types, a bounded stack depth), and on the library side the lazy-inline cap.
