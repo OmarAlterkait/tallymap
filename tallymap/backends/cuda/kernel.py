@@ -291,7 +291,6 @@ def build_source(p, *, block=BLOCK, split=True, inplace=True, events=False):
     em = Emitter()
     em.where = p.where
     em.inplace = inplace
-    em.events = bool(events)                 # also lowers every inner while loop with a cut (op_table._while_events)
     L = Layout()
     jx = p.cj.jaxpr
     nT, nP, nB = p.nT, p.nP, p.nB
@@ -673,7 +672,8 @@ extern "C" __global__ void {lb} sj_main(const SjParams P, const i64 n_items) {{
 
 
 def _events_main(L, lb, acc_decl, acc_flush, decls, claim, start, ywrite, ev):
-    """The persistent loop under event scheduling (no spawn).  Every lane is, between rounds, either in transit
+    """The persistent loop under event scheduling of the STEP loop (no spawn; inner loops are never event
+    scheduled -- measured slower on every toy built for it, see docs/design.md section 1b).  Every lane is, between rounds, either in transit
     (fetching an item, or just past a branch: it runs cond and head lane-locally and lands at the cut) or WAITING at
     the cut with its branch index sj_pc and its cut state.  Each round the warp votes, picks ONE branch j, and only the
     lanes waiting at j run it (then tail, cond, head).  The choice is warp-uniform and online, from measured cost:
