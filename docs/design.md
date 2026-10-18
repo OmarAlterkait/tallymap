@@ -50,9 +50,30 @@ exactly ONE top-level while loop is split into pre / cond / body / post
 is the faster of the two, by about half again, so the rule is: step refill unless the program spawns. (A warp is
 the group of 32 GPU threads that execute together on NVIDIA hardware.)
 
-That rule rests on the one production measurement. On five of the `benchmarks/vs_jax` problems at 262,144 items
-(L40S), whole-item mode was equal to or faster than step refill, forward and gradient alike (transport 0.90 vs
-0.96 ms forward), so the rule is due to be re-derived from a wider measurement rather than trusted.
+That rule was re-measured on every `benchmarks/vs_jax` problem (private `_schedule`, forward and gradient, `div`
+high), as the ratio of step-refill time to whole-item time (below 1: step refill is faster):
+
+| | 2080 Ti, 262k items | 2080 Ti, 4M items | L40S, 262k items |
+|---|---|---|---|
+| gillespie | 0.71 / 0.71 | 0.60 / 0.60 | 0.98 / 0.98 |
+| barrier | 0.72 / 0.96 | 0.74 / 0.95 | 0.99 / 1.01 |
+| random walk | 0.73 / 0.93 | 0.84 / 1.00 | 1.13 / 1.05 |
+| transport | 0.84 / 0.91 | 0.82 / 0.98 | 1.07 / 1.01 |
+| walk on spheres | 0.96 / 1.04 | 0.88 / 0.99 | 1.11 / 1.03 |
+| ode ensemble | 0.81 / 1.21 | 0.97 / 1.00 | 1.05 / 1.01 |
+| particle filter | 0.94 / 1.03 | 1.14 / 1.04 | 1.09 / 1.04 |
+| uniform | 1.17 / 1.05 | 1.25 / 1.02 | 1.11 / - |
+| interacting md | 1.28 / 1.04 | 1.56 / 1.15 | 1.13 / 1.06 |
+| shower (spawns) | 1.30 / 1.02 | 1.19 / - | 0.91 / 1.00 |
+
+(forward / gradient; identical kernels rerun differ by up to about 10%.)  Step refill wins by up to 1.7x where
+trip counts diverge and each resident thread runs several items (the 2080 Ti holds about 70k resident threads);
+it loses by up to 1.6x on uniform or interaction-bound items, and by 1-13% on the L40S at 262k items, where its
+218k resident threads leave about one item each and there is nothing to refill.  No structural rule picks the
+faster mode on both GPUs, and a rule on items per resident thread would need a fitted threshold (occupancy and
+divergence both move it), so the rule stays: step refill unless the program spawns, which is right on the
+divergent workloads the library is for.  Event scheduling (`_schedule='events'`) is the same kernel as step
+refill unless the step has a top-level `cond` worth cutting, and stays opt-in for lopsided branches.
 
 `max_steps` is applied by re-tracing the item jaxpr: every top-level while loop gets a counter and the item
 returns `truncated` (`Result.truncated`, `stats['n_truncated']`). It is one rewrite, upstream of every backend and
