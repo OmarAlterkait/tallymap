@@ -17,6 +17,8 @@ while / cond / scan, address arithmetic + loads for gathers from tables.
 Float semantics: IEEE-754 round-to-nearest +,-,*,/,sqrt, no FMA contraction; transcendentals call the CUDA
 math library (libdevice).  Results agree with XLA only statistically (see tallymap.compare), never bitwise by design.
 """
+import os
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -213,7 +215,8 @@ class Lazy(Val):
         self.shape, self.dtype, self.fn, self.cval, self.cost = tuple(shape), np.dtype(dtype), fn, cval, cost
 
 
-LAZY_MAX_COST = 256   # inlined lazy nodes per element; above it a lazy result is computed into a local array
+# inlined lazy nodes per element; above it a lazy result is computed into a local array (env: measurement only)
+LAZY_MAX_COST = int(os.environ.get("TALLYMAP_LAZY_MAX_COST", 256))
 
 
 def lazy_cost(v):
@@ -415,8 +418,9 @@ class Emitter:
 
     def const_val(self, x, aval=None):
         if isinstance(x, jax.core.Tracer):
+            from ..._foreign import CLOSED_TRACER
             raise CodegenError("a traced value is closed over inside a nested call; close over it at the top "
-                                "level of the item function or pass it as an argument")
+                               "level of the item function or pass it as an argument." + CLOSED_TRACER)
         a = np.asarray(x)
         if is_key_dtype(getattr(x, "dtype", None)):
             raise CodegenError("closed-over typed PRNG key constants are not supported")

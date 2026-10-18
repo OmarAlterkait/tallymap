@@ -228,6 +228,32 @@ CUSTOM_VJP = (
 )
 
 
+CLOSED_TRACER = (
+    " The program closes over a value from a trace that has already finished (a leaked tracer). Inside a tallymap "
+    "item this almost always means a jax.custom_jvp / custom_vjp function (or its rule) closes over a value "
+    "computed inside the item. JAX cannot differentiate that once the function is staged - plain "
+    "jax.jit(jax.vmap(f)) fails the same way - and tallymap always stages the item. Pass the value to the custom "
+    "function as an explicit argument (a nondiff_argnums argument if it must not be differentiated), or wrap the "
+    "function with jax.closure_convert."
+)
+
+
+def leaked_tracer(cj, _seen=None):
+    """-> True if a ClosedJaxpr (or any sub-jaxpr) holds a tracer among its constants: a value closed over from
+    a trace that no longer exists, which no backend can lower."""
+    import jax
+
+    from ._jaxpr import subjaxprs
+    _seen = set() if _seen is None else _seen
+    if id(cj) in _seen:
+        return False
+    _seen.add(id(cj))
+    if any(isinstance(c, jax.core.Tracer) for c in getattr(cj, "consts", ())):
+        return True
+    jx = getattr(cj, "jaxpr", cj)
+    return any(leaked_tracer(s, _seen) for e in jx.eqns for s in subjaxprs(e))
+
+
 def ad_advice(e, what):
     """-> an exception to raise in place of `e` when building or running an item program failed for a reason
     tallymap can explain, or None.  Called from _api._mk (every program is traced there) and from both backends."""

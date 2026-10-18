@@ -150,6 +150,8 @@ def _mk(fn, avals):
         cj = jax.make_jaxpr(fn)(*avals)
     except Exception as e:
         raise (_foreign.ad_advice(e, "item program") or e) from None
+    if _foreign.leaked_tracer(cj):
+        raise UnsupportedError(f"tallymap: cannot build this item program.{_foreign.CLOSED_TRACER}")
     return _foreign.expand(cj)
 
 

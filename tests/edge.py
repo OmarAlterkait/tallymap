@@ -1217,6 +1217,33 @@ def _(b):
     return "nested + sequential loops: fwd / jvp / per-item grad bitwise; matches the dense reference"
 
 
+@case("custom_jvp rule closing over an item-computed value: a clear UnsupportedError (JAX's staging limit); the "
+      "advised fix (an explicit argument) differentiates")
+def _(b):
+    def mk(explicit):
+        def item(t, x, th):
+            tab = jnp.stack([x, x * 2.0, x + 1.0])         # computed inside the item, not differentiated
+
+            @jax.custom_jvp
+            def f(a, tb):
+                return jnp.zeros_like(a)
+
+            @f.defjvp
+            def f_jvp(p, tng):
+                (a, tb), (da, _) = p, tng
+                return f(a, tb), da * jnp.sum(tb if explicit else tab) * jnp.cos(a)
+            y = f(th * x, tab if explicit else jnp.zeros(3, F)) + jnp.sin(x)
+            return t.add("Q", 0, y), y
+        return item
+    jv = lambda it: jax.jvp(lambda q: V(it, b, in_axes=(0, None))(xs, q).outputs["Q"], (TH,), (F(1.0),))[1]
+    m = raises(tm.UnsupportedError, lambda: jv(mk(False)), "closure_convert")
+
+    want = jax.vmap(lambda x: jax.jvp(lambda q: jnp.sin(x) + 0 * q, (TH,), (F(1.0),))[1] +
+                    jnp.sum(jnp.stack([x, x * 2.0, x + 1.0])) * jnp.cos(TH * x) * x)(xs).sum()
+    close(jv(mk(True))[0], want, rtol=1e-4)
+    return "leak: " + m.split(".")[1][:60] + "...; explicit argument: jvp matches"
+
+
 @case("jnp.linalg.solve / inv inside an item (lu, custom_linear_solve, triangular_solve): fwd, jvp, grad vs dense")
 def _(b):
     def mk(n):
