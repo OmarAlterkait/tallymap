@@ -89,7 +89,7 @@ deliberate: it is what makes an upgrade a bounded job.
 | `stats['n_truncated'] > 0` and the float tallies are NaN | items hit `max_steps` | raise it, or put the budget in the loop condition if it is deliberate (README, `max_steps`) |
 | `stats['dropped_emits'] > 0` | an emit index was negative or at least the output size | an off-by-one in your binning; clip the index |
 | a NaN gradient | in this order: your own arithmetic, a resource limit, then a reverse-mode check | if `jvp` or `jacfwd` is NaN too it is your arithmetic (look for overflow); else check `stats` for truncation and dropped children; only then rerun with `rev_stats=True` and read `tm.diagnostics()['reverse']` |
-| a perf row is more than 10% slower | a lost `jax.jit` fast path (usually a host callback in the jitted program), a changed kernel, or a busy machine | rerun once; compare `tm.diagnostics(f, *args)['kernels']` against the baseline commit's; then profile |
+| a perf row is more than 1.5x slower | a lost `jax.jit` fast path (usually a host callback in the jitted program), a changed kernel, or a busy machine | rerun once; compare `tm.diagnostics(f, *args)['kernels']` against the baseline commit's; then profile |
 
 ## Tuning constants (and where they were measured)
 
@@ -169,7 +169,7 @@ because each needs fresh JAX state.
 | every push and pull request | GitHub Actions, `.github/workflows/ci.yml` | ruff; the short suite on Python 3.10 + jax 0.5.3 and on Python 3.12 + the newest jax; the full CPU suite on the newest |
 | weekly | GitHub Actions, `.github/workflows/weekly.yml` | the full CPU suite on every minor in `TESTED_JAX`; a JAX nightly cell, allowed to fail |
 | weekly, and before a release | a GPU machine | the full suite on each supported GPU at the floor and at the newest JAX, once with `--x64`, plus `--unfused` and `--canary` on CPU |
-| weekly, and before a release | a GPU machine | `benchmarks/perf.py` against `benchmarks/perf_baseline.json` (more than 10% slower is a failure) |
+| weekly, and before a release | a GPU machine | `benchmarks/perf.py` against `benchmarks/perf_baseline.json` (more than 1.5x slower is a failure; `benchmarks/perf_negative_control.py` is its negative control) |
 
 GitHub Actions has no GPU, so the GPU cells run wherever the maintainer has one; each cell is one run of
 `tests/run_all.py --gpu` on a checkout of one commit. Run them from a snapshot of a commit, not from a live
