@@ -718,4 +718,7 @@ commit it came from; the measurements are on that private engine.
   2080 Ti the same rules are 1.016x on DTRAX, and on the photon-transport engine (LUCiD) 0.97x (v3 never fires
   there; +7 KB of frame). Not ported either: the base's other aliasing (`scatter` in place, a cond output that
   every branch returns as the same live operand's storage), which no switch turned off and the measurement
-  therefore did not isolate.
+  therefore did not isolate. The rule acts at a `while` / `cond` equation the emitter sees: an item whose only
+  loop is its single top-level `while` is split into step functions (section 1b) whose parameters are never
+  mutated, and there it does not fire, in `wavefront-state` either (checked on the generated source). `tests/edge.py`
+  therefore nests the loop, and compares against the rule patched off.
