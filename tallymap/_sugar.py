@@ -68,10 +68,14 @@ def _param(v, sug):
     if isinstance(v, ClosedJaxpr):
         return _one(v, sug)
     if type(v).__name__ == "Jaxpr":
-        c = _one(closed(v), sug)
+        cv = closed(v)
+        c = _one(cv, sug)
+        if c is cv:
+            return v
         if c.consts:                                     # pragma: no cover (expansions create no constants)
             raise NotImplementedError(f"tallymap: rewriting an open sub-jaxpr ({sug.label}) created constants")
-        return c.jaxpr
+        j, n = c.jaxpr, len(v.constvars)                 # closed() made v's constvars leading invars: undo that
+        return j.replace(constvars=list(j.invars[:n]), invars=list(j.invars[n:])) if n else j
     if isinstance(v, (tuple, list)) and any(isinstance(b, ClosedJaxpr) or type(b).__name__ == "Jaxpr" for b in v):
         return type(v)(_param(b, sug) for b in v)
     return v
