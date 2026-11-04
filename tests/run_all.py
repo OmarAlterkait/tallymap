@@ -10,7 +10,8 @@
 
 Suites: edge (edge cases), transforms (composability matrix), reverse (reverse mode), reverse_spawn (tree adjoint),
 invariants (schedule invariance, cache-key soundness, run-or-raise, AD self-consistency, truncation),
-ops (cuda op table vs jit(vmap(op)) and the host-exact result; --gpu only), equinox_compat (diffrax / optimistix /
+ops (cuda op table vs jit(vmap(op)) and the host-exact result; --gpu only), mulchain (a 64-bit multiply chain
+compiles fast and matches lockstep bitwise; --gpu only), equinox_compat (diffrax / optimistix /
 lineax / quadax solvers inside an item; skipped when those are not installed), examples (examples/*.py run as
 scripts).
 Each suite runs in its own process (fresh JAX state).  A suite passes iff its summary line was printed and every cell
@@ -28,8 +29,9 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-SUITES = ["edge", "transforms", "reverse", "reverse_spawn", "invariants", "ops", "equinox_compat", "examples"]
-GPU_ONLY = {"ops"}
+SUITES = ["edge", "transforms", "reverse", "reverse_spawn", "invariants", "ops", "mulchain", "equinox_compat",
+          "examples"]
+GPU_ONLY = {"ops", "mulchain"}
 OPTIONAL = {"equinox_compat"}      # needs a package the library does not depend on; prints 'SUITE SKIP' without it
 EXAMPLES = ["quickstart", "photon_toy", "shower_toy", "ensemble_toy", "walk_on_spheres",
             "ode_ensemble", "gillespie", "interacting_particles", "particle_filter", "gradient_pitfall"]

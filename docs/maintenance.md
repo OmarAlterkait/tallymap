@@ -157,7 +157,7 @@ because each needs fresh JAX state.
 
 | flag | what it adds |
 |---|---|
-| `--gpu` | the CUDA backend as well as lockstep, the spawn tree adjoint, and `tests/ops.py` (per-operation parity) |
+| `--gpu` | the CUDA backend as well as lockstep, the spawn tree adjoint, `tests/ops.py` (per-operation parity) and `tests/mulchain.py` |
 | `--x64` | `jax_enable_x64` |
 | `--unfused` | the two-node JVP design, which is what runs if JAX drops the partial-evaluation registries |
 | `--canary` | DeprecationWarning and FutureWarning become errors: the JAX-upgrade canary |

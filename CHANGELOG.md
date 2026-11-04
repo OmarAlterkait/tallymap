@@ -73,6 +73,26 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Changed
 
+- The cuda kernel cache and the eager-call cache key a program on a structural sha256 digest of its jaxpr
+  (`_jaxpr.digest`) instead of its printed text. JAX's pretty-printer cost 95 s per build on a large engine item
+  (4.2 s with the digest); the digest also separates literal values the printer rounds (`docs/design.md`
+  section 11).
+- `tm.diagnostics()` builds the item jaxpr's text when it is called, not at every bind (102 s of a 260 s cached
+  build on a large engine item). The returned record is unchanged.
+- A forward-only call (primal, `jvp`, `jacfwd`, a folded batch) no longer computes the per-item replay
+  fingerprint; reverse mode builds the fingerprinted program when it needs it, so the replay check is unchanged.
+  +76% forward on an engine item with a 16.8 KB loop carry, 1.19-1.31x on cheap items.
+- cuda: a serial chain of 64-bit integer multiplies is cut every 8 links by a zero-instruction barrier, because
+  NVRTC's front end is exponential in that chain's depth (127 s at 16 links, 0.2 s cut). Results are bitwise
+  unchanged; `tests/mulchain.py` checks it.
+- cuda: a lazily inlined value used more than once is computed once into a local array when its element expression
+  is longer than 200 characters, instead of being re-inlined into every consumer (a geometry kernel's source
+  13.0 -> 7.5 MB).
+- cuda buffer assignment: a `while` loop's dead initial carry array becomes the carry storage, and a `cond` output
+  is written into a dead operand of the same shape (also when the value is lazy and reads that storage only at its
+  own index), so neither is copied. Placement only, results bitwise unchanged; 1.59x on a large engine item on an
+  L40S (`docs/design.md` section 11).
+
 - The cuda kernel claims ONE item per warp-aggregated claim. It used to claim a run of up to
   `clamp(N / (16 * grid * block), 1, 16)` items per lane, which left the last claims holding several items each
   — a tail the other lanes wait for. Measured over all 18 `benchmarks/vs_jax` forward and gradient cells on a

@@ -94,6 +94,7 @@ they were run on. Nothing in this repository depends on them.
 | the spawn tree adjoint against `jax.grad` of a dense plain-JAX reference, with four negative controls | `tests/reverse_spawn.py` |
 | per-operation parity of the CUDA emitter against `jax.jit(jax.vmap(op))` and the host-exact result, with a bound per class and a per-GPU baseline | `tests/ops.py`, `tests/ops_baseline.json` |
 | edge cases and every documented failure mode | `tests/edge.py` |
+| a long chain of 64-bit integer multiplies compiles in seconds and matches lockstep bitwise | `tests/mulchain.py` |
 | speed, against a recorded baseline, as a regression net | `benchmarks/perf.py`, `benchmarks/perf_baseline.json` |
 | speed and memory against plain JAX | `docs/performance.md` |
 

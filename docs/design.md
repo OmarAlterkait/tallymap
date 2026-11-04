@@ -269,10 +269,11 @@ error) turn every affected cell into a failure, which is how the matrix is known
 - **In-place updates.** The CUDA emitter updates a dead per-item array in place in `dynamic_update_slice`, using
   liveness over all active scopes, with loop constants, pass-through carries, predicate inputs and function
   parameters frozen. Checkpoint stores were O(C * state) copies before that: 3.3 ms to 0.47 ms at K=100.
-- **Replay fingerprint.** The forward ItemProgram carries a hidden per-item uint32 hash of the final carries of
-  every top-level loop, computed with ordinary jaxpr operations. The adjoint receives the forward kernel's value
-  as an operand (the forward node is re-bound and XLA eliminates the common subexpression, which costs a few
-  percent) and compares it against its own replay. A mismatch makes every float cotangent of that call NaN. The
+- **Replay fingerprint.** Reverse mode uses a variant of the forward ItemProgram that carries a hidden per-item
+  uint32 hash of the final carries of every top-level loop, computed with ordinary jaxpr operations (a
+  forward-only call does not compute it: section 11). The adjoint receives the forward kernel's value as an
+  operand (the forward node is re-bound and XLA eliminates the common subexpression, which costs a few percent)
+  and compares it against its own replay. A mismatch makes every float cotangent of that call NaN. The
   adjoint uses the forward node's options, so the arithmetic is identical and there is no contraction anywhere.
   The negative control (a private option that runs the adjoint in `approx` math against an `ieee` forward) flags
   every item whose final state changes, 832 of 4096 on the toy walk. In every test and full-program run the
@@ -639,3 +640,82 @@ solves the same problem per thread. Here the lanes that need the work are gather
   synthetic switch over K phases inside a divergent loop, but no measurable change on any of the 13 benchmark
   problems, whose conds are unbatched or small. It does not clear the library's bar (a mechanism must buy 1.5x
   on a realistic workload), so it is not kept; all the gains above are the while-loop narrowing.
+
+## 11. Fixed rules ported from the `wavefront-state` branch (consolidation, 2026-11)
+
+`wavefront-state` was a private experimental branch driven by the shower engine's exact Geant4 port (DTRAX), with
+its levers behind environment variables. The ones that cleared the bar were re-implemented here as fixed rules: no
+environment variable, no option. Each paragraph gives the measurement that justified it and the `wavefront-state`
+commit it came from; the measurements are on that private engine.
+
+- **A structural digest, not `str(jaxpr)`, as the cache key** (wavefront `290f137`). The cuda kernel cache and the
+  eager-call cache keyed programs on the printed jaxpr, and JAX's pretty-printer builds a document tree per
+  equation: on DTRAX's mode-2 item that key cost 95.0 s per build on an A100 and 133.7 s on a 2080 Ti, more than
+  the trace and the emitter together. `_jaxpr.digest` hashes the same information into a sha256 without
+  materialising anything (4.22 s and 5.26 s; the cubin was unchanged): primitive names, operands numbered by first
+  appearance (alpha-equivalent jaxprs hash equal, as their printed forms are equal), output avals, every parameter
+  by value, sub-jaxprs recursively (each hashed once), and the exact bytes of every literal and of every nested
+  closed jaxpr's consts, which the printer rounds or omits and the emitter bakes into the kernel. The top-level
+  consts are keyed as before (by value in the kernel key, by identity in the eager key). `tests/invariants.py`
+  [key] checks that the real keys separate every pair, that a key made of the digest alone is caught by the same
+  pairs as the printed text, and the digest's own separation (alpha-equivalence, primitive, operand order, shape,
+  dtype, parameter, cond / while / scan structure, a literal one ulp apart).
+- **Diagnostics print the item jaxpr when read, not when bound** (wavefront `283b9e0`). `record_program` built
+  `str(jaxpr)` at every `tm.vmap` bind for `tm.diagnostics()['programs']`; on DTRAX that one call was 102 s of a
+  260 s fully cached build (cProfile, A100). The record now holds the jaxpr object, which the program being bound
+  keeps alive anyway, and `tm.diagnostics()` prints it.
+- **The replay fingerprint only where reverse mode reads it** (wavefront `501b2bd`, made automatic in `1f098b3`).
+  Every call computed the per-item fingerprint, a hash of every leaf of every top-level loop carry, although its
+  only consumer is reverse mode's replay check. Forward with it off, on an A100: a 16.8 KB per-item carry (the
+  faithful engine, 65,536 events) 4.354e7 -> 7.680e7 steps/s (+76%); DTRAX mode 3 +10.6%, with the cubin's local
+  frame 44,144 -> 29,136 bytes; 1.19-1.31x on cheap items. Now `tm.vmap` builds the program without it, and
+  `_primitive._vjp_call` asks for `ItemProgram.with_fp()`, which traces the fingerprinted variant once (derived
+  programs, `fold_prog` and `dual_lanes_prog`, derive it the same way from the base's variant). A call that is being
+  linearized (its operands are tracers of `jax.grad` / `jax.vjp`) is built with the fingerprint up front, so its
+  primal launch is the one the replay check re-binds and XLA merges the two; elsewhere reverse mode pays one extra
+  forward launch. A spawning program never builds it (its reverse mode, the tree adjoint, has its own check).
+  `tests/reverse.py`'s replay negative control (`_adj_math`) still makes the gradient NaN.
+- **A serial chain of 64-bit multiplies is cut every 8 links** (wavefront `41140a0`, `8337bb7`, merged in `58db0f2`).
+  NVVM is exponential in the depth of a dependency chain of 64-bit integer multiplies inside one function: on the
+  identical arithmetic (`cicc` alone) 0.2 s at depth 8, 0.7 s at 12, 127.3 s at 16, > 300 s at 20, while the same
+  multiplies without the dependency, a chain of 32-bit multiplies or a shift/xor mixer of the same size are free;
+  DTRAX's MixMax reseed is a 17-link chain. The emitter gives every value its chain depth (longest path counting one
+  per 64-bit multiply; a cond / loop body / call adds its own input-to-output depth after its own cuts) and passes a
+  scalar whose depth would exceed `codegen.MULCHAIN_K = 8` through `sj_brk`, an empty `asm` with the value tied in
+  and out, then restarts its depth. Cut every 1, 4 or 8 links the compile is 0.2 s at depths 16, 24 and 48; every
+  12 it is 2.2 s, every 16 125.6 s. The barrier is zero instructions (identical SASS, 928 == 928) and returns its
+  operand, so results are bitwise unchanged; the definitions are emitted only into kernels that use them, so every
+  other kernel's source is unchanged. Array-valued chain carriers are not cut (a chain through array slots did not
+  cliff). `tests/mulchain.py`: a 24-link chain compiles in seconds and matches lockstep bitwise.
+- **A lazy value used more than once is materialised when its expression is long** (prototype `TM_MAT_MULTI` in
+  the GDML calibration study's codegen patch, 2026-10-18). The emitter keeps one-use elementwise results and cheap
+  ops on large table gathers lazy (`op_table._ew_rule`, rules (a) and (b)), and a lazy value is re-inlined into
+  every consumer whatever its use count: on the GDML geometry kernel one equation became 543 kB of source.
+  Rule: a `Lazy` (or a `View` of one) used more than once in its jaxpr is computed into a local array when one
+  element's C expression is longer than `codegen.MAT_MULTI_CHARS = 200` characters. Measured with that threshold:
+  the GDML kernel's source 13.0 -> 7.5 MB. One-use values and short expressions stay lazy, so a large row gather
+  read in two places with a short expression keeps loading only the elements it reads.
+- **Pooled constant buffers are concatenated once** (wavefront `3732513`). `Emitter.fold_table` re-concatenated
+  its whole per-dtype pool at every folded table, O(K x S) in the number and total size of the folded tables,
+  although the pool is read once, when the kernel's buffers are laid out; `Emitter.flush_pools` now builds it
+  there. Same bytes in the same order, so the source and the cubin are unchanged; worth about a second of a 29 s
+  emitter on DTRAX's mode-2 item, which folds into few pools; a program that folds hundreds of tables pays the
+  quadratic term.
+- **Buffer assignment at loop and cond boundaries** (wavefront "v3", base commit `82d6ee2`, and "v5", `fbf2c5b`, as
+  ONE rule). v3: a `while` loop's initial carry array that is dead after the loop (the in-place liveness rule,
+  `Emitter.can_mutate`) and that no other operand of the loop reads IS the carry storage, so the init copy
+  disappears; a `cond` output array is written into the storage of a dead operand of the same shape and dtype
+  (destination passing), so a branch that passes the operand through or updates it in place copies nothing, and a
+  destination whose branch result reads another written destination falls back to a fresh array. v5: the same
+  when the value is lazy and reads that storage only at its own index (`Emitter.elementwise_self`, e.g. a
+  whole-array `jnp.where(p, a, x)`), which is then evaluated into the storage element by element; and a loop body
+  result of that kind is written straight back into its carry. Placement only: every element's expression is
+  unchanged, so results are bitwise unchanged. Measured on DTRAX's tape gate, L40S (M4, wavefront `a3b5107`):
+  with every buffer-assignment rule on 0.399 s and a 41,056-byte frame; v4, v5, v6 and scan-carry aliasing off
+  1.23x (v5 alone 1.21x) and 49,840 bytes; v3 off as well 1.59x (0.640 s) and 58,496 bytes, with the A/A spread
+  at most 1.8%. v4 (materialise the small lazy readers that block an in-place update) and scan-carry aliasing gave
+  an identical cubin and v6 (an elementwise result overwrites a dead operand) 0.98x, so they were not ported. On a
+  2080 Ti the same rules are 1.016x on DTRAX, and on the photon-transport engine (LUCiD) 0.97x (v3 never fires
+  there; +7 KB of frame). Not ported either: the base's other aliasing (`scatter` in place, a cond output that
+  every branch returns as the same live operand's storage), which no switch turned off and the measurement
+  therefore did not isolate.

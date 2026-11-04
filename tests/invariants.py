@@ -10,7 +10,8 @@ Sections (cell name prefixes):
   [key]    cache-key soundness: programs that differ only in a closed-over array's values, a closed-over Python
            scalar, dtype, shape, an option, max_steps or table contents never share a compiled program (one process,
            one fresh TALLYMAP_CUDA_CACHE).  NEGATIVE CONTROLS: the same pairs under a deliberately coarse key
-           (jaxpr text only / avals only) MUST be caught; the control cell PASSES when the stale reuse is detected.
+           (jaxpr text only / the real keys' structural digest only / avals only) MUST be caught; the control cell
+           PASSES when the stale reuse is detected.
   [tdep]   tangent-dependent control flow: a while loop whose trip count follows the tangent-carrying primal;
            lineax.CG under jacfwd (the _foreign.lanes_unsafe case; skipped without lineax).
   [size]   run-or-raise: dense solve / cholesky / qr and per-item carries on a size ladder either run and match
@@ -616,23 +617,59 @@ def _coarse_kernel_key(kind):
     def text_only(p, opts):                # the plan's "str()-only key": the jaxpr text, nothing else
         return ("NEG", str(p.cj.jaxpr))
 
+    def digest_only(p, opts):              # the real keys' structural part alone (_jaxpr.digest, no consts / options)
+        from tallymap._jaxpr import digest
+        return ("NEG", digest(p.cj.jaxpr))
+
     def avals_only(p, opts):               # operand / result avals and the tally layout: no program text at all
         return ("NEG", tuple((tuple(v.aval.shape), str(v.aval.dtype)) for v in p.cj.jaxpr.invars),
                 tuple((tuple(v.aval.shape), str(v.aval.dtype)) for v in p.cj.jaxpr.outvars),
                 tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.exact, s.kind) for s in p.tallies),
                 p.nP, p.nB, p.trunc, len(p.cj.consts))
-    return {"text": text_only, "avals": avals_only}[kind]
+    return {"text": text_only, "digest": digest_only, "avals": avals_only}[kind]
 
 
 # under the coarse key these pairs collide (same text / same avals) and MUST be caught
 NEG_EXPECT = {"text": {"closed-over array values", "table contents (closed-over 256 entries)",
                        "option cuda_math approx vs ieee"},
+              "digest": {"closed-over array values", "table contents (closed-over 256 entries)",
+                         "option cuda_math approx vs ieee"},
               "avals": {"closed-over array values", "table contents (closed-over 256 entries)",
                         "option cuda_math approx vs ieee", "closed-over Python scalar (1 ulp apart)",
                         "max_steps 8 vs 64"}}
 
 
-for _kind in ("text", "avals"):
+@case("[key] _jaxpr.digest: equal where str(jaxpr) is equal, different where it differs or a literal's bytes do",
+      ["lockstep"])
+def _(b):
+    from tallymap._jaxpr import digest
+    S, I = jax.ShapeDtypeStruct((4,), F), jax.ShapeDtypeStruct((), jnp.int32)
+    D = lambda f, *a: digest(jax.make_jaxpr(f)(*a).jaxpr)
+    base = lambda x: jnp.sum(x * x) + jnp.sin(x[0])
+    cnd = lambda k: (lambda n, x: lax.cond(n > 0, lambda a: a * k, lambda a: a + 1.0, x))
+    wh = lambda k: (lambda x: lax.while_loop(lambda c: c[0] < k, lambda c: c + 1.0, x))
+    a1 = float(np.nextafter(np.asarray(0.1, F), np.asarray(1.0, F)))
+    same_ = [("traced twice", D(base, S), D(base, S)),
+             ("alpha-equivalent", D(lambda x: (lambda a: a + a)(x * 2.0), S),
+              D(lambda x: (lambda zz: zz + zz)(x * 2.0), S)),
+             ("same cond body", D(cnd(2.0), I, S), D(cnd(2.0), I, S))]
+    differ = [("primitive", D(jnp.sin, S), D(jnp.cos, S)),
+              ("operand order", D(lambda x: x[0] - x[1], S), D(lambda x: x[1] - x[0], S)),
+              ("shape", D(base, S), D(base, jax.ShapeDtypeStruct((5,), F))),
+              ("dtype", D(base, S), D(base, jax.ShapeDtypeStruct((4,), jnp.int32))),
+              ("slice parameter", D(lambda x: lax.slice(x, (0,), (2,)), S), D(lambda x: lax.slice(x, (1,), (3,)), S)),
+              ("cond branch", D(cnd(2.0), I, S), D(cnd(3.0), I, S)),
+              ("while condition", D(wh(10.0), S), D(wh(11.0), S)),
+              ("scan length", D(lambda x: lax.scan(lambda c, _: (c + 1.0, c), x, length=3)[0], S),
+               D(lambda x: lax.scan(lambda c, _: (c + 1.0, c), x, length=4)[0], S)),
+              ("float literal 1 ulp apart", D(lambda x: x * 0.1, S), D(lambda x: x * a1, S))]
+    bad = [n for n, x, y in same_ if x != y] + [n for n, x, y in differ if x == y]
+    if bad:
+        raise Fail(f"digest wrong for {bad}")
+    return f"{len(same_)} equal, {len(differ)} different"
+
+
+for _kind in ("text", "digest", "avals"):
     @case(f"[key] NEGATIVE CONTROL: kernel key = {_kind} only must be caught (cuda _KERNELS)", ["cuda"])
     def _(b, kind=_kind):
         from tallymap.backends import cuda as CB

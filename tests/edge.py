@@ -955,6 +955,46 @@ def _(b):
     return "bitwise equal; in-place and copying cubins differ"
 
 
+@case("buffer assignment (while init alias, cond destination, lazy write-back) == copying cuda == lockstep", ["cuda"])
+def _(b):
+    """the dead initial carry IS the carry storage, the cond output is written into its dead operand (one branch
+    updates it in place, the other returns a lazy whole-array select over it: v5), and the lazy body result goes
+    straight back into the carry.  _cuda_inplace=False disables the liveness-based parts (the copying control)."""
+    import re
+
+    def item(t, x, key):
+        buf0 = jnp.zeros(32, F).at[0].set(x)                            # a per-item Local, dead after the loop
+
+        def body(c):
+            k, buf, t = c
+            j = (bits(key, k) % 32).astype(jnp.int32)
+            buf2 = lax.cond(k % 3 == 0, lambda q: q.at[j].add(1.0),
+                            lambda q: jnp.where(q > 0.5, q * 0.5, q + 0.25), buf)
+            t = t.add("C", j % NB, (buf2[j] > 0.75).astype(jnp.int32))
+            return k + 1, buf2 * 1.5 + x, t
+        k, buf, t = lax.while_loop(lambda c: c[0] < 9, body, (jnp.int32(0), buf0, t))
+        return t, buf
+    out = {"C": tm.Sum((NB,), jnp.int32)}
+    xs = (jnp.arange(N) % 7 * 0.125).astype(F)
+
+    def run(bk, **o):
+        tm.diagnostics(reset=True)
+        r = tm.vmap(item, outputs=out, backend=bk, **o)(xs, keys)
+        ks = tm.diagnostics()["kernels"]
+        src = open(ks[-1]["source"]).read() if ks else ""
+        return r, len(re.findall(r"\b(?:float|double) \w+\[32\];", src))
+    (ra, na), (rb, nb), (rl, _) = run("cuda"), run("cuda", _cuda_inplace=False), run("lockstep")
+    if not na < nb:
+        raise Fail(f"instrument: {na} 32-element arrays declared with buffer assignment, {nb} without")
+    for a, c in zip(jax.tree_util.tree_leaves(ra), jax.tree_util.tree_leaves(rb)):
+        if not np.array_equal(np.asarray(a), np.asarray(c)):
+            raise Fail("buffer-assigned cuda result differs from the copying cuda result")
+    if not np.array_equal(np.asarray(ra.outputs["C"]), np.asarray(rl.outputs["C"])):
+        raise Fail("integer tally differs from lockstep")
+    close(ra.per_item, rl.per_item, 1e-6, 0.0, "per-item vs lockstep")
+    return f"bitwise vs copying cuda; 32-element arrays declared {na} vs {nb}"
+
+
 @case("$CXX: a missing or wrong host C++ compiler is a tallymap error naming the variable and the fix",
       ["lockstep"])
 def _(b):

@@ -16,6 +16,7 @@ import numpy as np
 
 from ..._api import UnsupportedError
 from ..._compat import key_impl
+from ..._jaxpr import digest
 from . import compile as C
 from .codegen import CodegenError, is_key_dtype
 from .kernel import BLOCK, build_source
@@ -33,7 +34,8 @@ def _const_sig(c):
 
 
 def _key(p, opts):
-    return (str(p.cj.jaxpr), tuple(_const_sig(c) for c in p.cj.consts),
+    # the structural part is _jaxpr.digest (was str(p.cj.jaxpr): JAX's pretty-printer, 95 s per build on DTRAX)
+    return (digest(p.cj.jaxpr), tuple(_const_sig(c) for c in p.cj.consts),
             tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.exact, s.scale, s.kind) for s in p.tallies),
             p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), tuple(sorted(opts.items())))
 
