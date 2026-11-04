@@ -40,12 +40,6 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   and was 0.81x on the photon-transport engine at the same commit; its general form in the shower engine was
   0.50x / 0.77x on a 2080 Ti and hung once (`docs/design.md` section 1b). The inner-loop half (1.03-1.82x
   slower on four toys built for it) had already gone. No other kernel changes.
-- The dual-lanes local-memory guard (`_primitive.LANES_MAX_LOCAL`, `_taint_max`, `_largest_loop_array`) and the
-  `'force'` value of the private `_lanes` option, which only meant "ignore the guard" (`_lanes` takes `'off'` or
-  an int chunk size; any other value raises). The guard never fired on any toy-bench row (identical HLO with and
-  without it) nor on the photon-transport engine's 6- and 26-column `jacfwd` (largest lane-dependent loop array
-  54 / 117 elements against 512; identical CUDA source with it disabled). `MAX_LANES = 16` chunking is unchanged
-  (`docs/design.md` section 2).
 - `tm.compare` (with `criteria`, the private `_api._square_mode` and the re-tracer's `square=` hook). The frozen
   comparison is a test protocol, not an API: it moved to `tests/compare_protocol.py`, where `floor_fn` (the same
   item with every emitted value squared) is a required argument instead of a global trace mode. `tm.reference`

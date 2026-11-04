@@ -44,7 +44,7 @@ TH = jnp.array([0.9, 0.3], jnp.float32)
 WQ = jnp.linspace(0.5, 2.0, NB, dtype=jnp.float32)
 
 
-LANES = os.environ.get("LANES")        # private _lanes for every call: off | auto | <int chunk>
+LANES = os.environ.get("LANES")        # private _lanes for every call: off | auto | force | <int chunk>
 OPTS = {k: (int(v) if v.lstrip("-").isdigit() else {"False": False, "True": True}.get(v, v)) for k, v in
         (kv.split("=") for kv in os.environ.get("OPTS", "").split(",") if kv)}   # extra tm.vmap options: k=v,k=v
 

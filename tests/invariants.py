@@ -346,7 +346,7 @@ def _(b):
 
 
 LANE_VARIANTS = [("auto", {}), ("off", dict(_lanes="off")), ("chunk4", dict(_lanes=4)), ("chunk16", dict(_lanes=16)),
-                 ("one", dict(_lanes=64))]      # every lane in ONE kernel, past MAX_LANES
+                 ("force", dict(_lanes="force"))]
 
 
 def _chunk(b, T, opts):
