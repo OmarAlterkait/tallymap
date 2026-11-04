@@ -953,44 +953,70 @@ def _(b):
     return "bitwise equal; in-place and copying cubins differ"
 
 
-@case("buffer assignment (while init alias, cond destination, lazy write-back) == copying cuda == lockstep", ["cuda"])
+@case("buffer assignment (while init alias, cond destination, lazy write-back) == rule off == copying cuda == "
+      "lockstep", ["cuda"])
 def _(b):
     """the dead initial carry IS the carry storage, the cond output is written into its dead operand (one branch
     updates it in place, the other returns a lazy whole-array select over it: v5), and the lazy body result goes
-    straight back into the carry.  _cuda_inplace=False disables the liveness-based parts (the copying control)."""
+    straight back into the carry.  The loop is NESTED: a single top-level while is split into step functions whose
+    parameters are never mutated, where the rule (rightly) never fires.  Arms: the rule patched off (the control:
+    strictly more arrays must be declared without it), and _cuda_inplace=False (every liveness-based reuse off)."""
     import re
 
-    def item(t, x, key):
-        buf0 = jnp.zeros(32, F).at[0].set(x)                            # a per-item Local, dead after the loop
+    from tallymap import _primitive as _P
+    from tallymap.backends import cuda as CB
+    from tallymap.backends.cuda import codegen as CG
+    from tallymap.backends.cuda import op_table as OT
 
-        def body(c):
-            k, buf, t = c
-            j = (bits(key, k) % 32).astype(jnp.int32)
-            buf2 = lax.cond(k % 3 == 0, lambda q: q.at[j].add(1.0),
-                            lambda q: jnp.where(q > 0.5, q * 0.5, q + 0.25), buf)
-            t = t.add("C", j % NB, (buf2[j] > 0.75).astype(jnp.int32))
-            return k + 1, buf2 * 1.5 + x, t
-        k, buf, t = lax.while_loop(lambda c: c[0] < 9, body, (jnp.int32(0), buf0, t))
-        return t, buf
+    def item(t, x, key):
+        def outer(c):
+            m, acc, t = c
+            buf0 = jnp.zeros(32, F).at[0].set(x + m.astype(F))          # a per-item Local, dead after the loop
+
+            def body(c):
+                k, buf, t = c
+                j = (bits(key, k) % 32).astype(jnp.int32)
+                buf2 = lax.cond(k % 3 == 0, lambda q: q.at[j].add(1.0),
+                                lambda q: jnp.where(q > 0.5, q * 0.5, q + 0.25), buf)
+                t = t.add("C", j % NB, (buf2[j] > 0.75).astype(jnp.int32))
+                return k + 1, buf2 * 1.5 + x, t
+            k, buf, t = lax.while_loop(lambda c: c[0] < 9, body, (jnp.int32(0), buf0, t))
+            return m + 1, acc + buf, t
+        m, acc, t = lax.while_loop(lambda c: c[0] < 2, outer, (jnp.int32(0), jnp.zeros(32, F), t))
+        return t, acc
     out = {"C": tm.Sum((NB,), jnp.int32)}
     xs = (jnp.arange(N) % 7 * 0.125).astype(F)
 
-    def run(bk, **o):
-        tm.diagnostics(reset=True)
-        r = tm.vmap(item, outputs=out, backend=bk, **o)(xs, keys)
-        ks = tm.diagnostics()["kernels"]
+    def run(bk, off=False, **o):
+        saved = (OT._cond_dest, OT._init_alias, CG.Emitter.elementwise_self)
+        CB._KERNELS.clear()
+        _P._EAGER.clear()
+        if off:
+            OT._cond_dest = lambda em, eqn, ops, bodies: [None] * len(eqn.outvars)
+            OT._init_alias = lambda em, inits, ivars, pt, others: [None] * len(inits)
+            CG.Emitter.elementwise_self = lambda self, dst, x: False
+        try:
+            tm.diagnostics(reset=True)
+            r = tm.vmap(item, outputs=out, backend=bk, **o)(xs, keys)
+            ks = tm.diagnostics()["kernels"]
+        finally:
+            OT._cond_dest, OT._init_alias, CG.Emitter.elementwise_self = saved
+            CB._KERNELS.clear()
+            _P._EAGER.clear()
         src = open(ks[-1]["source"]).read() if ks else ""
         return r, len(re.findall(r"\b(?:float|double) \w+\[32\];", src))
-    (ra, na), (rb, nb), (rl, _) = run("cuda"), run("cuda", _cuda_inplace=False), run("lockstep")
-    if not na < nb:
-        raise Fail(f"instrument: {na} 32-element arrays declared with buffer assignment, {nb} without")
-    for a, c in zip(jax.tree_util.tree_leaves(ra), jax.tree_util.tree_leaves(rb)):
-        if not np.array_equal(np.asarray(a), np.asarray(c)):
-            raise Fail("buffer-assigned cuda result differs from the copying cuda result")
+    (ra, na), (ro, no), (rc, nc), (rl, _) = run("cuda"), run("cuda", off=True), run("cuda", _cuda_inplace=False), \
+        run("lockstep")
+    if not na < no:
+        raise Fail(f"instrument: {na} 32-element arrays declared with buffer assignment, {no} with the rule off")
+    for r_, what in ((ro, "rule-off"), (rc, "copying")):
+        for a, c in zip(jax.tree_util.tree_leaves(ra), jax.tree_util.tree_leaves(r_)):
+            if not np.array_equal(np.asarray(a), np.asarray(c)):
+                raise Fail(f"buffer-assigned cuda result differs from the {what} cuda result")
     if not np.array_equal(np.asarray(ra.outputs["C"]), np.asarray(rl.outputs["C"])):
         raise Fail("integer tally differs from lockstep")
     close(ra.per_item, rl.per_item, 1e-6, 0.0, "per-item vs lockstep")
-    return f"bitwise vs copying cuda; 32-element arrays declared {na} vs {nb}"
+    return f"bitwise vs rule-off and copying cuda; 32-element arrays declared {na} / rule off {no} / copying {nc}"
 
 
 @case("$CXX: a missing or wrong host C++ compiler is a tallymap error naming the variable and the fix",
