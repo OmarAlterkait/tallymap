@@ -660,11 +660,16 @@ class Emitter:
         off = pool[2]
         pool[1].append(a.ravel())
         pool[2] += a.size
-        self.consts[pool[0]] = ("static", None, np.concatenate(pool[1]))
         cast = "u8" if dt == np.bool_ else ctype(dt)
         t = Table(f"((const {cast}*)SJ_CONST({pool[0]}))", a.shape, dt, off=off)
         t.cnp = a
         return t
+
+    def flush_pools(self):
+        """write each pooled constant buffer into self.consts, concatenated ONCE (re-concatenating at every
+        fold_table was quadratic in the pool).  kernel.build_source calls it before reading self.consts."""
+        for pool in getattr(self, "_pools", {}).values():
+            self.consts[pool[0]] = ("static", None, np.concatenate(pool[1]))
 
     def _try_fold(self, eqn, ins):
         """All inputs compile-time known -> evaluate the primitive eagerly ON THE DEFAULT DEVICE (XLA's own kernels,

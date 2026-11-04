@@ -498,6 +498,7 @@ def build_source(p, *, block=BLOCK, split=True, inplace=True, events=False):
                       post=f"sj_post({', '.join(base_arg + post_args + ys_names)});",
                       disp="switch (sj_pc) { " + " ".join(f"case {k}: {c} break;" for k, c in enumerate(brs)) + " }",
                       tail=f"sj_tail({', '.join(base_arg + targs + nargs)}); {' '.join(upd)}", K=len(brs))
+    em.flush_pools()
     L.consts = list(em.consts)
     base_const = nP + nB
     nin = base_const + len(L.consts)

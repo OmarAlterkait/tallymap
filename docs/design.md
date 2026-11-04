@@ -695,3 +695,9 @@ commit it came from; the measurements are on that private engine.
   element's C expression is longer than `codegen.MAT_MULTI_CHARS = 200` characters. Measured with that threshold:
   the GDML kernel's source 13.0 -> 7.5 MB. One-use values and short expressions stay lazy, so a large row gather
   read in two places with a short expression keeps loading only the elements it reads.
+- **Pooled constant buffers are concatenated once** (wavefront `3732513`). `Emitter.fold_table` re-concatenated
+  its whole per-dtype pool at every folded table, O(K x S) in the number and total size of the folded tables,
+  although the pool is read once, when the kernel's buffers are laid out; `Emitter.flush_pools` now builds it
+  there. Same bytes in the same order, so the source and the cubin are unchanged; worth about a second of a 29 s
+  emitter on DTRAX's mode-2 item, which folds into few pools; a program that folds hundreds of tables pays the
+  quadratic term.
