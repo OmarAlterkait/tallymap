@@ -358,7 +358,8 @@ def dual_lanes_prog(p, T, bpi, bbc, shared=(0, 0)):
     vf = jax.vmap(lambda *a: list(f(*a)), in_axes=tuple(in_axes), out_axes=out_axes, axis_size=T)
     cj = _mk(vf, avals)
     tl = tuple(dataclasses.replace(s, lead=(T,) + tuple(s.lead)) if l else s for s, l in zip(p.tallies, lt))
-    return dataclasses.replace(p, cj=cj, tallies=tl, tag=p.tag + f"+dual_lanes{T}"), lt, ly
+    mk = None if p.mkfp is None else (lambda: dual_lanes_prog(p.with_fp(), T, bpi, bbc, shared)[0])   # (RV)
+    return dataclasses.replace(p, cj=cj, tallies=tl, tag=p.tag + f"+dual_lanes{T}", mkfp=mk), lt, ly
 
 
 # ------------------------------------------------------------------------------------------- jvp
@@ -442,6 +443,9 @@ def _vjp_call(node, base, pi, bc, U_pi, U_bc, cts, N):
     if base.spawn is not None:          # reverse through spawn: the tree adjoint (one adjoint launch per generation)
         from ._reverse_spawn import tree_vjp
         return tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N)
+    # (RV) the replay check needs the fingerprint, which a forward-only program does not compute: take the variant
+    # that has it (the extra per-item result is the last and uint32, so `cts` and every index below still line up)
+    base = base.with_fp()
     ot, tf, yf = _float_slots(base)
     nt = len(ot)
     ya = base.y_avals()
@@ -815,7 +819,8 @@ def fold_prog(p, B, bbc):
     bav = [jax.ShapeDtypeStruct((B,) + tuple(a.shape), a.dtype) if f else _sds(a) for a, f in zip(av[nT + nP:], bbc)]
     cj = _mk(item, tav + pav + [jax.ShapeDtypeStruct((), jnp.int32)] + bav)
     tl = tuple(dataclasses.replace(s, S=B * s.S) for s in p.tallies)
-    return dataclasses.replace(p, cj=cj, tallies=tl, nP=nP + 1, tag=p.tag + f"+folded_batch{B}")
+    mk = None if p.mkfp is None else (lambda: fold_prog(p.with_fp(), B, bbc))     # (RV) derived the same way
+    return dataclasses.replace(p, cj=cj, tallies=tl, nP=nP + 1, tag=p.tag + f"+folded_batch{B}", mkfp=mk)
 
 
 def _fold_batch(node, args, dims, bat, B):

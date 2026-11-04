@@ -71,6 +71,9 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   section 11).
 - `tm.diagnostics()` builds the item jaxpr's text when it is called, not at every bind (102 s of a 260 s cached
   build on a large engine item). The returned record is unchanged.
+- A forward-only call (primal, `jvp`, `jacfwd`, a folded batch) no longer computes the per-item replay
+  fingerprint; reverse mode builds the fingerprinted program when it needs it, so the replay check is unchanged.
+  +76% forward on an engine item with a 16.8 KB loop carry, 1.19-1.31x on cheap items.
 
 - The cuda kernel claims ONE item per warp-aggregated claim. It used to claim a run of up to
   `clamp(N / (16 * grid * block), 1, 16)` items per lane, which left the last claims holding several items each

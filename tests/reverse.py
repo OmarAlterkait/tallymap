@@ -758,6 +758,60 @@ def _(b):
             "gradient NaN (also without rev_stats)")
 
 
+@case("REPLAY CHECK on demand: forward builds no fingerprint; grad(vmap) builds it (NEGATIVE CONTROL -> NaN)")
+def _(b):
+    """the fingerprint is built only for reverse mode.  jax.grad of a direct call is linearized, so its program
+    carries it from the start; under jax.grad(jax.vmap(...)) the call is traced by vmap, so a forward-only program
+    (folded or mapped by the batching rule) reaches _vjp_call and must get it there (ItemProgram.with_fp, derived
+    through fold_prog): same gradient as per member, and on cuda the replay negative control must still poison it."""
+    from tallymap import _diagnostics as D
+    NB, n, B = 16, 1024, 2
+
+    def item(t, x):
+        def body(c):
+            k, y, w, t = c
+            y2 = y + 0.013 * jnp.sqrt(y + 0.1) / (x + 0.37) + 0.001 * jnp.sin(37.0 * y)
+            return k + 1, y2, w * 0.999, t.add("Q", (k * 7) % NB, w * y2)
+        k, y, w, t = lax.while_loop(lambda c: (c[1] < 3.0) & (c[0] < 5000), body, (0, x * 0.5, x, t))
+        return t, (k, y)
+    xs = jnp.stack([jnp.linspace(0.11, 1.9, n), jnp.linspace(0.2, 1.7, n)]).astype(F)
+    wq = jnp.cos(jnp.arange(B * NB)).astype(F).reshape(B, NB)
+    o = dict(cuda_math="ieee") if b == "cuda" else {}
+    progs, rec = [], D.record_program
+    D.record_program = lambda p: (progs.append(p), rec(p))[1]
+
+    def fps(fn, *a):
+        del progs[:]
+        jax.block_until_ready(fn(*a))
+        return [p.fp for p in progs]
+    try:
+        f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend=b, **o)
+        Lb = lambda x2: jnp.sum(jax.vmap(lambda x: f(x).outputs["Q"])(x2) * wq)
+        fwd_fp = fps(jax.jit(lambda x2: jax.vmap(lambda x: f(x).outputs["Q"])(x2)), xs)
+        gv = jax.jit(jax.grad(Lb))
+        gv_fp = fps(gv, xs)
+        g = np.asarray(gv(xs))
+        gm = [jax.jit(jax.grad(lambda x, m=m: jnp.sum(f(x).outputs["Q"] * wq[m]))) for m in range(B)]
+        gm_fp = fps(gm[0], xs[0])
+        ref = np.stack([np.asarray(gm[m](xs[m])) for m in range(B)])
+    finally:
+        D.record_program = rec
+    if not fwd_fp or not gv_fp or any(x is not None for x in fwd_fp + gv_fp):
+        raise Fail(f"a program traced outside linearization computes the fingerprint: fwd {fwd_fp}, grad(vmap) {gv_fp}")
+    if not gm_fp or any(x is None for x in gm_fp):
+        raise Fail(f"jax.grad's program was not built with the fingerprint up front: {gm_fp}")
+    if not np.isfinite(g).all():
+        raise Fail("grad(vmap) gradient not finite")
+    msg = close(dict(g=g), dict(g=ref), "grad(vmap) vs per-member grad")
+    if b == "cuda" and not X64:
+        fn = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend=b, cuda_math="ieee", _adj_math="approx")
+        Ln = lambda x2: jnp.sum(jax.vmap(lambda x: fn(x).outputs["Q"])(x2) * wq)
+        if not np.isnan(np.asarray(jax.jit(jax.grad(Ln))(xs))).all():
+            raise Fail("NEGATIVE CONTROL: the on-demand fingerprint did not poison the grad(vmap) gradient")
+        msg += "; NEGATIVE CONTROL NaN"
+    return "fwd / grad(vmap) programs without fingerprint, grad with; " + msg
+
+
 print("\n================ SUMMARY", jax.__version__, "x64" if X64 else "", jax.devices()[0].device_kind)
 for n, b, m in RES:
     print(f"{n:58s} {b:8s} {m[:200]}")

@@ -283,10 +283,11 @@ error) turn every affected cell into a failure, which is how the matrix is known
 - **In-place updates.** The CUDA emitter updates a dead per-item array in place in `dynamic_update_slice`, using
   liveness over all active scopes, with loop constants, pass-through carries, predicate inputs and function
   parameters frozen. Checkpoint stores were O(C * state) copies before that: 3.3 ms to 0.47 ms at K=100.
-- **Replay fingerprint.** The forward ItemProgram carries a hidden per-item uint32 hash of the final carries of
-  every top-level loop, computed with ordinary jaxpr operations. The adjoint receives the forward kernel's value
-  as an operand (the forward node is re-bound and XLA eliminates the common subexpression, which costs a few
-  percent) and compares it against its own replay. A mismatch makes every float cotangent of that call NaN. The
+- **Replay fingerprint.** Reverse mode uses a variant of the forward ItemProgram that carries a hidden per-item
+  uint32 hash of the final carries of every top-level loop, computed with ordinary jaxpr operations (a
+  forward-only call does not compute it: section 11). The adjoint receives the forward kernel's value as an
+  operand (the forward node is re-bound and XLA eliminates the common subexpression, which costs a few percent)
+  and compares it against its own replay. A mismatch makes every float cotangent of that call NaN. The
   adjoint uses the forward node's options, so the arithmetic is identical and there is no contraction anywhere.
   The negative control (a private option that runs the adjoint in `approx` math against an `ieee` forward) flags
   every item whose final state changes, 832 of 4096 on the toy walk. In every test and full-program run the
@@ -663,3 +664,14 @@ commit it came from; the measurements are on that private engine.
   `str(jaxpr)` at every `tm.vmap` bind for `tm.diagnostics()['programs']`; on DTRAX that one call was 102 s of a
   260 s fully cached build (cProfile, A100). The record now holds the jaxpr object, which the program being bound
   keeps alive anyway, and `tm.diagnostics()` prints it.
+- **The replay fingerprint only where reverse mode reads it** (wavefront `501b2bd`, made automatic in `1f098b3`).
+  Every call computed the per-item fingerprint, a hash of every leaf of every top-level loop carry, although its
+  only consumer is reverse mode's replay check. Forward with it off, on an A100: a 16.8 KB per-item carry (the
+  faithful engine, 65,536 events) 4.354e7 -> 7.680e7 steps/s (+76%); DTRAX mode 3 +10.6%, with the cubin's local
+  frame 44,144 -> 29,136 bytes; 1.19-1.31x on cheap items. Now `tm.vmap` builds the program without it, and
+  `_primitive._vjp_call` asks for `ItemProgram.with_fp()`, which traces the fingerprinted variant once (derived
+  programs, `fold_prog` and `dual_lanes_prog`, derive it the same way from the base's variant). A call that is being
+  linearized (its operands are tracers of `jax.grad` / `jax.vjp`) is built with the fingerprint up front, so its
+  primal launch is the one the replay check re-binds and XLA merges the two; elsewhere reverse mode pays one extra
+  forward launch. A spawning program never builds it (its reverse mode, the tree adjoint, has its own check).
+  `tests/reverse.py`'s replay negative control (`_adj_math`) still makes the gradient NaN.
