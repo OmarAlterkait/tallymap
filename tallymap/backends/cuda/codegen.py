@@ -572,6 +572,27 @@ class Emitter:
                     return False
         return True
 
+    def elementwise_self(self, dst, x):
+        """may the lazy value `x` be written into `dst`'s storage in place?  Yes when x's element expression reads
+        that storage only at its own index: `dst[i] = f(.., dst[i])` then gives every element the value a copy
+        through a temporary would (no element depends on another element of dst).  Placement only."""
+        if (isinstance(x, (Table, VTally, Local)) or x is None or not isinstance(dst, Local)
+                or tuple(getattr(x, "shape", ())) != tuple(dst.shape) or np.dtype(x.dtype) != np.dtype(dst.dtype)):
+            return False
+        sym = [f"_q{k}" for k in range(len(dst.shape))]
+        saved = (self.lines, self.ind, self.uid)
+        try:
+            self.lines = []
+            t, own = elem(x, sym), elem(dst, sym)
+        except Exception:
+            return False
+        finally:
+            self.lines, self.ind, self.uid = saved
+        if own not in t:
+            return False
+        import re
+        return re.search(r"(?<![A-Za-z0-9_])" + re.escape(dst.name) + r"(?![A-Za-z0-9_])", t.replace(own, "")) is None
+
     def run_top(self, cj, args, fn):
         """Run a top-level ClosedJaxpr: concrete scalar consts become literals, every other const (arrays, and
         tracers closed over from an enclosing trace) is a dynamic kernel input."""

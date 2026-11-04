@@ -701,3 +701,21 @@ commit it came from; the measurements are on that private engine.
   there. Same bytes in the same order, so the source and the cubin are unchanged; worth about a second of a 29 s
   emitter on DTRAX's mode-2 item, which folds into few pools; a program that folds hundreds of tables pays the
   quadratic term.
+- **Buffer assignment at loop and cond boundaries** (wavefront "v3", base commit `82d6ee2`, and "v5", `fbf2c5b`, as
+  ONE rule). v3: a `while` loop's initial carry array that is dead after the loop (the in-place liveness rule,
+  `Emitter.can_mutate`) and that no other operand of the loop reads IS the carry storage, so the init copy
+  disappears; a `cond` output array is written into the storage of a dead operand of the same shape and dtype
+  (destination passing), so a branch that passes the operand through or updates it in place copies nothing, and a
+  destination whose branch result reads another written destination falls back to a fresh array. v5: the same
+  when the value is lazy and reads that storage only at its own index (`Emitter.elementwise_self`, e.g. a
+  whole-array `jnp.where(p, a, x)`), which is then evaluated into the storage element by element; and a loop body
+  result of that kind is written straight back into its carry. Placement only: every element's expression is
+  unchanged, so results are bitwise unchanged. Measured on DTRAX's tape gate, L40S (M4, wavefront `a3b5107`):
+  with every buffer-assignment rule on 0.399 s and a 41,056-byte frame; v4, v5, v6 and scan-carry aliasing off
+  1.23x (v5 alone 1.21x) and 49,840 bytes; v3 off as well 1.59x (0.640 s) and 58,496 bytes, with the A/A spread
+  at most 1.8%. v4 (materialise the small lazy readers that block an in-place update) and scan-carry aliasing gave
+  an identical cubin and v6 (an elementwise result overwrites a dead operand) 0.98x, so they were not ported. On a
+  2080 Ti the same rules are 1.016x on DTRAX, and on the photon-transport engine (LUCiD) 0.97x (v3 never fires
+  there; +7 KB of frame). Not ported either: the base's other aliasing (`scatter` in place, a cond output that
+  every branch returns as the same live operand's storage), which no switch turned off and the measurement
+  therefore did not isolate.

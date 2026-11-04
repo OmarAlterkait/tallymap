@@ -80,6 +80,10 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 - cuda: a lazily inlined value used more than once is computed once into a local array when its element expression
   is longer than 200 characters, instead of being re-inlined into every consumer (a geometry kernel's source
   13.0 -> 7.5 MB).
+- cuda buffer assignment: a `while` loop's dead initial carry array becomes the carry storage, and a `cond` output
+  is written into a dead operand of the same shape (also when the value is lazy and reads that storage only at its
+  own index), so neither is copied. Placement only, results bitwise unchanged; 1.59x on a large engine item on an
+  L40S (`docs/design.md` section 11).
 
 - The cuda kernel claims ONE item per warp-aggregated claim. It used to claim a run of up to
   `clamp(N / (16 * grid * block), 1, 16)` items per lane, which left the last claims holding several items each
