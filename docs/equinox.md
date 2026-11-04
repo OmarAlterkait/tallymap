@@ -201,6 +201,8 @@ emit, after every autodiff rule has been applied, so the derivative is JAX's own
   substitution loop (`tallymap/_foreign.py`).  Measured against straight-line versions on a 2080 Ti
   (`jnp.linalg.solve` of n = 3 / 6 / 12 inside 1M items): faster in 8 of 9 cells (forward, grad, jacfwd) and 9%
   slower in one.
+* `qr` (behind `jnp.linalg.qr`, and `lineax.QR` on Lineax 0.0.x) becomes JAX's own lowering onto `geqrf` and
+  `householder_product` (Q's first columns: `ormqr` applied to the identity); without this it raised on cuda.
 * `cholesky`, `geqrf` and `ormqr`, which JAX has no pure-JAX form of, are textbook unblocked algorithms with
   LAPACK's conventions, unrolled in Python (`tallymap/backends/cuda/dense.py`).  MEASURED against LAPACK through
   `jax.lax.linalg` itself, in float32 and float64, for 1x1 to 16x16 and three rectangular shapes: the factors and

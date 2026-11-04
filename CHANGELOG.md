@@ -8,6 +8,9 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Added
 
+- cuda: `jnp.linalg.qr` inside an item (JAX's own `qr` lowering onto `geqrf` + a new `householder_product`
+  rule); it raised `UnsupportedError` before. Found by the first CI run with the Equinox family installed
+  (`lineax.QR` / `optimistix` least squares on Lineax 0.0.8, JAX 0.5.3).
 - `benchmarks/compile_scaling.py`: NVRTC compile time, generated source size, registers and per-thread
   local memory against the SIZE of one item, with and without `jacfwd` lanes. The cuda emitter inlines the
   whole item into one kernel, so for a large item the compile time is the size of that one function, and

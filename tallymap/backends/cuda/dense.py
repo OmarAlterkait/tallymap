@@ -17,6 +17,7 @@ These are textbook unblocked algorithms with LAPACK's conventions, not a reimple
 | `cholesky`                 | Cholesky-Banachiewicz, by column | the lower factor; the strict upper is ZERO |
 | `geqrf`                    | Householder `geqr2` / `larfg`    | R above the diagonal, v below, `taus` as `larfg` |
 | `ormqr`                    | the reflectors applied in turn   | Q = H_0 ... H_(k-1), H_j = I - tau_j v_j v_j^T |
+| `householder_product`      | `ormqr` applied to the identity  | Q's first n columns (JAX lowers `qr` onto it) |
 
 XLA leaves `cholesky`'s strict upper triangle unspecified, so zero is as good a choice as any; every caller in
 JAX masks it.
@@ -104,6 +105,12 @@ def ormqr(a, taus, c, *, left, transpose):
     return c
 
 
-FUNCS = {"cholesky": cholesky, "geqrf": geqrf, "ormqr": ormqr}
+def householder_product(a, taus):
+    """-> the first n columns of Q (m x n), Q the reflectors of `geqrf` in a, as lax.linalg.householder_product."""
+    m, n = a.shape
+    return ormqr(a, taus, jnp.eye(m, n, dtype=a.dtype), left=True, transpose=False)
+
+
+FUNCS = {"cholesky": cholesky, "geqrf": geqrf, "ormqr": ormqr, "householder_product": householder_product}
 # ndim of each operand WITHOUT a batch axis: op_table.py reads one extra leading axis as a batch and maps over it
-OPERAND_NDIM = {"cholesky": (2,), "geqrf": (2,), "ormqr": (2, 1, 2)}
+OPERAND_NDIM = {"cholesky": (2,), "geqrf": (2,), "ormqr": (2, 1, 2), "householder_product": (2, 1)}

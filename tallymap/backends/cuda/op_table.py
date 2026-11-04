@@ -1593,7 +1593,7 @@ def _rseed(em, eqn, ins, impl):
 # =============================================================================== small dense linear algebra
 # XLA lowers these to cuSOLVER / cuBLAS custom calls, which a kernel cannot make.  dense.py holds the algorithms
 # as plain JAX; each rule traces the one for this equation on its avals and emits the resulting jaxpr.
-@rule("cholesky", "geqrf", "ormqr")
+@rule("cholesky", "geqrf", "ormqr", "householder_product")
 def _dense(em, eqn, ins, **p):
     from . import dense
     name = eqn.primitive.name

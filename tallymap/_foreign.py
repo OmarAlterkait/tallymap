@@ -82,7 +82,7 @@ NAMES = (
 LATE_NAMES = NAMES + (
     "linear_solve",                                    # lineax/_solve.py (an equinox "vprim")
     "vprim",                                           # equinox/internal/_primitive.py: a vprim under vmap
-    "lu", "lu_pivots_to_permutation", "custom_linear_solve", "triangular_solve",   # JAX's own (module docstring)
+    "lu", "lu_pivots_to_permutation", "custom_linear_solve", "triangular_solve", "qr",   # JAX's own (module docstring)
 )
 
 # name -> what to tell the user, appended to the UnsupportedError.  These are foreign primitives whose impl is

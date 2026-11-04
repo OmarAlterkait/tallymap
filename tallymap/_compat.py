@@ -149,6 +149,9 @@ def jax_generic_linalg():
         out["lu"] = lambda x: L._lu_python(x)
         out["lu_pivots_to_permutation"] = (
             lambda swaps, permutation_size: L._generic_lu_pivots_to_permutation(swaps, permutation_size))
+        # jnp.linalg.qr (lineax.QR on 0.0.x): geqrf + householder_product, both cuda rules (pivoting binds geqp3,
+        # which stays unsupported)
+        out["qr"] = lambda a, **p: L._qr_lowering(a, **p)
     except (ImportError, AttributeError):            # pragma: no cover
         pass
     return out
