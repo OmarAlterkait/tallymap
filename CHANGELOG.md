@@ -69,6 +69,8 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   (`_jaxpr.digest`) instead of its printed text. JAX's pretty-printer cost 95 s per build on a large engine item
   (4.2 s with the digest); the digest also separates literal values the printer rounds (`docs/design.md`
   section 11).
+- `tm.diagnostics()` builds the item jaxpr's text when it is called, not at every bind (102 s of a 260 s cached
+  build on a large engine item). The returned record is unchanged.
 
 - The cuda kernel claims ONE item per warp-aggregated claim. It used to claim a run of up to
   `clamp(N / (16 * grid * block), 1, 16)` items per lane, which left the last claims holding several items each

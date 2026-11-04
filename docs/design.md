@@ -659,3 +659,7 @@ commit it came from; the measurements are on that private engine.
   [key] checks that the real keys separate every pair, that a key made of the digest alone is caught by the same
   pairs as the printed text, and the digest's own separation (alpha-equivalence, primitive, operand order, shape,
   dtype, parameter, cond / while / scan structure, a literal one ulp apart).
+- **Diagnostics print the item jaxpr when read, not when bound** (wavefront `283b9e0`). `record_program` built
+  `str(jaxpr)` at every `tm.vmap` bind for `tm.diagnostics()['programs']`; on DTRAX that one call was 102 s of a
+  260 s fully cached build (cProfile, A100). The record now holds the jaxpr object, which the program being bound
+  keeps alive anyway, and `tm.diagnostics()` prints it.
