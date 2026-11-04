@@ -841,10 +841,9 @@ def _(b):
     return f"no dual lanes; vs jvp columns {m1}; vs jax {m2}"
 
 
-@case("[tdep] lineax.CG under jacfwd, dual lanes FORCED (lanes_unsafe bypassed)",
-      xfail={"cuda": "plan section 4 / _foreign.lanes_unsafe: NaN in lanes 2..T on cuda.  Hypothesis: dual lanes "
-                     "assume control flow does not depend on the tangents, and CG's tangent solve is an iterative "
-                     "solve whose loop condition reads the (laned) tangent residual"})
+# Was XFAIL on cuda (plan section 4: NaN in lanes 2..T).  It does not reproduce: MEASURED 2026-11-04, bitwise equal to
+# the jvp columns on an L40S and a 2080 Ti, JAX 0.5.3 and 0.11.2.  So this cell now pins that forced lanes are right.
+@case("[tdep] lineax.CG under jacfwd, dual lanes FORCED (lanes_unsafe bypassed)")
 def _(b):
     real = _FO.lanes_unsafe
     _FO.lanes_unsafe = lambda cj: False

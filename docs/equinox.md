@@ -158,7 +158,9 @@ not use tallymap's dual tangent lanes under `jacfwd`.  Batching the item turns t
 Equinox's batched `_vprim_p`, and MEASURED on an L40S a `lineax.CG` solve then gives NaN in every lane but the
 first on the cuda backend (the same iteration written by hand is right, and so is a `lineax.LU` solve, which has
 no loop inside the primitive).  tallymap therefore runs such a program one lane at a time, which is measured to
-be right; `tallymap/_foreign.lanes_unsafe` is the rule and says so.
+be right; `tallymap/_foreign.lanes_unsafe` is the rule and says so.  The NaN no longer reproduces on the test
+suite's `lineax.CG` case (MEASURED 2026-11-04, L40S and 2080 Ti, JAX 0.5.3 and 0.11.2), so the rule may go once a
+larger case is measured.
 
 The lockstep backend (`backend='lockstep'`, and the default off a GPU) runs every JAX primitive, so the rows above
 that are only a kernel restriction - the callbacks, `noinline`, the dense limit - do work there.  The autodiff rows

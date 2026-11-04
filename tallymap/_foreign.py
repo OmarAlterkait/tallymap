@@ -223,6 +223,10 @@ def lanes_unsafe(cj):
     lane, and so is a `lineax.LU` solve (a vprim with no loop).  Until that is understood, a program with a
     batched vprim runs one lane at a time, which is MEASURED to be right on both backends.  The cost is
     performance, and only for `jacfwd` of an item that calls a Lineax or Optimistix solver.
+
+    2026-11-04: the NaN does NOT reproduce on tests/invariants.py's lineax.CG cell with this rule bypassed (bitwise
+    equal to the jvp columns on an L40S and a 2080 Ti, JAX 0.5.3 and 0.11.2).  The rule stays until the original
+    case is found or a larger one is measured.
     """
     from ._jaxpr import contains
     return contains(cj.jaxpr, ("vprim",))
