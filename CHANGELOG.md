@@ -46,6 +46,10 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   without it) nor on the photon-transport engine's 6- and 26-column `jacfwd` (largest lane-dependent loop array
   54 / 117 elements against 512; identical CUDA source with it disabled). `MAX_LANES = 16` chunking is unchanged
   (`docs/design.md` section 2).
+- `tm.compare` (with `criteria`, the private `_api._square_mode` and the re-tracer's `square=` hook). The frozen
+  comparison is a test protocol, not an API: it moved to `tests/compare_protocol.py`, where `floor_fn` (the same
+  item with every emitted value squared) is a required argument instead of a global trace mode. `tm.reference`
+  is unchanged.
 - `tm.Sum(..., tangent_scale=)`, the fixed-point scale of the TANGENT tally of an `exact=True` output. Nothing
   in the tests, benchmarks, examples or documentation ever set it and no number was ever recorded for it; a
   tangent tally now always uses its primal output's `scale`, which is what every program that did not set it

@@ -105,7 +105,7 @@ adaptive:
 | diffrax, `Kvaerno3` / `Kvaerno5` + PID | up to 7.8e-6 | up to 3.8e-6 |
 
 Gradients, where plain JAX can take one to compare with, agree with `jax.grad(jax.vmap(f))` to between 0 and
-2.3e-6.  Use `tallymap.compare` if you need a statistical statement about a particular program.
+2.3e-6.  For a statistical statement about a particular program, use the `compare` protocol (`docs/validation.md`).
 
 ## The adjoint
 

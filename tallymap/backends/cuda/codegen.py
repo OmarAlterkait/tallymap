@@ -15,7 +15,7 @@ explicit round-to-nearest intrinsics, no FMA contraction), C loops / ifs for
 while / cond / scan, address arithmetic + loads for gathers from tables.
 
 Float semantics: IEEE-754 round-to-nearest +,-,*,/,sqrt, no FMA contraction; transcendentals call the CUDA
-math library (libdevice).  Results agree with XLA only statistically (see tallymap.compare), never bitwise by design.
+math library (libdevice).  Results agree with XLA only statistically (see docs/validation.md), never bitwise by design.
 """
 
 import jax

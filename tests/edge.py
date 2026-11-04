@@ -723,13 +723,25 @@ def _(b):
     close(jax.jit(jax.hessian(loss(f)))(p), Hr, what="hessian")
 
 
-@case("tm.compare: cuda vs lockstep (CRN, ulp control, Poisson floor)", ["cuda"])
+@case("compare protocol (tests/compare_protocol.py): cuda vs lockstep (CRN, ulp control, Poisson floor)",
+      ["cuda"])
 def _(b):
+    from compare_protocol import compare
+
+    def walk_sq(t, x, key, tab, th):               # the floor run: walk with every emitted value squared
+        def body(c):
+            k, w, t = c
+            i = (bits(key, k) % NB).astype(jnp.int32)
+            v = w * tab[i] * th
+            t = t.add("Q", i, v * v)
+            return k + 1, w * (0.7 + 0.2 * th), t
+        k, w, t = lax.while_loop(lambda c: (bits(key, c[0] + 1000) % 5 != 0) | (c[0] == 0), body, (0, x, t))
+        return t, (w, k)
     n = 1 << 14
     x2 = jnp.linspace(0.1, 3.0, n).astype(F)
     k2 = jax.random.split(jax.random.PRNGKey(7), n)
-    ok, rep = tm.compare(V(walk, "cuda", in_axes=AX), x2, k2, tab, TH, other=V(walk, "lockstep", in_axes=AX),
-                         verbose=False)
+    ok, rep = compare(V(walk, "cuda", in_axes=AX), x2, k2, tab, TH, other=V(walk, "lockstep", in_axes=AX),
+                      floor_fn=V(walk_sq, "lockstep", in_axes=AX), verbose=False)
     if not ok:
         raise Fail(str(rep))
     return f"flip {rep['flip_rate']:.2e} (ctrl {rep['flip_rate_control']:.2e}); rms_z {rep['Q']['rms_z']:.2e}"

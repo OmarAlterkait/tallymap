@@ -45,12 +45,13 @@ used to answer a B question.
 
 ## The `compare` criterion
 
-`tm.compare(f, *args, other=...)` compares two implementations of the same item program, for example
-`backend='cuda'` against `backend='lockstep'`, on the same per-item keys. It is a statistical test, not an
+`compare(f, *args, other=..., floor_fn=...)` in `tests/compare_protocol.py` compares two implementations of the
+same item program, for example `backend='cuda'` against `backend='lockstep'`, on the same per-item keys. It is a
+test protocol, not library API; `tests/edge.py` runs it on the CUDA backend. It is a statistical test, not an
 equality check, because the two backends do not produce bitwise identical f32 sums by design
 (`docs/float_semantics.md`).
 
-Its three legs, all required, are in `tallymap/_compare.py::criteria()` and are frozen:
+Its three legs, all required, are in `tests/compare_protocol.py::criteria()` and are frozen:
 
 | leg | bound |
 |---|---|
@@ -58,8 +59,8 @@ Its three legs, all required, are in `tallymap/_compare.py::criteria()` and are 
 | `rms_z` | at most 3 x the control's `rms_z` + 0.05 |
 | `max_z` | at most `max(5, 2 x` the control's `max_z)` |
 
-where `z` per bin is `|f - other| / sqrt(sum w^2 + median_over_hit_bins(sum w^2))`, the floor coming from a
-square-mode run in which every emitted value is squared. The **control** is `other` run on float inputs
+where `z` per bin is `|f - other| / sqrt(sum w^2 + median_over_hit_bins(sum w^2))`, the floor coming from
+`floor_fn`, the same item program with every emitted value squared. The **control** is `other` run on float inputs
 perturbed by one unit in the last place: it measures how much the same program moves under a perturbation that
 should not matter, and every bound is relative to it. Bins hit by `f` but never by the floor run are reported
 (`empty_bin_mismatch`) and not judged; that hole was stated in advance and is still there.

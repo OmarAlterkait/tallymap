@@ -116,7 +116,7 @@ derivatives with spawn give children tangents for every float per-item leaf. Rev
 - One CUDA emitter: IEEE round-to-nearest arithmetic without fused-multiply-add contraction, transcendental
   functions from the CUDA math library, and the `cuda_math` choice for f32 division, square root and reciprocal
   square root (`docs/float_semantics.md`). The CUDA and lockstep backends agree statistically, not bitwise;
-  `tm.compare` is the contract (`docs/validation.md`).
+  the `compare` protocol is the contract (`docs/validation.md`).
 - `backend='auto'`: CUDA on a GPU; a program the emitter does not support raises `UnsupportedError` there unless
   `allow_fallback=True`, in which case lockstep runs with a warning, because a silent change to the reference
   interpreter is a silent factor-of-100 slowdown. On every other platform it is lockstep with a one-time warning.
@@ -342,6 +342,10 @@ independent workloads), both covered below; `Sum(tangent_scale=)`, which nothing
 cost-decomposition options (`_rev_phase`, `_tree_phase`), which produced wrong gradients on purpose and which no
 test used -- the decompositions they produced are quoted in section 6. The fold rule is one comparison against
 the device's resident-thread count and no longer consults the kernel's privatisation rule at all (section 2).
+
+Removed from the public namespace before the first release (an API decision, so no measurement is involved):
+`tm.compare`, with `criteria` and the square mode of the re-tracer that produced its floor run. Its frozen thresholds are a test protocol rather than an API, and one test used it; it is now
+`tests/compare_protocol.py`, where the floor run is the same item with squared emits, written by the caller.
 
 Dual-lanes chunking, measured on the shower-shaped program: one kernel with T lanes cost 1.34, 1.99, 2.27 and
 2.57 times the forward pass for T = 1 to 4, but 14, 23 and 32 times for T = 6, 8 and 10. Chunking into the

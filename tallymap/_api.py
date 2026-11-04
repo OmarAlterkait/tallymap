@@ -196,17 +196,6 @@ def jvp_prog(p, pert_pi, pert_bc):
 
 # ------------------------------------------------------------------------------------------- dispatch
 _WARNED = set()
-_SQUARE = [False]
-
-
-class _square_mode:
-    """tallymap.compare only: trace tallymap.vmap functions with every emitted value squared (per-bin sum of w^2)."""
-
-    def __enter__(self):
-        _SQUARE[0] = True
-
-    def __exit__(self, *a):
-        _SQUARE[0] = False
 
 
 def _out_tallies(p):
@@ -374,7 +363,7 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
             consts = list(cj.consts)
             for k, x in zip(hidx, a[nT + len(pi) + nb0:]):
                 consts[k] = x
-            fr = retrace(ClosedJaxpr(cj.jaxpr, consts), cap=max_steps, n_tally=nT, square=_SQUARE[0],
+            fr = retrace(ClosedJaxpr(cj.jaxpr, consts), cap=max_steps, n_tally=nT,
                          fingerprint=True)          # (RV) per-item replay fingerprint, last per-item result
             return fr(*a[:nT + len(pi) + nb0])
         cj2 = _mk(item2, tav + pav + bav + [_sds(h) for h in hoisted])
