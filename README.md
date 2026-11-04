@@ -423,8 +423,7 @@ item jaxprs and generated kernels. `tm.diagnostics(f, *args)` reports what `jax.
 
 | option | default | meaning |
 |---|---|---|
-| `backend` | `'auto'` | `'auto'`: cuda on a GPU, where a program the cuda emitter cannot compile raises `tm.UnsupportedError`; lockstep elsewhere, with a one-time warning. `'cuda'`: cuda or raise. `'lockstep'`: always the plain-JAX interpreter, slow by design, the reference. |
-| `allow_fallback` | `False` | with `backend='auto'` on a GPU, run lockstep with a warning instead of raising. It is about 100x slower, which is why it is not the default. |
+| `backend` | `'auto'` | `'auto'`: cuda on a GPU, where a program the cuda emitter cannot compile raises `tm.UnsupportedError` (pass `backend='lockstep'` to run it; it never falls back on its own, because lockstep is about 100x slower); lockstep elsewhere, with a one-time warning. `'cuda'`: cuda or raise. `'lockstep'`: always the plain-JAX interpreter, slow by design, the reference. |
 | `cuda_math` | `'approx'` | cuda f32 division, sqrt and rsqrt. `'approx'`: the PTX XLA:GPU itself emits, so it is the arithmetic a plain JAX program on the same GPU gets. `'ieee'`: correctly rounded, the portable reference, about 1.5x slower. |
 | `lockstep_block` | `2**18` | lockstep backend: lanes per block, which bounds its memory. |
 | `rev_checkpoints` | `16` | reverse mode: checkpoint buffer size C. O(K) work for loops of K <= C^2 steps; 2C states of memory per item. |

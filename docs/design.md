@@ -117,10 +117,10 @@ derivatives with spawn give children tangents for every float per-item leaf. Rev
   functions from the CUDA math library, and the `cuda_math` choice for f32 division, square root and reciprocal
   square root (`docs/float_semantics.md`). The CUDA and lockstep backends agree statistically, not bitwise;
   the `compare` protocol is the contract (`docs/validation.md`).
-- `backend='auto'`: CUDA on a GPU; a program the emitter does not support raises `UnsupportedError` there unless
-  `allow_fallback=True`, in which case lockstep runs with a warning, because a silent change to the reference
-  interpreter is a silent factor-of-100 slowdown. On every other platform it is lockstep with a one-time warning.
-  `backend='cuda'` raises instead of falling back. Compile errors from NVRTC (NVIDIA's runtime CUDA compiler) are
+- `backend='auto'`: CUDA on a GPU; a program the emitter does not support raises `UnsupportedError` there, with
+  the advice to pass `backend='lockstep'`, because a silent change to the reference interpreter is a silent
+  factor-of-100 slowdown. On every other platform it is lockstep with a one-time warning. `backend='cuda'` raises
+  the same way. Compile errors from NVRTC (NVIDIA's runtime CUDA compiler) are
   bugs and raise. Effects, such as `jax.debug.print` or an input/output callback, raise on both backends.
 - N, the number of items, is a runtime kernel argument: neither the compiled kernel nor the in-memory kernel cache
   key contains it. One call takes fewer than 2^31 items.
@@ -328,7 +328,7 @@ emitted value AT THE SPAWN STEP, inside the parent's ordinary replay adjoint. No
 
 ## 5. Fewer knobs
 
-Unknown option names raise. The public options are the six in the README; every measurement and
+Unknown option names raise. The public options are the five in the README; every measurement and
 negative-control switch is a private option whose name starts with an underscore (they are listed in
 `_api._OPTS`), part of the node and of every cache key, never global state.
 
@@ -343,19 +343,24 @@ cost-decomposition options (`_rev_phase`, `_tree_phase`), which produced wrong g
 test used -- the decompositions they produced are quoted in section 6. The fold rule is one comparison against
 the device's resident-thread count and no longer consults the kernel's privatisation rule at all (section 2).
 
-Removed from the public namespace before the first release (an API decision, so no measurement is involved):
-`tm.compare`, with `criteria` and the square mode of the re-tracer that produced its floor run. Its frozen thresholds are a test protocol rather than an API, and one test used it; it is now
-`tests/compare_protocol.py`, where the floor run is the same item with squared emits, written by the caller.
-`tm.assert_arms_differ` (and its `artifacts`), the A/B rule, is measurement hygiene for the library's own
-developers, built entirely on `tm.diagnostics`; it is now `tests/ab_rule.py`, used by the tests and by
-`benchmarks/perf_negative_control.py`.
+Removed from the public surface before the first release (API decisions, so no measurement is involved):
+
+- `tm.compare`, with `criteria` and the square mode of the re-tracer that produced its floor run. Its frozen
+  thresholds are a test protocol rather than an API, and one test used it; it is now `tests/compare_protocol.py`,
+  where the floor run is the same item with squared emits, written by the caller.
+- `tm.assert_arms_differ` (and its `artifacts`), the A/B rule: measurement hygiene for the library's own
+  developers, built entirely on `tm.diagnostics`. It is now `tests/ab_rule.py`, used by the tests and by
+  `benchmarks/perf_negative_control.py`.
+- The option `allow_fallback` (run lockstep with a warning when `backend='auto'` on a GPU cannot compile a
+  program), with `_lockstep_cannot_run`, which kept its error from suggesting a fallback that could not run
+  either. `backend='lockstep'` is the same thing, explicit, and the cuda error now says to pass it.
 
 Dual-lanes chunking, measured on the shower-shaped program: one kernel with T lanes cost 1.34, 1.99, 2.27 and
 2.57 times the forward pass for T = 1 to 4, but 14, 23 and 32 times for T = 6, 8 and 10. Chunking into the
 largest size the `LANES_MAX_LOCAL` guard allowed (129 lane-dependent elements per lane: at most 3 lanes per
-chunk) gave 4.5, 4.5, 6.8 and 9.1 times for T = 4, 6, 8 and 10. That is the guard's one positive record, on a private program
-and an earlier library version; nothing current reproduces it, so the guard is removed (section 2) and only the
-MAX_LANES = 16 chunking remains.
+chunk) gave 4.5, 4.5, 6.8 and 9.1 times for T = 4, 6, 8 and 10. That is the guard's one positive record, on a
+private program and an earlier library version; nothing current reproduces it, so the guard is removed
+(section 2) and only the MAX_LANES = 16 chunking remains.
 
 ## 6. Why reverse mode is slow, and what to do per case
 
@@ -472,8 +477,8 @@ from it are worth recording, because they are reproducible here:
 Everything in this section has a test.
 
 - **No silent failure modes left on the default path.** `backend='auto'` raises on a GPU instead of falling back
-  to the roughly 100 times slower lockstep backend (`allow_fallback=True` opts back in). A dropped spawn child or
-  an item truncated at `max_steps` makes the float tallies NaN by multiplying them by
+  to the roughly 100 times slower lockstep backend (`backend='lockstep'` asks for it explicitly). A dropped spawn
+  child or an item truncated at `max_steps` makes the float tallies NaN by multiplying them by
   `where(affected > 0, nan, 1)`, which is exact when nothing was affected. Integer tallies cannot be NaN, so for
   those the counter in `stats` is the only signal. Out-of-range emit indices are dropped, exactly as JAX's own
   scatter drops out-of-bounds updates, so this is not a deviation from the dense meaning, but they are counted in

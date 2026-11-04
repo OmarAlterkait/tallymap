@@ -52,6 +52,9 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   is unchanged.
 - `tm.assert_arms_differ` (and `_diagnostics.artifacts`): the A/B rule is developer measurement hygiene built on
   `tm.diagnostics`, and moved to `tests/ab_rule.py` (used by `tests/` and `benchmarks/perf_negative_control.py`).
+- The public option `allow_fallback` (and `_primitive._lockstep_cannot_run`). Passing it now raises, like any
+  unknown option. `backend='lockstep'` is the explicit equivalent, and the `UnsupportedError` for a program the
+  cuda backend cannot compile now says to pass it, for `backend='cuda'` as well as `'auto'`.
 - `tm.Sum(..., tangent_scale=)`, the fixed-point scale of the TANGENT tally of an `exact=True` output. Nothing
   in the tests, benchmarks, examples or documentation ever set it and no number was ever recorded for it; a
   tangent tally now always uses its primal output's `scale`, which is what every program that did not set it

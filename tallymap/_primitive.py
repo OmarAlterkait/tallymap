@@ -175,7 +175,6 @@ def _run(node, args, platform):
     p = node.prog
     pi, bc = _split(node, args)
     opts = dict(node.opts)
-    fallback = bool(opts.pop("allow_fallback", False))
     b = node.backend
     if b == "auto" and platform != "cuda":
         _warn_once("tallymap: no CUDA GPU on this platform; running the lockstep backend (plain JAX)", node.site)
@@ -191,44 +190,11 @@ def _run(node, args, platform):
     try:
         return list(CB.run(p, pi, bc, **opts))
     except UnsupportedError as e:
-        if b == "cuda":
-            raise
-        if not fallback:
-            why = _lockstep_cannot_run(p)
-            if why is not None:          # suggesting a fallback that cannot run either would only waste a run
-                raise UnsupportedError(f"{e}\ntallymap: the lockstep backend cannot run this program either "
-                                       f"({why}), so allow_fallback=True would not help") from None
-            # (C1) never a SILENT ~100x slowdown on a GPU: the lockstep backend is the reference interpreter, not a
-            # fast path (measured: a 7 ms cuda program took 678 ms on lockstep)
-            raise UnsupportedError(f"{e}\ntallymap: backend='auto' on a GPU does not fall back to the lockstep backend "
-                                   "(~100x slower): pass allow_fallback=True to accept the fallback, or "
-                                   "backend='lockstep'") from None
-        _warn_once(f"tallymap: cuda backend cannot run this program ({e}); falling back to the lockstep backend "
-                   "(allow_fallback=True)", node.site)
-        return list(LB.run(p, pi, bc, **opts))
-
-
-def _lockstep_cannot_run(p):
-    """-> why the lockstep backend cannot run this item program either, or None.  The lockstep interpreter runs
-    every JAX primitive, with two exceptions: side effects, and exact=True outputs without jax_enable_x64."""
-    from ._jaxpr import subjaxprs
-
-    def walk(jaxpr):
-        for e in jaxpr.eqns:
-            if e.effects:
-                return (f"the item function has side effects ({', '.join(sorted(str(x) for x in e.effects))}); "
-                        "effects are not supported inside tallymap.vmap on any backend")
-            for sj in subjaxprs(e):
-                why = walk(sj.jaxpr)
-                if why is not None:
-                    return why
-        return None
-    why = walk(p.cj.jaxpr)
-    if why is not None:
-        return why
-    if any(s.exact for s in p.tallies) and not jax.config.jax_enable_x64:
-        return "exact=True outputs need jax_enable_x64 on the lockstep backend"
-    return None
+        # (C1) backend='auto' never falls back: the lockstep backend is the reference interpreter, not a fast path
+        # (measured: a 7 ms cuda program took 678 ms on lockstep), so a silent fallback is a silent ~100x slowdown
+        raise UnsupportedError(f"{e}\ntallymap: the cuda backend cannot compile this program; pass "
+                               "backend='lockstep' to run it in plain JAX (the reference interpreter, ~100x slower; "
+                               "it runs every JAX primitive that has no side effects)") from None
 
 
 def _warn_once(msg, site=None):

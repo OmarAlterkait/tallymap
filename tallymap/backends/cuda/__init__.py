@@ -5,7 +5,7 @@ rsqrt.approx), everything else IEEE round-to-nearest without FMA contraction; 'i
 well: the portable reference.
 
 run(prog, pi, bc, cuda_math=None) -> [sum tallies] + [stats i32[5]] + [per-item results]
-Unsupported constructs raise tallymap.UnsupportedError (backend='auto' too, unless allow_fallback=True).
+Unsupported constructs raise tallymap.UnsupportedError (backend='auto' too; backend='lockstep' runs them).
 """
 import hashlib
 import os

@@ -652,7 +652,7 @@ class Emitter:
         self.prims.add(name)
         if eqn.effects:
             raise CodegenError(f"primitive {name!r} has side effects {eqn.effects}; effects are not allowed "
-                                f"inside the item function.{advice(eqn)}")
+                                f"inside the item function on any backend.{advice(eqn)}")
         from . import op_table
         rule = self.hooks.get(name) or op_table.RULES.get(name)
         if name not in op_table.TALLY_AWARE and name not in self.hooks and any(isinstance(v, VTally) for v in ins):

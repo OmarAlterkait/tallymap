@@ -231,11 +231,10 @@ def _(b):
         r = tm.vmap(lambda ti, y: ti.add("Q", 0, y * x), outputs={"Q": tm.Sum((NB,), F)}, backend="lockstep")(
             jnp.stack([x, 2 * x]))
         return t.add("Q", 3, r.outputs["Q"][0])
-    kw = {}
     if b == "cuda":
-        raises(tm.UnsupportedError, lambda: V(outer, b)(xs))
-        b, kw = "auto", dict(allow_fallback=True)
-    q = V(outer, b, **kw)(xs).outputs["Q"]
+        raises(tm.UnsupportedError, lambda: V(outer, b)(xs), "backend='lockstep'")
+        b = "lockstep"
+    q = V(outer, b)(xs).outputs["Q"]
     close(q[3], 3 * float((xs ** 2).sum()))
 
 
@@ -586,7 +585,7 @@ def _(b):
     close(V(item, b)(xs), R(item)(xs))
 
 
-@case("debug.print raises clearly; pure_callback -> cuda unsupported (auto raises; allow_fallback falls back)")
+@case("debug.print raises clearly; pure_callback -> cuda unsupported (cuda and auto raise, pointing to lockstep)")
 def _(b):
     def dbg(t, x):
         jax.debug.print("x={x}", x=x)
@@ -597,13 +596,9 @@ def _(b):
         y = jax.pure_callback(lambda v: np.asarray(v * 2), jax.ShapeDtypeStruct((), F), x, vmap_method="sequential")
         return t.add("Q", 0, y)
     if b == "cuda":
-        raises(tm.UnsupportedError, lambda: V(cb, "cuda")(xs))
-        raises(tm.UnsupportedError, lambda: V(cb, "auto")(xs), "allow_fallback")
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            q = V(cb, "auto", allow_fallback=True)(xs).outputs["Q"]
-        if not any("falling back" in str(x.message) for x in w):
-            raise Fail("auto fallback did not warn")
+        raises(tm.UnsupportedError, lambda: V(cb, "cuda")(xs), "backend='lockstep'")
+        raises(tm.UnsupportedError, lambda: V(cb, "auto")(xs), "backend='lockstep'")
+        q = V(cb, "lockstep")(xs).outputs["Q"]
     else:
         q = V(cb, b)(xs).outputs["Q"]
     close(q[0], 2 * float(xs.sum()))
@@ -787,7 +782,7 @@ def _(b):
     return f"arms {diff}: kernels {len(ka)}/{len(kb)}, hlo {ha[:8]} vs {hb[:8]}"
 
 
-@case("backend='auto': GPU raises on an unsupported program (allow_fallback=True: lockstep + warning); "
+@case("backend='auto': GPU raises on an unsupported program (the error points to backend='lockstep'); "
       "elsewhere lockstep with a one-time warning", ["lockstep"])
 def _(b):
     from tallymap import _api
@@ -796,20 +791,14 @@ def _(b):
         return t.add("Q", 0, y)
     want = 2 * float(xs.sum())
     if GPU:
-        m = raises(tm.UnsupportedError, lambda: V(cb, "auto")(xs), "allow_fallback=True")
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            close(V(cb, "auto", allow_fallback=True)(xs).outputs["Q"][0], want)
-        if not any("falling back" in str(x.message) for x in w):
-            raise Fail("allow_fallback=True did not warn")
+        m = raises(tm.UnsupportedError, lambda: V(cb, "auto")(xs), "pass backend='lockstep'")
+        close(V(cb, "lockstep")(xs).outputs["Q"][0], want)
         close(V(walk, "auto", in_axes=AX)(xs, keys, tab, TH), R(walk, in_axes=AX)(xs, keys, tab, TH))
 
-        def dbg(t, x):                      # an effect: the lockstep backend cannot run it either
+        def dbg(t, x):                      # an effect: the error says no backend runs it
             jax.debug.print("x={x}", x=x)
             return t.add("Q", 0, x)
-        md = raises(tm.UnsupportedError, lambda: V(dbg, "auto")(xs), "cannot run this program either")
-        if "pass allow_fallback=True to accept the fallback" in md or "would not help" not in md:
-            raise Fail(f"allow_fallback suggested for a program the lockstep backend cannot run: {md}")
+        raises(tm.UnsupportedError, lambda: V(dbg, "auto")(xs), "on any backend")
         return "GPU: " + m.splitlines()[-1][:90]
     _api._WARNED.clear()
     with warnings.catch_warnings(record=True) as w:

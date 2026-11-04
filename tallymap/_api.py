@@ -83,8 +83,8 @@ class Result(NamedTuple):
 
 
 class UnsupportedError(NotImplementedError):
-    """A backend cannot run this program.  backend='auto' on a GPU raises it too, unless allow_fallback=True (then it
-    falls back to the lockstep backend, with a warning)."""
+    """A backend cannot run this program.  backend='auto' on a GPU raises it too (it never falls back to the lockstep
+    backend: pass backend='lockstep' for that)."""
 
 
 # ------------------------------------------------------------------------------------------- programs
@@ -207,9 +207,6 @@ def _out_tallies(p):
 # ------------------------------------------------------------------------------------------- vmap
 _OPTS = {
     # public
-    "allow_fallback": "backend='auto' on a GPU: run the lockstep backend (with a warning) instead of raising "
-                      "UnsupportedError when the cuda backend cannot compile the program (default False; it is "
-                      "only ever suggested for programs the lockstep backend can actually run)",
     "cuda_math": "cuda backend, f32 div/sqrt: 'approx' (default) | 'ieee'",
     "lockstep_block": "lockstep backend: lanes per block",
     "rev_checkpoints": "reverse mode: checkpoint buffer size C",
@@ -240,10 +237,9 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                that does not terminate does not terminate.  Setting it is the recommended safety net; an item that
                hits the cap is flagged in Result.truncated and POISONS every float tally of the call (see below)
     spawn:     tallymap.Queue(capacity) to allow tally.spawn(child)
-    backend:   'auto': cuda on a GPU (a program it cannot compile raises UnsupportedError unless allow_fallback=True),
-               the lockstep backend elsewhere (with a one-time warning) | 'cuda' | 'lockstep'
-    opts:      allow_fallback     backend='auto' on a GPU: fall back to lockstep (warning) instead of raising.
-               cuda_math          cuda f32 div/sqrt: 'approx' (default; XLA:GPU's own PTX) | 'ieee' (correctly
+    backend:   'auto': cuda on a GPU (a program it cannot compile raises UnsupportedError; backend='lockstep' runs
+               it), the lockstep backend elsewhere (with a one-time warning) | 'cuda' | 'lockstep'
+    opts:      cuda_math          cuda f32 div/sqrt: 'approx' (default; XLA:GPU's own PTX) | 'ieee' (correctly
                                   rounded: the portable reference).
                lockstep_block     lockstep backend: lanes per block (default 2^18; bounds its memory).
                rev_checkpoints    reverse mode: states per checkpoint buffer C (default 16).  O(K) work for loops
