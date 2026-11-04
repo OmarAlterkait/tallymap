@@ -9,11 +9,15 @@
     env RUN_ALL="--gpu --x64" (same flags), TEST_LOG=<prefix> (full output of a failing suite -> <prefix>.<suite>.log)
 
 Suites: edge (edge cases), transforms (composability matrix), reverse (reverse mode), reverse_spawn (tree adjoint),
-ops (cuda op table vs jit(vmap(op)) and the host-exact result; --gpu only), equinox_compat (diffrax / optimistix /
+invariants (schedule invariance, cache-key soundness, run-or-raise, AD self-consistency, truncation),
+ops (cuda op table vs jit(vmap(op)) and the host-exact result; --gpu only), mulchain (a 64-bit multiply chain
+compiles fast and matches lockstep bitwise; --gpu only), equinox_compat (diffrax / optimistix /
 lineax / quadax solvers inside an item; skipped when those are not installed), examples (examples/*.py run as
 scripts).
 Each suite runs in its own process (fresh JAX state).  A suite passes iff its summary line was printed and every cell
-is PASS or an EXPECTED raise (RAISES-OK); anything else (FAIL, unexpected RAISE, crash, timeout) fails the run.
+is PASS, an EXPECTED raise (RAISES-OK) or an expected failure (XFAIL: a known library defect pinned by the suite);
+anything else (FAIL, unexpected RAISE, XPASS -- an XFAIL cell that now passes, so its marker must go --, crash,
+timeout) fails the run.  Summary line: TOTAL n PASS k [RAISES-OK m] [XFAIL x].
 Exit status 0 = all suites pass.  The full suite takes about 15 minutes on CPU.
 On GPU the suites run with XLA_PYTHON_CLIENT_PREALLOCATE=false unless you set it (see main()).
 """
@@ -25,8 +29,9 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-SUITES = ["edge", "transforms", "reverse", "reverse_spawn", "ops", "equinox_compat", "examples"]
-GPU_ONLY = {"ops"}
+SUITES = ["edge", "transforms", "reverse", "reverse_spawn", "invariants", "ops", "mulchain", "equinox_compat",
+          "examples"]
+GPU_ONLY = {"ops", "mulchain"}
 OPTIONAL = {"equinox_compat"}      # needs a package the library does not depend on; prints 'SUITE SKIP' without it
 EXAMPLES = ["quickstart", "photon_toy", "shower_toy", "ensemble_toy", "walk_on_spheres",
             "ode_ensemble", "gillespie", "interacting_particles", "particle_filter", "gradient_pitfall"]
@@ -40,11 +45,13 @@ def verdict(name, out, rc):
         if not m:
             return False, f"no summary (exit {rc})"
         return m.group(1) == "PASS" and rc == 0, f"{m.group(2)}/{m.group(3)} pass"
-    m = re.search(r"^TOTAL (\d+) PASS (\d+)(?: RAISES-OK (\d+))?", out, re.M)
+    m = re.search(r"^TOTAL (\d+) PASS (\d+)(?: RAISES-OK (\d+))?(?: XFAIL (\d+))?", out, re.M)
     if not m:
         return False, f"no summary (exit {rc})"
-    tot, ok, exp = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
-    return tot > 0 and ok + exp == tot and rc == 0, f"{ok} pass + {exp} expected raises of {tot}"
+    tot, ok, exp, xf = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0), int(m.group(4) or 0)
+    # XFAIL (a pinned, known defect) is OK; XPASS is not counted in ok + exp + xf, so it fails the suite
+    return (tot > 0 and ok + exp + xf == tot and rc == 0,
+            f"{ok} pass + {exp} expected raises" + (f" + {xf} xfail" if xf else "") + f" of {tot}")
 
 
 def run(cmd, env, timeout):
@@ -95,7 +102,7 @@ def main(argv):
         else:
             out, rc = run([sys.executable, "-u", os.path.join(HERE, f"{s}.py")], env, timeout)
         ok, msg = verdict(s, out, rc)
-        bad = [l for l in out.splitlines() if re.match(r".*\s(FAIL|RAISE)\s", l) and "RAISES-OK" not in l][:10]
+        bad = [l for l in out.splitlines() if re.match(r".*\s(FAIL|RAISE|XPASS)\s", l) and "RAISES-OK" not in l][:10]
         res.append((s, ok, msg, time.time() - t0))
         print(f"{s:13s} {'PASS' if ok else 'FAIL'}  {msg}  [{time.time() - t0:.0f}s]", flush=True)
         for l in bad if not ok else []:

@@ -74,33 +74,14 @@ faster mode on both GPUs, and a rule on items per resident thread would need a f
 divergence both move it), so the rule stays: step refill unless the program spawns, which is right on the
 divergent workloads the library is for.
 
-Event scheduling (`_schedule='events'`) is the same kernel as step refill unless the STEP BODY has a top-level
-`cond` worth cutting; it then cuts the step there and lets each warp run ONE branch per round (`kernel._cut`,
-`kernel._events_main`).  No `benchmarks/vs_jax` problem has such a `cond`, so on all of them it compiles to the
-identical kernel; `benchmarks/events_bench.py` is the measurement of what it buys, on the item shape it is for
--- a divergent loop whose body is a lopsided three-way switch, one branch W times more expensive and taken with
-probability P (2080 Ti, 4M items, median of 9 / min):
-
-| | `'step'` | `'events'` | `'item'` |
-|---|---|---|---|
-| forward, P = 0.2, W = 64 | 21.91 / 16.45 ms | **13.73 / 11.89** | 22.00 / 21.94 |
-| forward, P = 0.05, W = 256 | 45.64 / 44.98 ms | **14.60 / 12.68** | 46.27 / 46.11 |
-| gradient, P = 0.2, W = 64 | 176.4 ms | 170.5 | 176.4 |
-| gradient, P = 0.05, W = 256 | 2978 ms | 2943 | 2978 |
-
-So the rarer and costlier the branch, the bigger the win: 3.1x on the forward pass at P = 0.05, W = 256, and
-1.6x at P = 0.2, W = 64; the gradient is unchanged (1.01-1.03), because an adjoint program has three top-level
-while loops and so never gets the step split at all (section 6) -- it runs whole-item either way.  Event
-scheduling nevertheless stays OPT-IN and is not a default: nothing in the item jaxpr says how lopsided a branch
-is at run time, and a short branch gains nothing (a toy with a 256-step branch: 0.90 ms step against 0.86
-events at P = 0.14, 0.93 against 1.07 at P = 0.5).
-
-Only the step loop is cut.  Event-scheduling an INNER while loop (at any depth, by the same ski-rental rule) was
-implemented and is removed: it never fires on any `benchmarks/vs_jax` problem either, and on four toys built to
-be its best case -- a lopsided switch inside an inner while loop of 8 or 64 trips, long branch 256 or 2048
-steps, 1M items, 2080 Ti -- it was 1.82x, 1.36x, 1.22x and 1.03x SLOWER than the plain loop, never faster.  It
-was also what made `_schedule='events'` cost 3.1x in reverse mode (an adjoint program's three top-level loops
-were each event-scheduled): with it gone the gradient row above is a wash.
+Event scheduling of the step loop was implemented and is removed. It cut the step body at its most expensive
+top-level `cond` and let each warp run ONE branch per round, chosen online by a ski-rental rule. It won only on
+the synthetic item built for it, a divergent loop around a lopsided three-way switch (one branch W times more
+expensive, taken with probability P; 2080 Ti, 4M items): 1.6x forward at P = 0.2, W = 64 and 3.1x at P = 0.05,
+W = 256, with the gradient unchanged. No `benchmarks/vs_jax` problem has a step body it would cut. On the
+photon-transport engine at the same commit it was 0.81x (0.052 against 0.043 s), and its general form in the
+particle-shower engine (the step cut into phases) was 0.50x and 0.77x on a 2080 Ti and hung on one
+configuration. An earlier inner-loop variant was 1.03-1.82x SLOWER on four toys built as its best case.
 
 A lane claims ONE item per claim, warp-aggregated: the needy lanes of a warp take one contiguous run of item
 indices between them, so the claim counter sees one atomic per warp rather than one per lane. Claiming a RUN of
@@ -135,11 +116,11 @@ derivatives with spawn give children tangents for every float per-item leaf. Rev
 - One CUDA emitter: IEEE round-to-nearest arithmetic without fused-multiply-add contraction, transcendental
   functions from the CUDA math library, and the `cuda_math` choice for f32 division, square root and reciprocal
   square root (`docs/float_semantics.md`). The CUDA and lockstep backends agree statistically, not bitwise;
-  `tm.compare` is the contract (`docs/validation.md`).
-- `backend='auto'`: CUDA on a GPU; a program the emitter does not support raises `UnsupportedError` there unless
-  `allow_fallback=True`, in which case lockstep runs with a warning, because a silent change to the reference
-  interpreter is a silent factor-of-100 slowdown. On every other platform it is lockstep with a one-time warning.
-  `backend='cuda'` raises instead of falling back. Compile errors from NVRTC (NVIDIA's runtime CUDA compiler) are
+  the `compare` protocol is the contract (`docs/validation.md`).
+- `backend='auto'`: CUDA on a GPU; a program the emitter does not support raises `UnsupportedError` there, with
+  the advice to pass `backend='lockstep'`, because a silent change to the reference interpreter is a silent
+  factor-of-100 slowdown. On every other platform it is lockstep with a one-time warning. `backend='cuda'` raises
+  the same way. Compile errors from NVRTC (NVIDIA's runtime CUDA compiler) are
   bugs and raise. Effects, such as `jax.debug.print` or an input/output callback, raise on both backends.
 - N, the number of items, is a runtime kernel argument: neither the compiled kernel nor the in-memory kernel cache
   key contains it. One call takes fewer than 2^31 items.
@@ -202,11 +183,16 @@ ITEM function and binds the primitive again, so the rules recurse to any order o
   way, and the full test matrix passes with the fusion on and off on every tested version
   (`tests/run_all.py --unfused`). One known simplification: a fully known fused equation under `jax.checkpoint`
   is treated as saveable for every policy, which costs memory and is never wrong.
-- **dual-lanes guard**: on CUDA, a `dual_lanes` program whose loop body carries a first-order intermediate of 512
-  elements or more is split into chunks of fewer lanes, because the kernel keeps T copies of it in per-thread
-  local memory. Measured on the toy walk at 1M items, `jax.hessian` went from 1629 ms to 13.5 ms with the guard.
-  At most MAX_LANES = 16 lanes go in one kernel: `jacrev` of the 256 outputs of the toy walk at 1M items took
-  229 / 191 / 175 / 176 / 325 ms in chunks of 4 / 8 / 16 / 32 / 64 lanes, and 4.3 s with all 256 at once.
+- **dual-lanes chunking**: on CUDA at most MAX_LANES = 16 lanes go in one kernel: `jacrev` of the 256 outputs of
+  the toy walk at 1M items took 229 / 191 / 175 / 176 / 325 ms in chunks of 4 / 8 / 16 / 32 / 64 lanes, and 4.3 s
+  with all 256 at once; `jax.hessian` of the same walk went from 1629 ms to 13.5 ms. A second guard,
+  `LANES_MAX_LOCAL`, split a `dual_lanes` program into smaller chunks when its loop body carried a lane-dependent
+  intermediate of 512 elements or more, and is removed: it never fired on any toy-bench row (identical HLO with
+  and without it, `hvp`, grad-of-jvp, `hessian` 2x2 and 8x8, grad-of-grad at 65k and 1M items; the 1629 -> 13.5 ms
+  above is the chunking), nor on the photon-transport engine's `jacfwd` (largest lane-dependent loop array 54
+  elements at 6 columns and 117 at 26, against 512; at most 144 at 16 lanes), whose traced program and CUDA
+  source are identical with it disabled. Its own evidence, 95 ms against 2.3 ms for a dense `[T, 256]` table
+  cotangent, predates sparse table cotangents, which no longer build that array.
 - A `fused_jvp` node whose primal operands are unbatched is batched into ONE `dual_lanes` kernel that computes the
   primal once plus T tangent lanes (`dual_lanes_prog(shared=...)`). Before that fix, `jacfwd` ran two launches.
 
@@ -283,10 +269,11 @@ error) turn every affected cell into a failure, which is how the matrix is known
 - **In-place updates.** The CUDA emitter updates a dead per-item array in place in `dynamic_update_slice`, using
   liveness over all active scopes, with loop constants, pass-through carries, predicate inputs and function
   parameters frozen. Checkpoint stores were O(C * state) copies before that: 3.3 ms to 0.47 ms at K=100.
-- **Replay fingerprint.** The forward ItemProgram carries a hidden per-item uint32 hash of the final carries of
-  every top-level loop, computed with ordinary jaxpr operations. The adjoint receives the forward kernel's value
-  as an operand (the forward node is re-bound and XLA eliminates the common subexpression, which costs a few
-  percent) and compares it against its own replay. A mismatch makes every float cotangent of that call NaN. The
+- **Replay fingerprint.** Reverse mode uses a variant of the forward ItemProgram that carries a hidden per-item
+  uint32 hash of the final carries of every top-level loop, computed with ordinary jaxpr operations (a
+  forward-only call does not compute it: section 11). The adjoint receives the forward kernel's value as an
+  operand (the forward node is re-bound and XLA eliminates the common subexpression, which costs a few percent)
+  and compares it against its own replay. A mismatch makes every float cotangent of that call NaN. The
   adjoint uses the forward node's options, so the arithmetic is identical and there is no contraction anywhere.
   The negative control (a private option that runs the adjoint in `approx` math against an `ieee` forward) flags
   every item whose final state changes, 832 of 4096 on the toy walk. In every test and full-program run the
@@ -342,7 +329,7 @@ emitted value AT THE SPAWN STEP, inside the parent's ordinary replay adjoint. No
 
 ## 5. Fewer knobs
 
-Unknown option names raise. The public options are the six in the README; every measurement and
+Unknown option names raise. The public options are the five in the README; every measurement and
 negative-control switch is a private option whose name starts with an underscore (they are listed in
 `_api._OPTS`), part of the node and of every cache key, never global state.
 
@@ -351,16 +338,30 @@ slower wherever it was measured); turning activity analysis off; the CUDA block 
 schedule options (fixed rules instead: a block of 128 threads is within 1% of 64 and 256, and step refill unless
 the program spawns); the replay-check raise mode; the tree adjoint's own capacity, depth and on-mismatch
 options; `cuda_min_blocks` (at most 1.08x on any cell measured) and `rev_step_segments` (nothing on four
-independent workloads), both covered below; `Sum(tangent_scale=)`, which nothing ever set; the inner-loop half
-of event scheduling (never faster, up to 1.82x slower, section 1b); and the two reverse-mode
+independent workloads), both covered below; `Sum(tangent_scale=)`, which nothing ever set; event scheduling
+(section 1b); and the two reverse-mode
 cost-decomposition options (`_rev_phase`, `_tree_phase`), which produced wrong gradients on purpose and which no
 test used -- the decompositions they produced are quoted in section 6. The fold rule is one comparison against
 the device's resident-thread count and no longer consults the kernel's privatisation rule at all (section 2).
 
+Removed from the public surface before the first release (API decisions, so no measurement is involved):
+
+- `tm.compare`, with `criteria` and the square mode of the re-tracer that produced its floor run. Its frozen
+  thresholds are a test protocol rather than an API, and one test used it; it is now `tests/compare_protocol.py`,
+  where the floor run is the same item with squared emits, written by the caller.
+- `tm.assert_arms_differ` (and its `artifacts`), the A/B rule: measurement hygiene for the library's own
+  developers, built entirely on `tm.diagnostics`. It is now `tests/ab_rule.py`, used by the tests and by
+  `benchmarks/perf_negative_control.py`.
+- The option `allow_fallback` (run lockstep with a warning when `backend='auto'` on a GPU cannot compile a
+  program), with `_lockstep_cannot_run`, which kept its error from suggesting a fallback that could not run
+  either. `backend='lockstep'` is the same thing, explicit, and the cuda error now says to pass it.
+
 Dual-lanes chunking, measured on the shower-shaped program: one kernel with T lanes cost 1.34, 1.99, 2.27 and
 2.57 times the forward pass for T = 1 to 4, but 14, 23 and 32 times for T = 6, 8 and 10. Chunking into the
-largest size allowed by the guard gave 4.5, 4.5, 6.8 and 9.1 times for T = 4, 6, 8 and 10. That is why the guard
-exists.
+largest size the `LANES_MAX_LOCAL` guard allowed (129 lane-dependent elements per lane: at most 3 lanes per
+chunk) gave 4.5, 4.5, 6.8 and 9.1 times for T = 4, 6, 8 and 10. That is the guard's one positive record, on a
+private program and an earlier library version; nothing current reproduces it, so the guard is removed
+(section 2) and only the MAX_LANES = 16 chunking remains.
 
 ## 6. Why reverse mode is slow, and what to do per case
 
@@ -477,16 +478,16 @@ from it are worth recording, because they are reproducible here:
 Everything in this section has a test.
 
 - **No silent failure modes left on the default path.** `backend='auto'` raises on a GPU instead of falling back
-  to the roughly 100 times slower lockstep backend (`allow_fallback=True` opts back in). A dropped spawn child or
-  an item truncated at `max_steps` makes the float tallies NaN by multiplying them by
+  to the roughly 100 times slower lockstep backend (`backend='lockstep'` asks for it explicitly). A dropped spawn
+  child or an item truncated at `max_steps` makes the float tallies NaN by multiplying them by
   `where(affected > 0, nan, 1)`, which is exact when nothing was affected. Integer tallies cannot be NaN, so for
   those the counter in `stats` is the only signal. Out-of-range emit indices are dropped, exactly as JAX's own
   scatter drops out-of-bounds updates, so this is not a deviation from the dense meaning, but they are counted in
   `stats['dropped_emits']`. Error messages name the item function and the source line of the offending operation,
   using `jax.extend.source_info_util`; re-traced equations keep the user's source information.
 - **One reporting channel**: `tm.diagnostics()` gives versions, the GPU, the kernels with their cached CUDA
-  source, the item jaxprs and the reverse-mode counters. `tm.assert_arms_differ` is the A/B rule
-  (`docs/validation.md`).
+  source, the item jaxprs and the reverse-mode counters. The A/B rule is `tests/ab_rule.py`
+  (`docs/validation.md`), built on it.
 - **The JAX surface in two modules**: `_compat.py` holds every version shim (batching registration, dropped
   variables, typed-key pseudo-random generators through the public implementation methods, the version policy)
   and `_jaxpr.py` is the only reader of control-flow and call equation parameters. One guarded `jax._src` import
@@ -639,3 +640,89 @@ solves the same problem per thread. Here the lanes that need the work are gather
   synthetic switch over K phases inside a divergent loop, but no measurable change on any of the 13 benchmark
   problems, whose conds are unbatched or small. It does not clear the library's bar (a mechanism must buy 1.5x
   on a realistic workload), so it is not kept; all the gains above are the while-loop narrowing.
+
+## 11. Fixed rules ported from the `wavefront-state` branch (consolidation, 2026-11)
+
+`wavefront-state` was a private experimental branch driven by the shower engine's exact Geant4 port (DTRAX), with
+its levers behind environment variables. The ones that cleared the bar were re-implemented here as fixed rules: no
+environment variable, no option. Each paragraph gives the measurement that justified it and the `wavefront-state`
+commit it came from; the measurements are on that private engine.
+
+- **A structural digest, not `str(jaxpr)`, as the cache key** (wavefront `290f137`). The cuda kernel cache and the
+  eager-call cache keyed programs on the printed jaxpr, and JAX's pretty-printer builds a document tree per
+  equation: on DTRAX's mode-2 item that key cost 95.0 s per build on an A100 and 133.7 s on a 2080 Ti, more than
+  the trace and the emitter together. `_jaxpr.digest` hashes the same information into a sha256 without
+  materialising anything (4.22 s and 5.26 s; the cubin was unchanged): primitive names, operands numbered by first
+  appearance (alpha-equivalent jaxprs hash equal, as their printed forms are equal), output avals, every parameter
+  by value, sub-jaxprs recursively (each hashed once), and the exact bytes of every literal and of every nested
+  closed jaxpr's consts, which the printer rounds or omits and the emitter bakes into the kernel. The top-level
+  consts are keyed as before (by value in the kernel key, by identity in the eager key). `tests/invariants.py`
+  [key] checks that the real keys separate every pair, that a key made of the digest alone is caught by the same
+  pairs as the printed text, and the digest's own separation (alpha-equivalence, primitive, operand order, shape,
+  dtype, parameter, cond / while / scan structure, a literal one ulp apart).
+- **Diagnostics print the item jaxpr when read, not when bound** (wavefront `283b9e0`). `record_program` built
+  `str(jaxpr)` at every `tm.vmap` bind for `tm.diagnostics()['programs']`; on DTRAX that one call was 102 s of a
+  260 s fully cached build (cProfile, A100). The record now holds the jaxpr object, which the program being bound
+  keeps alive anyway, and `tm.diagnostics()` prints it.
+- **The replay fingerprint only where reverse mode reads it** (wavefront `501b2bd`, made automatic in `1f098b3`).
+  Every call computed the per-item fingerprint, a hash of every leaf of every top-level loop carry, although its
+  only consumer is reverse mode's replay check. Forward with it off, on an A100: a 16.8 KB per-item carry (the
+  faithful engine, 65,536 events) 4.354e7 -> 7.680e7 steps/s (+76%); DTRAX mode 3 +10.6%, with the cubin's local
+  frame 44,144 -> 29,136 bytes; 1.19-1.31x on cheap items. Now `tm.vmap` builds the program without it, and
+  `_primitive._vjp_call` asks for `ItemProgram.with_fp()`, which traces the fingerprinted variant once (derived
+  programs, `fold_prog` and `dual_lanes_prog`, derive it the same way from the base's variant). A call that is being
+  linearized (its operands are tracers of `jax.grad` / `jax.vjp`) is built with the fingerprint up front, so its
+  primal launch is the one the replay check re-binds and XLA merges the two; elsewhere reverse mode pays one extra
+  forward launch. A spawning program never builds it (its reverse mode, the tree adjoint, has its own check).
+  `tests/reverse.py`'s replay negative control (`_adj_math`) still makes the gradient NaN.
+- **A serial chain of 64-bit multiplies is cut every 8 links** (wavefront `41140a0`, `8337bb7`, merged in `58db0f2`).
+  NVVM is exponential in the depth of a dependency chain of 64-bit integer multiplies inside one function: on the
+  identical arithmetic (`cicc` alone) 0.2 s at depth 8, 0.7 s at 12, 127.3 s at 16, > 300 s at 20, while the same
+  multiplies without the dependency, a chain of 32-bit multiplies or a shift/xor mixer of the same size are free;
+  DTRAX's MixMax reseed is a 17-link chain. The emitter gives every value its chain depth (longest path counting one
+  per 64-bit multiply; a cond / loop body / call adds its own input-to-output depth after its own cuts) and passes a
+  scalar whose depth would exceed `codegen.MULCHAIN_K = 8` through `sj_brk`, an empty `asm` with the value tied in
+  and out, then restarts its depth. Cut every 1, 4 or 8 links the compile is 0.2 s at depths 16, 24 and 48; every
+  12 it is 2.2 s, every 16 125.6 s. The barrier is zero instructions (identical SASS, 928 == 928) and returns its
+  operand, so results are bitwise unchanged; the definitions are emitted only into kernels that use them, so every
+  other kernel's source is unchanged. Array-valued chain carriers are not cut (a chain through array slots did not
+  cliff). Measured on this tree through tallymap's own compiler path (NVRTC 12.1, sm_75, job 43057989): the spawning
+  item of wavefront's `test_mulchain.py` compiles in 60.7 s at chain depth 16 and 60.8 s at 24 without the cut, 1.7 s
+  with it (nvcc: 52.6 / 53.5 s -> 0.9 / 1.0 s); depth 12 is 5.3 -> 1.7 s; results bitwise equal with and without the
+  cut and to lockstep. A flat item with the same chains does not cliff (1.6-1.8 s either way), so the CI test
+  `tests/mulchain.py` is structural only (cuts present, bitwise vs lockstep, compile time a sanity bound).
+- **A lazy value used more than once is materialised when its expression is long** (prototype `TM_MAT_MULTI` in
+  the GDML calibration study's codegen patch, 2026-10-18). The emitter keeps one-use elementwise results and cheap
+  ops on large table gathers lazy (`op_table._ew_rule`, rules (a) and (b)), and a lazy value is re-inlined into
+  every consumer whatever its use count: on the GDML geometry kernel one equation became 543 kB of source.
+  Rule: a `Lazy` (or a `View` of one) used more than once in its jaxpr is computed into a local array when one
+  element's C expression is longer than `codegen.MAT_MULTI_CHARS = 200` characters. Measured with that threshold:
+  the GDML kernel's source 13.0 -> 7.5 MB. One-use values and short expressions stay lazy, so a large row gather
+  read in two places with a short expression keeps loading only the elements it reads.
+- **Pooled constant buffers are concatenated once** (wavefront `3732513`). `Emitter.fold_table` re-concatenated
+  its whole per-dtype pool at every folded table, O(K x S) in the number and total size of the folded tables,
+  although the pool is read once, when the kernel's buffers are laid out; `Emitter.flush_pools` now builds it
+  there. Same bytes in the same order, so the source and the cubin are unchanged; worth about a second of a 29 s
+  emitter on DTRAX's mode-2 item, which folds into few pools; a program that folds hundreds of tables pays the
+  quadratic term.
+- **Buffer assignment at loop and cond boundaries** (wavefront "v3", base commit `82d6ee2`, and "v5", `fbf2c5b`, as
+  ONE rule). v3: a `while` loop's initial carry array that is dead after the loop (the in-place liveness rule,
+  `Emitter.can_mutate`) and that no other operand of the loop reads IS the carry storage, so the init copy
+  disappears; a `cond` output array is written into the storage of a dead operand of the same shape and dtype
+  (destination passing), so a branch that passes the operand through or updates it in place copies nothing, and a
+  destination whose branch result reads another written destination falls back to a fresh array. v5: the same
+  when the value is lazy and reads that storage only at its own index (`Emitter.elementwise_self`, e.g. a
+  whole-array `jnp.where(p, a, x)`), which is then evaluated into the storage element by element; and a loop body
+  result of that kind is written straight back into its carry. Placement only: every element's expression is
+  unchanged, so results are bitwise unchanged. Measured on DTRAX's tape gate, L40S (M4, wavefront `a3b5107`):
+  with every buffer-assignment rule on 0.399 s and a 41,056-byte frame; v4, v5, v6 and scan-carry aliasing off
+  1.23x (v5 alone 1.21x) and 49,840 bytes; v3 off as well 1.59x (0.640 s) and 58,496 bytes, with the A/A spread
+  at most 1.8%. v4 (materialise the small lazy readers that block an in-place update) and scan-carry aliasing gave
+  an identical cubin and v6 (an elementwise result overwrites a dead operand) 0.98x, so they were not ported. On a
+  2080 Ti the same rules are 1.016x on DTRAX, and on the photon-transport engine (LUCiD) 0.97x (v3 never fires
+  there; +7 KB of frame). Not ported either: the base's other aliasing (`scatter` in place, a cond output that
+  every branch returns as the same live operand's storage), which no switch turned off and the measurement
+  therefore did not isolate. The rule acts at a `while` / `cond` equation the emitter sees: an item whose only
+  loop is its single top-level `while` is split into step functions (section 1b) whose parameters are never
+  mutated, and there it does not fire, in `wavefront-state` either (checked on the generated source). `tests/edge.py`
+  therefore nests the loop, and compares against the rule patched off.

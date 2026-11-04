@@ -13,6 +13,7 @@ if os.environ.get("TEST_X64"):
 import jax
 import jax.numpy as jnp
 import numpy as np
+from ab_rule import assert_arms_differ
 from jax import lax
 
 import tallymap as tm
@@ -230,11 +231,10 @@ def _(b):
         r = tm.vmap(lambda ti, y: ti.add("Q", 0, y * x), outputs={"Q": tm.Sum((NB,), F)}, backend="lockstep")(
             jnp.stack([x, 2 * x]))
         return t.add("Q", 3, r.outputs["Q"][0])
-    kw = {}
     if b == "cuda":
-        raises(tm.UnsupportedError, lambda: V(outer, b)(xs))
-        b, kw = "auto", dict(allow_fallback=True)
-    q = V(outer, b, **kw)(xs).outputs["Q"]
+        raises(tm.UnsupportedError, lambda: V(outer, b)(xs), "backend='lockstep'")
+        b = "lockstep"
+    q = V(outer, b)(xs).outputs["Q"]
     close(q[3], 3 * float((xs ** 2).sum()))
 
 
@@ -585,7 +585,7 @@ def _(b):
     close(V(item, b)(xs), R(item)(xs))
 
 
-@case("debug.print raises clearly; pure_callback -> cuda unsupported (auto raises; allow_fallback falls back)")
+@case("debug.print raises clearly; pure_callback -> cuda unsupported (cuda and auto raise, pointing to lockstep)")
 def _(b):
     def dbg(t, x):
         jax.debug.print("x={x}", x=x)
@@ -596,13 +596,9 @@ def _(b):
         y = jax.pure_callback(lambda v: np.asarray(v * 2), jax.ShapeDtypeStruct((), F), x, vmap_method="sequential")
         return t.add("Q", 0, y)
     if b == "cuda":
-        raises(tm.UnsupportedError, lambda: V(cb, "cuda")(xs))
-        raises(tm.UnsupportedError, lambda: V(cb, "auto")(xs), "allow_fallback")
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            q = V(cb, "auto", allow_fallback=True)(xs).outputs["Q"]
-        if not any("falling back" in str(x.message) for x in w):
-            raise Fail("auto fallback did not warn")
+        raises(tm.UnsupportedError, lambda: V(cb, "cuda")(xs), "backend='lockstep'")
+        raises(tm.UnsupportedError, lambda: V(cb, "auto")(xs), "backend='lockstep'")
+        q = V(cb, "lockstep")(xs).outputs["Q"]
     else:
         q = V(cb, b)(xs).outputs["Q"]
     close(q[0], 2 * float(xs.sum()))
@@ -723,13 +719,25 @@ def _(b):
     close(jax.jit(jax.hessian(loss(f)))(p), Hr, what="hessian")
 
 
-@case("tm.compare: cuda vs lockstep (CRN, ulp control, Poisson floor)", ["cuda"])
+@case("compare protocol (tests/compare_protocol.py): cuda vs lockstep (CRN, ulp control, Poisson floor)",
+      ["cuda"])
 def _(b):
+    from compare_protocol import compare
+
+    def walk_sq(t, x, key, tab, th):               # the floor run: walk with every emitted value squared
+        def body(c):
+            k, w, t = c
+            i = (bits(key, k) % NB).astype(jnp.int32)
+            v = w * tab[i] * th
+            t = t.add("Q", i, v * v)
+            return k + 1, w * (0.7 + 0.2 * th), t
+        k, w, t = lax.while_loop(lambda c: (bits(key, c[0] + 1000) % 5 != 0) | (c[0] == 0), body, (0, x, t))
+        return t, (w, k)
     n = 1 << 14
     x2 = jnp.linspace(0.1, 3.0, n).astype(F)
     k2 = jax.random.split(jax.random.PRNGKey(7), n)
-    ok, rep = tm.compare(V(walk, "cuda", in_axes=AX), x2, k2, tab, TH, other=V(walk, "lockstep", in_axes=AX),
-                         verbose=False)
+    ok, rep = compare(V(walk, "cuda", in_axes=AX), x2, k2, tab, TH, other=V(walk, "lockstep", in_axes=AX),
+                      floor_fn=V(walk_sq, "lockstep", in_axes=AX), verbose=False)
     if not ok:
         raise Fail(str(rep))
     return f"flip {rep['flip_rate']:.2e} (ctrl {rep['flip_rate_control']:.2e}); rms_z {rep['Q']['rms_z']:.2e}"
@@ -762,19 +770,19 @@ def _(b):
     return f"{len(d['programs'])} program(s), {len(d['kernels'])} kernel(s); jax {d['versions']['jax']}"
 
 
-@case("A/B rule: tm.assert_arms_differ (identical arms raise; different programs pass)")
+@case("A/B rule: tests/ab_rule.assert_arms_differ (identical arms raise; different programs pass)")
 def _(b):
     g = lambda **o: (lambda x, k, t, th: V(walk, b, in_axes=AX, **o)(x, k, t, th).outputs["Q"])
     if b == "cuda":
         same, diff = (dict(cuda_math="approx"), dict()), (dict(_schedule="step"), dict(_schedule="item"))
     else:
         same, diff = (dict(cuda_math="ieee"), dict()), (dict(lockstep_block=8), dict())
-    raises(AssertionError, lambda: tm.assert_arms_differ(g(**same[0]), g(**same[1]), xs, keys, tab, TH), "identical")
-    (ka, ha), (kb, hb) = tm.assert_arms_differ(g(**diff[0]), g(**diff[1]), xs, keys, tab, TH)
+    raises(AssertionError, lambda: assert_arms_differ(g(**same[0]), g(**same[1]), xs, keys, tab, TH), "identical")
+    (ka, ha), (kb, hb) = assert_arms_differ(g(**diff[0]), g(**diff[1]), xs, keys, tab, TH)
     return f"arms {diff}: kernels {len(ka)}/{len(kb)}, hlo {ha[:8]} vs {hb[:8]}"
 
 
-@case("backend='auto': GPU raises on an unsupported program (allow_fallback=True: lockstep + warning); "
+@case("backend='auto': GPU raises on an unsupported program (the error points to backend='lockstep'); "
       "elsewhere lockstep with a one-time warning", ["lockstep"])
 def _(b):
     from tallymap import _api
@@ -783,20 +791,14 @@ def _(b):
         return t.add("Q", 0, y)
     want = 2 * float(xs.sum())
     if GPU:
-        m = raises(tm.UnsupportedError, lambda: V(cb, "auto")(xs), "allow_fallback=True")
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            close(V(cb, "auto", allow_fallback=True)(xs).outputs["Q"][0], want)
-        if not any("falling back" in str(x.message) for x in w):
-            raise Fail("allow_fallback=True did not warn")
+        m = raises(tm.UnsupportedError, lambda: V(cb, "auto")(xs), "pass backend='lockstep'")
+        close(V(cb, "lockstep")(xs).outputs["Q"][0], want)
         close(V(walk, "auto", in_axes=AX)(xs, keys, tab, TH), R(walk, in_axes=AX)(xs, keys, tab, TH))
 
-        def dbg(t, x):                      # an effect: the lockstep backend cannot run it either
+        def dbg(t, x):                      # an effect: the error says no backend runs it
             jax.debug.print("x={x}", x=x)
             return t.add("Q", 0, x)
-        md = raises(tm.UnsupportedError, lambda: V(dbg, "auto")(xs), "cannot run this program either")
-        if "pass allow_fallback=True to accept the fallback" in md or "would not help" not in md:
-            raise Fail(f"allow_fallback suggested for a program the lockstep backend cannot run: {md}")
+        raises(tm.UnsupportedError, lambda: V(dbg, "auto")(xs), "on any backend")
         return "GPU: " + m.splitlines()[-1][:90]
     _api._WARNED.clear()
     with warnings.catch_warnings(record=True) as w:
@@ -944,13 +946,79 @@ def _(b):
     ii = jnp.arange(N, dtype=jnp.int32) % 5 + 1
     run = lambda bk, **o: tm.vmap(item, outputs=out, backend=bk, **o)
     g = lambda **o: (lambda a, k: run("cuda", **o)(a, k).per_item[0])
-    tm.assert_arms_differ(g(), g(_cuda_inplace=False), ii, keys)      # instrument: in-place updates did happen
+    assert_arms_differ(g(), g(_cuda_inplace=False), ii, keys)      # instrument: in-place updates did happen
     rs = [run("cuda")(ii, keys), run("cuda", _cuda_inplace=False)(ii, keys), run("lockstep")(ii, keys)]
     for r in rs[1:]:
         for a, c in zip(jax.tree_util.tree_leaves(rs[0]), jax.tree_util.tree_leaves(r)):
             if not np.array_equal(np.asarray(a), np.asarray(c)):
                 raise Fail("in-place cuda result differs from the copying cuda / lockstep result")
     return "bitwise equal; in-place and copying cubins differ"
+
+
+@case("buffer assignment (while init alias, cond destination, lazy write-back) == rule off == copying cuda == "
+      "lockstep", ["cuda"])
+def _(b):
+    """the dead initial carry IS the carry storage, the cond output is written into its dead operand (one branch
+    updates it in place, the other returns a lazy whole-array select over it: v5), and the lazy body result goes
+    straight back into the carry.  The loop is NESTED: a single top-level while is split into step functions whose
+    parameters are never mutated, where the rule (rightly) never fires.  Arms: the rule patched off (the control:
+    strictly more arrays must be declared without it), and _cuda_inplace=False (every liveness-based reuse off)."""
+    import re
+
+    from tallymap import _primitive as _P
+    from tallymap.backends import cuda as CB
+    from tallymap.backends.cuda import codegen as CG
+    from tallymap.backends.cuda import op_table as OT
+
+    def item(t, x, key):
+        def outer(c):
+            m, acc, t = c
+            buf0 = jnp.zeros(32, F).at[0].set(x + m.astype(F))          # a per-item Local, dead after the loop
+
+            def body(c):
+                k, buf, t = c
+                j = (bits(key, k) % 32).astype(jnp.int32)
+                buf2 = lax.cond(k % 3 == 0, lambda q: q.at[j].add(1.0),
+                                lambda q: jnp.where(q > 0.5, q * 0.5, q + 0.25), buf)
+                t = t.add("C", j % NB, (buf2[j] > 0.75).astype(jnp.int32))
+                return k + 1, buf2 * 1.5 + x, t
+            k, buf, t = lax.while_loop(lambda c: c[0] < 9, body, (jnp.int32(0), buf0, t))
+            return m + 1, acc + buf, t
+        m, acc, t = lax.while_loop(lambda c: c[0] < 2, outer, (jnp.int32(0), jnp.zeros(32, F), t))
+        return t, acc
+    out = {"C": tm.Sum((NB,), jnp.int32)}
+    xs = (jnp.arange(N) % 7 * 0.125).astype(F)
+
+    def run(bk, off=False, **o):
+        saved = (OT._cond_dest, OT._init_alias, CG.Emitter.elementwise_self)
+        CB._KERNELS.clear()
+        _P._EAGER.clear()
+        if off:
+            OT._cond_dest = lambda em, eqn, ops, bodies: [None] * len(eqn.outvars)
+            OT._init_alias = lambda em, inits, ivars, pt, others: [None] * len(inits)
+            CG.Emitter.elementwise_self = lambda self, dst, x: False
+        try:
+            tm.diagnostics(reset=True)
+            r = tm.vmap(item, outputs=out, backend=bk, **o)(xs, keys)
+            ks = tm.diagnostics()["kernels"]
+        finally:
+            OT._cond_dest, OT._init_alias, CG.Emitter.elementwise_self = saved
+            CB._KERNELS.clear()
+            _P._EAGER.clear()
+        src = open(ks[-1]["source"]).read() if ks else ""
+        return r, len(re.findall(r"\b(?:float|double) \w+\[32\];", src))
+    (ra, na), (ro, no), (rc, nc), (rl, _) = run("cuda"), run("cuda", off=True), run("cuda", _cuda_inplace=False), \
+        run("lockstep")
+    if not na < no:
+        raise Fail(f"instrument: {na} 32-element arrays declared with buffer assignment, {no} with the rule off")
+    for r_, what in ((ro, "rule-off"), (rc, "copying")):
+        for a, c in zip(jax.tree_util.tree_leaves(ra), jax.tree_util.tree_leaves(r_)):
+            if not np.array_equal(np.asarray(a), np.asarray(c)):
+                raise Fail(f"buffer-assigned cuda result differs from the {what} cuda result")
+    if not np.array_equal(np.asarray(ra.outputs["C"]), np.asarray(rl.outputs["C"])):
+        raise Fail("integer tally differs from lockstep")
+    close(ra.per_item, rl.per_item, 1e-6, 0.0, "per-item vs lockstep")
+    return f"bitwise vs rule-off and copying cuda; 32-element arrays declared {na} / rule off {no} / copying {nc}"
 
 
 @case("$CXX: a missing or wrong host C++ compiler is a tallymap error naming the variable and the fix",
@@ -1132,51 +1200,6 @@ def _(b):
         return t.add("Q", 0, jnp.sum(v))
     close(V(item, b)(xs).outputs["Q"], R(item)(xs).outputs["Q"], rtol=1e-3)
     return "fresh() skips reserved names; a 40-stage roll chain compiles and matches the reference"
-
-@case("event scheduling (_schedule='events') == 'step': per-item results, exact tallies, jvp bitwise; grad per-item "
-      "bitwise; a cond-free body falls back", ["cuda"])
-def _(b):
-    def item(t, x0, key, th):                      # a skewed 3-way switch inside a divergent loop, emits in branches
-        def body(c):
-            k, x, t = c
-            u = jax.random.uniform(jax.random.fold_in(key, k))
-            idx = jnp.where(u < 0.2, 2, (u * 10).astype(jnp.int32) % 2)
-
-            def cheap(j):
-                return lambda x, t: (x * 0.9 + th * u + j, t.add("Q", (k + j) % NB, x * th))
-
-            def costly(x, t):
-                y = lax.fori_loop(0, 64, lambda i, y: jnp.sin(y) * th + 0.01 * i, x)
-                return y, t.add("Q", (k * 3) % NB, y)
-            x, t = lax.switch(idx, [cheap(0), cheap(1), costly], x, t)
-            return k + 1, x, t
-        k, x, t = lax.while_loop(lambda c: c[0] < 4 + (x0 * 7).astype(jnp.int32), body, (0, x0, t))
-        return t, x * th
-
-    out = {"Q": tm.Sum((NB,), F, exact=True)}
-    f = {s: tm.vmap(item, outputs=out, in_axes=(0, 0, None), backend=b, _schedule=s) for s in ("step", "events")}
-    ys = xs * 1.7 % 1.0
-    r = {s: jax.jit(lambda q: f[s](ys, keys, q))(TH) for s in f}
-    jv = {s: jax.jvp(lambda q: f[s](ys, keys, q).outputs["Q"], (TH,), (F(1.0),)) for s in f}
-    for a_, b_, what in ((r["step"].outputs, r["events"].outputs, "tallies"), (r["step"].per_item, r["events"].per_item,
-                         "per-item"), (jv["step"], jv["events"], "jvp")):
-        for x, y in zip(jax.tree_util.tree_leaves(a_), jax.tree_util.tree_leaves(b_)):
-            if not np.array_equal(np.asarray(x), np.asarray(y), equal_nan=True):
-                raise Fail(f"events != step ({what})")
-    modes = {k["mode"] for k in tm.diagnostics()["kernels"]}
-    ev = [k["cut"] for k in tm.diagnostics()["kernels"] if k["mode"] == "events"]
-    if not {"step", "events"} <= modes or not ev or ev[0]["branches"] != 3:
-        raise Fail(f"kernel modes {modes}, cuts {ev}")
-    loss = lambda s: (lambda xx, q: jnp.sum(f[s](xx, keys, q).per_item ** 2) + jnp.sum(f[s](xx, keys, q).outputs["Q"]))
-    g = {s: jax.grad(loss(s), argnums=(0, 1))(ys, TH) for s in f}
-    if not np.array_equal(np.asarray(g["step"][0]), np.asarray(g["events"][0])):
-        raise Fail("grad per-item (x) events != step")
-    close(g["events"][1], g["step"][1], rtol=1e-5, what="grad theta")
-    plain = lambda t, x: (t.add("Q", 0, x), x * 2)  # no loop at all: events falls back to the item mode
-    pe = tm.vmap(plain, outputs={"Q": tm.Sum((NB,), F)}, backend=b, _schedule="events")(xs)
-    close(pe.outputs["Q"], R(plain)(xs).outputs["Q"])
-    return "3-way switch: fwd / jvp / per-item bitwise, grad per-item bitwise; loop-free program falls back"
-
 
 @case("custom_jvp rule closing over an item-computed value: a clear UnsupportedError (JAX's staging limit); the "
       "advised fix (an explicit argument) differentiates")

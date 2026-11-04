@@ -1150,11 +1150,93 @@ TALLY_AWARE = {"while", "cond", "scan", "pjit", "jit", "closed_call", "core_call
                "custom_vjp_call", "custom_vjp_call_jaxpr", "checkpoint", "remat", "remat2"}
 
 
-def _carry_vars(em, inits, pass_through):
+# ------------------------------------------------------------------ buffer assignment at loop / cond boundaries
+# (wavefront-state 82d6ee2 "v3" + fbf2c5b "v5", one fixed rule; DTRAX on an L40S runs 1.59x slower without both.)
+# v3: a while loop's initial carry array that is dead after the loop (the in-place liveness rule, Emitter.can_mutate)
+#     and that no other operand of the loop reads IS the carry storage (no init copy); a cond output array is written
+#     into the storage of a dead operand of the same shape and dtype (destination passing: no fresh array, and a
+#     branch that passes the operand through or updates it in place copies nothing).
+# v5: the same when the value is LAZY and reads that storage only at its own index (Emitter.elementwise_self, e.g. a
+#     whole-array jnp.where(p, a, x)): it is evaluated into the storage, element by element; and a loop body result of
+#     that kind is written straight back into its carry.  Placement only: every element's expression is unchanged.
+def _refs(em, x, name):
+    """does the C text value x reads mention storage `name`?  (Local: by name; anything else: rendered)"""
+    import re
+    if isinstance(x, VTally) or x is None:
+        return False
+    if isinstance(x, Local):
+        return x.name == name
+    saved = (em.lines, em.ind, em.uid)
+    try:
+        em.lines = []
+        t = elem(x, [f"_q{k}" for k in range(len(x.shape))])
+    except Exception:
+        return True
+    finally:
+        em.lines, em.ind, em.uid = saved
+    return re.search(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])", t) is not None
+
+
+def _src_locals(x, out=None, d=0):
+    """the per-item Local arrays a lazy value's elements are built from (through View.src / Lazy.origin)."""
+    out = {} if out is None else out
+    if x is None or d > 12:
+        return out
+    if isinstance(x, Local):
+        out[x.name] = x
+    elif isinstance(x, View):
+        _src_locals(x.src, out, d + 1)
+    elif isinstance(x, Lazy):
+        for v in (getattr(x, "origin", None) or ("", ()))[1]:
+            _src_locals(v, out, d + 1)
+    return out
+
+
+def _lazy_dest(em, v, others, used):
+    """(v5) a dead Local the lazy initial carry v reads only at its own index, and nothing else live or another
+    operand of the loop reads: v is evaluated INTO it.  -> that Local or None."""
+    for X in _src_locals(v).values():
+        if X.name in used or tuple(X.shape) != tuple(v.shape) or X.dtype != v.dtype:
+            continue
+        if not em.elementwise_self(X, v) or not em.can_mutate(None, X):
+            continue
+        if any(_refs(em, o, X.name) for o in others if o is not v):
+            continue
+        return X
+    return None
+
+
+def _init_alias(em, inits, ivars, pt, others):
+    """(v3, v5) per initial carry of a while loop: None (copy it into a fresh carry), or the Local that IS the carry
+    storage (the init itself, dead after the loop; or for a lazy init, the dead storage it is evaluated into)."""
+    dest, used = [], set()
+    for v, ivar, p_ in zip(inits, ivars, pt):
+        X = None
+        if not p_ and not isinstance(v, VTally) and v.shape != ():
+            if isinstance(v, Local):
+                if (v.name not in used and em.can_mutate(ivar, v)
+                        and not any(_refs(em, x, v.name) for x in others if x is not v)):
+                    X = v
+            elif not isinstance(v, Table):
+                X = _lazy_dest(em, v, others, used)
+        if X is not None:
+            used.add(X.name)
+        dest.append(X)
+    return dest
+
+
+def _carry_vars(em, inits, pass_through, dest=None):
     cars = []
-    for v, pt in zip(inits, pass_through):
+    for i, (v, pt) in enumerate(zip(inits, pass_through)):
         if pt or isinstance(v, VTally):          # loop invariant, or a virtual tally (no data to carry)
             cars.append(v)
+            continue
+        X = dest[i] if dest is not None else None
+        if X is not None:                       # (v3 / v5) buffer assignment: this storage IS the carry
+            if X is not v:
+                em.assign(X, v)
+                X.key_impl = v.key_impl
+            cars.append(X)
             continue
         if v.shape == ():
             n = em.fresh("c")
@@ -1194,12 +1276,15 @@ def _update_carries(em, cars, outs, pass_through):
             tmps.append(o)
         elif isinstance(o, Local) and o.name == c.name and o.shape == c.shape:
             tmps.append(None)
+        elif (not isinstance(o, Local) and em.elementwise_self(c, o)
+              and not any(nm != c.name and _refs(em, o, nm) for nm in names)):
+            tmps.append(("self", o))             # (v5) written straight back into the carry, element by element
         else:
             tmps.append(em.mat_copy(o))
     for c, t, pt in zip(cars, tmps, pass_through):
         if pt or t is None:
             continue
-        em.assign(c, t)
+        em.assign(c, t[1] if isinstance(t, tuple) else t)
 
 
 def _pass_through(jaxpr, nconsts, ncarry, n_out_offset=0):
@@ -1216,7 +1301,8 @@ def _while(em, eqn, ins, **p):
     bc = list(ins[w.nc:w.nc + w.nb])
     init = list(ins[w.nc + w.nb:])
     pt = _pass_through(w.body.jaxpr, w.nb, len(init))
-    cars = _carry_vars(em, init, pt)
+    dest = _init_alias(em, init, list(em.cur_invars)[w.nc + w.nb:], pt, cc + bc + init)
+    cars = _carry_vars(em, init, pt, dest)
     vals = [_carry_val(c) if not p_ else c for c, p_ in zip(cars, pt)]
     em.freeze(cc + bc + [c for c, p_ in zip(cars, pt) if p_])     # re-read every iteration: never in place
     em.open("while (true)")
@@ -1259,8 +1345,12 @@ def _cond(em, eqn, ins, **p):
     iv = em.fresh("bi")
     em.line(f"const int {iv} = (int)({ie});")
     bodies = [_branch(em, br, ops) for br in branches]
+    dest = _cond_dest(em, eqn, ops, bodies)
     outs = []
     for j, v in enumerate(eqn.outvars):
+        if dest[j] is not None:
+            outs.append(("dest", dest[j]))
+            continue
         # virtual in ANY branch -> virtual (an inert discard tally may meet a filler value in another branch)
         r0 = next((b[1][j] for b in bodies if isinstance(b[1][j], VTally)), None)
         if r0 is not None:
@@ -1281,10 +1371,58 @@ def _cond(em, eqn, ins, **p):
             em.ind += 1
         em.lines += lines
         for o, r in zip(outs, res):
-            if not isinstance(o, VTally):
+            if not isinstance(o, (VTally, tuple)):
                 em.assign(o, r)
+        for o, r in zip(outs, res):            # destination outputs last: they overwrite an operand
+            if isinstance(o, tuple) and not (isinstance(r, Local) and r.name == o[1].name):
+                em.assign(o[1], r)
     em.close()
-    return [o if isinstance(o, VTally) else _carry_val(o) for o in outs]
+    return [o[1] if isinstance(o, tuple) else (o if isinstance(o, VTally) else _carry_val(o)) for o in outs]
+
+
+def _cond_dest(em, eqn, ops, bodies):
+    """(v3, v5) per cond output: the dead operand Local it is written into, or None (a fresh array).  Exactly one
+    branch runs; in it the other outputs are assigned first, so only another DESTINATION reading this storage could
+    see it overwritten, which the second loop excludes."""
+    civ = list(eqn.invars[1:])
+    n = len(eqn.outvars)
+    dest, used = [None] * n, set()
+    for j, v in enumerate(eqn.outvars):
+        if any(isinstance(bd[1][j], VTally) for bd in bodies):
+            continue
+        shape, dt, _ = phys(v.aval)
+        if shape == ():
+            continue
+        for k in ([j] if j < len(ops) else []) + [k for k in range(len(ops)) if k != j]:
+            op = ops[k]
+            if k in used or not isinstance(op, Local) or op.shape != tuple(shape) or op.dtype != dt:
+                continue
+            if not em.can_mutate(civ[k], op):
+                continue
+            # every branch result is this storage (passed through / updated in place: nothing to write), another
+            # array, or a lazy value that reads this storage only at its own index (v5)
+            if all((isinstance(r, Local) and r.name == op.name) or not _refs(em, r, op.name)
+                   or em.elementwise_self(op, r) for r in (bd[1][j] for bd in bodies)):
+                dest[j] = op
+                used.add(k)
+                break
+    changed = True
+    while changed:                     # a destination whose branch result reads ANOTHER written destination: drop it
+        changed = False
+        for j in range(n):
+            if dest[j] is None:
+                continue
+            for bd in bodies:
+                r = bd[1][j]
+                if isinstance(r, Local) and r.name == dest[j].name:
+                    continue
+                if any(dest[m] is not None and m != j and not (isinstance(bd[1][m], Local) and
+                                                               bd[1][m].name == dest[m].name)
+                       and _refs(em, r, dest[m].name) for m in range(n)):
+                    dest[j] = None
+                    changed = True
+                    break
+    return dest
 
 
 @rule("scan")

@@ -2,7 +2,8 @@
 
     user fn(tally, *args) -> tally | (tally, y)
       |  make_jaxpr + tally linearity check + hoist closed-over tracers as explicit operands
-      |  retrace: cap top-level while loops at max_steps (a per-item `truncated` output) + the replay fingerprint
+      |  retrace: cap top-level while loops at max_steps (a per-item `truncated` output) [+ the replay fingerprint,
+      |  built only for reverse mode: ItemProgram.with_fp]
       v
     ItemProgram (item jaxpr + layout)  ->  bind_call(*per_item, *broadcast, node=Node(prog))      (_primitive.py)
 
@@ -83,8 +84,8 @@ class Result(NamedTuple):
 
 
 class UnsupportedError(NotImplementedError):
-    """A backend cannot run this program.  backend='auto' on a GPU raises it too, unless allow_fallback=True (then it
-    falls back to the lockstep backend, with a warning)."""
+    """A backend cannot run this program.  backend='auto' on a GPU raises it too (it never falls back to the lockstep
+    backend: pass backend='lockstep' for that)."""
 
 
 # ------------------------------------------------------------------------------------------- programs
@@ -112,10 +113,26 @@ class ItemProgram:
     tag: str = "primal"
     fp: Any = None         # (RV) index of the replay fingerprint (uint32) among the per-item results
     where: str = ""        # the user's item function ('qualname (file:line)'), for error messages
+    mkfp: Any = None       # (RV) () -> this program WITH the replay fingerprint (with_fp), or None
 
     @property
     def nT(self):
         return len(self.tallies)
+
+    def with_fp(self):
+        """(RV) this program with the per-item replay fingerprint (built once, on demand).  The fingerprint is a
+        hash of every leaf of every top-level loop carry, and its only consumer is reverse mode's replay check
+        (_primitive._vjp_call), so a forward-only call is built without it.  It is the LAST per-item result and
+        uint32, so every other output index is the same in both programs."""
+        if self.fp is not None or self.mkfp is None:
+            return self
+        q = self.__dict__.get("_with_fp")
+        if q is None:
+            q = self.mkfp()
+            if q.fp is None or (q.nT, q.nP, q.nB, q.nY) != (self.nT, self.nP, self.nB, self.nY + 1):
+                raise AssertionError("tallymap: the fingerprinted program does not match its base (internal error)")
+            object.__setattr__(self, "_with_fp", q)
+        return q
 
     @property
     def nY(self):
@@ -196,17 +213,6 @@ def jvp_prog(p, pert_pi, pert_bc):
 
 # ------------------------------------------------------------------------------------------- dispatch
 _WARNED = set()
-_SQUARE = [False]
-
-
-class _square_mode:
-    """tallymap.compare only: trace tallymap.vmap functions with every emitted value squared (per-bin sum of w^2)."""
-
-    def __enter__(self):
-        _SQUARE[0] = True
-
-    def __exit__(self, *a):
-        _SQUARE[0] = False
 
 
 def _out_tallies(p):
@@ -218,18 +224,15 @@ def _out_tallies(p):
 # ------------------------------------------------------------------------------------------- vmap
 _OPTS = {
     # public
-    "allow_fallback": "backend='auto' on a GPU: run the lockstep backend (with a warning) instead of raising "
-                      "UnsupportedError when the cuda backend cannot compile the program (default False; it is "
-                      "only ever suggested for programs the lockstep backend can actually run)",
     "cuda_math": "cuda backend, f32 div/sqrt: 'approx' (default) | 'ieee'",
     "lockstep_block": "lockstep backend: lanes per block",
     "rev_checkpoints": "reverse mode: checkpoint buffer size C",
     "rev_stats": "reverse mode: report replay mismatches / tree stats to the host (costs jit's fast path)",
     # PRIVATE (measurements / tests / negative controls; not API)
-    "_schedule": "cuda: 'step' | 'item' | 'events' overrides the rule (step unless the program spawns)",
+    "_schedule": "cuda: 'step' | 'item' overrides the rule (step unless the program spawns)",
     "_cuda_inplace": "cuda: False never updates a per-item array in place (A/B control of the aliasing analysis)",
     "_lockstep_compact": "lockstep: False never narrows a while loop (the A/B control) | int: that lane width",
-    "_lanes": "'off' never dual lanes | 'force' ignore the local-memory guard | int: chunks of at most this many lanes",
+    "_lanes": "'off' never dual lanes | int: chunks of at most this many lanes (default MAX_LANES on cuda)",
     "_fold": "False: never fold a batch into the item axis",
     "_rev_sparse_min": "smallest table (elements) that gets sparse emitted cotangents (default 32)",
     "_adj_math": "NEGATIVE CONTROL: compile the adjoint with this cuda_math (replay check must fire)",
@@ -251,14 +254,13 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                that does not terminate does not terminate.  Setting it is the recommended safety net; an item that
                hits the cap is flagged in Result.truncated and POISONS every float tally of the call (see below)
     spawn:     tallymap.Queue(capacity) to allow tally.spawn(child)
-    backend:   'auto': cuda on a GPU (a program it cannot compile raises UnsupportedError unless allow_fallback=True),
-               the lockstep backend elsewhere (with a one-time warning) | 'cuda' | 'lockstep'
-    opts:      allow_fallback     backend='auto' on a GPU: fall back to lockstep (warning) instead of raising.
-               cuda_math          cuda f32 div/sqrt: 'approx' (default; XLA:GPU's own PTX) | 'ieee' (correctly
+    backend:   'auto': cuda on a GPU (a program it cannot compile raises UnsupportedError; backend='lockstep' runs
+               it), the lockstep backend elsewhere (with a one-time warning) | 'cuda' | 'lockstep'
+    opts:      cuda_math          cuda f32 div/sqrt: 'approx' (default; XLA:GPU's own PTX) | 'ieee' (correctly
                                   rounded: the portable reference).
                lockstep_block     lockstep backend: lanes per block (default 2^18; bounds its memory).
                rev_checkpoints    reverse mode: states per checkpoint buffer C (default 16).  O(K) work for loops
-                                  of K <= C^2 steps, 2C+1 states of per-item memory.
+                                  of K <= C^2 steps, 2C states of per-item memory.
                rev_stats          reverse mode: report replay mismatches and tree-adjoint stats to the host
                                   (tallymap.diagnostics()['reverse']).  Off by default: a host callback takes jax.jit
                                   off its C++ fast path.  A failed check makes the gradient NaN either way.
@@ -370,20 +372,28 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
         hoisted = [cj.consts[k] for k in hidx]
         nb0 = len(bc)
 
-        def item2(*a):
-            consts = list(cj.consts)
-            for k, x in zip(hidx, a[nT + len(pi) + nb0:]):
-                consts[k] = x
-            fr = retrace(ClosedJaxpr(cj.jaxpr, consts), cap=max_steps, n_tally=nT, square=_SQUARE[0],
-                         fingerprint=True)          # (RV) per-item replay fingerprint, last per-item result
-            return fr(*a[:nT + len(pi) + nb0])
-        cj2 = _mk(item2, tav + pav + bav + [_sds(h) for h in hoisted])
-        if spawn is not None:
-            _check_spawn(cj2, pav, where)
-        nY = len(cj2.jaxpr.outvars) - nT
-        prog = ItemProgram(cj2, tuple(tspecs), len(pi), len(bc) + len(hoisted),
-                       nY - 2 if max_steps is not None else None, spawn, fp=nY - 1, where=where)
+        def build(fp):
+            """the item program; fp: with the (RV) per-item replay fingerprint as its last per-item result.  Only
+            reverse mode reads it (ItemProgram.with_fp), and a spawning program's reverse mode (the tree adjoint)
+            never does."""
+            def item2(*a):
+                consts = list(cj.consts)
+                for k, x in zip(hidx, a[nT + len(pi) + nb0:]):
+                    consts[k] = x
+                fr = retrace(ClosedJaxpr(cj.jaxpr, consts), cap=max_steps, n_tally=nT, fingerprint=fp)
+                return fr(*a[:nT + len(pi) + nb0])
+            cj2 = _mk(item2, tav + pav + bav + [_sds(h) for h in hoisted])
+            if spawn is not None:
+                _check_spawn(cj2, pav, where)
+            nY = len(cj2.jaxpr.outvars) - nT
+            return ItemProgram(cj2, tuple(tspecs), len(pi), len(bc) + len(hoisted),
+                               (nY - 1 - fp) if max_steps is not None else None, spawn, fp=nY - 1 if fp else None,
+                               where=where, mkfp=None if (fp or spawn is not None) else (lambda: build(True)))
         bc_all = bc + hoisted
+        # built with the fingerprint up front only when this call is being LINEARIZED (jax.grad / vjp): the primal
+        # launch and the one _vjp_call adds for the fingerprint are then the same kernel and XLA merges them.  A
+        # wrong guess costs a launch, never a result.
+        prog = build(spawn is None and _linearizing(pi + bc_all))
         from ._diagnostics import record_program
         record_program(prog)
         from ._primitive import bind_call, make_node
@@ -394,7 +404,8 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
         stats = {"exact_overflow": st[3], "dropped_emits": st[4]}
         if spawn is not None:
             stats.update(spawned=st[0], dropped=st[1], children_truncated=st[2])
-        ys = ys[:-1]                           # the replay fingerprint (ItemProgram.fp): internal
+        if prog.fp is not None:
+            ys = ys[:-1]                       # the replay fingerprint (ItemProgram.fp): internal
         if max_steps is not None:
             trunc = ys[-1]
             ys = ys[:-1]
@@ -406,6 +417,20 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
         return Result(res_out, per_item, trunc, stats)
     mapped.__wrapped__ = fn
     return mapped
+
+
+def _linearizing(xs):
+    """is any of xs a tracer of JAX's linearization (what jax.grad / jax.vjp trace with)?  JAX >= 0.7 direct
+    linearize: a LinearizeTracer; before: a JVPTracer whose tangent is a partial-eval (unknown) tracer.  A plain
+    jvp / jacfwd has a concrete, staged or batched tangent instead."""
+    from jax.interpreters import ad
+    from jax.interpreters import partial_eval as pe
+    for x in xs:
+        if type(x).__name__ == "LinearizeTracer":
+            return True
+        if isinstance(x, ad.JVPTracer) and isinstance(getattr(x, "tangent", None), pe.JaxprTracer):
+            return True
+    return False
 
 
 def _limits(stats, st, spawn, max_steps):

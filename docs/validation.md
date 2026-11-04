@@ -39,18 +39,19 @@ used to answer a B question.
 - Set `jax_default_matmul_precision='highest'` for any GPU parity test. JAX's default on recent NVIDIA GPUs is a
   TF32 matmul, which biases results at the 1e-4 level.
 - Before computing anything, assert that the two arms really differ end to end: both a program hash and an
-  output. `tm.assert_arms_differ` does the first half.
+  output. `assert_arms_differ` in `tests/ab_rule.py` does the first half.
 - Never validate a gradient at the truth point, where its expectation is zero. Use common-random-number finite
   differences with a large step.
 
 ## The `compare` criterion
 
-`tm.compare(f, *args, other=...)` compares two implementations of the same item program, for example
-`backend='cuda'` against `backend='lockstep'`, on the same per-item keys. It is a statistical test, not an
+`compare(f, *args, other=..., floor_fn=...)` in `tests/compare_protocol.py` compares two implementations of the
+same item program, for example `backend='cuda'` against `backend='lockstep'`, on the same per-item keys. It is a
+test protocol, not library API; `tests/edge.py` runs it on the CUDA backend. It is a statistical test, not an
 equality check, because the two backends do not produce bitwise identical f32 sums by design
 (`docs/float_semantics.md`).
 
-Its three legs, all required, are in `tallymap/_compare.py::criteria()` and are frozen:
+Its three legs, all required, are in `tests/compare_protocol.py::criteria()` and are frozen:
 
 | leg | bound |
 |---|---|
@@ -58,8 +59,8 @@ Its three legs, all required, are in `tallymap/_compare.py::criteria()` and are 
 | `rms_z` | at most 3 x the control's `rms_z` + 0.05 |
 | `max_z` | at most `max(5, 2 x` the control's `max_z)` |
 
-where `z` per bin is `|f - other| / sqrt(sum w^2 + median_over_hit_bins(sum w^2))`, the floor coming from a
-square-mode run in which every emitted value is squared. The **control** is `other` run on float inputs
+where `z` per bin is `|f - other| / sqrt(sum w^2 + median_over_hit_bins(sum w^2))`, the floor coming from
+`floor_fn`, the same item program with every emitted value squared. The **control** is `other` run on float inputs
 perturbed by one unit in the last place: it measures how much the same program moves under a perturbation that
 should not matter, and every bound is relative to it. Bins hit by `f` but never by the floor run are reported
 (`empty_bin_mismatch`) and not judged; that hole was stated in advance and is still there.
@@ -93,6 +94,7 @@ they were run on. Nothing in this repository depends on them.
 | the spawn tree adjoint against `jax.grad` of a dense plain-JAX reference, with four negative controls | `tests/reverse_spawn.py` |
 | per-operation parity of the CUDA emitter against `jax.jit(jax.vmap(op))` and the host-exact result, with a bound per class and a per-GPU baseline | `tests/ops.py`, `tests/ops_baseline.json` |
 | edge cases and every documented failure mode | `tests/edge.py` |
+| a long chain of 64-bit integer multiplies compiles in seconds and matches lockstep bitwise | `tests/mulchain.py` |
 | speed, against a recorded baseline, as a regression net | `benchmarks/perf.py`, `benchmarks/perf_baseline.json` |
 | speed and memory against plain JAX | `docs/performance.md` |
 

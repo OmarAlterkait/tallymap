@@ -90,7 +90,8 @@ Any change that is meant to make something faster, or to change a number, needs 
 job**, and an assertion that the two arms are genuinely different programs:
 
 ```python
-tm.assert_arms_differ(f_a, f_b, *args)      # cuda: the cubin hashes; lockstep: the StableHLO
+from ab_rule import assert_arms_differ      # tests/ab_rule.py (tests/ on sys.path)
+assert_arms_differ(f_a, f_b, *args)         # cuda: the cubin hashes; lockstep: the StableHLO
 ```
 
 Comparing two identical programs measures noise, and it is an easy mistake to make, because an option can be

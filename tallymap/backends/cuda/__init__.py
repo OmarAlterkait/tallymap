@@ -5,7 +5,7 @@ rsqrt.approx), everything else IEEE round-to-nearest without FMA contraction; 'i
 well: the portable reference.
 
 run(prog, pi, bc, cuda_math=None) -> [sum tallies] + [stats i32[5]] + [per-item results]
-Unsupported constructs raise tallymap.UnsupportedError (backend='auto' too, unless allow_fallback=True).
+Unsupported constructs raise tallymap.UnsupportedError (backend='auto' too; backend='lockstep' runs them).
 """
 import hashlib
 import os
@@ -16,6 +16,7 @@ import numpy as np
 
 from ..._api import UnsupportedError
 from ..._compat import key_impl
+from ..._jaxpr import digest
 from . import compile as C
 from .codegen import CodegenError, is_key_dtype
 from .kernel import BLOCK, build_source
@@ -33,7 +34,8 @@ def _const_sig(c):
 
 
 def _key(p, opts):
-    return (str(p.cj.jaxpr), tuple(_const_sig(c) for c in p.cj.consts),
+    # the structural part is _jaxpr.digest (was str(p.cj.jaxpr): JAX's pretty-printer, 95 s per build on DTRAX)
+    return (digest(p.cj.jaxpr), tuple(_const_sig(c) for c in p.cj.consts),
             tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.exact, s.scale, s.kind) for s in p.tallies),
             p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), tuple(sorted(opts.items())))
 
@@ -42,10 +44,10 @@ MATH_OPTS = {"ieee": [], "approx": ["-DTALLYMAP_APPROX_DIVSQRT", "--prec-div=fal
 
 
 class Kernel:
-    def __init__(self, p, split=True, math="approx", inplace=True, events=False):
+    def __init__(self, p, split=True, math="approx", inplace=True):
         self.block = BLOCK
         try:
-            self.src, self.L = build_source(p, split=bool(split), inplace=bool(inplace), events=bool(events))
+            self.src, self.L = build_source(p, split=bool(split), inplace=bool(inplace))
         except CodegenError as e:
             raise UnsupportedError(str(e)) from None
         if math not in MATH_OPTS:
@@ -60,7 +62,7 @@ def kernel(p, **opts):
         _KERNELS[k] = Kernel(p, **opts)
     kern = _KERNELS[k]
     from ..._diagnostics import record_kernel
-    record_kernel(dict(tag=p.tag, mode=kern.L.mode, cut=kern.L.cut, hash=kern.info["hash"], cached=kern.info["cached"],
+    record_kernel(dict(tag=p.tag, mode=kern.L.mode, hash=kern.info["hash"], cached=kern.info["cached"],
                        kid=kern.kid, compile_s=round(kern.info["seconds"], 1),
                        source=os.path.join(C.cache_dir(), kern.info["hash"] + ".cu"), prims=list(kern.L.prims),
                        options=dict(opts)))
@@ -72,11 +74,9 @@ def _phys_in(x):
 
 
 def run(p, pi, bc, cuda_math="approx", _schedule=None, _cuda_inplace=True, **_):
-    """Scheduling: a lane is refilled with a new item at STEP granularity (needs one top-level while loop;
-    1.35x faster than whole items on a photon-transport item) unless the program spawns (whole items: 1.5x faster
-    on a particle shower); private _schedule
-    'step' | 'item' overrides it (measurements and A/B checks only); 'events' cuts the step at its most expensive
-    top-level cond / switch and lets each warp run one branch at a time (kernel.build_source, _events_main).
+    """Scheduling: a lane is refilled with a new item at STEP granularity (needs one top-level while loop) unless
+    the program spawns (whole items); the measurements behind the rule are in docs/design.md section 1b.  Private
+    _schedule 'step' | 'item' overrides it (measurements and A/B checks only).
     Private _cuda_inplace=False: never update a
     per-item array in place (every dynamic_update_slice copies; the A/B control of the emitter's aliasing analysis).
     cuda_math: 'approx' (DEFAULT: div.full / sqrt.approx / rsqrt.approx, the PTX XLA:GPU itself emits for f32;
@@ -84,12 +84,10 @@ def run(p, pi, bc, cuda_math="approx", _schedule=None, _cuda_inplace=True, **_):
     docs/validation.md) |
     'ieee' (correctly rounded f32 div/sqrt: the portable reference)."""
     math = cuda_math or "approx"
-    if _schedule not in (None, "step", "item", "events"):
-        raise ValueError("tallymap: _schedule must be 'step', 'item' or 'events'")
-    split = _schedule in ("step", "events") or (_schedule is None and p.spawn is None)
+    if _schedule not in (None, "step", "item"):
+        raise ValueError("tallymap: _schedule must be 'step' or 'item'")
+    split = _schedule == "step" or (_schedule is None and p.spawn is None)
     extra = {} if _cuda_inplace else dict(inplace=False)        # (the default leaves the kernel key unchanged)
-    if _schedule == "events":
-        extra["events"] = True
     kern = kernel(p, split=split, math=math, **extra)
     L = kern.L
     N = int(pi[0].shape[0])

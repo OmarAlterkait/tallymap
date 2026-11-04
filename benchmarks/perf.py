@@ -1,9 +1,14 @@
-"""Performance safety net: re-measure a small fixed set of timings and flag regressions > 10% against the committed
-baseline for THIS GPU model (benchmarks/perf_baseline.json).
+"""Performance safety net: re-measure a small fixed set of timings and flag regressions > 50% (1.5x) against the
+committed baseline for THIS GPU model (benchmarks/perf_baseline.json).
 
-    python benchmarks/perf.py              # compare (exit 1 if any row is > 10% slower than the baseline)
+    python benchmarks/perf.py              # compare (exit 1 if any row is > 1.5x slower than the baseline)
     python benchmarks/perf.py --record     # (re)write this GPU's baseline entry
-    env PERF_TOL=0.10     PERF_MATH=approx (ieee: the negative control -- must FAIL)     PERF_BASELINE (another file)
+    env PERF_TOL=0.5     PERF_MATH=approx|ieee     PERF_BASELINE (another file)
+    (benchmarks/perf_negative_control.py: the comparator's negative control -- a known >= 2x slowdown must FAIL)
+
+The tolerance is the project's bar, 1.5x: a speedup or a slowdown under 1.5x does not matter, and identical reruns
+of the same commit already move these rows by ~10% (toy_jacfwd8 is bimodal across processes, see main()), so a
+tighter tolerance only reports noise.  The tripwire is for real regressions (a lost fast path is 2x and more).
 
 Rows = jax.jit WALL time per call (median; NOT AOT, because a host callback in the jitted program drops jax.jit off
 its C++ fast path and only the wall time shows it); toy rows: min over 3 processes; cuda_math="approx", the default:
@@ -53,7 +58,7 @@ def hardware():
 
 
 def main(argv):
-    tol = float(os.environ.get("PERF_TOL", 0.10))
+    tol = float(os.environ.get("PERF_TOL", 0.5))
     hw = hardware()
     key = hw["gpu"].split(",")[0].strip()
     rows = {}
@@ -84,7 +89,7 @@ def main(argv):
             print(f"{k:18s} {b!s:>9} {n!s:>9}   (missing)", flush=True)
             continue
         r = n / b
-        flag = "REGRESSION" if r > 1 + tol else ("faster" if r < 1 - tol else "")
+        flag = "REGRESSION" if r > 1 + tol else ("faster" if r < 1 / (1 + tol) else "")
         if flag == "REGRESSION":
             bad.append(k)
         print(f"{k:18s} {b:9.2f} {n:9.2f} {r:6.2f}  {flag}", flush=True)

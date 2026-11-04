@@ -15,7 +15,7 @@ Terms used in the code, the docs and the error messages.
 | **resource limit** | the two limits that can make a tallymap result differ from `jax.vmap` of the same item: `max_steps` and the spawn `Queue` capacity.  Both report themselves.  With `max_steps=None`, the default, and no spawn, there is no limit and no deviation. |
 | **per-item result** | the optional second return value of the item: `Result.per_item[N, ...]`. |
 | **dense reference** | `tm.reference`: `jax.vmap(item)` with real per-item tally arrays, summed.  The definition every backend and every transformation must reproduce. |
-| **compare** | `tm.compare`: the frozen statistical comparison of two implementations of one item program (`docs/validation.md`). |
+| **compare** | the frozen statistical comparison of two implementations of one item program, a test protocol in `tests/compare_protocol.py` (`docs/validation.md`). |
 | **question A / question B** | A (mechanics): is the derivative the exact derivative of the program as written?  tallymap's job.  B (estimator): is it an unbiased estimate of d E[loss] / d theta?  The program's job. |
 
 ## Backends

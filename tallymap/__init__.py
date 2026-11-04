@@ -13,9 +13,9 @@ it.  See README.md and docs/.
 """
 from . import _primitive  # noqa: F401  (registers tallymap_call / tallymap_jvp and their rules)
 from ._api import Queue, Result, Sum, UnsupportedError, vmap
-from ._compare import compare, reference
+from ._compare import reference
 from ._compat import TESTED_JAX, _check_jax_version
-from ._diagnostics import assert_arms_differ, diagnostics
+from ._diagnostics import diagnostics
 from ._rewrite import TallyError
 from ._tally import Tally
 
@@ -30,5 +30,5 @@ def supported_primitives():
 
 __version__ = "0.5.0"
 _check_jax_version()       # one warning at import, only when JAX is newer than the newest tested version
-__all__ = ["vmap", "Sum", "Queue", "Result", "Tally", "compare", "reference", "diagnostics",
-           "assert_arms_differ", "supported_primitives", "TallyError", "UnsupportedError", "TESTED_JAX"]
+__all__ = ["vmap", "Sum", "Queue", "Result", "Tally", "reference", "diagnostics",
+           "supported_primitives", "TallyError", "UnsupportedError", "TESTED_JAX"]

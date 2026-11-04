@@ -105,7 +105,7 @@ adaptive:
 | diffrax, `Kvaerno3` / `Kvaerno5` + PID | up to 7.8e-6 | up to 3.8e-6 |
 
 Gradients, where plain JAX can take one to compare with, agree with `jax.grad(jax.vmap(f))` to between 0 and
-2.3e-6.  Use `tallymap.compare` if you need a statistical statement about a particular program.
+2.3e-6.  For a statistical statement about a particular program, use the `compare` protocol (`docs/validation.md`).
 
 ## The adjoint
 
@@ -263,7 +263,7 @@ The gradient needs `rev_checkpoints` chosen for the item, so it gets its own sec
 
 `rev_checkpoints` (C) is the number of loop states the reverse pass keeps per checkpoint buffer.  The README
 already says it is not monotone in the step count; a diffrax item is the clearest case of that, because a diffrax
-solver's state is large (the solution, the controller, the stage buffers, several counters) so `2C+1` copies of it
+solver's state is large (the solution, the controller, the stage buffers, several counters) so `2C` copies of it
 leave registers, while a small C pays quadratic recomputation once the loop is longer than C^2 steps.
 
 MEASURED, `Kvaerno5` gradient in ms, the best C in bold:

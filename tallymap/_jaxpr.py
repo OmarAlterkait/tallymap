@@ -1,11 +1,13 @@
 """Jaxpr structure: the ONE module that knows how JAX stores control flow and call-like equations.
 
 Every walker (the tally checker and the re-tracer in _rewrite, the lockstep interpreter, the cuda emitter and its
-step split, the dual-lanes size guard in _primitive) reads while / cond / scan / call equations through these
+step split) reads while / cond / scan / call equations through these
 accessors, never through eqn.params directly.  The parameter names are not a JAX API (they changed at least once:
 scan's num_consts / num_carry became a flat-tree `ft_in` on JAX 0.10), so a JAX release that renames them breaks here.
 """
+import hashlib
 import os
+import weakref
 from typing import NamedTuple
 
 import numpy as np
@@ -172,6 +174,117 @@ def located(err, eqn, where=""):
     return new
 
 
+# ------------------------------------------------------------------------------------------- structural digest
+# The cache keys (the cuda kernel cache, the eager-call cache) need a structural identity of a jaxpr.  str(jaxpr)
+# is one, but JAX's pretty-printer builds a document tree per equation: on DTRAX's mode-2 item it took 95 s (A100)
+# and 134 s (2080 Ti) per build, for a dict key.  digest() hashes the same information into a sha256 without
+# materialising anything (4.2 s / 5.3 s there): primitive names, operands numbered by first appearance (so two
+# alpha-equivalent jaxprs hash equal, as their printed forms are equal), output avals, every equation parameter
+# by value (sub-jaxprs recursively, anything else by repr, as the printer prints it), and the exact BYTES of every
+# literal and of the consts of nested closed jaxprs (the printer rounds floats and does not show nested consts,
+# both of which the cuda emitter bakes into the kernel).  A sub-jaxpr is hashed once (memoised by identity on the
+# Jaxpr object, weakly, so nothing is kept alive).
+_DIGEST = weakref.WeakKeyDictionary()
+
+
+def _d_aval(h, a):
+    h.update(b"|a" + repr(tuple(getattr(a, "shape", ()))).encode() + str(getattr(a, "dtype", None)).encode())
+    if getattr(a, "weak_type", False):
+        h.update(b"w")
+
+
+def _d_const(h, c):
+    try:
+        a = np.asarray(c)
+    except Exception:                      # a tracer or an opaque object: identity (never equal to anything else)
+        h.update(b"|?" + type(c).__name__.encode() + repr(id(c)).encode())
+        return
+    if a.dtype == np.dtype(object):
+        h.update(b"|?" + repr(c).encode())
+        return
+    h.update(b"|c" + str(a.dtype).encode() + repr(a.shape).encode())
+    h.update(np.ascontiguousarray(a).tobytes())
+
+
+def _d_param(h, x):
+    if isinstance(x, ClosedJaxpr):
+        h.update(b"|CJ" + _d_jaxpr(x.jaxpr) + b"%d" % len(x.consts))
+        for c in x.consts:
+            _d_const(h, c)
+    elif type(x).__name__ == "Jaxpr":
+        h.update(b"|J" + _d_jaxpr(x))
+    elif isinstance(x, (tuple, list)):
+        h.update(b"|(%d" % len(x))
+        for y in x:
+            _d_param(h, y)
+        h.update(b")")
+    elif isinstance(x, dict):
+        h.update(b"|{%d" % len(x))
+        for k in sorted(x, key=repr):
+            h.update(repr(k).encode())
+            _d_param(h, x[k])
+        h.update(b"}")
+    elif isinstance(x, np.ndarray):
+        _d_const(h, x)
+    else:
+        h.update(b"|r" + repr(x).encode())
+
+
+def _d_jaxpr(jaxpr):
+    """-> the hex digest (bytes) of one Jaxpr, memoised."""
+    d = _DIGEST.get(jaxpr)
+    if d is not None:
+        return d
+    g = hashlib.sha256()
+    num = {}
+    for v in list(jaxpr.constvars) + list(jaxpr.invars):
+        num[v] = len(num)
+        _d_aval(g, v.aval)
+    g.update(b"|%d|%d" % (len(jaxpr.constvars), len(jaxpr.invars)))
+    for e in jaxpr.eqns:
+        g.update(b"\n" + e.primitive.name.encode())
+        for a in e.invars:
+            if isinstance(a, Literal):
+                g.update(b"|L")
+                _d_const(g, a.val)
+                _d_aval(g, a.aval)
+            else:
+                g.update(b"|v%d" % num.get(a, -1))
+        for v in e.outvars:
+            if is_dropvar(v):
+                g.update(b"|_")
+            else:
+                num.setdefault(v, len(num))
+                g.update(b"|o%d" % num[v])
+            _d_aval(g, v.aval)
+        for k in sorted(e.params):
+            g.update(b"|p" + k.encode())
+            _d_param(g, e.params[k])
+    g.update(b"\nout")
+    for v in jaxpr.outvars:
+        if isinstance(v, Literal):
+            g.update(b"|L")
+            _d_const(g, v.val)
+            _d_aval(g, v.aval)
+        else:
+            g.update(b"|v%d" % num.get(v, -1))
+    d = g.hexdigest().encode()
+    _DIGEST[jaxpr] = d
+    return d
+
+
+def digest(jaxpr):
+    """-> hex sha256 of everything str(jaxpr) shows, plus the exact bytes of every literal and of every nested closed
+    jaxpr's consts: the cache-key replacement for str(jaxpr).  A ClosedJaxpr's own consts are hashed by value too;
+    the cache keys pass the bare `p.cj.jaxpr` and key the top-level consts themselves (by value in the cuda kernel
+    key, by identity in the eager-call key)."""
+    if isinstance(jaxpr, ClosedJaxpr):
+        h = hashlib.sha256()
+        _d_param(h, jaxpr)
+        return h.hexdigest()
+    return _d_jaxpr(jaxpr).decode()
+
+
 __all__ = ["CALL_PARAM", "Literal", "closed", "call_jaxpr", "While", "while_parts", "cond_branches", "Scan",
            "scan_counts", "scan_parts", "subjaxprs", "contains", "host_callbacks", "is_dropvar", "lit", "with_source",
-           "bind", "source_summary", "item_name", "located"]
+           "bind", "source_summary", "item_name", "located", "digest"]

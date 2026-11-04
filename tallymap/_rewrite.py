@@ -213,14 +213,13 @@ def emit_p_bind(t, i, v):
     return emit_p.bind(t, i, v)
 
 
-def retrace(cj, *, cap=None, rev=False, n_tally=0, square=False, emit=None, tables=None, report=None,
+def retrace(cj, *, cap=None, rev=False, n_tally=0, emit=None, tables=None, report=None,
             fingerprint=False, spawn=None, gate=None):
     """-> python function f(*invars) evaluating cj with (cap) every top-level while loop capped at `cap`
     iterations (f returns its outputs + [truncated:bool]), or (rev: True or _reverse.RevOpts) every while loop replaced
     by a reverse-differentiable loop (_reverse.checkpointed_while).  The first n_tally invars are tallies (rev: their
-    carries get a pass-through cotangent instead of a dense one).  square: every emitted value is squared
-    (tallymap.compare floor); emit: f(tally, idx, val) -> tally' replaces every emit (e.g. offset indices when a batch
-    is folded into items).
+    carries get a pass-through cotangent instead of a dense one).  emit: f(tally, idx, val) -> tally' replaces every
+    emit (e.g. offset indices when a batch is folded into items).
     spawn: f(token, when, *child) -> token' replaces every spawn (the tree adjoint, _reverse_spawn.py).  With hooks a
     tally value may be a python TUPLE (e.g. (array, hash)): equations it flows into are interpreted (never bound),
     and lax control flow carries it as a pytree.  Only for rev=False (the hooked program is re-traced to a flat jaxpr).
@@ -232,8 +231,6 @@ def retrace(cj, *, cap=None, rev=False, n_tally=0, square=False, emit=None, tabl
     other uses (they need the dense cotangent for those).
     fingerprint: f also returns (last) a uint32 hash of the final carries of every top-level while loop (replay
     consistency: the adjoint replays the same ops and compares, _reverse.vjp_prog)."""
-    if square:
-        emit = lambda t, i, v: emit_p_bind(t, i, v * v)
     tables = dict(tables or {})
     nt = len(tables)
 

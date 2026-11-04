@@ -15,7 +15,7 @@ explicit round-to-nearest intrinsics, no FMA contraction), C loops / ifs for
 while / cond / scan, address arithmetic + loads for gathers from tables.
 
 Float semantics: IEEE-754 round-to-nearest +,-,*,/,sqrt, no FMA contraction; transcendentals call the CUDA
-math library (libdevice).  Results agree with XLA only statistically (see tallymap.compare), never bitwise by design.
+math library (libdevice).  Results agree with XLA only statistically (see docs/validation.md), never bitwise by design.
 """
 
 import jax
@@ -221,6 +221,13 @@ class Lazy(Val):
 LAZY_MAX_COST = 32
 
 
+# A lazy value (Lazy, or a View of one) is re-inlined into EVERY consumer, so one used k times is emitted k times.
+# Rule: a lazy value used more than once in its jaxpr is materialised when one element's C expression is longer than
+# MAT_MULTI_CHARS characters (rendered at index 0); a one-use or short one stays lazy, as before.  Measured on the
+# GDML geometry kernel (prototype TM_MAT_MULTI=200): 543 kB of source for one equation; 13.0 -> 7.5 MB in all.
+MAT_MULTI_CHARS = 200
+
+
 def lazy_cost(v):
     if isinstance(v, Lazy):
         return v.cost
@@ -247,6 +254,54 @@ def elem(v, idx):
     if isinstance(v, VTally):
         raise CodegenError("a tally is read (tallies are write-only)")
     raise TypeError(v)
+
+
+# ----------------------------------------------------------------------------- wide-multiply chains
+# NVVM (the front end of NVRTC and nvcc) is EXPONENTIAL in the depth of a serial dependency chain of 64-bit integer
+# multiplies (the 64x64->128 product, spelled natively or in 32-bit limbs) inside one function: on the identical
+# arithmetic 0.7 s at depth 12, 127 s at 16, > 300 s at 20 (DTRAX's MixMax reseed is 17 links).  The same multiplies
+# without the dependency, or a chain of 32-bit multiplies, are free.  So every scalar whose chain depth (the longest
+# path to it counting one per wide multiply) would pass MULCHAIN_K is passed through `sj_brk` (kernel.PRELUDE: an
+# empty asm with the value tied in and out, zero instructions, and the front end cannot see through it) and its
+# depth restarts at 0.  sj_brk(x) == x, so the bits cannot change.  Measured (wavefront-state 41140a0): cut every
+# 1, 4 or 8 links the compile is 0.2 s at depth 16, 24 and 48; every 12 it is 2.2 s; every 16 it is 125.6 s;
+# identical SASS (928 == 928 instructions).
+MULCHAIN_K = 8
+
+
+def _wide_mul(eqn):
+    """1 if `eqn` is one link of a wide-multiply chain (an integer multiply with a >= 64-bit result)."""
+    n = eqn.primitive.name
+    if n not in ("mul", "mulhi", "integer_pow") or (n == "integer_pow" and int(eqn.params.get("y", 0)) < 2):
+        return 0
+    return int(any(not is_dropvar(v) and _isint(v.aval.dtype) and _bits(v.aval.dtype) >= 64 for v in eqn.outvars))
+
+
+def mul_chain(jaxpr, memo, cuts=None):
+    """walk `jaxpr` in emission order giving every variable its wide-multiply chain depth; a scalar whose depth
+    passes MULCHAIN_K is cut (added to `cuts`) and restarts at 0.  A sub-jaxpr (cond branch, loop body, call)
+    adds its input-to-output depth with its own cuts applied (the emitter cuts it when it emits it).
+    -> the deepest output depth of `jaxpr`.  memo: id(sub-jaxpr) -> its output depth (one build)."""
+    from ..._jaxpr import subjaxprs
+    d = {}
+    for eqn in jaxpr.eqns:
+        w = _wide_mul(eqn)
+        for sj in subjaxprs(eqn):
+            k = id(sj.jaxpr)
+            if k not in memo:
+                memo[k] = (sj.jaxpr, mul_chain(sj.jaxpr, memo))       # (the jaxpr is held: its id stays unique)
+            w = max(w, memo[k][1])
+        dep = max([d.get(a, 0) for a in eqn.invars if not isinstance(a, Literal)] or [0]) + w
+        for v in eqn.outvars:
+            if is_dropvar(v):
+                continue
+            if dep > MULCHAIN_K and v.aval.shape == ():
+                d[v] = 0
+                if cuts is not None:
+                    cuts.add(v)
+            else:
+                d[v] = dep
+    return max([d.get(v, 0) for v in jaxpr.outvars if not isinstance(v, Literal)] or [0])
 
 
 # ----------------------------------------------------------------------------- constant folding
@@ -287,6 +342,8 @@ class Emitter:
         self._frozen = [set()]    # names of Local arrays that must never be mutated (loop consts, function params)
         self.where = ""           # the item function (error messages)
         self.inplace = True       # False (private _cuda_inplace=False): never update an array in place
+        self._mulmemo = {}        # mul_chain: id(jaxpr) -> (jaxpr, output chain depth)
+        self.n_brk = 0            # chain cuts emitted (sj_brk)
 
     # ------------------------------------------------------------ text helpers
     def fresh(self, p="v"):
@@ -394,6 +451,32 @@ class Emitter:
         self.assign(d, v)
         return d
 
+    def mat_multi(self, v, uses):
+        """v, or v materialised when it is a lazy value used more than once with a long expression (MAT_MULTI_CHARS)"""
+        if uses < 2 or not isinstance(v, (Lazy, View)) or not 0 < v.size <= MAX_LOCAL or lazy_cost(v) == 0:
+            return v
+        saved = (self.lines, self.ind, self.uid)
+        try:
+            self.lines = []
+            n = len(elem(v, [0] * len(v.shape)))
+        except Exception:
+            return v
+        finally:
+            self.lines, self.ind, self.uid = saved
+        return self.mat(v) if n > MAT_MULTI_CHARS else v
+
+    def brk(self, v):
+        """the same scalar through the chain-cut barrier sj_brk (see MULCHAIN_K); other values unchanged."""
+        if v.shape != () or v.cval is not None or isinstance(v, VTally) or v.dtype is None or \
+                np.dtype(v.dtype).kind not in "iuf" or np.dtype(v.dtype) == _FLOAT0:
+            return v
+        n = self.fresh("b")
+        self.line(f"const {ctype(v.dtype)} {n} = sj_brk({elem(v, [])});")
+        self.n_brk += 1
+        out = Scalar(n, v.dtype)
+        out.key_impl = v.key_impl
+        return out
+
     def computed(self, shape, dtype, fn, p="v"):
         """New value whose elements are fn(idx); scalars become a const variable."""
         ct = ctype(dtype)
@@ -489,6 +572,27 @@ class Emitter:
                     return False
         return True
 
+    def elementwise_self(self, dst, x):
+        """may the lazy value `x` be written into `dst`'s storage in place?  Yes when x's element expression reads
+        that storage only at its own index: `dst[i] = f(.., dst[i])` then gives every element the value a copy
+        through a temporary would (no element depends on another element of dst).  Placement only."""
+        if (isinstance(x, (Table, VTally, Local)) or x is None or not isinstance(dst, Local)
+                or tuple(getattr(x, "shape", ())) != tuple(dst.shape) or np.dtype(x.dtype) != np.dtype(dst.dtype)):
+            return False
+        sym = [f"_q{k}" for k in range(len(dst.shape))]
+        saved = (self.lines, self.ind, self.uid)
+        try:
+            self.lines = []
+            t, own = elem(x, sym), elem(dst, sym)
+        except Exception:
+            return False
+        finally:
+            self.lines, self.ind, self.uid = saved
+        if own not in t:
+            return False
+        import re
+        return re.search(r"(?<![A-Za-z0-9_])" + re.escape(dst.name) + r"(?![A-Za-z0-9_])", t.replace(own, "")) is None
+
     def run_top(self, cj, args, fn):
         """Run a top-level ClosedJaxpr: concrete scalar consts become literals, every other const (arrays, and
         tracers closed over from an enclosing trace) is a dynamic kernel input."""
@@ -539,6 +643,8 @@ class Emitter:
             if not isinstance(a, Literal):
                 uses[a] = uses.get(a, 0) + 1
         rem = dict(uses)
+        cuts = set()
+        mul_chain(jaxpr, self._mulmemo, cuts)
         self._scopes.append((env, rem))
         try:
             for eqn in jaxpr.eqns:
@@ -555,7 +661,7 @@ class Emitter:
                     outs = [outs]
                 for v, x in zip(eqn.outvars, outs):
                     if not is_dropvar(v):
-                        env[v] = x
+                        env[v] = self.brk(x) if v in cuts else self.mat_multi(x, uses.get(v, 0))
             return [read(a) for a in jaxpr.outvars]
         finally:
             self._scopes.pop()
@@ -575,11 +681,16 @@ class Emitter:
         off = pool[2]
         pool[1].append(a.ravel())
         pool[2] += a.size
-        self.consts[pool[0]] = ("static", None, np.concatenate(pool[1]))
         cast = "u8" if dt == np.bool_ else ctype(dt)
         t = Table(f"((const {cast}*)SJ_CONST({pool[0]}))", a.shape, dt, off=off)
         t.cnp = a
         return t
+
+    def flush_pools(self):
+        """write each pooled constant buffer into self.consts, concatenated ONCE (re-concatenating at every
+        fold_table was quadratic in the pool).  kernel.build_source calls it before reading self.consts."""
+        for pool in getattr(self, "_pools", {}).values():
+            self.consts[pool[0]] = ("static", None, np.concatenate(pool[1]))
 
     def _try_fold(self, eqn, ins):
         """All inputs compile-time known -> evaluate the primitive eagerly ON THE DEFAULT DEVICE (XLA's own kernels,
@@ -652,7 +763,7 @@ class Emitter:
         self.prims.add(name)
         if eqn.effects:
             raise CodegenError(f"primitive {name!r} has side effects {eqn.effects}; effects are not allowed "
-                                f"inside the item function.{advice(eqn)}")
+                                f"inside the item function on any backend.{advice(eqn)}")
         from . import op_table
         rule = self.hooks.get(name) or op_table.RULES.get(name)
         if name not in op_table.TALLY_AWARE and name not in self.hooks and any(isinstance(v, VTally) for v in ins):

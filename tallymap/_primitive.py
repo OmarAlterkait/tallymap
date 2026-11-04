@@ -24,7 +24,7 @@ they recurse to any order.  Node kinds:
                (or anything else linear) -> the generic vjp of its own item.
   batching     only linear operands batched (jacfwd, jacrev, vmap of jvp/vjp tangents; for a fused_jvp node: only its
                tangents) -> `dual_lanes`: T dual lanes per item, the primal computed once; on cuda in chunks of at
-               most MAX_LANES (16) lanes whose lane-dependent loop arrays stay < LANES_MAX_LOCAL (512) elements, one
+               most MAX_LANES (16) lanes, one
                launch per chunk.  Otherwise, when no spawn / exact outputs, every batched broadcast operand is small
                (<= FOLD_MAX_BC elements per member) and (cuda) one member's N items cannot fill the device
                -> `folded_batch`: ONE launch over B*N items; anything else -> lax.map (one launch per member).
@@ -90,13 +90,15 @@ class Node:
         return any(self.lin_pi) or any(self.lin_bc)
 
     def key(self):
-        """structural identity: equal keys -> the same compiled program (used for the eager-call cache).  Host
-        callbacks enter by identity (the jaxpr text only names them; a cached entry keeps its objects alive)."""
+        """structural identity: equal keys -> the same compiled program (used for the eager-call cache): the
+        structural digest of the item jaxpr (_jaxpr.digest).  Host callbacks enter by identity (the jaxpr only names
+        them; a cached entry keeps its objects alive)."""
         k = self.__dict__.get("_key")
         if k is None:
-            from ._jaxpr import host_callbacks
+            from ._jaxpr import digest, host_callbacks
             p = self.prog
-            k = (str(p.cj.jaxpr), tuple(id(c) for c in p.cj.consts), tuple(id(c) for c in host_callbacks(p.cj.jaxpr)),
+            k = (digest(p.cj.jaxpr), tuple(id(c) for c in p.cj.consts),
+                 tuple(id(c) for c in host_callbacks(p.cj.jaxpr)),
                  tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.exact, s.scale, s.kind) for s in p.tallies),
                  p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), self.backend, self.opts)
             object.__setattr__(self, "_key", k)
@@ -175,7 +177,6 @@ def _run(node, args, platform):
     p = node.prog
     pi, bc = _split(node, args)
     opts = dict(node.opts)
-    fallback = bool(opts.pop("allow_fallback", False))
     b = node.backend
     if b == "auto" and platform != "cuda":
         _warn_once("tallymap: no CUDA GPU on this platform; running the lockstep backend (plain JAX)", node.site)
@@ -191,44 +192,11 @@ def _run(node, args, platform):
     try:
         return list(CB.run(p, pi, bc, **opts))
     except UnsupportedError as e:
-        if b == "cuda":
-            raise
-        if not fallback:
-            why = _lockstep_cannot_run(p)
-            if why is not None:          # suggesting a fallback that cannot run either would only waste a run
-                raise UnsupportedError(f"{e}\ntallymap: the lockstep backend cannot run this program either "
-                                       f"({why}), so allow_fallback=True would not help") from None
-            # (C1) never a SILENT ~100x slowdown on a GPU: the lockstep backend is the reference interpreter, not a
-            # fast path (measured: a 7 ms cuda program took 678 ms on lockstep)
-            raise UnsupportedError(f"{e}\ntallymap: backend='auto' on a GPU does not fall back to the lockstep backend "
-                                   "(~100x slower): pass allow_fallback=True to accept the fallback, or "
-                                   "backend='lockstep'") from None
-        _warn_once(f"tallymap: cuda backend cannot run this program ({e}); falling back to the lockstep backend "
-                   "(allow_fallback=True)", node.site)
-        return list(LB.run(p, pi, bc, **opts))
-
-
-def _lockstep_cannot_run(p):
-    """-> why the lockstep backend cannot run this item program either, or None.  The lockstep interpreter runs
-    every JAX primitive, with two exceptions: side effects, and exact=True outputs without jax_enable_x64."""
-    from ._jaxpr import subjaxprs
-
-    def walk(jaxpr):
-        for e in jaxpr.eqns:
-            if e.effects:
-                return (f"the item function has side effects ({', '.join(sorted(str(x) for x in e.effects))}); "
-                        "effects are not supported inside tallymap.vmap on any backend")
-            for sj in subjaxprs(e):
-                why = walk(sj.jaxpr)
-                if why is not None:
-                    return why
-        return None
-    why = walk(p.cj.jaxpr)
-    if why is not None:
-        return why
-    if any(s.exact for s in p.tallies) and not jax.config.jax_enable_x64:
-        return "exact=True outputs need jax_enable_x64 on the lockstep backend"
-    return None
+        # (C1) backend='auto' never falls back: the lockstep backend is the reference interpreter, not a fast path
+        # (measured: a 7 ms cuda program took 678 ms on lockstep), so a silent fallback is a silent ~100x slowdown
+        raise UnsupportedError(f"{e}\ntallymap: the cuda backend cannot compile this program; pass "
+                               "backend='lockstep' to run it in plain JAX (the reference interpreter, ~100x slower; "
+                               "it runs every JAX primitive that has no side effects)") from None
 
 
 def _warn_once(msg, site=None):
@@ -356,7 +324,8 @@ def dual_lanes_prog(p, T, bpi, bbc, shared=(0, 0)):
     vf = jax.vmap(lambda *a: list(f(*a)), in_axes=tuple(in_axes), out_axes=out_axes, axis_size=T)
     cj = _mk(vf, avals)
     tl = tuple(dataclasses.replace(s, lead=(T,) + tuple(s.lead)) if l else s for s, l in zip(p.tallies, lt))
-    return dataclasses.replace(p, cj=cj, tallies=tl, tag=p.tag + f"+dual_lanes{T}"), lt, ly
+    mk = None if p.mkfp is None else (lambda: dual_lanes_prog(p.with_fp(), T, bpi, bbc, shared)[0])   # (RV)
+    return dataclasses.replace(p, cj=cj, tallies=tl, tag=p.tag + f"+dual_lanes{T}", mkfp=mk), lt, ly
 
 
 # ------------------------------------------------------------------------------------------- jvp
@@ -440,6 +409,9 @@ def _vjp_call(node, base, pi, bc, U_pi, U_bc, cts, N):
     if base.spawn is not None:          # reverse through spawn: the tree adjoint (one adjoint launch per generation)
         from ._reverse_spawn import tree_vjp
         return tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N)
+    # (RV) the replay check needs the fingerprint, which a forward-only program does not compute: take the variant
+    # that has it (the extra per-item result is the last and uint32, so `cts` and every index below still line up)
+    base = base.with_fp()
     ot, tf, yf = _float_slots(base)
     nt = len(ot)
     ya = base.y_avals()
@@ -577,6 +549,8 @@ def _dual_lanes(args, dims, node, fused):
     bat = [d is not NM for d in dims]
     lin = list(lin_pi) + list(lin_bc)
     mode = dict(node.opts).get("_lanes", "auto")
+    if mode not in ("auto", "off") and not isinstance(mode, int):
+        raise ValueError(f"tallymap: _lanes must be 'off' or an int (lanes per chunk), got {mode!r}")
     if not any(lin) or any(b and not l for b, l in zip(bat, lin)) or mode == "off":
         return None
     size = next(a.shape[d] for a, d in zip(args, dims) if d is not NM)
@@ -589,18 +563,6 @@ def _dual_lanes(args, dims, node, fused):
     q, lt, ly = dual_lanes_prog(p, T, bpi, bbc, shared)
     if _foreign.lanes_unsafe(q.cj):     # a batched foreign primitive: one lane at a time (see lanes_unsafe)
         return None
-    if gpu:
-        # see LANES_MAX_LOCAL: the cuda kernel keeps T copies of every lane-dependent loop array in local memory.
-        # Too big -> chunks of Tc < T lanes (the lane state is linear in T), one launch per chunk.
-        m = _taint_max(q.cj.jaxpr, list(lt) + list(bpi) + list(bbc), False)[0]
-        if m >= LANES_MAX_LOCAL:
-            T = min(T - 1, (LANES_MAX_LOCAL - 1) * T // m)
-            if T < 2:
-                return None
-            T = _balanced(size, T)
-            q, lt, ly = dual_lanes_prog(p, T, bpi, bbc, shared)
-            if _taint_max(q.cj.jaxpr, list(lt) + list(bpi) + list(bbc), False)[0] >= LANES_MAX_LOCAL:
-                return None
     if fused:
         ln = node.derived(q, "fused_jvp", base=(fwd, pp, pb, chain + ((T, bpi, bbc),)), pp=pp, pb=pb)
     else:
@@ -643,19 +605,9 @@ def _dual_lanes(args, dims, node, fused):
 register_batcher(tallymap_call_p, _batch)
 
 
-# Lanes vmap the item: a dense intermediate of S elements inside a loop becomes [T, S].  The cuda backend keeps such
-# arrays in per-thread local memory; measured (L40S, 65k items): jacfwd(grad) of a walk gathering a 256-entry table
-# (its replay adjoint scatters the table cotangent into a dense [256] array every step) -> lanes kernel with [2, 256]
-# arrays: 6 KB stack frame, 95 ms vs 2.3 ms for one lane.  A particle-shower item with 129 lane-dependent elements
-# per lane (L40S): T lanes in one kernel cost 1.34 / 1.99 / 2.27 / 2.57 x fwd for T = 1..4 but 14 / 23 / 32 x for
-# T = 6 / 8 / 10
-# (one launch per column: 2.2 + 1.2 (T-1) x).  On cuda the lane-dependent loop state is kept below LANES_MAX_LOCAL
-# elements by splitting the lanes into chunks (one launch each); a single lane over the limit -> fold / lax.map.
-LANES_MAX_LOCAL = 512
-# ... and at most MAX_LANES lanes per kernel (the guard sees the largest lane array, not the sum of many small lane
-# values).  Measured (L40S, toy walk 1M items, jacrev of 256 outputs = 256 cotangent lanes of the adjoint): one
-# kernel per chunk of 4 / 8 / 16 / 32 / 64 lanes 229 / 191 / 175 / 176 / 325 ms, all 256 at once 4.3 s, fold 533 ms;
-# hessian 8x8 (8 lanes) 83 ms vs fold 102 ms.  A photon-transport jacfwd of 10 parameters stays one kernel.
+# Lanes vmap the item: a dense intermediate of S elements inside a loop becomes [T, S], and T lanes in one kernel
+# stop paying off beyond a few, so at most MAX_LANES lanes go in one kernel (measurements: docs/design.md section 2,
+# "dual-lanes chunking", and section 5).
 MAX_LANES = 16
 
 
@@ -669,78 +621,6 @@ def _balanced(size, cap):
 
 def _gpu(node):
     return node.backend == "cuda" or (node.backend == "auto" and jax.default_backend() == "gpu")
-
-
-def _taint_max(jaxpr, tin, in_loop):
-    """(max size of a tainted first-order loop intermediate, taint of the outvars)."""
-    from jax.extend.core import Literal
-
-    from ._jaxpr import call_jaxpr, cond_branches, scan_parts, subjaxprs, while_parts
-    tv = {v: t for v, t in zip(jaxpr.invars, tin)}
-    m = 0
-    for e in jaxpr.eqns:
-        ti = [False if isinstance(v, Literal) else tv.get(v, False) for v in e.invars]
-        name = e.primitive.name
-        to = None
-        if name == "while":
-            w = while_parts(e)
-            nc, nb = w.nc, w.nb
-            car = ti[nc + nb:]
-            for _ in range(len(car) + 1):
-                mb, ob = _taint_max(w.body.jaxpr, ti[nc:nc + nb] + car, True)
-                new = [a or b for a, b in zip(car, ob)]
-                if new == car:
-                    break
-                car = new
-            m = max(m, mb)
-            to = car
-        elif name == "scan":
-            sc = scan_parts(e)
-            nc, nk = sc.nconsts, sc.ncarry
-            car = ti[nc:nc + nk]
-            for _ in range(len(car) + 1):
-                mb, ob = _taint_max(sc.body.jaxpr, ti[:nc] + car + ti[nc + nk:], True)
-                new = [a or b for a, b in zip(car, ob[:nk])]
-                if new == car:
-                    break
-                car = new
-            m = max(m, mb)
-            to = car + ob[nk:]
-        elif name == "cond":
-            outs = [_taint_max(b.jaxpr, ti[1:], in_loop) for b in cond_branches(e)]
-            m = max([m] + [o[0] for o in outs])
-            to = [any(o[1][j] for o in outs) or ti[0] for j in range(len(e.outvars))]
-        elif call_jaxpr(e) is not None:
-            mb, to = _taint_max(call_jaxpr(e).jaxpr, ti, in_loop)
-            m = max(m, mb)
-        elif subjaxprs(e):
-            to = [any(ti)] * len(e.outvars)
-            if any(ti):
-                m = max([m] + [_largest_loop_array(sj.jaxpr, in_loop) for sj in subjaxprs(e)])
-        else:
-            to = [any(ti)] * len(e.outvars)
-            if in_loop and any(ti) and name != "tallymap_emit":
-                for v in e.outvars:
-                    sh = getattr(v.aval, "shape", ())
-                    m = max(m, int(np.prod(sh, dtype=np.int64)) if sh else 1)
-        for v, t in zip(e.outvars, to):
-            tv[v] = t
-    return m, [False if isinstance(v, Literal) else tv.get(v, False) for v in jaxpr.outvars]
-
-
-def _largest_loop_array(jaxpr, in_loop=False):
-    from ._jaxpr import subjaxprs
-    m = 0
-    for e in jaxpr.eqns:
-        subs = subjaxprs(e)
-        if in_loop and not subs and e.primitive.name != "tallymap_emit":     # first-order, non-tally intermediates
-            for v in e.outvars:
-                sh = getattr(v.aval, "shape", ())
-                m = max(m, int(np.prod(sh, dtype=np.int64)) if sh else 1)
-        loop = in_loop or e.primitive.name in ("while", "scan")
-        for sj in subs:
-            m = max(m, _largest_loop_array(sj.jaxpr, loop))
-    return m
 
 
 # ------------------------------------------------------------------------------------------- fold a batch into items
@@ -813,7 +693,8 @@ def fold_prog(p, B, bbc):
     bav = [jax.ShapeDtypeStruct((B,) + tuple(a.shape), a.dtype) if f else _sds(a) for a, f in zip(av[nT + nP:], bbc)]
     cj = _mk(item, tav + pav + [jax.ShapeDtypeStruct((), jnp.int32)] + bav)
     tl = tuple(dataclasses.replace(s, S=B * s.S) for s in p.tallies)
-    return dataclasses.replace(p, cj=cj, tallies=tl, nP=nP + 1, tag=p.tag + f"+folded_batch{B}")
+    mk = None if p.mkfp is None else (lambda: fold_prog(p.with_fp(), B, bbc))     # (RV) derived the same way
+    return dataclasses.replace(p, cj=cj, tallies=tl, nP=nP + 1, tag=p.tag + f"+folded_batch{B}", mkfp=mk)
 
 
 def _fold_batch(node, args, dims, bat, B):

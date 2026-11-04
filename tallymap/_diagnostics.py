@@ -22,10 +22,6 @@ Keys:
              thread outside JAX's pool (local_reserved_gib: what an out-of-memory error at launch is about)
 With f: `programs` / `kernels` are those of f only (JAX's caches are cleared first so that everything is re-traced
 and re-lowered), plus `stablehlo_sha256` of the lowered program.
-
-tm.assert_arms_differ(f_a, f_b, *args) is the A/B rule for the library's own options: before comparing two arms
-(timings, numerics), assert that they compiled to different programs (different cuda kernels, or for the lockstep
-backend different StableHLO); raises AssertionError otherwise.
 """
 import collections
 import contextlib
@@ -38,16 +34,23 @@ import jax
 import numpy as np
 
 HISTORY = 16
-PROGRAMS = collections.deque(maxlen=HISTORY)       # (tag, jaxpr text) of item programs bound by tm.vmap
+PROGRAMS = collections.deque(maxlen=HISTORY)       # (tag, jaxpr object) of item programs bound by tm.vmap
 KERNELS = collections.deque(maxlen=HISTORY)        # dicts recorded by backends/cuda.kernel()
 _CAPTURE = []                                      # active diagnostics(f, ...) captures: dict(programs=, kernels=)
 
 
 def record_program(prog):
-    rec = dict(tag=prog.tag, jaxpr=str(prog.cj.jaxpr))
+    # the jaxpr OBJECT, printed only when diagnostics() is read: str(jaxpr) at every bind was 102 s of a 260 s fully
+    # cached build on DTRAX (JAX's pretty-printer).  The object is alive anyway, in the program being bound.
+    rec = dict(tag=prog.tag, jaxpr=prog.cj.jaxpr)
     PROGRAMS.append(rec)
     for c in _CAPTURE:
         c["programs"].append(rec)
+
+
+def _render(rec):
+    """a program record as returned by diagnostics(): the jaxpr as text (built now, not at bind time)."""
+    return dict(rec, jaxpr=str(rec["jaxpr"]))
 
 
 def record_kernel(rec):
@@ -119,10 +122,10 @@ def diagnostics(fn=None, *args, reset=False, **kwargs):
         with _capture() as c:
             low = jax.jit(fn).lower(*args, **kwargs)
         txt = low.as_text()
-        d.update(programs=c["programs"], kernels=c["kernels"],
+        d.update(programs=[_render(r) for r in c["programs"]], kernels=c["kernels"],
                  stablehlo_sha256=hashlib.sha256(txt.encode()).hexdigest())
     else:
-        d.update(programs=list(PROGRAMS), kernels=list(KERNELS))
+        d.update(programs=[_render(r) for r in PROGRAMS], kernels=list(KERNELS))
     d["kernels"] = [_with_resources(k) for k in d["kernels"]]
     if reset:
         from . import _reverse as R
@@ -142,25 +145,6 @@ def _with_resources(rec):
     from .backends.cuda.compile import kernel_info
     info = kernel_info(rec["kid"])
     return dict(rec, resources=info) if info is not None else rec
-
-
-def artifacts(fn, *args, **kwargs):
-    """(sorted cubin hashes of the cuda kernels, StableHLO sha256) that jax.jit(fn)(*args) compiles to."""
-    d = diagnostics(fn, *args, **kwargs)
-    return tuple(sorted(k["hash"] for k in d["kernels"])), d["stablehlo_sha256"]
-
-
-def assert_arms_differ(fn_a, fn_b, *args, **kwargs):
-    """The A/B rule: two arms of an option comparison must compile to different programs (else the comparison is
-    void).  cuda: the kernels' cubin hashes differ; lockstep (no kernels): the StableHLO differs.  -> the two
-    artifacts; raises AssertionError when they are identical."""
-    ka, ha = artifacts(fn_a, *args, **kwargs)
-    kb, hb = artifacts(fn_b, *args, **kwargs)
-    same = (ka == kb) if (ka or kb) else (ha == hb)
-    if same:
-        raise AssertionError("tallymap A/B rule: the two arms compiled to identical programs "
-                             f"(kernels {list(ka)}, StableHLO {ha[:12]}); the comparison would be void")
-    return (ka, ha), (kb, hb)
 
 
 def _env():                                                    # the environment variables that matter

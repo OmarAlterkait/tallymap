@@ -15,12 +15,6 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   as source size to the power 1.8 to 2.3 between 99 KB and 706 KB of generated source
   (18 s to 725 s).
 
-- `benchmarks/events_bench.py`: the measurement of event scheduling (`_schedule='events'`) against the default
-  step refill, on the item shape it is for (a divergent loop whose body is a lopsided switch). No `vs_jax`
-  problem has a top-level `cond` with a dynamic index in its step body, so on all of them the two schedules
-  compile to the same kernel and the mechanism's benefit was undocumented. It is 3.1x on the forward pass of
-  a rare, 256-times-more-expensive branch at 4M items on a 2080 Ti, and a wash in reverse mode
-  (`docs/design.md`, section 1b).
 - `jnp.linalg.solve`, `inv`, `det` and `lu_factor` / `lu_solve` run inside an item on cuda: `lu`,
   `lu_pivots_to_permutation`, `custom_linear_solve` and `triangular_solve` are lowered after autodiff to JAX's own
   pure-JAX implementations (and a substitution loop), so the derivative is JAX's own. `supported_primitives()`
@@ -40,13 +34,27 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   local memory per thread, grad/forward 8.1x: 32.4 / 31.2 / 32.1 ms at S = 0 / 2 / 4) and the diffrax ensemble
   of `docs/equinox.md` (4,936 against 4,968 ms). `docs/design.md` section 6 already recorded that ptxas reports
   zero spill bytes for every public adjoint kernel, so no rule could have set S either. -96 lines.
-- Event scheduling of INNER while loops. `_schedule='events'` now cuts only the step body of the outer loop
-  (`kernel._cut` / `kernel._events_main`); an inner `while` is lowered as a plain C loop again. On four toys
-  built to be the inner-loop scheduler's best case it was 1.82x / 1.36x / 1.22x / 1.03x slower than the plain
-  loop and never faster, and it never fired on any `benchmarks/vs_jax` problem. It was also the reason
-  `_schedule='events'` cost 3.1x in reverse mode (every top-level loop of an adjoint program was
-  event-scheduled); the gradient is now within 3% of the default, while the forward win (1.6-3.1x on
-  `benchmarks/events_bench.py`) is unchanged.
+- Event scheduling (the private `_schedule='events'`, `kernel._cut`, `kernel._events_main`) and
+  `benchmarks/events_bench.py`; `_schedule` takes `'step'` | `'item'`. It won only on the synthetic lopsided
+  switch it was built for (1.6-3.1x forward, gradient unchanged), never fired on a `benchmarks/vs_jax` problem,
+  and was 0.81x on the photon-transport engine at the same commit; its general form in the shower engine was
+  0.50x / 0.77x on a 2080 Ti and hung once (`docs/design.md` section 1b). The inner-loop half (1.03-1.82x
+  slower on four toys built for it) had already gone. No other kernel changes.
+- The dual-lanes local-memory guard (`_primitive.LANES_MAX_LOCAL`, `_taint_max`, `_largest_loop_array`) and the
+  `'force'` value of the private `_lanes` option, which only meant "ignore the guard" (`_lanes` takes `'off'` or
+  an int chunk size; any other value raises). The guard never fired on any toy-bench row (identical HLO with and
+  without it) nor on the photon-transport engine's 6- and 26-column `jacfwd` (largest lane-dependent loop array
+  54 / 117 elements against 512; identical CUDA source with it disabled). `MAX_LANES = 16` chunking is unchanged
+  (`docs/design.md` section 2).
+- `tm.compare` (with `criteria`, the private `_api._square_mode` and the re-tracer's `square=` hook). The frozen
+  comparison is a test protocol, not an API: it moved to `tests/compare_protocol.py`, where `floor_fn` (the same
+  item with every emitted value squared) is a required argument instead of a global trace mode. `tm.reference`
+  is unchanged.
+- `tm.assert_arms_differ` (and `_diagnostics.artifacts`): the A/B rule is developer measurement hygiene built on
+  `tm.diagnostics`, and moved to `tests/ab_rule.py` (used by `tests/` and `benchmarks/perf_negative_control.py`).
+- The public option `allow_fallback` (and `_primitive._lockstep_cannot_run`). Passing it now raises, like any
+  unknown option. `backend='lockstep'` is the explicit equivalent, and the `UnsupportedError` for a program the
+  cuda backend cannot compile now says to pass it, for `backend='cuda'` as well as `'auto'`.
 - `tm.Sum(..., tangent_scale=)`, the fixed-point scale of the TANGENT tally of an `exact=True` output. Nothing
   in the tests, benchmarks, examples or documentation ever set it and no number was ever recorded for it; a
   tangent tally now always uses its primal output's `scale`, which is what every program that did not set it
@@ -64,6 +72,26 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   `docs/design.md` section 6. No behaviour change on any supported option value.
 
 ### Changed
+
+- The cuda kernel cache and the eager-call cache key a program on a structural sha256 digest of its jaxpr
+  (`_jaxpr.digest`) instead of its printed text. JAX's pretty-printer cost 95 s per build on a large engine item
+  (4.2 s with the digest); the digest also separates literal values the printer rounds (`docs/design.md`
+  section 11).
+- `tm.diagnostics()` builds the item jaxpr's text when it is called, not at every bind (102 s of a 260 s cached
+  build on a large engine item). The returned record is unchanged.
+- A forward-only call (primal, `jvp`, `jacfwd`, a folded batch) no longer computes the per-item replay
+  fingerprint; reverse mode builds the fingerprinted program when it needs it, so the replay check is unchanged.
+  +76% forward on an engine item with a 16.8 KB loop carry, 1.19-1.31x on cheap items.
+- cuda: a serial chain of 64-bit integer multiplies is cut every 8 links by a zero-instruction barrier, because
+  NVRTC's front end is exponential in that chain's depth (127 s at 16 links, 0.2 s cut). Results are bitwise
+  unchanged; `tests/mulchain.py` checks it.
+- cuda: a lazily inlined value used more than once is computed once into a local array when its element expression
+  is longer than 200 characters, instead of being re-inlined into every consumer (a geometry kernel's source
+  13.0 -> 7.5 MB).
+- cuda buffer assignment: a `while` loop's dead initial carry array becomes the carry storage, and a `cond` output
+  is written into a dead operand of the same shape (also when the value is lazy and reads that storage only at its
+  own index), so neither is copied. Placement only, results bitwise unchanged; 1.59x on a large engine item on an
+  L40S (`docs/design.md` section 11).
 
 - The cuda kernel claims ONE item per warp-aggregated claim. It used to claim a run of up to
   `clamp(N / (16 * grid * block), 1, 16)` items per lane, which left the last claims holding several items each
