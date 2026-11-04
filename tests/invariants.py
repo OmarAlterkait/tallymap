@@ -669,6 +669,47 @@ def _(b):
     return f"{len(same_)} equal, {len(differ)} different"
 
 
+def _with_power(kind, pairs, expect):
+    """the expected pairs under which the coarse key really COLLIDES (both programs get the same coarse key): only
+    there can a stale reuse happen, so only there does the control have power.  Not every key collides on every
+    JAX: on 0.11 a closed-over array reaches the item jaxpr where _jaxpr.digest hashes its bytes (not as a top-level
+    const), so the digest-only key already separates those pairs -- the real keys' structural part is then sound on
+    its own.  -> (pairs with power, {pair without power: why})"""
+    from tallymap import _diagnostics as D
+    ck = _coarse_kernel_key(kind)
+    held, orig = [], D.record_program
+    D.record_program = lambda q: (held.append(q), orig(q))[1]
+    power, none = set(), {}
+    try:
+        for p in pairs:
+            if p.name not in expect:
+                continue
+            del held[:]
+            p.a()
+            pa = held[-1]
+            del held[:]
+            p.b()
+            pb = held[-1]
+            if ck(pa, {}) == ck(pb, {}):
+                power.add(p.name)
+            else:
+                none[p.name] = f"top-level consts {len(pa.cj.consts)}/{len(pb.cj.consts)}"
+    finally:
+        D.record_program = orig
+    return power, none
+
+
+def _neg_verdict(kind, res, expect, none):
+    caught = {k for k, v in res.items() if v}
+    miss = expect - caught
+    if miss:
+        raise Fail(f"the coarse key was NOT detected for {sorted(miss)}: the [key] test is blind there")
+    if not expect:
+        raise Skip(f"no power on JAX {jax.__version__}: the {kind}-only key already separates every expected pair "
+                   f"({none})")
+    return f"stale reuse caught in {sorted(caught)}" + (f"; no collision (no power) for {none}" if none else "")
+
+
 for _kind in ("text", "digest", "avals"):
     @case(f"[key] NEGATIVE CONTROL: kernel key = {_kind} only must be caught (cuda _KERNELS)", ["cuda"])
     def _(b, kind=_kind):
@@ -676,35 +717,36 @@ for _kind in ("text", "digest", "avals"):
         real = CB._key
         CB._KERNELS.clear()
         _P._EAGER.clear()
+        pairs = [p for p in make_pairs(b) if p.safe]
+        expect, none = _with_power(kind, pairs, NEG_EXPECT[kind])
+        if "option cuda_math approx vs ieee" in NEG_EXPECT[kind]:
+            expect.add("option cuda_math approx vs ieee")     # the coarse keys ignore options: always collides
+            none.pop("option cuda_math approx vs ieee", None)
+        CB._KERNELS.clear()
+        _P._EAGER.clear()
         CB._key = _coarse_kernel_key(kind)
         try:
-            res = _pair_cell(b, [p for p in make_pairs(b) if p.safe])
+            res = _pair_cell(b, pairs)
         finally:
             CB._key = real
             CB._KERNELS.clear()
             _P._EAGER.clear()
-        caught = {k for k, v in res.items() if v}
-        miss = NEG_EXPECT[kind] - caught
-        if miss:
-            raise Fail(f"the coarse key was NOT detected for {sorted(miss)}: the [key] test is blind there")
-        return f"stale reuse caught in {sorted(caught)}"
+        return _neg_verdict(kind, res, expect, none)
 
     @case(f"[key] NEGATIVE CONTROL: eager-cache Node.key = {_kind} only must be caught", ["lockstep"])
     def _(b, kind=_kind):
         real = _P.Node.key
         ck = _coarse_kernel_key(kind)
+        pairs = [p for p in make_pairs(b) if p.safe]
+        expect, none = _with_power(kind, pairs, {k for k in NEG_EXPECT[kind] if "cuda_math" not in k})
         _P._EAGER.clear()
         _P.Node.key = lambda self: (ck(self.prog, {}), self.backend, self.kind)
         try:
-            res = _pair_cell(b, [p for p in make_pairs(b) if p.safe])
+            res = _pair_cell(b, pairs)
         finally:
             _P.Node.key = real
             _P._EAGER.clear()
-        caught = {k for k, v in res.items() if v}
-        miss = {k for k in NEG_EXPECT[kind] if "cuda_math" not in k} - caught
-        if miss:
-            raise Fail(f"the coarse key was NOT detected for {sorted(miss)}: the [key] test is blind there")
-        return f"stale reuse caught in {sorted(caught)}"
+        return _neg_verdict(kind, res, expect, none)
 
 
 # =================================================================================================== [tdep]
