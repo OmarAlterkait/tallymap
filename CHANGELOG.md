@@ -65,6 +65,11 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Changed
 
+- The cuda kernel cache and the eager-call cache key a program on a structural sha256 digest of its jaxpr
+  (`_jaxpr.digest`) instead of its printed text. JAX's pretty-printer cost 95 s per build on a large engine item
+  (4.2 s with the digest); the digest also separates literal values the printer rounds (`docs/design.md`
+  section 11).
+
 - The cuda kernel claims ONE item per warp-aggregated claim. It used to claim a run of up to
   `clamp(N / (16 * grid * block), 1, 16)` items per lane, which left the last claims holding several items each
   — a tail the other lanes wait for. Measured over all 18 `benchmarks/vs_jax` forward and gradient cells on a

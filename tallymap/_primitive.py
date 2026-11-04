@@ -90,13 +90,15 @@ class Node:
         return any(self.lin_pi) or any(self.lin_bc)
 
     def key(self):
-        """structural identity: equal keys -> the same compiled program (used for the eager-call cache).  Host
-        callbacks enter by identity (the jaxpr text only names them; a cached entry keeps its objects alive)."""
+        """structural identity: equal keys -> the same compiled program (used for the eager-call cache): the
+        structural digest of the item jaxpr (_jaxpr.digest).  Host callbacks enter by identity (the jaxpr only names
+        them; a cached entry keeps its objects alive)."""
         k = self.__dict__.get("_key")
         if k is None:
-            from ._jaxpr import host_callbacks
+            from ._jaxpr import digest, host_callbacks
             p = self.prog
-            k = (str(p.cj.jaxpr), tuple(id(c) for c in p.cj.consts), tuple(id(c) for c in host_callbacks(p.cj.jaxpr)),
+            k = (digest(p.cj.jaxpr), tuple(id(c) for c in p.cj.consts),
+                 tuple(id(c) for c in host_callbacks(p.cj.jaxpr)),
                  tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.exact, s.scale, s.kind) for s in p.tallies),
                  p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), self.backend, self.opts)
             object.__setattr__(self, "_key", k)

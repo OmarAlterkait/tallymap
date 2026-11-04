@@ -639,3 +639,23 @@ solves the same problem per thread. Here the lanes that need the work are gather
   synthetic switch over K phases inside a divergent loop, but no measurable change on any of the 13 benchmark
   problems, whose conds are unbatched or small. It does not clear the library's bar (a mechanism must buy 1.5x
   on a realistic workload), so it is not kept; all the gains above are the while-loop narrowing.
+
+## 11. Fixed rules ported from the `wavefront-state` branch (consolidation, 2026-11)
+
+`wavefront-state` was a private experimental branch driven by the shower engine's exact Geant4 port (DTRAX), with
+its levers behind environment variables. The ones that cleared the bar were re-implemented here as fixed rules: no
+environment variable, no option. Each paragraph gives the measurement that justified it and the `wavefront-state`
+commit it came from; the measurements are on that private engine.
+
+- **A structural digest, not `str(jaxpr)`, as the cache key** (wavefront `290f137`). The cuda kernel cache and the
+  eager-call cache keyed programs on the printed jaxpr, and JAX's pretty-printer builds a document tree per
+  equation: on DTRAX's mode-2 item that key cost 95.0 s per build on an A100 and 133.7 s on a 2080 Ti, more than
+  the trace and the emitter together. `_jaxpr.digest` hashes the same information into a sha256 without
+  materialising anything (4.22 s and 5.26 s; the cubin was unchanged): primitive names, operands numbered by first
+  appearance (alpha-equivalent jaxprs hash equal, as their printed forms are equal), output avals, every parameter
+  by value, sub-jaxprs recursively (each hashed once), and the exact bytes of every literal and of every nested
+  closed jaxpr's consts, which the printer rounds or omits and the emitter bakes into the kernel. The top-level
+  consts are keyed as before (by value in the kernel key, by identity in the eager key). `tests/invariants.py`
+  [key] checks that the real keys separate every pair, that a key made of the digest alone is caught by the same
+  pairs as the printed text, and the digest's own separation (alpha-equivalence, primitive, operand order, shape,
+  dtype, parameter, cond / while / scan structure, a literal one ulp apart).
