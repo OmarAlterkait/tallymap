@@ -183,11 +183,16 @@ ITEM function and binds the primitive again, so the rules recurse to any order o
   way, and the full test matrix passes with the fusion on and off on every tested version
   (`tests/run_all.py --unfused`). One known simplification: a fully known fused equation under `jax.checkpoint`
   is treated as saveable for every policy, which costs memory and is never wrong.
-- **dual-lanes guard**: on CUDA, a `dual_lanes` program whose loop body carries a first-order intermediate of 512
-  elements or more is split into chunks of fewer lanes, because the kernel keeps T copies of it in per-thread
-  local memory. Measured on the toy walk at 1M items, `jax.hessian` went from 1629 ms to 13.5 ms with the guard.
-  At most MAX_LANES = 16 lanes go in one kernel: `jacrev` of the 256 outputs of the toy walk at 1M items took
-  229 / 191 / 175 / 176 / 325 ms in chunks of 4 / 8 / 16 / 32 / 64 lanes, and 4.3 s with all 256 at once.
+- **dual-lanes chunking**: on CUDA at most MAX_LANES = 16 lanes go in one kernel: `jacrev` of the 256 outputs of
+  the toy walk at 1M items took 229 / 191 / 175 / 176 / 325 ms in chunks of 4 / 8 / 16 / 32 / 64 lanes, and 4.3 s
+  with all 256 at once; `jax.hessian` of the same walk went from 1629 ms to 13.5 ms. A second guard,
+  `LANES_MAX_LOCAL`, split a `dual_lanes` program into smaller chunks when its loop body carried a lane-dependent
+  intermediate of 512 elements or more, and is removed: it never fired on any toy-bench row (identical HLO with
+  and without it, `hvp`, grad-of-jvp, `hessian` 2x2 and 8x8, grad-of-grad at 65k and 1M items; the 1629 -> 13.5 ms
+  above is the chunking), nor on the photon-transport engine's `jacfwd` (largest lane-dependent loop array 54
+  elements at 6 columns and 117 at 26, against 512; at most 144 at 16 lanes), whose traced program and CUDA
+  source are identical with it disabled. Its own evidence, 95 ms against 2.3 ms for a dense `[T, 256]` table
+  cotangent, predates sparse table cotangents, which no longer build that array.
 - A `fused_jvp` node whose primal operands are unbatched is batched into ONE `dual_lanes` kernel that computes the
   primal once plus T tangent lanes (`dual_lanes_prog(shared=...)`). Before that fix, `jacfwd` ran two launches.
 
@@ -340,8 +345,10 @@ the device's resident-thread count and no longer consults the kernel's privatisa
 
 Dual-lanes chunking, measured on the shower-shaped program: one kernel with T lanes cost 1.34, 1.99, 2.27 and
 2.57 times the forward pass for T = 1 to 4, but 14, 23 and 32 times for T = 6, 8 and 10. Chunking into the
-largest size allowed by the guard gave 4.5, 4.5, 6.8 and 9.1 times for T = 4, 6, 8 and 10. That is why the guard
-exists.
+largest size the `LANES_MAX_LOCAL` guard allowed (129 lane-dependent elements per lane: at most 3 lanes per
+chunk) gave 4.5, 4.5, 6.8 and 9.1 times for T = 4, 6, 8 and 10. That is the guard's one positive record, on a private program
+and an earlier library version; nothing current reproduces it, so the guard is removed (section 2) and only the
+MAX_LANES = 16 chunking remains.
 
 ## 6. Why reverse mode is slow, and what to do per case
 

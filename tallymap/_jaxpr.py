@@ -1,7 +1,7 @@
 """Jaxpr structure: the ONE module that knows how JAX stores control flow and call-like equations.
 
 Every walker (the tally checker and the re-tracer in _rewrite, the lockstep interpreter, the cuda emitter and its
-step split, the dual-lanes size guard in _primitive) reads while / cond / scan / call equations through these
+step split) reads while / cond / scan / call equations through these
 accessors, never through eqn.params directly.  The parameter names are not a JAX API (they changed at least once:
 scan's num_consts / num_carry became a flat-tree `ft_in` on JAX 0.10), so a JAX release that renames them breaks here.
 """
