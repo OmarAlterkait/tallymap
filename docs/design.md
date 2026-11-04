@@ -686,7 +686,11 @@ commit it came from; the measurements are on that private engine.
   12 it is 2.2 s, every 16 125.6 s. The barrier is zero instructions (identical SASS, 928 == 928) and returns its
   operand, so results are bitwise unchanged; the definitions are emitted only into kernels that use them, so every
   other kernel's source is unchanged. Array-valued chain carriers are not cut (a chain through array slots did not
-  cliff). `tests/mulchain.py`: a 24-link chain compiles in seconds and matches lockstep bitwise.
+  cliff). Measured on this tree through tallymap's own compiler path (NVRTC 12.1, sm_75, job 43057989): the spawning
+  item of wavefront's `test_mulchain.py` compiles in 60.7 s at chain depth 16 and 60.8 s at 24 without the cut, 1.7 s
+  with it (nvcc: 52.6 / 53.5 s -> 0.9 / 1.0 s); depth 12 is 5.3 -> 1.7 s; results bitwise equal with and without the
+  cut and to lockstep. A flat item with the same chains does not cliff (1.6-1.8 s either way), so the CI test
+  `tests/mulchain.py` is structural only (cuts present, bitwise vs lockstep, compile time a sanity bound).
 - **A lazy value used more than once is materialised when its expression is long** (prototype `TM_MAT_MULTI` in
   the GDML calibration study's codegen patch, 2026-10-18). The emitter keeps one-use elementwise results and cheap
   ops on large table gathers lazy (`op_table._ew_rule`, rules (a) and (b)), and a lazy value is re-inlined into
