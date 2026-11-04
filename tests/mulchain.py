@@ -3,9 +3,11 @@
 NVVM is exponential in the depth of a serial chain of 64-bit integer multiplies inside one function (127 s at depth
 16, > 300 s at 20), so the cuda emitter cuts such a chain every codegen.MULCHAIN_K links with a zero-instruction
 barrier (sj_brk).  The item below is ONE chain of DEPTH modular multiply links (the 64x64->128 product in 32-bit
-limbs, as a JAX program has to spell it).  Checked: the cuts are in the source, the kernel compiles in seconds (a
-fresh cubin cache), and the results are BITWISE equal to the lockstep backend (integer arithmetic: any difference is
-a bug, not rounding).
+limbs, as a JAX program has to spell it).  This is a STRUCTURAL test: the cuts are in the source and the results
+are BITWISE equal to the lockstep backend (integer arithmetic: any difference is a bug, not rounding); the compile
+bound is only a sanity limit.  It does not reproduce the cliff: with the rule patched off this item also compiles in
+under a second through NVRTC on the CI GPUs (job 43047843).  The off / on compile measurement is a one-off job,
+recorded in docs/design.md section 11.
 """
 import os
 import shutil
@@ -86,7 +88,7 @@ def main():
         src = open(kern[0]["source"]).read()
         ncut = src.count("= sj_brk(")
         assert ncut >= DEPTH // CG.MULCHAIN_K - 1, f"{ncut} chain cuts for a {DEPTH}-link chain"
-        assert kern[0]["compile_s"] < 60, f"compile {kern[0]['compile_s']} s (the uncut chain is > 300 s)"
+        assert kern[0]["compile_s"] < 60, f"compile {kern[0]['compile_s']} s (sanity bound)"
         return f"{ncut} cuts, compile {kern[0]['compile_s']} s"
 
     def bitwise():
@@ -96,7 +98,7 @@ def main():
         assert np.array_equal(np.asarray(rc.per_item), np.asarray(rl.per_item)), "per-item chain value differs"
         return f"tallies and {N} per-item values bitwise equal"
 
-    cell(f"wide-multiply chain of {DEPTH} links: cut every {CG.MULCHAIN_K}, compiles in seconds", compiled)
+    cell(f"wide-multiply chain of {DEPTH} links: cut every {CG.MULCHAIN_K} (structural)", compiled)
     cell("wide-multiply chain: cuda == lockstep bitwise", bitwise)
     print("TOTAL", len(RES), "PASS", sum(m.startswith("PASS") for m in RES))
     return 0 if all(m.startswith("PASS") for m in RES) else 1
