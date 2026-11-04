@@ -115,6 +115,16 @@ def _too_big_here(e):
     return f"too big for this GPU, with the advice: {m.group(1)} GiB of local memory vs {lim / 2 ** 30:.1f} GiB"
 
 
+# (cell, backend) -> reason: a KNOWN defect, pinned.  The cell then prints XFAIL when it fails and XPASS (which fails
+# the run, so the marker goes) when it passes.  Keyed on the measured combination only.
+XFAIL = {}
+if jax.__version__ == "0.5.3" and qx.__version__ == "0.3.0":
+    XFAIL[("qx_quadts fwd", "cuda")] = (
+        "plan section 15: quadts forward is ~1e-9 x the right value on cuda (MEASURED 2080 Ti, JAX 0.5.3 + quadax "
+        "0.3.0; the same on dev 0f2737f, so not round 1; cuda_math and the schedule change nothing; its grad cell "
+        "passes; JAX 0.11.2 + quadax 0.3.1 is right)")
+
+
 def case(name, backends=None):
     def deco(fn):
         for b in (backends or BACKENDS):
@@ -131,6 +141,9 @@ def case(name, backends=None):
                 msg = f"PASS ({big})" if big else f"RAISE {type(e).__name__}: {str(e)[:300]}"
                 if not big:
                     traceback.print_exc()
+            xf = XFAIL.get((name, b))
+            if xf is not None:
+                msg = f"XPASS (marked XFAIL: {xf}) {msg}" if msg.startswith("PASS") else f"XFAIL ({xf}) -- {msg}"
             RES.append((name, b, msg))
             print(f"{name:40s} {b:8s} {msg}  [{time.perf_counter() - t0:.1f}s]", flush=True)
         return fn
@@ -508,4 +521,5 @@ print("\n================ SUMMARY", jax.__version__, "x64" if jax.config.jax_ena
 for _n, _b, _m in RES:
     print(f"{_n:40s} {_b:8s} {_m[:200]}")
 _cnt = lambda p: sum(m.startswith(p) for _, _, m in RES)
-print("TOTAL", len(RES), "PASS", _cnt("PASS"), "FAIL", _cnt("FAIL"), "RAISE", _cnt("RAISE "))
+print("TOTAL", len(RES), "PASS", _cnt("PASS"), "XFAIL", _cnt("XFAIL"), "FAIL", _cnt("FAIL"), "RAISE", _cnt("RAISE "),
+      "XPASS", _cnt("XPASS"))
