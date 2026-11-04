@@ -121,6 +121,23 @@ __device__ __forceinline__ void sj_atomic_max_f32(float* a, float v) {
 #define SJ_LDV(p) (*((volatile u32*)(p)))
 """
 
+# the wide-multiply chain cut (codegen.MULCHAIN_K), emitted only into kernels that use it (so every other kernel's
+# source, and cubin, is unchanged)
+BRK = r"""
+// the wide-multiply chain cut (codegen.MULCHAIN_K): the same value, through an empty asm the front end cannot see
+// through; the register allocator ties output to input, so it is zero instructions
+__device__ __forceinline__ u64 sj_brk(u64 x) { asm("" : "+l"(x)); return x; }
+__device__ __forceinline__ i64 sj_brk(i64 x) { asm("" : "+l"(x)); return x; }
+__device__ __forceinline__ u32 sj_brk(u32 x) { asm("" : "+r"(x)); return x; }
+__device__ __forceinline__ i32 sj_brk(i32 x) { asm("" : "+r"(x)); return x; }
+__device__ __forceinline__ u16 sj_brk(u16 x) { u32 t = x; asm("" : "+r"(t)); return (u16)t; }
+__device__ __forceinline__ i16 sj_brk(i16 x) { u32 t = (u16)x; asm("" : "+r"(t)); return (i16)t; }
+__device__ __forceinline__ u8 sj_brk(u8 x) { u32 t = x; asm("" : "+r"(t)); return (u8)t; }
+__device__ __forceinline__ i8 sj_brk(i8 x) { u32 t = (u8)x; asm("" : "+r"(t)); return (i8)t; }
+__device__ __forceinline__ double sj_brk(double x) { asm("" : "+d"(x)); return x; }
+__device__ __forceinline__ float sj_brk(float x) { asm("" : "+f"(x)); return x; }
+"""
+
 
 class Layout:
     pass
@@ -565,6 +582,8 @@ def build_source(p, *, block=BLOCK, split=True, inplace=True, events=False):
     if spawn is not None:
         flags |= 4         # grid is not capped by N (children)
     L.flags = flags
+    if em.n_brk:
+        src.append(BRK)
     src += fdefs
 
     # ---------------------------------------------------------------- main kernel

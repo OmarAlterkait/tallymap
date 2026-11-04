@@ -74,6 +74,9 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 - A forward-only call (primal, `jvp`, `jacfwd`, a folded batch) no longer computes the per-item replay
   fingerprint; reverse mode builds the fingerprinted program when it needs it, so the replay check is unchanged.
   +76% forward on an engine item with a 16.8 KB loop carry, 1.19-1.31x on cheap items.
+- cuda: a serial chain of 64-bit integer multiplies is cut every 8 links by a zero-instruction barrier, because
+  NVRTC's front end is exponential in that chain's depth (127 s at 16 links, 0.2 s cut). Results are bitwise
+  unchanged; `tests/mulchain.py` checks it.
 
 - The cuda kernel claims ONE item per warp-aggregated claim. It used to claim a run of up to
   `clamp(N / (16 * grid * block), 1, 16)` items per lane, which left the last claims holding several items each

@@ -675,3 +675,15 @@ commit it came from; the measurements are on that private engine.
   primal launch is the one the replay check re-binds and XLA merges the two; elsewhere reverse mode pays one extra
   forward launch. A spawning program never builds it (its reverse mode, the tree adjoint, has its own check).
   `tests/reverse.py`'s replay negative control (`_adj_math`) still makes the gradient NaN.
+- **A serial chain of 64-bit multiplies is cut every 8 links** (wavefront `41140a0`, `8337bb7`, merged in `58db0f2`).
+  NVVM is exponential in the depth of a dependency chain of 64-bit integer multiplies inside one function: on the
+  identical arithmetic (`cicc` alone) 0.2 s at depth 8, 0.7 s at 12, 127.3 s at 16, > 300 s at 20, while the same
+  multiplies without the dependency, a chain of 32-bit multiplies or a shift/xor mixer of the same size are free;
+  DTRAX's MixMax reseed is a 17-link chain. The emitter gives every value its chain depth (longest path counting one
+  per 64-bit multiply; a cond / loop body / call adds its own input-to-output depth after its own cuts) and passes a
+  scalar whose depth would exceed `codegen.MULCHAIN_K = 8` through `sj_brk`, an empty `asm` with the value tied in
+  and out, then restarts its depth. Cut every 1, 4 or 8 links the compile is 0.2 s at depths 16, 24 and 48; every
+  12 it is 2.2 s, every 16 125.6 s. The barrier is zero instructions (identical SASS, 928 == 928) and returns its
+  operand, so results are bitwise unchanged; the definitions are emitted only into kernels that use them, so every
+  other kernel's source is unchanged. Array-valued chain carriers are not cut (a chain through array slots did not
+  cliff). `tests/mulchain.py`: a 24-link chain compiles in seconds and matches lockstep bitwise.
