@@ -72,10 +72,9 @@ def _phys_in(x):
 
 
 def run(p, pi, bc, cuda_math="approx", _schedule=None, _cuda_inplace=True, **_):
-    """Scheduling: a lane is refilled with a new item at STEP granularity (needs one top-level while loop;
-    1.35x faster than whole items on a photon-transport item) unless the program spawns (whole items: 1.5x faster
-    on a particle shower); private _schedule
-    'step' | 'item' overrides it (measurements and A/B checks only).
+    """Scheduling: a lane is refilled with a new item at STEP granularity (needs one top-level while loop) unless
+    the program spawns (whole items); the measurements behind the rule are in docs/design.md section 1b.  Private
+    _schedule 'step' | 'item' overrides it (measurements and A/B checks only).
     Private _cuda_inplace=False: never update a
     per-item array in place (every dynamic_update_slice copies; the A/B control of the emitter's aliasing analysis).
     cuda_math: 'approx' (DEFAULT: div.full / sqrt.approx / rsqrt.approx, the PTX XLA:GPU itself emits for f32;

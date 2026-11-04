@@ -263,7 +263,7 @@ The gradient needs `rev_checkpoints` chosen for the item, so it gets its own sec
 
 `rev_checkpoints` (C) is the number of loop states the reverse pass keeps per checkpoint buffer.  The README
 already says it is not monotone in the step count; a diffrax item is the clearest case of that, because a diffrax
-solver's state is large (the solution, the controller, the stage buffers, several counters) so `2C+1` copies of it
+solver's state is large (the solution, the controller, the stage buffers, several counters) so `2C` copies of it
 leave registers, while a small C pays quadratic recomputation once the loop is longer than C^2 steps.
 
 MEASURED, `Kvaerno5` gradient in ms, the best C in bold:

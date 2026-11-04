@@ -142,8 +142,8 @@ def _val(name, shape, dt, impl):
 def _split(cj):
     """If the item has exactly ONE top-level while loop, split it into pre / (cond, body) / post so the kernel can
     refill a lane with a new item at STEP granularity (a lane whose item finished does not idle until the whole
-    warp's items finish: 2.6x on a photon-transport item).  -> None (whole-item mode) or dict of closed jaxprs +
-    wiring."""
+    warp's items finish; measurements: docs/design.md section 1b).  -> None (whole-item mode) or dict of closed
+    jaxprs + wiring."""
     import jax
     from jax.extend.core import Literal
 

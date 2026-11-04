@@ -243,7 +243,7 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                                   rounded: the portable reference).
                lockstep_block     lockstep backend: lanes per block (default 2^18; bounds its memory).
                rev_checkpoints    reverse mode: states per checkpoint buffer C (default 16).  O(K) work for loops
-                                  of K <= C^2 steps, 2C+1 states of per-item memory.
+                                  of K <= C^2 steps, 2C states of per-item memory.
                rev_stats          reverse mode: report replay mismatches and tree-adjoint stats to the host
                                   (tallymap.diagnostics()['reverse']).  Off by default: a host callback takes jax.jit
                                   off its C++ fast path.  A failed check makes the gradient NaN either way.

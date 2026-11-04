@@ -599,12 +599,9 @@ def _dual_lanes(args, dims, node, fused):
 register_batcher(tallymap_call_p, _batch)
 
 
-# Lanes vmap the item: a dense intermediate of S elements inside a loop becomes [T, S].  A particle-shower item with
-# 129 lane-dependent elements per lane (L40S): T lanes in one kernel cost 1.34 / 1.99 / 2.27 / 2.57 x fwd for
-# T = 1..4 but 14 / 23 / 32 x for T = 6 / 8 / 10 (one launch per column: 2.2 + 1.2 (T-1) x).  So at most MAX_LANES
-# lanes per kernel.  Measured (L40S, toy walk 1M items, jacrev of 256 outputs = 256 cotangent lanes of the adjoint):
-# one kernel per chunk of 4 / 8 / 16 / 32 / 64 lanes 229 / 191 / 175 / 176 / 325 ms, all 256 at once 4.3 s, fold
-# 533 ms; hessian 8x8 (8 lanes) 83 ms vs fold 102 ms.  A photon-transport jacfwd of 10 parameters stays one kernel.
+# Lanes vmap the item: a dense intermediate of S elements inside a loop becomes [T, S], and T lanes in one kernel
+# stop paying off beyond a few, so at most MAX_LANES lanes go in one kernel (measurements: docs/design.md section 2,
+# "dual-lanes chunking", and section 5).
 MAX_LANES = 16
 
 
