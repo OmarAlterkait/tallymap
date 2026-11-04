@@ -49,7 +49,7 @@ try:
     import lineax as lx
     import optimistix as optx
     import quadax as qx
-except ImportError as e:                                     # pragma: no cover (the normal CI has them)
+except ImportError as e:     # pragma: no cover (CI installs them: pip install .[equinox])
     print(f"equinox_compat: Equinox is not installed ({e})")
     print("SUITE SKIP")
     sys.exit(0)

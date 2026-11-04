@@ -55,6 +55,9 @@ cuda = [
 ]
 # tests/run_all.py needs nothing beyond jax + numpy, except the jax.export cell (flatbuffers on some versions)
 test = ["flatbuffers"]
+# tests/equinox_compat.py and the lineax cells of tests/invariants.py (skipped without them).  CI-tested versions:
+# 0.13.8 / 0.1.1 / 0.1.0 / 0.7.2 / 0.3.1 on JAX 0.11.2, and 0.13.8 / 0.0.8 / 0.0.11 / 0.7.0 / 0.3.0 on JAX 0.5.3
+equinox = ["equinox", "lineax", "optimistix", "diffrax", "quadax"]
 
 [tool.setuptools.dynamic]
 version = { attr = "tallymap.__version__" }
