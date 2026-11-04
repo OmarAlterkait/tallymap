@@ -146,8 +146,8 @@ one host callback in the program).
 ## The A/B rule
 
 Before comparing two arms of an option, for timings or for numerics, assert that they compiled to different
-programs: `tm.assert_arms_differ(f_a, f_b, *args)` (on CUDA it compares the cubin hashes, on lockstep the
-StableHLO). Comparing two identical programs measures noise. Before a negative control, measure that the injected
+programs: `assert_arms_differ(f_a, f_b, *args)` from `tests/ab_rule.py` (on CUDA it compares the cubin hashes,
+on lockstep the StableHLO). Comparing two identical programs measures noise. Before a negative control, measure that the injected
 defect changes the observable at all.
 
 ## Tests and CI

@@ -8,7 +8,7 @@ slowdown well above 1.5x:
      known >= 2x slowdown.  Instrument (docs/validation.md: a defect must be shown to change the observable): at
      least two rows must move by >= 2x, else the control is VOID.  Verdict: PASS iff perf.py flags a row other
      than the bimodal toy_jacfwd8 (4.9 or 6.9 ms across processes for the same program).
-  INFO: cuda_math='ieee' against the approx baseline.  The A/B rule (tm.assert_arms_differ on fwd / jvp / grad)
+  INFO: cuda_math='ieee' against the approx baseline.  The A/B rule (tests/ab_rule.py on fwd / jvp / grad)
      first shows the two arms compile to different kernels; then the ratios are printed.  MEASURED 2026-10-14: the
      toy rows do not move under ieee (well inside 10%), so ieee is NOT a usable defect at any tolerance; it is kept
      as a report only.
@@ -26,9 +26,11 @@ import tallymap as tm
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "tests"))
 os.environ.setdefault("N", str(1 << 16))
 os.environ["MODES"] = "none"                     # import the toy program only (run no benchmark rows)
 import toy_bench as T  # noqa: E402  (the toy rows' own program)
+from ab_rule import assert_arms_differ  # noqa: E402  (tests/ab_rule.py: the A/B rule)
 
 N_DEFAULT = 1 << 20                              # toy_bench's default N: what the baseline was recorded with
 SCALE = 4
@@ -57,7 +59,7 @@ def perf(**env):
 # INFO: the ieee arm (A/B rule first: the two arms must be different programs)
 a, b = arm("approx"), arm("ieee")
 for k in a:
-    (ka, _), (kb, _) = tm.assert_arms_differ(a[k], b[k], T.TH)
+    (ka, _), (kb, _) = assert_arms_differ(a[k], b[k], T.TH)
     print("AB", k, "approx kernels", ka, "ieee kernels", kb, flush=True)
 out, ratios, flagged = perf(PERF_MATH="ieee")
 print(out, flush=True)

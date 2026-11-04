@@ -50,6 +50,8 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   comparison is a test protocol, not an API: it moved to `tests/compare_protocol.py`, where `floor_fn` (the same
   item with every emitted value squared) is a required argument instead of a global trace mode. `tm.reference`
   is unchanged.
+- `tm.assert_arms_differ` (and `_diagnostics.artifacts`): the A/B rule is developer measurement hygiene built on
+  `tm.diagnostics`, and moved to `tests/ab_rule.py` (used by `tests/` and `benchmarks/perf_negative_control.py`).
 - `tm.Sum(..., tangent_scale=)`, the fixed-point scale of the TANGENT tally of an `exact=True` output. Nothing
   in the tests, benchmarks, examples or documentation ever set it and no number was ever recorded for it; a
   tangent tally now always uses its primal output's `scale`, which is what every program that did not set it

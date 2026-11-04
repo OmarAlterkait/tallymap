@@ -39,7 +39,7 @@ used to answer a B question.
 - Set `jax_default_matmul_precision='highest'` for any GPU parity test. JAX's default on recent NVIDIA GPUs is a
   TF32 matmul, which biases results at the 1e-4 level.
 - Before computing anything, assert that the two arms really differ end to end: both a program hash and an
-  output. `tm.assert_arms_differ` does the first half.
+  output. `assert_arms_differ` in `tests/ab_rule.py` does the first half.
 - Never validate a gradient at the truth point, where its expectation is zero. Use common-random-number finite
   differences with a large step.
 

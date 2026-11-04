@@ -13,6 +13,7 @@ if os.environ.get("TEST_X64"):
 import jax
 import jax.numpy as jnp
 import numpy as np
+from ab_rule import assert_arms_differ
 from jax import lax
 
 import tallymap as tm
@@ -774,15 +775,15 @@ def _(b):
     return f"{len(d['programs'])} program(s), {len(d['kernels'])} kernel(s); jax {d['versions']['jax']}"
 
 
-@case("A/B rule: tm.assert_arms_differ (identical arms raise; different programs pass)")
+@case("A/B rule: tests/ab_rule.assert_arms_differ (identical arms raise; different programs pass)")
 def _(b):
     g = lambda **o: (lambda x, k, t, th: V(walk, b, in_axes=AX, **o)(x, k, t, th).outputs["Q"])
     if b == "cuda":
         same, diff = (dict(cuda_math="approx"), dict()), (dict(_schedule="step"), dict(_schedule="item"))
     else:
         same, diff = (dict(cuda_math="ieee"), dict()), (dict(lockstep_block=8), dict())
-    raises(AssertionError, lambda: tm.assert_arms_differ(g(**same[0]), g(**same[1]), xs, keys, tab, TH), "identical")
-    (ka, ha), (kb, hb) = tm.assert_arms_differ(g(**diff[0]), g(**diff[1]), xs, keys, tab, TH)
+    raises(AssertionError, lambda: assert_arms_differ(g(**same[0]), g(**same[1]), xs, keys, tab, TH), "identical")
+    (ka, ha), (kb, hb) = assert_arms_differ(g(**diff[0]), g(**diff[1]), xs, keys, tab, TH)
     return f"arms {diff}: kernels {len(ka)}/{len(kb)}, hlo {ha[:8]} vs {hb[:8]}"
 
 
@@ -956,7 +957,7 @@ def _(b):
     ii = jnp.arange(N, dtype=jnp.int32) % 5 + 1
     run = lambda bk, **o: tm.vmap(item, outputs=out, backend=bk, **o)
     g = lambda **o: (lambda a, k: run("cuda", **o)(a, k).per_item[0])
-    tm.assert_arms_differ(g(), g(_cuda_inplace=False), ii, keys)      # instrument: in-place updates did happen
+    assert_arms_differ(g(), g(_cuda_inplace=False), ii, keys)      # instrument: in-place updates did happen
     rs = [run("cuda")(ii, keys), run("cuda", _cuda_inplace=False)(ii, keys), run("lockstep")(ii, keys)]
     for r in rs[1:]:
         for a, c in zip(jax.tree_util.tree_leaves(rs[0]), jax.tree_util.tree_leaves(r)):

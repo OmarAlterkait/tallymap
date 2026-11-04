@@ -346,6 +346,9 @@ the device's resident-thread count and no longer consults the kernel's privatisa
 Removed from the public namespace before the first release (an API decision, so no measurement is involved):
 `tm.compare`, with `criteria` and the square mode of the re-tracer that produced its floor run. Its frozen thresholds are a test protocol rather than an API, and one test used it; it is now
 `tests/compare_protocol.py`, where the floor run is the same item with squared emits, written by the caller.
+`tm.assert_arms_differ` (and its `artifacts`), the A/B rule, is measurement hygiene for the library's own
+developers, built entirely on `tm.diagnostics`; it is now `tests/ab_rule.py`, used by the tests and by
+`benchmarks/perf_negative_control.py`.
 
 Dual-lanes chunking, measured on the shower-shaped program: one kernel with T lanes cost 1.34, 1.99, 2.27 and
 2.57 times the forward pass for T = 1 to 4, but 14, 23 and 32 times for T = 6, 8 and 10. Chunking into the
@@ -477,8 +480,8 @@ Everything in this section has a test.
   `stats['dropped_emits']`. Error messages name the item function and the source line of the offending operation,
   using `jax.extend.source_info_util`; re-traced equations keep the user's source information.
 - **One reporting channel**: `tm.diagnostics()` gives versions, the GPU, the kernels with their cached CUDA
-  source, the item jaxprs and the reverse-mode counters. `tm.assert_arms_differ` is the A/B rule
-  (`docs/validation.md`).
+  source, the item jaxprs and the reverse-mode counters. The A/B rule is `tests/ab_rule.py`
+  (`docs/validation.md`), built on it.
 - **The JAX surface in two modules**: `_compat.py` holds every version shim (batching registration, dropped
   variables, typed-key pseudo-random generators through the public implementation methods, the version policy)
   and `_jaxpr.py` is the only reader of control-flow and call equation parameters. One guarded `jax._src` import

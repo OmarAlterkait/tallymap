@@ -22,10 +22,6 @@ Keys:
              thread outside JAX's pool (local_reserved_gib: what an out-of-memory error at launch is about)
 With f: `programs` / `kernels` are those of f only (JAX's caches are cleared first so that everything is re-traced
 and re-lowered), plus `stablehlo_sha256` of the lowered program.
-
-tm.assert_arms_differ(f_a, f_b, *args) is the A/B rule for the library's own options: before comparing two arms
-(timings, numerics), assert that they compiled to different programs (different cuda kernels, or for the lockstep
-backend different StableHLO); raises AssertionError otherwise.
 """
 import collections
 import contextlib
@@ -142,25 +138,6 @@ def _with_resources(rec):
     from .backends.cuda.compile import kernel_info
     info = kernel_info(rec["kid"])
     return dict(rec, resources=info) if info is not None else rec
-
-
-def artifacts(fn, *args, **kwargs):
-    """(sorted cubin hashes of the cuda kernels, StableHLO sha256) that jax.jit(fn)(*args) compiles to."""
-    d = diagnostics(fn, *args, **kwargs)
-    return tuple(sorted(k["hash"] for k in d["kernels"])), d["stablehlo_sha256"]
-
-
-def assert_arms_differ(fn_a, fn_b, *args, **kwargs):
-    """The A/B rule: two arms of an option comparison must compile to different programs (else the comparison is
-    void).  cuda: the kernels' cubin hashes differ; lockstep (no kernels): the StableHLO differs.  -> the two
-    artifacts; raises AssertionError when they are identical."""
-    ka, ha = artifacts(fn_a, *args, **kwargs)
-    kb, hb = artifacts(fn_b, *args, **kwargs)
-    same = (ka == kb) if (ka or kb) else (ha == hb)
-    if same:
-        raise AssertionError("tallymap A/B rule: the two arms compiled to identical programs "
-                             f"(kernels {list(ka)}, StableHLO {ha[:12]}); the comparison would be void")
-    return (ka, ha), (kb, hb)
 
 
 def _env():                                                    # the environment variables that matter

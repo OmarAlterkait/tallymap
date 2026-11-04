@@ -53,6 +53,7 @@ if os.environ.get("TEST_X64"):
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
+from ab_rule import assert_arms_differ  # noqa: E402
 from jax import lax  # noqa: E402
 
 import tallymap as tm  # noqa: E402
@@ -287,7 +288,7 @@ def _(b):
 def _(b):
     fs, fi = walk_fn(b, _schedule="step"), walk_fn(b, _schedule="item")
     th = th_of(3)
-    tm.assert_arms_differ(lambda t: fs(XS, KEYS, TAB, t).outputs["Q"], lambda t: fi(XS, KEYS, TAB, t).outputs["Q"],
+    assert_arms_differ(lambda t: fs(XS, KEYS, TAB, t).outputs["Q"], lambda t: fi(XS, KEYS, TAB, t).outputs["Q"],
                           th)
     # the same per-item arithmetic in both kernels: per-item results bitwise; Q's atomics order differs: FT
     return agree(fs(XS, KEYS, TAB, th), fi(XS, KEYS, TAB, th), "step vs item")
@@ -297,7 +298,7 @@ def _(b):
 def _(b):
     fa, fb = walk_fn(b), walk_fn(b, _cuda_inplace=False)
     th = th_of(3)
-    tm.assert_arms_differ(lambda t: fa(XS, KEYS, TAB, t).per_item[2], lambda t: fb(XS, KEYS, TAB, t).per_item[2], th)
+    assert_arms_differ(lambda t: fa(XS, KEYS, TAB, t).per_item[2], lambda t: fb(XS, KEYS, TAB, t).per_item[2], th)
     return agree(fa(XS, KEYS, TAB, th), fb(XS, KEYS, TAB, th), "inplace on vs off")
 
 
