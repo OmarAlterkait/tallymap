@@ -226,7 +226,7 @@ _OPTS = {
     "rev_checkpoints": "reverse mode: checkpoint buffer size C",
     "rev_stats": "reverse mode: report replay mismatches / tree stats to the host (costs jit's fast path)",
     # PRIVATE (measurements / tests / negative controls; not API)
-    "_schedule": "cuda: 'step' | 'item' | 'events' overrides the rule (step unless the program spawns)",
+    "_schedule": "cuda: 'step' | 'item' overrides the rule (step unless the program spawns)",
     "_cuda_inplace": "cuda: False never updates a per-item array in place (A/B control of the aliasing analysis)",
     "_lockstep_compact": "lockstep: False never narrows a while loop (the A/B control) | int: that lane width",
     "_lanes": "'off' never dual lanes | 'force' ignore the local-memory guard | int: chunks of at most this many lanes",

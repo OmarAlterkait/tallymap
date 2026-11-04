@@ -1133,51 +1133,6 @@ def _(b):
     close(V(item, b)(xs).outputs["Q"], R(item)(xs).outputs["Q"], rtol=1e-3)
     return "fresh() skips reserved names; a 40-stage roll chain compiles and matches the reference"
 
-@case("event scheduling (_schedule='events') == 'step': per-item results, exact tallies, jvp bitwise; grad per-item "
-      "bitwise; a cond-free body falls back", ["cuda"])
-def _(b):
-    def item(t, x0, key, th):                      # a skewed 3-way switch inside a divergent loop, emits in branches
-        def body(c):
-            k, x, t = c
-            u = jax.random.uniform(jax.random.fold_in(key, k))
-            idx = jnp.where(u < 0.2, 2, (u * 10).astype(jnp.int32) % 2)
-
-            def cheap(j):
-                return lambda x, t: (x * 0.9 + th * u + j, t.add("Q", (k + j) % NB, x * th))
-
-            def costly(x, t):
-                y = lax.fori_loop(0, 64, lambda i, y: jnp.sin(y) * th + 0.01 * i, x)
-                return y, t.add("Q", (k * 3) % NB, y)
-            x, t = lax.switch(idx, [cheap(0), cheap(1), costly], x, t)
-            return k + 1, x, t
-        k, x, t = lax.while_loop(lambda c: c[0] < 4 + (x0 * 7).astype(jnp.int32), body, (0, x0, t))
-        return t, x * th
-
-    out = {"Q": tm.Sum((NB,), F, exact=True)}
-    f = {s: tm.vmap(item, outputs=out, in_axes=(0, 0, None), backend=b, _schedule=s) for s in ("step", "events")}
-    ys = xs * 1.7 % 1.0
-    r = {s: jax.jit(lambda q: f[s](ys, keys, q))(TH) for s in f}
-    jv = {s: jax.jvp(lambda q: f[s](ys, keys, q).outputs["Q"], (TH,), (F(1.0),)) for s in f}
-    for a_, b_, what in ((r["step"].outputs, r["events"].outputs, "tallies"), (r["step"].per_item, r["events"].per_item,
-                         "per-item"), (jv["step"], jv["events"], "jvp")):
-        for x, y in zip(jax.tree_util.tree_leaves(a_), jax.tree_util.tree_leaves(b_)):
-            if not np.array_equal(np.asarray(x), np.asarray(y), equal_nan=True):
-                raise Fail(f"events != step ({what})")
-    modes = {k["mode"] for k in tm.diagnostics()["kernels"]}
-    ev = [k["cut"] for k in tm.diagnostics()["kernels"] if k["mode"] == "events"]
-    if not {"step", "events"} <= modes or not ev or ev[0]["branches"] != 3:
-        raise Fail(f"kernel modes {modes}, cuts {ev}")
-    loss = lambda s: (lambda xx, q: jnp.sum(f[s](xx, keys, q).per_item ** 2) + jnp.sum(f[s](xx, keys, q).outputs["Q"]))
-    g = {s: jax.grad(loss(s), argnums=(0, 1))(ys, TH) for s in f}
-    if not np.array_equal(np.asarray(g["step"][0]), np.asarray(g["events"][0])):
-        raise Fail("grad per-item (x) events != step")
-    close(g["events"][1], g["step"][1], rtol=1e-5, what="grad theta")
-    plain = lambda t, x: (t.add("Q", 0, x), x * 2)  # no loop at all: events falls back to the item mode
-    pe = tm.vmap(plain, outputs={"Q": tm.Sum((NB,), F)}, backend=b, _schedule="events")(xs)
-    close(pe.outputs["Q"], R(plain)(xs).outputs["Q"])
-    return "3-way switch: fwd / jvp / per-item bitwise, grad per-item bitwise; loop-free program falls back"
-
-
 @case("custom_jvp rule closing over an item-computed value: a clear UnsupportedError (JAX's staging limit); the "
       "advised fix (an explicit argument) differentiates")
 def _(b):
