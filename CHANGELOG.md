@@ -77,6 +77,9 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 - cuda: a serial chain of 64-bit integer multiplies is cut every 8 links by a zero-instruction barrier, because
   NVRTC's front end is exponential in that chain's depth (127 s at 16 links, 0.2 s cut). Results are bitwise
   unchanged; `tests/mulchain.py` checks it.
+- cuda: a lazily inlined value used more than once is computed once into a local array when its element expression
+  is longer than 200 characters, instead of being re-inlined into every consumer (a geometry kernel's source
+  13.0 -> 7.5 MB).
 
 - The cuda kernel claims ONE item per warp-aggregated claim. It used to claim a run of up to
   `clamp(N / (16 * grid * block), 1, 16)` items per lane, which left the last claims holding several items each

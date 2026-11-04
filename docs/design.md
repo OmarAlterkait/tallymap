@@ -687,3 +687,11 @@ commit it came from; the measurements are on that private engine.
   operand, so results are bitwise unchanged; the definitions are emitted only into kernels that use them, so every
   other kernel's source is unchanged. Array-valued chain carriers are not cut (a chain through array slots did not
   cliff). `tests/mulchain.py`: a 24-link chain compiles in seconds and matches lockstep bitwise.
+- **A lazy value used more than once is materialised when its expression is long** (prototype `TM_MAT_MULTI` in
+  the GDML calibration study's codegen patch, 2026-10-18). The emitter keeps one-use elementwise results and cheap
+  ops on large table gathers lazy (`op_table._ew_rule`, rules (a) and (b)), and a lazy value is re-inlined into
+  every consumer whatever its use count: on the GDML geometry kernel one equation became 543 kB of source.
+  Rule: a `Lazy` (or a `View` of one) used more than once in its jaxpr is computed into a local array when one
+  element's C expression is longer than `codegen.MAT_MULTI_CHARS = 200` characters. Measured with that threshold:
+  the GDML kernel's source 13.0 -> 7.5 MB. One-use values and short expressions stay lazy, so a large row gather
+  read in two places with a short expression keeps loading only the elements it reads.

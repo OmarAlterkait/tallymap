@@ -221,6 +221,13 @@ class Lazy(Val):
 LAZY_MAX_COST = 32
 
 
+# A lazy value (Lazy, or a View of one) is re-inlined into EVERY consumer, so one used k times is emitted k times.
+# Rule: a lazy value used more than once in its jaxpr is materialised when one element's C expression is longer than
+# MAT_MULTI_CHARS characters (rendered at index 0); a one-use or short one stays lazy, as before.  Measured on the
+# GDML geometry kernel (prototype TM_MAT_MULTI=200): 543 kB of source for one equation; 13.0 -> 7.5 MB in all.
+MAT_MULTI_CHARS = 200
+
+
 def lazy_cost(v):
     if isinstance(v, Lazy):
         return v.cost
@@ -444,6 +451,20 @@ class Emitter:
         self.assign(d, v)
         return d
 
+    def mat_multi(self, v, uses):
+        """v, or v materialised when it is a lazy value used more than once with a long expression (MAT_MULTI_CHARS)"""
+        if uses < 2 or not isinstance(v, (Lazy, View)) or not 0 < v.size <= MAX_LOCAL or lazy_cost(v) == 0:
+            return v
+        saved = (self.lines, self.ind, self.uid)
+        try:
+            self.lines = []
+            n = len(elem(v, [0] * len(v.shape)))
+        except Exception:
+            return v
+        finally:
+            self.lines, self.ind, self.uid = saved
+        return self.mat(v) if n > MAT_MULTI_CHARS else v
+
     def brk(self, v):
         """the same scalar through the chain-cut barrier sj_brk (see MULCHAIN_K); other values unchanged."""
         if v.shape != () or v.cval is not None or isinstance(v, VTally) or v.dtype is None or \
@@ -619,7 +640,7 @@ class Emitter:
                     outs = [outs]
                 for v, x in zip(eqn.outvars, outs):
                     if not is_dropvar(v):
-                        env[v] = self.brk(x) if v in cuts else x
+                        env[v] = self.brk(x) if v in cuts else self.mat_multi(x, uses.get(v, 0))
             return [read(a) for a in jaxpr.outvars]
         finally:
             self._scopes.pop()
