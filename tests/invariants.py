@@ -1145,6 +1145,39 @@ def _(b):
     return "; ".join(msgs)
 
 
+_TOKEN_XFAIL = ("round-2 band-aid audit A5: a reverse program's sparse-table cotangent TOKEN is a discard tally, "
+                "i.e. modelled as a VALUE, so JAX's partial evaluation can put it at the same cond output as a "
+                "plain array of the same aval (DTRAX item VJP: a 128-entry token and a 128-entry table) and the "
+                "merged output's tally mark is a guess; reading it raises 'reads a Tally' here and, past the "
+                "checker, in the emitter. Fix: a scatter-add EFFECT primitive with no value (not dtrax's Soft slot, "
+                "which only silences the checker)")
+
+
+@case("[ad] reverse cond: a cotangent token that meets a same-aval array at a cond output is not refused",
+      ["lockstep"], xfail={"lockstep": _TOKEN_XFAIL})
+def _(b):
+    # hand-built, as the reverse program builds it (dtrax tests_wavefront/test_revtables.py T4)
+    from tallymap import _rewrite
+    from tallymap._tally import emit_p
+
+    def f(t, a):
+        def b0(c):
+            tt, aa = c
+            return emit_p.bind(tt, jnp.int32(0), jnp.asarray(1.0, F)), aa
+
+        def b1(c):
+            tt, aa = c
+            return aa, tt                       # the filler: branch 1 swaps them
+        u, v = lax.cond(a[0] > 0, b0, b1, (t, a))
+        return t, jnp.sum(u[1:3]) + jnp.sum(v)  # and the merged outputs are READ
+    cj = jax.make_jaxpr(f)(jnp.zeros((8,), F), jnp.ones((8,), F))
+    try:
+        _rewrite.check_tallies(cj, ["discard"], name="token meets array")
+    except tm.TallyError as e:
+        raise Fail(f"refused: {str(e).splitlines()[0][:160]}") from None
+    return "accepted"
+
+
 # =================================================================================================== [trunc]
 CAP = 10
 

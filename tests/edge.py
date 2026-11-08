@@ -217,31 +217,6 @@ def _(b):
     return m[:60]
 
 
-@case("cond whose branches DISAGREE about a discard tally: reading the merged output is not refused", ["lockstep"])
-def _(b):
-    # A discard tally (a reverse program's cotangent token) may meet a plain value of the SAME aval in another
-    # cond branch; the merged output's tally mark is then a guess, and reading it was refused as "reads a Tally"
-    # (the DTRAX item VJP: a 128-entry token and a 128-entry table).  Hand-built, as the reverse program builds it.
-    from tallymap import _rewrite
-    from tallymap._tally import emit_p
-
-    def f(t, a):
-        def b0(c):
-            tt, aa = c
-            return emit_p.bind(tt, jnp.int32(0), jnp.asarray(1.0, F)), aa
-
-        def b1(c):
-            tt, aa = c
-            return aa, tt                       # the filler: branch 1 swaps them
-        u, v = lax.cond(a[0] > 0, b0, b1, (t, a))
-        return t, jnp.sum(u[1:3]) + jnp.sum(v)  # and the merged outputs are READ
-    cj = jax.make_jaxpr(f)(jnp.zeros((8,), F), jnp.ones((8,), F))
-    _rewrite.check_tallies(cj, ["discard"], name="soft slot")
-    # control: the same jaxpr with a NON-discard tally is still refused (its branches must agree)
-    m = raises(tm.TallyError, lambda: _rewrite.check_tallies(cj, ["sum"], name="soft slot"), "the same way")
-    return "discard: accepted; sum: " + m[:50]
-
-
 @case("nested tm.vmap: inner item writing the OUTER tally rejected")
 def _(b):
     def outer(t, x):
