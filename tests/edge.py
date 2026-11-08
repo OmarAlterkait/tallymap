@@ -1,6 +1,7 @@
 """Phase-2 edge-case matrix.  python tests/edge.py  (env: BACKENDS=lockstep,cuda  TEST_X64=1  ONLY=substr)
 Prints one line per (case, backend): PASS / FAIL <why> / RAISE <exception> and a summary table."""
 import os
+import re
 import sys
 import time
 import traceback
@@ -434,6 +435,57 @@ def _(b):
                        f"{int(E.stats['exact_overflow'])}")
         msg += "; exact tally too"
     return msg
+
+
+@case("dual lanes: the lane guard decides T on the unbatched program; a refused T-lane program is never built",
+      ["lockstep"])
+def _(b):
+    # Traced with backend='cuda' (the guard is the cuda one), never lowered, so it runs on every host.  Every
+    # dual_lanes_prog call made by _dual_lanes is recorded with the lane state it really has, which must be T x the
+    # unbatched one (the linearity the decision rests on); P lanes over a loop array of S elements per lane.
+    from tallymap import _primitive as P_
+    orig, built = P_.dual_lanes_prog, []
+
+    def rec(p, T, bpi, bbc, shared=(0, 0)):
+        q, lt, ly = orig(p, T, bpi, bbc, shared)
+        if sys._getframe(1).f_code.co_name != "_dual_lanes":      # (a fused node rebuilding its chosen lanes)
+            return q, lt, ly
+        lt0 = [s_.kind != "spawn" and k >= shared[0] for k, s_ in enumerate(p.tallies)]
+        m1 = P_._taint_max(p.cj.jaxpr, lt0 + list(bpi) + list(bbc), False)[0]
+        built.append((T, P_._taint_max(q.cj.jaxpr, list(lt) + list(bpi) + list(bbc), False)[0], m1))
+        return q, lt, ly
+
+    def prog(S, P):
+        def item(t, x, th):
+            def body(c):
+                k, a, t = c
+                a = a * (1.0 + 0.01 * th[k % P]) + x
+                return k + 1, a, t.add("Q", k % NB, jnp.sum(a))
+            return lax.while_loop(lambda c: c[0] < 3, body, (0, jnp.full((S,), x, F), t))[2]
+        f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, in_axes=(0, None), backend="cuda")
+        return lambda th: f(xs, th).outputs["Q"]
+    # (S, P) -> the lane width the guard must choose: under the limit (all P lanes), chunked, refused (no lanes)
+    want = {(10, 16): 16, (100, 16): 4, (300, 4): None}
+    out = []
+    P_.dual_lanes_prog = rec
+    try:
+        for (S, P), w in want.items():
+            built.clear()
+            jx = str(jax.make_jaxpr(jax.jacfwd(prog(S, P)))(jnp.ones((P,), F)))
+            got = sorted(set(int(v) for v in re.findall(r"dual_lanes(\d+)", jx)))
+            if got != ([w] if w else []):
+                raise Fail(f"S={S} P={P}: lanes {got} in the jaxpr, expected {w}")
+            Ts = [T for T, _, _ in built]
+            if Ts != ([w] if w else []):
+                raise Fail(f"S={S} P={P}: T-lane programs built for T={Ts}, expected {[w] if w else []} "
+                           "(a refused or re-chunked width must not be built)")
+            for T, mT, m1 in built:
+                if mT != T * m1:
+                    raise Fail(f"S={S} P={P} T={T}: lane state {mT} != T x unbatched {m1}")
+            out.append(f"S={S} P={P}: T={w}")
+    finally:
+        P_.dual_lanes_prog = orig
+    return "; ".join(out)
 
 
 @case("done at step 0 / NaN in the predicate")

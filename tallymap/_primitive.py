@@ -558,21 +558,24 @@ def _dual_lanes(args, dims, node, fused):
     shared = (fwd.prog.nT, fwd.prog.nY) if fused else (0, 0)
     gpu = mode == "auto" and _gpu(node)
     T = _balanced(size, min(size, mode) if isinstance(mode, int) else min(size, MAX_LANES) if gpu else size)
-    q, lt, ly = dual_lanes_prog(p, T, bpi, bbc, shared)
-    if _foreign.lanes_unsafe(q.cj):     # a batched foreign primitive: one lane at a time (see lanes_unsafe)
-        return None
     if gpu:
         # see LANES_MAX_LOCAL: the cuda kernel keeps T copies of every lane-dependent loop array in local memory.
-        # Too big -> chunks of Tc < T lanes (the lane state is linear in T), one launch per chunk.
-        m = _taint_max(q.cj.jaxpr, list(lt) + list(bpi) + list(bbc), False)[0]
-        if m >= LANES_MAX_LOCAL:
-            T = min(T - 1, (LANES_MAX_LOCAL - 1) * T // m)
+        # Too big -> chunks of Tc < T lanes, one launch per chunk.  The lane state is LINEAR in T (every
+        # lane-dependent value of the T-lane program is the unbatched one with a leading T axis), so it is measured
+        # once on the UNBATCHED program and T is decided before the T-lane program is built: vmapping a large item
+        # over T lanes only to measure it and throw it away was hours on an exact Geant4 port.
+        lt0 = [s.kind != "spawn" and k >= shared[0] for k, s in enumerate(p.tallies)]
+        m1 = _taint_max(p.cj.jaxpr, lt0 + list(bpi) + list(bbc), False)[0]
+        if T * m1 >= LANES_MAX_LOCAL:
+            T = min(T - 1, (LANES_MAX_LOCAL - 1) // m1)
             if T < 2:
                 return None
             T = _balanced(size, T)
-            q, lt, ly = dual_lanes_prog(p, T, bpi, bbc, shared)
-            if _taint_max(q.cj.jaxpr, list(lt) + list(bpi) + list(bbc), False)[0] >= LANES_MAX_LOCAL:
+            if T * m1 >= LANES_MAX_LOCAL:
                 return None
+    q, lt, ly = dual_lanes_prog(p, T, bpi, bbc, shared)
+    if _foreign.lanes_unsafe(q.cj):     # a batched foreign primitive: one lane at a time (see lanes_unsafe)
+        return None
     if fused:
         ln = node.derived(q, "fused_jvp", base=(fwd, pp, pb, chain + ((T, bpi, bbc),)), pp=pp, pb=pb)
     else:

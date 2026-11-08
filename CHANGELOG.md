@@ -111,6 +111,12 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 - cuda compile time: lazily inlined element expressions are capped at 32 nodes (was 256). On a large
   photon-transport item this took the forward compile from 1543 to 834 s and the run from 9.04 to 6.87 s on a
   2080 Ti, with bitwise identical results.
+- cuda dual lanes (`jacfwd` / `jacrev` / vmap of `jvp`): the lane-memory guard measures the lane-dependent loop
+  state on the UNBATCHED program (that state is linear in the lane count) and picks the lane width before the
+  T-lane program is built, instead of tracing the item over 16 lanes, measuring it, and rebuilding at the
+  chunked width or discarding it. Same width chosen; on a large engine item the discarded 16-lane trace was
+  3-4 h of compile time. From the private engine line (8af307d), with the measurement moved ahead of the build
+  rather than added as a second check.
 - `jacfwd` / `jacrev` with more tangent lanes than one kernel takes split them evenly across kernels (26 lanes:
   13 + 13, not 16 + 16 with 6 padded); every chunk recomputes the primal, so padding cost a primal's worth of
   lanes.
