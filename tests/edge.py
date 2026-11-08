@@ -994,6 +994,48 @@ def _(b):
     return m.split("; ")[-1][:70]
 
 
+def _ix(xi):                 # a TRACED table index (a constant index would fold the table read at trace time)
+    return (xi * 8).astype(jnp.int32) % 32
+
+
+@case("jvp: a differentiated call whose operands carry no float tangent warns when the item closes over floats",
+      ["lockstep"])
+def _(b):
+    # JAX binds a primitive whose tangents are all SYMBOLIC zeros without calling its jvp rule, so the rule sees
+    # "no tangent" only when a tangent is a concrete zero of an integer operand (float0): here from a custom_jvp.
+    from tallymap import _api
+    tabc = jnp.linspace(0.5, 1.5, 32, dtype=F)
+    out = {"Q": tm.Sum((NB,), F)}
+
+    @jax.custom_jvp
+    def to_int(v):
+        return (v * 0).astype(jnp.int32)
+    to_int.defjvp(lambda p, t: (to_int(p[0]), np.zeros((), jax.dtypes.float0)))
+    cap = tm.vmap(lambda t, xi, k: t.add("Q", k % NB, xi * tabc[_ix(xi)]), outputs=out, in_axes=(0, None), backend=b)
+    opr = tm.vmap(lambda t, xi, k, tb: t.add("Q", k % NB, xi * tb[_ix(xi)]), outputs=out, in_axes=(0, None, None),
+                  backend=b)
+
+    def run(g, th):
+        for m_ in [m_ for m_ in _api._WARNED if "NONE of its operands" in m_]:
+            _api._WARNED.discard(m_)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            d = jax.jvp(g, (th,), (jnp.ones_like(th),))[1]
+        return d, [str(x.message) for x in w if "NONE of its operands" in str(x.message)]
+    d1, w1 = run(lambda th: cap(xs, to_int(th)).outputs["Q"], F(1))
+    if not w1 or "1 float constant" not in w1[0]:
+        raise Fail(f"no warning for a captured float table: {w1}")
+    close(d1, jnp.zeros((NB,), F), what="tangent")
+    _, w2 = run(lambda th: opr(xs, to_int(th), tabc).outputs["Q"], F(1))      # no float constant: silent
+    if w2:
+        raise Fail(f"warned with no float constant: {w2[0][:80]}")
+    d3, w3 = run(lambda tb: opr(xs, jnp.int32(0), tb).outputs["Q"], tabc)      # the table as an operand: a tangent
+    if w3:
+        raise Fail(f"warned with a tangent-carrying operand: {w3[0][:80]}")
+    close(d3[0], jnp.sum(xs), what="operand tangent")
+    return w1[0][:70]
+
+
 @case("a located error keeps the original exception's attributes", ["lockstep"])
 def _(b):
     from tallymap._jaxpr import located

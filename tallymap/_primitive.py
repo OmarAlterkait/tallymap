@@ -336,6 +336,14 @@ def _jvp(primals, tangents, *, node):
     pp = [isfloat(x.dtype) and not _is_zero(t) for x, t in zip(pi, dpi)]
     pb = [isfloat(x.dtype) and not _is_zero(t) for x, t in zip(bc, dbc)]
     if not any(pp) and not any(pb):
+        nc = len(float_consts(p.cj))
+        if nc:
+            _warn_once("tallymap: this call was differentiated but NONE of its operands carries a tangent, so "
+                       f"every output tangent is exactly zero. The item program closes over {nc} float "
+                       "constant(s); a closed-over value is baked into the kernel and a constant has no "
+                       "derivative. If one of them is the parameter you meant to differentiate, pass it as an "
+                       "argument of the tm.vmap function (in_axes=None for a table or a parameter vector) instead "
+                       "of capturing it.", node.site)
         outs = bind_call(*primals, node=node)
         return outs, [_zero(_aval(o)) for o in outs]
     if p.spawn is not None:            # spawned children carry tangents for every float per-item leaf
@@ -354,6 +362,18 @@ def _jvp(primals, tangents, *, node):
     outs = bind_call(*primals, node=node)
     touts = bind_call(*pi, *dl, *bc, *db, node=_tangent_node(node, pp, pb))
     return outs, _tangents_out(p, outs, touts)
+
+
+def float_consts(cj):
+    """[(shape, dtype, size)] of the FLOAT constants of an item program: the values its item function closed over,
+    which a derivative cannot reach (a constant's tangent is zero, silently)."""
+    out = []
+    for c in cj.consts:
+        dt = c.dtype if hasattr(c, "dtype") else np.asarray(c).dtype
+        if isfloat(dt):
+            sh = tuple(np.shape(c))
+            out.append((sh, str(dt), int(np.prod(sh, dtype=np.int64))))
+    return out
 
 
 def _tangent_node(node, pp, pb):

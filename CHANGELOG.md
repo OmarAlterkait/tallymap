@@ -11,6 +11,11 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 - cuda: `jnp.linalg.qr` inside an item (JAX's own `qr` lowering onto `geqrf` + a new `householder_product`
   rule); it raised `UnsupportedError` before. Found by the first CI run with the Equinox family installed
   (`lineax.QR` / `optimistix` least squares on Lineax 0.0.8, JAX 0.5.3).
+- A tallymap call reached by `jax.jvp` / `jacfwd` with no operand carrying a float tangent warns once when its
+  item function closes over float constants: a captured parameter is baked into the program and its tangent is
+  silently zero; the warning says to pass it as an argument. From the private engine line (7ae398f, lumen/next
+  5a26fea). JAX does not call the rule when every tangent is a symbolic zero (a call whose operands are all
+  constants), so that case stays silent.
 - `benchmarks/compile_scaling.py`: NVRTC compile time, generated source size, registers and per-thread
   local memory against the SIZE of one item, with and without `jacfwd` lanes. The cuda emitter inlines the
   whole item into one kernel, so for a large item the compile time is the size of that one function, and
