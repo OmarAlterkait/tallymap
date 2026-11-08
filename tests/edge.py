@@ -1047,6 +1047,52 @@ def _(b):
     return str(n)[-60:]
 
 
+QT_NK = 8
+
+
+def _qt_tree(t, gen, x, kind):
+    t = t.add("c", kind, jnp.int32(1)).add("s", kind, jnp.sin(x) + gen.astype(x.dtype))
+    k2 = ((kind * 7 + gen + 1) % QT_NK).astype(jnp.int32)
+    k3 = ((kind * 5 + 3) % QT_NK).astype(jnp.int32)
+    t = t.spawn((gen + 1, x * 0.5 + 0.25, k2), when=gen < 5)
+    return t.spawn((gen + 1, x * 0.25 + 0.5, k3), when=(gen < 4) & (x > 0.3))
+
+
+def _qt_flat(t, gen, x, kind):          # no children: every thread lives in the root-claim path
+    return t.add("c", kind, jnp.int32(1)).add("s", kind, jnp.cos(x) + gen.astype(x.dtype))
+
+
+@case("spawn queue termination: every named item runs, launch after launch (cuda == lockstep, exact counts)",
+      ["cuda"])
+def _(b):
+    # dtrax tests_wavefront/test_qterm.py (b65e17a), the one-queue cells: a tree with children in flight while
+    # roots are still being claimed, and roots only with N far above the resident grid.  An early exit loses
+    # items, and every item is one count in "c": the integer tallies must equal the lockstep ones exactly.
+    out = {"c": tm.Sum((QT_NK,), jnp.int32), "s": tm.Sum((QT_NK,), F)}
+    rng = np.random.default_rng(0)
+    msg = []
+    for fn, n, nm in ((_qt_tree, 20000, "tree"), (_qt_flat, 1 << 20, "roots only")):
+        args = (jnp.zeros((n,), jnp.int32), jnp.asarray(rng.random(n), F),
+                jnp.asarray(rng.integers(0, QT_NK, n), jnp.int32))
+        ref = tm.vmap(fn, outputs=out, spawn=tm.Queue(1 << 20), backend="lockstep")(*args)
+        rc = np.asarray(ref.outputs["c"])
+        if int(ref.stats["dropped"]) != 0:
+            raise Fail(f"{nm}: the lockstep reference dropped {int(ref.stats['dropped'])}")
+        f = jax.jit(lambda *a, fn=fn: tm.vmap(fn, outputs=out, spawn=tm.Queue(1 << 20), backend=b)(*a))
+        for rep in range(3):
+            r = f(*args)
+            c = np.asarray(r.outputs["c"])
+            if not np.array_equal(c, rc) or int(r.stats["dropped"]) != 0:
+                raise Fail(f"{nm} launch {rep}: {int(c.sum())} items vs {int(rc.sum())}, dropped "
+                           f"{int(r.stats['dropped'])}")
+            if int(r.stats["spawned"]) != int(rc.sum()) - n:
+                raise Fail(f"{nm} launch {rep}: spawned {int(r.stats['spawned'])} != {int(rc.sum()) - n}")
+            close(r.outputs["s"], ref.outputs["s"], rtol=1e-10 if F == jnp.float64 else 1e-3,   # (sum order)
+                  what=f"{nm} launch {rep} float tally")
+        msg.append(f"{nm}: {int(rc.sum())} items x3 launches")
+    return "; ".join(msg)
+
+
 @case("spawn queue stress: fan-out >> capacity, repeated; counts consistent; int tally exact, float tally NaN")
 def _(b):
     F_OUT, DEPTH, NR = 6, 3, 2048
