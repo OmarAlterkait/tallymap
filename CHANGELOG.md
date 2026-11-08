@@ -154,6 +154,11 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   keeps every attribute of the original exception; it kept only the message. No library exception carries one
   today; the private engine line lost `CodegenError.nbytes` this way (8fe2295).
 
+- `tm.diagnostics(f, ...)["stablehlo_sha256"]` (and `tests/ab_rule.py`, which compares it for the lockstep
+  backend) is the same on every lowering of a program with a host callback. On JAX < 0.7 a callback lowers
+  with the address of its Python callable, new every time, so the raw text never hashed the same twice; the
+  descriptors are now replaced by their ordinal before hashing. From the private engine line (48eea82).
+
 
 ## 0.5.0 - first public release
 

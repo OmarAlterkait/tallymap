@@ -21,13 +21,15 @@ Keys:
              memory, resident blocks per SM, and the local memory the CUDA driver reserves for every resident
              thread outside JAX's pool (local_reserved_gib: what an out-of-memory error at launch is about)
 With f: `programs` / `kernels` are those of f only (JAX's caches are cleared first so that everything is re-traced
-and re-lowered), plus `stablehlo_sha256` of the lowered program.
+and re-lowered), plus `stablehlo_sha256` of the lowered program: of its text with every host-callback descriptor
+(the ADDRESS of a registered Python callable, new on every lowering of the same program) replaced by its ordinal.
 """
 import collections
 import contextlib
 import hashlib
 import os
 import platform
+import re
 import sys
 
 import jax
@@ -112,6 +114,26 @@ def _reverse():
     return dict(replay=R.replay_mismatch(), tree=RS.LAST[-1] if RS.LAST else None)
 
 
+_CB_LINE = re.compile(r"^.*python_\w*callback.*$", re.M)
+_CB_CFG = re.compile(r'backend_config = "(\d+)"')
+
+
+def canon_hlo(txt):
+    """StableHLO text with every host-callback descriptor replaced by its first-appearance ordinal.  JAX < 0.7 lowers
+    a host callback (jax.debug.callback, pure_callback) with the address of the registered Python callable as a
+    constant operand and as the custom_call's backend_config; it is new on every lowering, so the raw text of one
+    program hashes differently every time.  Programs with a different number or placement of callbacks still
+    differ."""
+    ds = []
+    for line in _CB_LINE.findall(txt):
+        for d in _CB_CFG.findall(line):
+            if d not in ds:
+                ds.append(d)
+    for k, d in enumerate(ds):
+        txt = re.sub(rf"(?<!\d){d}(?!\d)", f"TM_HOST_CALLBACK_{k}", txt)
+    return txt
+
+
 def diagnostics(fn=None, *args, reset=False, **kwargs):
     """-> dict (see the module docstring).  fn, args: also lower jax.jit(fn)(*args, **kwargs) and report its
     programs / kernels.  reset: clear the counters and the history after reading them."""
@@ -121,7 +143,7 @@ def diagnostics(fn=None, *args, reset=False, **kwargs):
         jax.clear_caches()
         with _capture() as c:
             low = jax.jit(fn).lower(*args, **kwargs)
-        txt = low.as_text()
+        txt = canon_hlo(low.as_text())
         d.update(programs=[_render(r) for r in c["programs"]], kernels=c["kernels"],
                  stablehlo_sha256=hashlib.sha256(txt.encode()).hexdigest())
     else:

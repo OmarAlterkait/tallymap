@@ -859,6 +859,31 @@ def _(b):
     return f"arms {diff}: kernels {len(ka)}/{len(kb)}, hlo {ha[:8]} vs {hb[:8]}"
 
 
+@case("tm.diagnostics: the StableHLO sha of a program with a host callback is the same on every lowering")
+def _(b):
+    f = V(walk, b, in_axes=AX)
+
+    def one(x, k, t, th):
+        jax.debug.callback(lambda v: None, th)
+        return f(x, k, t, th).outputs["Q"]
+
+    def two(x, k, t, th):                # the control: one more callback is a different program
+        jax.debug.callback(lambda v: None, th)
+        jax.debug.callback(lambda v: None, x)
+        return f(x, k, t, th).outputs["Q"]
+    a = [jax.jit(one).lower(xs, keys, tab, TH).as_text() for _ in range(2)]
+    if "callback" not in a[0]:
+        raise Fail("instrument: the lowered program has no host callback")
+    raw_same = a[0] == a[1]
+    h1, h2 = (tm.diagnostics(one, xs, keys, tab, TH)["stablehlo_sha256"] for _ in range(2))
+    h3 = tm.diagnostics(two, xs, keys, tab, TH)["stablehlo_sha256"]
+    if h1 != h2:
+        raise Fail(f"two lowerings of one program hash differently: {h1[:12]} vs {h2[:12]}")
+    if h3 == h1:
+        raise Fail("a program with one more host callback hashes the same")
+    return f"sha {h1[:12]} twice, two callbacks {h3[:12]}; raw texts {'equal' if raw_same else 'DIFFER'}"
+
+
 @case("backend='auto': GPU raises on an unsupported program (the error points to backend='lockstep'); "
       "elsewhere lockstep with a one-time warning", ["lockstep"])
 def _(b):
