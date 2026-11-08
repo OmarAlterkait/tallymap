@@ -178,6 +178,15 @@ def _applies_late(eqn):
 
 
 def _expand_late(eqn, ins):
+    if eqn.primitive.name == "lu":       # the same size limit as the cuda backend's own factorisations (op_table.py)
+        from .backends.cuda import dense
+        from .backends.cuda.codegen import CodegenError
+        trail = tuple(eqn.invars[0].aval.shape[-2:])
+        if any(d > dense.MAXD for d in trail):
+            raise CodegenError(f"lu (jnp.linalg.solve / inv / det / lu_factor) on a matrix with a dimension above "
+                               f"{dense.MAXD} is not supported inside an item (this one is {trail}). An item emits "
+                               "the factorisation as straight-line code, which is only worth doing while the system "
+                               "is small; solve a larger system outside tallymap.vmap.")
     fn = _generic().get(eqn.primitive.name)
     if fn is None:
         return _expand(eqn, ins)

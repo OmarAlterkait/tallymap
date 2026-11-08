@@ -163,6 +163,10 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 - An error re-raised with the item function and source line appended (tally misuse, unsupported operations)
   keeps every attribute of the original exception; it kept only the message. No library exception carries one
   today; the private engine line lost `CodegenError.nbytes` this way (8fe2295).
+- cuda: `jnp.linalg.solve` / `inv` / `det` / `lu_factor` on a matrix with a dimension above 16 raises
+  `UnsupportedError` naming the size, as `cholesky` and `qr` already did; the late LU expansion had no size check
+  and compiled silently (a 24x24 solve: a 16.8 KB local frame per thread on an L40S). The 16x16 solve (255
+  registers, about 19x off the trend) is still pinned as an XFAIL in `tests/invariants.py`.
 - `tm.diagnostics(f, ...)["stablehlo_sha256"]` (and `tests/ab_rule.py`, which compares it for the lockstep
   backend) is the same on every lowering of a program with a host callback. On JAX < 0.7 a callback lowers
   with the address of its Python callable, new every time, so the raw text never hashed the same twice; the

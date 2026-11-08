@@ -927,15 +927,12 @@ def solve_ref(xs, M, rhs):
 
 
 MAXD = 16              # tallymap.backends.cuda.dense.MAXD (not imported: the CPU suite must not need the cuda backend)
-_SOLVE_XFAIL = ("plan section 4: dense.MAXD=16 guards cholesky / QR, but jnp.linalg.solve (late LU expansion, "
-                "_foreign.expand_late) has no size check, so an n > MAXD solve compiles silently (MEASURED L40S, "
-                "n=24: 16.8 KB local frame per thread) instead of raising like cholesky / geqrf do")
 _SOLVE16_XFAIL = ("plan section 4: the n=16 solve (late LU expansion, _foreign.expand_late) compiles silently to a "
                   "register-capped kernel (MEASURED L40S: 255 registers, 4.8 KB local frame; plan: ~19x off the "
                   "trend) instead of running within the trend or raising")
 for n in (4, 8, 16, 24):
     @case(f"[size] jnp.linalg.solve n={n}: runs and matches jax.vmap, or raises naming the size",
-          xfail={"cuda": _SOLVE_XFAIL if n > MAXD else _SOLVE16_XFAIL} if n >= MAXD else None)
+          xfail={"cuda": _SOLVE16_XFAIL} if n == MAXD else None)
     def _(b, n=n):
         m, res = run_or_raise(b, solve_item, _solve_inputs(n), (0, None, None), solve_ref,
                               1e-9 if X64 else 2e-4, limit=f"({n}, {n})")
