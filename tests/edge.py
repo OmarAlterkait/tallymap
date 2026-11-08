@@ -943,6 +943,22 @@ def _(b):
     return " | ".join(out)
 
 
+@case("a located error keeps the original exception's attributes", ["lockstep"])
+def _(b):
+    from tallymap._jaxpr import located
+    eqn = jax.make_jaxpr(lambda x: x * 2.0)(F(1)).jaxpr.eqns[0]
+    e = tm.TallyError("tallymap: refusal")
+    e.nbytes, e._tm_eqn = 12345, eqn          # data a caller acts on (dtrax: CodegenError.nbytes)
+    n = located(e, eqn, "item function g")
+    if type(n) is not tm.TallyError or "item function g" not in str(n) or "refusal" not in str(n):
+        raise Fail(f"located: {type(n).__name__}: {n}")
+    if getattr(n, "nbytes", None) != 12345 or getattr(n, "_tm_eqn", None) is not eqn:
+        raise Fail(f"located dropped the attributes: {sorted(vars(n))}")
+    if located(n, eqn) is not n:
+        raise Fail("located twice re-wrapped the error")
+    return str(n)[-60:]
+
+
 @case("spawn queue stress: fan-out >> capacity, repeated; counts consistent; int tally exact, float tally NaN")
 def _(b):
     F_OUT, DEPTH, NR = 6, 3, 2048

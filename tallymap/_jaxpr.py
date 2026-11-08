@@ -171,11 +171,12 @@ def item_name(fn):
 
 def located(err, eqn, where=""):
     """`err` (an exception) with the item function and the source location of `eqn` appended once (innermost
-    equation wins)."""
+    equation wins).  Everything else the original carries (its attributes) comes across: a caller may act on them."""
     if getattr(err, "_tm_located", False):
         return err
     msg = f"{err} [{where + ', ' if where else ''}at {source_summary(eqn)}]"
     new = type(err)(msg)
+    new.__dict__.update(err.__dict__)
     new._tm_located = True
     return new
 

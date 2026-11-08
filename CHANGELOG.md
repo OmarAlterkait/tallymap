@@ -150,6 +150,10 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   value of the same shape in another no longer raises a false "reads a Tally" when the merged value is read.
   The merge marked the output with the token's slot, which is a guess when the branches disagree. Found on a
   large engine item's VJP (a 128-entry token and a 128-entry table). From the private engine line (34006d0).
+- An error re-raised with the item function and source line appended (tally misuse, unsupported operations)
+  keeps every attribute of the original exception; it kept only the message. No library exception carries one
+  today; the private engine line lost `CodegenError.nbytes` this way (8fe2295).
+
 
 ## 0.5.0 - first public release
 
