@@ -54,7 +54,7 @@ import numpy as np
 from jax import lax
 
 from ._compat import key_impl
-from ._rewrite import check_tallies, emit_p_bind, isfloat, retrace
+from ._rewrite import emit_p_bind, isfloat, retrace
 
 U32 = jnp.uint32
 FNV = 16777619
@@ -230,7 +230,7 @@ def _rec_prog(p, R, cj, specs, tag):
 
 def _progs(p, Cg, U_bc, o):
     """(Rec, count ItemProgram, write ItemProgram, adjoint-base ItemProgram, T ItemProgram) for base p; cached on p."""
-    from ._reverse import vjp_prog
+    from ._reverse import check_slots, vjp_prog
     cache = p.__dict__.setdefault("_tree_cache", {})
     key = (Cg, tuple(U_bc), tuple(sorted(o.items())))
     if key in cache:
@@ -242,7 +242,7 @@ def _progs(p, Cg, U_bc, o):
     count = _rec_prog(p, R, R.cj, _rec_specs(p, R, "discard", "discard", "discard", "discard"), "+rec_count")
     write = _rec_prog(p, R, R.cj, _rec_specs(p, R, None, "discard", "sum", "discard"), "+rec_write")
     adj_specs = _rec_specs(p, R, None, "sum", "discard", "sum")
-    check_tallies(R.cj_adj, [s.kind for s in adj_specs])
+    check_slots(R.cj_adj, adj_specs, p.tag + "+rec_adj")
     adj = _rec_prog(p, R, R.cj_adj, adj_specs, "+rec_adj")
     pert_pi = tuple(i in R.fl for i in range(p.nP)) + (False, False, False, False, True)
     pert_bc = tuple(U_bc) + (False,)

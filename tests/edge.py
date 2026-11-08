@@ -968,6 +968,32 @@ def _(b):
     return " | ".join(out)
 
 
+@case("a tally refusal names the operand, slot and kind; inside a call, the position alignment; a reverse "
+      "program's slot legend", ["lockstep"])
+def _(b):
+    def reader(t, x):
+        return t, t._a["Q"].sum() * x
+    m = raises(tm.TallyError, lambda: V(reader, b)(xs), "reads a Tally")
+    for want in ("operand 0", "tally slot 0 (kind sum)"):
+        if want not in m:
+            raise Fail(f"refusal lacks {want!r}: {m}")
+
+    def inner(t, x):
+        return t, jax.jit(lambda a: a.sum())(t._a["Q"]) * x
+    m2 = raises(tm.TallyError, lambda: V(inner, b)(xs), "reads a Tally")
+    for want in ("tally slot 0", "1 equation operand(s) vs 1 sub-jaxpr invar(s)", "slot 0]"):
+        if want not in m2:
+            raise Fail(f"refusal inside a call lacks {want!r}: {m2}")
+    from tallymap._api import TSpec
+    from tallymap._reverse import check_slots
+    cj = jax.make_jaxpr(lambda t, a: (t, jnp.sum(t) + jnp.sum(a)))(jnp.zeros((8,), F), jnp.ones((8,), F))
+    m3 = raises(tm.TallyError, lambda: check_slots(cj, (TSpec("tok3", 8, F, kind="discard"),), "item+vjp"),
+                "reads a Tally")
+    if "tally slot(s) of item+vjp, in order: 0=tok3(discard,S=8)" not in m3:
+        raise Fail(f"no slot legend: {m3}")
+    return m.split("; ")[-1][:70]
+
+
 @case("a located error keeps the original exception's attributes", ["lockstep"])
 def _(b):
     from tallymap._jaxpr import located

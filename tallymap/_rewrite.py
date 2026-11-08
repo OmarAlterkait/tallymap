@@ -21,6 +21,7 @@ from ._jaxpr import (
     lit,
     located,
     scan_parts,
+    source_summary,
     subjaxprs,
     while_parts,
     with_source,
@@ -143,7 +144,10 @@ def _walk_eqn(eqn, slot, state, prod, tslots, use, lin, kinds, where):
         return
     sub = call_jaxpr(eqn)
     if sub is not None:
-        o, u = _walk(sub.jaxpr, ins, kinds, f"{name} in {where}")
+        try:
+            o, u = _walk(sub.jaxpr, ins, kinds, f"{name} in {where}")
+        except TallyError as e:
+            raise _align(e, eqn, sub, ins) from None
         _consume(eqn.invars, ins, u, use, name)
         _bind_out(eqn.outvars, o, slot, state)
     elif name == "while":
@@ -197,10 +201,47 @@ def _walk_eqn(eqn, slot, state, prod, tslots, use, lin, kinds, where):
     else:
         if any(s is not None and not isinstance(s, Soft) for s in ins):
             raise TallyError(f"tallymap: primitive {name!r} reads a Tally (in {where}); tallies are write-only "
-                             "(emit with .add, return it, thread it through control flow)")
+                             "(emit with .add, return it, thread it through control flow); "
+                             + _which(eqn, ins, kinds, prod))
         if not any(contains(x.jaxpr, TALLYMAP_PRIMS) for x in subs):
             return                      # Soft slots only: the value may be the other branch's, so this is a read
         raise TallyError(f"tallymap: emit/spawn inside an unsupported higher-order primitive {name!r} (in {where})")
+
+
+def _which(eqn, ins, kinds, prod):
+    """which operand of a refused equation is a tally, which slot and kind it is, and what produced it: on a program
+    with many tallies and identically shaped arrays (a cotangent token has the shape of its table) the primitive's
+    name alone does not identify the defect."""
+    parts = []
+    for i, s in enumerate(ins):
+        if s is not None:
+            v, pe = eqn.invars[i], prod.get(eqn.invars[i])
+            src = f", produced by {pe.primitive.name!r} at {source_summary(pe)}" if pe is not None else ""
+            parts.append(f"operand {i} ({getattr(v, 'aval', None)}) is tally slot {s} (kind {kinds[s]}){src}")
+    return "the tally operand(s): " + "; ".join(parts)
+
+
+def _align(e, eqn, sub, ins):
+    """a refusal raised inside a call-like sub-jaxpr, with the position alignment appended once (outermost call):
+    tally slots are carried in BY POSITION, so the equation's operands against the sub-jaxpr's invars are what
+    says whether a slot was assigned to the right operand."""
+    if getattr(e, "_tm_align", False):
+        return e
+    n_e, n_s = len(eqn.invars), len(sub.jaxpr.invars)
+    extra = "; ".join(f"{k}={eqn.params[k]!r}" for k in ("num_consts", "symbolic_zeros") if k in eqn.params)
+    ops = ", ".join(f"[{i} {getattr(v, 'aval', None)} {'slot %d' % ins[i] if ins[i] is not None else '-'}]"
+                    for i, v in enumerate(eqn.invars[:40]))
+    new = TallyError(f"{e}\n  in {eqn.primitive.name}: {n_e} equation operand(s) vs {n_s} sub-jaxpr invar(s)"
+                     + (f" ({extra})" if extra else "")
+                     + (" -- THESE DO NOT MATCH, so the tally slots are carried in by the wrong position"
+                        if n_e != n_s else "")
+                     + f"\n  operand(s) [index aval slot]: {ops}"
+                     + ("" if n_e <= 40 else f", ... ({n_e} in all)")
+                     + "\n  sub-jaxpr invar aval(s): "
+                     + ", ".join(str(getattr(v, "aval", None)) for v in list(sub.jaxpr.invars)[:40]))
+    new.__dict__.update(e.__dict__)
+    new._tm_align = True
+    return new
 
 
 def _consume(vars_, slots, used, use, name):

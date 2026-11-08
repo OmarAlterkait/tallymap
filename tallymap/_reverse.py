@@ -420,7 +420,7 @@ def vjp_prog(p, pert_pi, pert_bc, opts=None):
     The fingerprint (ItemProgram.fp) is a hash of the final carries of the top-level loops, computed by the same jaxpr
     ops in the forward kernel and in this replay: a mismatch means the adjoint differentiated a DIFFERENT trajectory."""
     from ._api import ItemProgram, TSpec, _mk, _sds
-    from ._rewrite import check_tallies, retrace
+    from ._rewrite import retrace
     if p.spawn is not None:          # (spawning programs go through the tree adjoint, _reverse_spawn.tree_vjp)
         raise NotImplementedError("tallymap: vjp_prog of a spawning program (internal error: use the tree adjoint)")
     o = rev_opts(opts)
@@ -501,5 +501,19 @@ def vjp_prog(p, pert_pi, pert_bc, opts=None):
     tl = (tuple(dataclasses.replace(s, kind="discard") for s in p.tallies)
           + tuple(TSpec(f"ct{i}", size(i), bav[i].dtype) for i in ib)
           + tuple(TSpec(f"tok{i}", size(i), bav[i].dtype, kind="discard") for i in big))
-    check_tallies(cj, [s.kind for s in tl])          # the cotangent tallies are threaded linearly (or raise)
+    check_slots(cj, tl, p.tag + "+vjp")             # the cotangent tallies are threaded linearly (or raise)
     return ItemProgram(cj, tl, nP + len(yf) + FP, nB + len(tf), None, None, p.tag + "+vjp", where=p.where)
+
+
+def check_slots(cj, tl, tag):
+    """check_tallies with the program's SLOT LEGEND appended to a refusal: a reverse program's slots are the user's
+    tallies, then one cotangent tally per perturbed broadcast operand, then one cotangent token per sparse table,
+    which the user never wrote and cannot recognise from an index alone."""
+    from ._rewrite import TallyError, check_tallies
+    try:
+        check_tallies(cj, [s.kind for s in tl], name=tag)
+    except TallyError as e:
+        legend = ", ".join(f"{k}={s.name}({s.kind},S={s.S})" for k, s in enumerate(tl))
+        new = TallyError(f"{e}\n  the {len(tl)} tally slot(s) of {tag}, in order: {legend}")
+        new.__dict__.update(e.__dict__)
+        raise new from None

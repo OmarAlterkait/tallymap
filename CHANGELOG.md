@@ -117,6 +117,11 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   chunked width or discarding it. Same width chosen; on a large engine item the discarded 16-lane trace was
   3-4 h of compile time. From the private engine line (8af307d), with the measurement moved ahead of the build
   rather than added as a second check.
+- A "reads a Tally" refusal names each tally operand: its position, aval, tally slot and kind, and the
+  primitive and source line that produced it. Raised inside a call-like sub-jaxpr (`jit`, `custom_jvp`), it
+  also shows the call's operands against the sub-jaxpr's invars, with the slot each position carries; inside a
+  reverse program, the program's slot legend (user tallies, cotangent tallies, cotangent tokens). Text only.
+  From the private engine line (0863aa1, c033ea8).
 - `jacfwd` / `jacrev` with more tangent lanes than one kernel takes split them evenly across kernels (26 lanes:
   13 + 13, not 16 + 16 with 6 padded); every chunk recomputes the primal, so padding cost a primal's worth of
   lanes.
