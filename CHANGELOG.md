@@ -138,6 +138,13 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   hardware picks the order of a scatter-add, so a float tally can move by an ulp, exactly as the block width
   already could. There is no new public option.
 
+### Fixed
+
+- A reverse program whose `cond` branches use a cotangent token (a discard tally) in one branch and a plain
+  value of the same shape in another no longer raises a false "reads a Tally" when the merged value is read.
+  The merge marked the output with the token's slot, which is a guess when the branches disagree. Found on a
+  large engine item's VJP (a 128-entry token and a 128-entry table). From the private engine line (34006d0).
+
 ## 0.5.0 - first public release
 
 tallymap runs divergent per-item Monte Carlo loops as a single JAX primitive. You write one ordinary JAX function

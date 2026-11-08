@@ -29,6 +29,15 @@ from ._jaxpr import (
 TALLYMAP_PRIMS = ("tallymap_emit", "tallymap_spawn")
 
 
+class Soft(int):
+    """A tally slot that may also be a plain value.  cond/switch branches must use a non-discard tally the same
+    way, but a DISCARD one need not appear in every branch: an inert discard tally may meet a filler value of the
+    same aval in another branch, and the merge then marks the cond's output with the tally's slot.  When the
+    branches disagree that mark is a guess (the value flowing out may be the filler), so READING it must not be
+    refused.  Found on the DTRAX item VJP, whose 128-entry cotangent token and 128-entry table share an aval.
+    An int subclass, so every slot comparison is unchanged; it only stops the write-only refusal."""
+
+
 class TallyError(TypeError):
     """A Tally is used in a way the virtual (write-through) implementation cannot honour: read, forked, dropped,
     closed over by a loop, or used differently by two cond branches.  Raised at trace time."""
@@ -179,12 +188,18 @@ def _walk_eqn(eqn, slot, state, prod, tslots, use, lin, kinds, where):
             raise TallyError(f"tallymap: cond/switch branches must use each Tally the same way (all emit-chain "
                              f"and return it, or none touch it) (in {where})")
         _consume(eqn.invars[1:], ops, res[0][1], use, name)
-        merged = [next((r[0][j] for r in res if r[0][j] is not None), None) for j in range(len(eqn.outvars))]
+        merged = []
+        for j in range(len(eqn.outvars)):
+            ss = [r[0][j] for r in res]
+            m = next((x for x in ss if x is not None), None)
+            merged.append(Soft(m) if m is not None and any(x != m for x in ss) else m)   # disagreement: a guess
         _bind_out(eqn.outvars, merged, slot, state)      # (an inert discard tally may meet a filler value)
     else:
-        if any(s is not None for s in ins):
+        if any(s is not None and not isinstance(s, Soft) for s in ins):
             raise TallyError(f"tallymap: primitive {name!r} reads a Tally (in {where}); tallies are write-only "
                              "(emit with .add, return it, thread it through control flow)")
+        if not any(contains(x.jaxpr, TALLYMAP_PRIMS) for x in subs):
+            return                      # Soft slots only: the value may be the other branch's, so this is a read
         raise TallyError(f"tallymap: emit/spawn inside an unsupported higher-order primitive {name!r} (in {where})")
 
 
