@@ -1011,6 +1011,26 @@ def _(b):
     return w1[0][:70]
 
 
+@case("diagnostics baked_floats: a captured float table is listed, the same table as an operand is not",
+      ["lockstep"])
+def _(b):
+    tabc = jnp.linspace(0.5, 1.5, 32, dtype=F)
+    out = {"Q": tm.Sum((1,), F)}
+    cap = tm.vmap(lambda t, xi: t.add("Q", 0, xi * tabc[_ix(xi)]), outputs=out, backend=b)
+    opr = tm.vmap(lambda t, xi, tb: t.add("Q", 0, xi * tb[_ix(xi)]), outputs=out, in_axes=(0, None), backend=b)
+    pc = tm.diagnostics(lambda x: cap(x).outputs["Q"], xs)["programs"]
+    po = tm.diagnostics(lambda x, tb: opr(x, tb).outputs["Q"], xs, tabc)["programs"]
+    if not pc or not any(sh == (32,) and n == 32 for r in pc for sh, _, n in r["baked_floats"]):
+        raise Fail(f"the captured table is not listed: {[r['baked_floats'] for r in pc]}")
+    if not po or any(r["baked_floats"] for r in po):
+        raise Fail(f"an operand is listed as baked: {[r['baked_floats'] for r in po]}")
+    if "baked_floats" in tm.diagnostics()["programs"][-1] and "consts" in tm.diagnostics()["programs"][-1]:
+        raise Fail("the raw constants leak into the returned record")
+    g = jax.jvp(lambda tb: opr(xs, tb).outputs["Q"], (tabc,), (jnp.ones_like(tabc),))[1]
+    close(g, jnp.sum(xs)[None], rtol=1e-5)
+    return f"captured {pc[0]['baked_floats']}, operand []; the operand's tangent reaches the tally"
+
+
 @case("a located error keeps the original exception's attributes", ["lockstep"])
 def _(b):
     from tallymap._jaxpr import located

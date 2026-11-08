@@ -15,7 +15,9 @@ Keys:
                trajectory, their mismatching items, the last such count;
                tree   = stats of the last tree adjoint (reverse through spawn): generations, particles, launches,
                         overflow, drop_risk, replay_mismatch, fwd_mismatch (any of the last four -> NaN gradient)
-  programs   the last item programs bound by tm.vmap: tag, item jaxpr (text)
+  programs   the last item programs bound by tm.vmap: tag, item jaxpr (text), and baked_floats: [(shape, dtype,
+             size)] of the FLOAT constants the item function closed over, the values a derivative cannot reach
+             (a constant's tangent is zero, silently): anything you differentiate must be an argument
   kernels    the last cuda kernels used: tag, schedule, cubin hash, cached CUDA source (.cu), primitives, compile
              seconds, and once a kernel has run `resources`: registers and local memory per thread, static shared
              memory, resident blocks per SM, and the local memory the CUDA driver reserves for every resident
@@ -44,15 +46,17 @@ _CAPTURE = []                                      # active diagnostics(f, ...) 
 def record_program(prog):
     # the jaxpr OBJECT, printed only when diagnostics() is read: str(jaxpr) at every bind was 102 s of a 260 s fully
     # cached build on DTRAX (JAX's pretty-printer).  The object is alive anyway, in the program being bound.
-    rec = dict(tag=prog.tag, jaxpr=prog.cj.jaxpr)
+    rec = dict(tag=prog.tag, jaxpr=prog.cj.jaxpr, consts=prog.cj.consts)
     PROGRAMS.append(rec)
     for c in _CAPTURE:
         c["programs"].append(rec)
 
 
 def _render(rec):
-    """a program record as returned by diagnostics(): the jaxpr as text (built now, not at bind time)."""
-    return dict(rec, jaxpr=str(rec["jaxpr"]))
+    """a program record as returned by diagnostics(): the jaxpr as text and the float constants (built now, not at
+    bind time)."""
+    from ._primitive import float_consts
+    return dict(tag=rec["tag"], jaxpr=str(rec["jaxpr"]), baked_floats=float_consts(rec["consts"]))
 
 
 def record_kernel(rec):

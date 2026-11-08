@@ -336,7 +336,7 @@ def _jvp(primals, tangents, *, node):
     pp = [isfloat(x.dtype) and not _is_zero(t) for x, t in zip(pi, dpi)]
     pb = [isfloat(x.dtype) and not _is_zero(t) for x, t in zip(bc, dbc)]
     if not any(pp) and not any(pb):
-        nc = len(float_consts(p.cj))
+        nc = len(float_consts(p.cj.consts))
         if nc:
             _warn_once("tallymap: this call was differentiated but NONE of its operands carries a tangent, so "
                        f"every output tangent is exactly zero. The item program closes over {nc} float "
@@ -364,11 +364,11 @@ def _jvp(primals, tangents, *, node):
     return outs, _tangents_out(p, outs, touts)
 
 
-def float_consts(cj):
-    """[(shape, dtype, size)] of the FLOAT constants of an item program: the values its item function closed over,
-    which a derivative cannot reach (a constant's tangent is zero, silently)."""
+def float_consts(consts):
+    """[(shape, dtype, size)] of the FLOAT ones among an item program's constants: the values its item function
+    closed over, which a derivative cannot reach (a constant's tangent is zero, silently)."""
     out = []
-    for c in cj.consts:
+    for c in consts:
         dt = c.dtype if hasattr(c, "dtype") else np.asarray(c).dtype
         if isfloat(dt):
             sh = tuple(np.shape(c))
