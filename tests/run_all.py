@@ -10,6 +10,7 @@
 
 Suites: edge (edge cases), transforms (composability matrix), reverse (reverse mode), reverse_spawn (tree adjoint),
 invariants (schedule invariance, cache-key soundness, run-or-raise, AD self-consistency, truncation),
+dice (DiCE gradients of discrete outcomes against closed forms, float score leaves through spawn),
 ops (cuda op table vs jit(vmap(op)) and the host-exact result; --gpu only), mulchain (a 64-bit multiply chain
 compiles fast and matches lockstep bitwise; --gpu only), equinox_compat (diffrax / optimistix /
 lineax / quadax solvers inside an item; skipped when those are not installed), examples (examples/*.py run as
@@ -29,8 +30,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-SUITES = ["edge", "transforms", "reverse", "reverse_spawn", "invariants", "ops", "mulchain", "equinox_compat",
-          "examples"]
+SUITES = ["edge", "transforms", "reverse", "reverse_spawn", "invariants", "dice", "ops", "mulchain",
+          "equinox_compat", "examples"]
 GPU_ONLY = {"ops", "mulchain"}
 OPTIONAL = {"equinox_compat"}      # needs a package the library does not depend on; prints 'SUITE SKIP' without it
 EXAMPLES = ["quickstart", "photon_toy", "shower_toy", "ensemble_toy", "walk_on_spheres",
