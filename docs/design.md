@@ -308,7 +308,7 @@ error) turn every affected cell into a failure, which is how the matrix is known
   global arena, not this reservation; dev has no arena.)
 - **Replay fingerprint.** Reverse mode uses a variant of the forward ItemProgram that carries a hidden per-item
   uint32 hash of the final carries of every top-level loop, computed with ordinary jaxpr operations (a
-  forward-only call does not compute it: section 11). The adjoint receives the forward kernel's value as an
+  forward-only call does not compute it: section 10). The adjoint receives the forward kernel's value as an
   operand (the forward node is re-bound and XLA eliminates the common subexpression, which costs a few percent)
   and compares it against its own replay. A mismatch makes every float cotangent of that call NaN. The
   adjoint uses the forward node's options, so the arithmetic is identical and there is no contraction anywhere.
@@ -637,49 +637,7 @@ What remains is the volume of straight-line code itself. A large item's stack fr
 properties of the program; the levers that worked were in the program (fewer generic call sites, a static set of
 geometry types, a bounded stack depth), and on the library side the lazy-inline cap.
 
-## 10. The lockstep backend: cost that follows the active lanes
-
-The lockstep backend is the reference implementation and the only backend off CUDA, and masking alone makes it
-pay for lanes that have nothing to do: a `while_loop` runs its body on all P lanes until the LAST lane finishes,
-so it costs P * max(trip count) rather than sum(trip counts), and a `cond` or `switch` with a per-lane index
-runs every branch that ANY lane takes on all P lanes, so a step costs the SUM of the branches. The cuda backend
-solves the same problem per thread. Here the lanes that need the work are gathered instead.
-
-- **A while loop narrows its lane axis.** The masked loop stops as soon as at most W = P >> 2 lanes are still
-  running, gathers those lanes into a W-wide lane axis (one gather per carry) and runs the SAME loop there,
-  where a round costs a quarter as much; at the end one scatter puts the survivors back. A lane that stops never
-  restarts, because its carry is frozen and its predicate stays false, so nothing is ever gathered back and the
-  bookkeeping is one `cumsum` per level, not per round. Nothing has to be known in advance: a loop whose lanes
-  all run to the end narrows once, near the end, and pays two gathers for it.
-- **How much.** Both arms in one process on one milano node (two jobs of the same code measured up to 30%
-  apart), JAX 0.5.3, the `benchmarks/vs_jax` problems at N = 65,536: forward 1.3 to 2.1x faster on the divergent
-  problems (walk on spheres 329 -> 155 ms, transport 356 -> 193 ms, random walk 300 -> 179 ms, shower
-  803 -> 492 ms, gillespie 21.0 -> 14.7 s, interacting md 119 -> 91 ms), gradients 1.1 to 1.8x faster, and 0.92
-  to 1.04x -- within noise -- on the problems whose lanes stay active together (barrier, uniform, dense state,
-  ode ensemble, small n, trajectory, particle filter forward). Trace and compile time grows by 0 to 30% on all of them except the
-  shower's gradient, where the loop body is the tree adjoint's and the extra instantiation cost 75 -> 219 s for
-  1.24x per call. Peak resident memory grows by 4 to 76 MB at N = 65,536, the W-wide copy of the carries.
-- **Results do not change.** On a CPU every benchmark problem and every test gives BITWISE identical tallies,
-  per-item results and stats with compaction on and off, in f32 and f64, forward, jvp, grad and vmap. That is
-  not luck: a scatter-add runs in index order there, the gather is stable so the live lanes keep their relative
-  order, and the lanes that drop out contributed nothing to the accumulator in the first place. On a GPU the
-  hardware orders the updates of one scatter itself, so a different lane count sums them differently: the
-  forward pass measured bitwise on a 2080 Ti and a jvp 9.7e-08 relative, which is the same one-ulp caveat the
-  block width already carries (section 1d). Integer tallies and stats are identical on both.
-  `tests/edge.py` asserts it (`_lockstep_compact=False` is the A/B control).
-- **Three designs measured and rejected.** (1) Chunking EVERY round into ceil(active / W) chunks, which is what
-  the per-element cost model says to do: on a CPU an HLO operation costs a thread fork-join whatever its width,
-  so chunked rounds cost 1.1 to 4.1x the masked loop on the problems whose lanes stay active, for about 2x on
-  the divergent ones. (2) Letting every nested loop narrow, and narrowing more than once: the compiled program
-  then grows with the loop nesting, and the shower's reverse-mode program took 899 s to compile instead of 56 s
-  for 1.3x per call. Hence the rule: only a loop the interpreter is not already inside a loop for narrows, and
-  only once. (3) Running each branch of a batched `cond` on the lanes that take it (one permutation by branch,
-  chunks of P >> 2 lanes, gated by a cost model priced per operation from the jaxpr): 1.3 to 9.9x forward on a
-  synthetic switch over K phases inside a divergent loop, but no measurable change on any of the 13 benchmark
-  problems, whose conds are unbatched or small. It does not clear the library's bar (a mechanism must buy 1.5x
-  on a realistic workload), so it is not kept; all the gains above are the while-loop narrowing.
-
-## 11. Fixed rules ported from the `wavefront-state` branch (consolidation, 2026-11)
+## 10. Fixed rules ported from the `wavefront-state` branch (consolidation, 2026-11)
 
 `wavefront-state` was a private experimental branch driven by the shower engine's exact Geant4 port (DTRAX), with
 its levers behind environment variables. The ones that cleared the bar were re-implemented here as fixed rules: no

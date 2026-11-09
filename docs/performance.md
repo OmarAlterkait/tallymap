@@ -28,7 +28,7 @@ tables are regenerated from a full sweep, not patched, so they will carry the ol
 | arm | what it is | modes |
 |---|---|---|
 | `tallymap (cuda)` | `tm.vmap`, one persistent-thread CUDA kernel | all |
-| `tallymap (lockstep)` | `tm.vmap`, the reference interpreter: masked lanes, compacted where they diverge | all |
+| `tallymap (lockstep)` | `tm.vmap`, the masked reference interpreter (the only backend on CPU) | all |
 | `jax.vmap + while_loop` | `jax.vmap` of the SAME item with its `lax.while_loop`, then one `.at[].add` | forward only |
 | `padded scan` | `jax.vmap` of the same item rewritten as a masked `lax.scan` | all |
 | `padded scan + remat` | the same with a nested `jax.checkpoint`-ed inner scan | all |
@@ -1307,18 +1307,18 @@ A CPU row is a shared machine: 16 cores of a 64-core node, with other jobs on th
 ### cpu, JAX 0.5.3
 | problem | kind | size | forward: tallymap vs best plain JAX | gradient: tallymap vs best plain JAX | gradient peak memory |
 |---|---|---|---|---|---|
-| random walk | natural | N = 65,536 | 361 vs 354 ms (padded scan (oracle)): **1.02x** **slower** | 789 vs 427 ms (padded scan (oracle)): **1.85x** **slower** | - |
-| transport | natural | N = 65,536 | 267 vs 525 ms (padded scan + remat (oracle)): **1.96x** faster | 2.3e+03 vs 587 ms (padded scan (oracle)): **3.92x** **slower** | - |
-| walk on spheres | natural | N = 65,536 | 256 vs 511 ms (padded scan (oracle)): **2.00x** faster | 1.17e+03 vs 527 ms (padded scan (oracle)): **2.22x** **slower** | - |
-| ode ensemble | natural | N = 65,536 | 461 vs 493 ms (padded scan + remat (oracle)): **1.07x** faster | 8.8e+03 vs 1.68e+03 ms (padded scan (oracle)): **5.23x** **slower** | - |
-| gillespie | natural | N = 65,536 | 1.4e+04 vs 2.45e+04 ms (jax.vmap + while_loop): **1.75x** faster | - | - |
-| shower | natural | N = 65,536 | 613 vs 529 ms (generation vmap + compaction (oracle)): **1.16x** **slower** | 3.54e+03 vs 1.15e+03 ms (generation vmap + compaction (oracle)): **3.09x** **slower** | - |
-| barrier | natural | N = 65,536 | 1.35e+03 vs 995 ms (jax.vmap + while_loop): **1.36x** **slower** | 4.72e+03 vs 889 ms (padded scan (oracle)): **5.31x** **slower** | - |
-| interacting md | interacting | N = 65,536 | 103 vs 46.7 ms (padded neighbour list (oracle)): **2.22x** **slower** | 2.88e+04 vs 5.06e+03 ms (padded neighbour list (oracle)): **5.69x** **slower** | - |
-| particle filter | interacting | N = 65,536 | 814 vs 1.01e+03 ms (jax.vmap + while_loop): **1.24x** faster | 1.04e+04 vs 4.79e+03 ms (padded scan (oracle)): **2.18x** **slower** | - |
-| uniform | floor | N = 65,536 | 259 vs 258 ms (padded scan + remat (oracle)): **1.00x** **slower** | 1.25e+03 vs 286 ms (padded scan (oracle)): **4.37x** **slower** | - |
-| dense state | bad-fit | D = 64 | 9.45 vs 82.1 ms (jax.vmap + while_loop): **8.68x** faster | 1.27e+03 vs 311 ms (padded scan (oracle)): **4.10x** **slower** | - |
-| trajectory | bad-fit | L = 256 | 1.07e+03 vs 277 ms (jax.vmap + while_loop): **3.84x** **slower** | - | - |
+| random walk | natural | N = 65,536 | 238 vs 227 ms (padded scan (oracle)): **1.05x** **slower** | 897 vs 240 ms (padded scan (oracle)): **3.74x** **slower** | - |
+| transport | natural | N = 65,536 | 317 vs 300 ms (padded scan (oracle)): **1.06x** **slower** | 2.44e+03 vs 368 ms (padded scan (oracle)): **6.64x** **slower** | - |
+| walk on spheres | natural | N = 65,536 | 270 vs 284 ms (padded scan (oracle)): **1.05x** faster | 1.71e+03 vs 279 ms (padded scan (oracle)): **6.14x** **slower** | - |
+| ode ensemble | natural | N = 65,536 | 416 vs 346 ms (padded scan (oracle)): **1.20x** **slower** | 7.21e+03 vs 1.35e+03 ms (padded scan (oracle)): **5.36x** **slower** | - |
+| gillespie | natural | N = 65,536 | 1.69e+04 vs 1.58e+04 ms (padded scan (oracle)): **1.07x** **slower** | - | - |
+| shower | natural | N = 65,536 | 663 vs 453 ms (generation vmap + compaction (oracle)): **1.46x** **slower** | 3.32e+03 vs 705 ms (generation vmap + compaction (oracle)): **4.72x** **slower** | - |
+| barrier | natural | N = 65,536 | 646 vs 624 ms (jax.vmap + while_loop): **1.04x** **slower** | 4.26e+03 vs 680 ms (padded scan (oracle)): **6.27x** **slower** | - |
+| interacting md | interacting | N = 65,536 | 108 vs 29.8 ms (padded neighbour list (oracle)): **3.63x** **slower** | 3.05e+04 vs 4.83e+03 ms (padded neighbour list (oracle)): **6.31x** **slower** | - |
+| particle filter | interacting | N = 65,536 | 532 vs 693 ms (jax.vmap + while_loop): **1.30x** faster | 1.14e+04 vs 3.76e+03 ms (padded scan (oracle)): **3.02x** **slower** | - |
+| uniform | floor | N = 65,536 | 74.8 vs 75 ms (padded scan + remat (oracle)): **1.00x** faster | 792 vs 167 ms (padded scan (oracle)): **4.76x** **slower** | - |
+| dense state | bad-fit | D = 64 | 5.16 vs 52.3 ms (jax.vmap + while_loop): **10.14x** faster | 1.28e+03 vs 246 ms (padded scan (oracle)): **5.19x** **slower** | - |
+| trajectory | bad-fit | L = 256 | 737 vs 273 ms (padded scan (oracle)): **2.70x** **slower** | - | - |
 
 ## Cross-arm agreement
 

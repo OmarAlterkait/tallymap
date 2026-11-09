@@ -23,7 +23,7 @@ Terms used in the code, the docs and the error messages.
 | term | meaning |
 |---|---|
 | **cuda** | the item jaxpr compiled to one CUDA kernel with NVRTC, NVIDIA's runtime compiler, launched through one `jax.ffi` handler (`tallymap_cuda_launch`). |
-| **lockstep** | the plain-JAX lane interpreter: the reference implementation and the fallback, on every platform.  Masked, except that a diverging while loop narrows to the lanes still running (design.md 10).  Slow by design, about 100 times the cuda backend. |
+| **lockstep** | the plain-JAX masked lockstep interpreter: the reference implementation and the fallback, on every platform.  Slow by design, about 100 times the cuda backend. |
 | **step refill** | cuda scheduling: a lane takes a new item when its current one finishes, at loop-STEP granularity.  Needs exactly one top-level while loop; not used with spawn. |
 | **privatised tally** | a small sum output kept in shared memory per block and flushed once, instead of going to global atomics. |
 | **op table** | `backends/cuda/op_table.py`: one emission rule per JAX primitive.  The main maintenance surface. |

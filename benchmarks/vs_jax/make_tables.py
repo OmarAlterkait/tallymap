@@ -323,7 +323,7 @@ repository.
 | arm | what it is | modes |
 |---|---|---|
 | `tallymap (cuda)` | `tm.vmap`, one persistent-thread CUDA kernel | all |
-| `tallymap (lockstep)` | `tm.vmap`, the reference interpreter: masked lanes, compacted where they diverge | all |
+| `tallymap (lockstep)` | `tm.vmap`, the masked reference interpreter (the only backend on CPU) | all |
 | `jax.vmap + while_loop` | `jax.vmap` of the SAME item with its `lax.while_loop`, then one `.at[].add` | forward only |
 | `padded scan` | `jax.vmap` of the same item rewritten as a masked `lax.scan` | all |
 | `padded scan + remat` | the same with a nested `jax.checkpoint`-ed inner scan | all |

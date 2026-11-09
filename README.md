@@ -7,7 +7,7 @@ You write one ordinary JAX function of ONE item, with its own `lax.while_loop`, 
 gathers and its own `jax.random` draws: one walker, one photon, one trajectory, one chain. `tm.vmap` maps it over
 N independent items whose results go into commutative sums, called tallies. On an NVIDIA GPU the item compiles to
 a single CUDA kernel in which a lane picks up a new item as soon as its current one finishes, so a batch costs
-the *average* item rather than the longest. Everywhere else it runs the lockstep backend, a plain-JAX
+the *average* item rather than the longest. Everywhere else it runs the lockstep backend, a masked plain-JAX
 interpreter over lanes that doubles as the reference implementation. Because it is all one JAX primitive, `jit`, `vmap`,
 `grad`, `jvp`, `jacfwd`, `jacrev`, `hessian`, `checkpoint` and `shard_map` work on it, and the result means
 exactly `jax.vmap(item)` followed by a sum. tallymap was built for in-house photon-transport and particle-shower

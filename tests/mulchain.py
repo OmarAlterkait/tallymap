@@ -7,7 +7,7 @@ limbs, as a JAX program has to spell it).  This is a STRUCTURAL test: the cuts a
 are BITWISE equal to the lockstep backend (integer arithmetic: any difference is a bug, not rounding); the compile
 bound is only a sanity limit.  It does not reproduce the cliff: with the rule patched off this item also compiles in
 under a second through NVRTC on the CI GPUs (job 43047843).  The off / on compile measurement is a one-off job,
-recorded in docs/design.md section 11.
+recorded in docs/design.md section 10.
 """
 import os
 import shutil
