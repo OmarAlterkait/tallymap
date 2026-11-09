@@ -36,6 +36,7 @@ from jax.core import ShapedArray as _SA
 from jax.custom_derivatives import SymbolicZero
 from jax.extend.core import Primitive
 from jax.interpreters import ad as _jad
+from jax.interpreters import batching as _batching
 from jax.interpreters import mlir as _mlir
 
 from ._rewrite import isfloat
@@ -125,8 +126,40 @@ def _unphys(d, like):
     return jax.random.wrap_key_data(d, impl=jax.random.key_impl(like)) if _is_key(like) else d
 
 
+# An UNINITIALISED per-item buffer (a checkpoint buffer: every slot is written before it is read, by construction).
+# The cuda backend declares it without a fill; everywhere else it is zeros.  MEASURED (lumen/perf d6cb9fc): zero-
+# filling 3C+1 states per item (C = 64) cost the cheap-step benchmarks/vs_jax gradients up to 5x at 2^19 items
+# (random_walk 0.80 -> 3.98 ms) -- more than their whole step.  tests/reverse.py gates it: the cuda per-item
+# cotangents are bitwise equal with every uninitialised declaration filled with 0x00 and with 0xFF.
+uninit_p = Primitive("tallymap_uninit")
+
+
+def _uninit_impl(*, shape, dtype):
+    return jnp.zeros(shape, dtype)
+
+
+uninit_p.def_impl(_uninit_impl)
+uninit_p.def_abstract_eval(lambda *, shape, dtype: _SA(shape, dtype))
+_mlir.register_lowering(uninit_p, _mlir.lower_fun(_uninit_impl, multiple_results=False))
+
+
+def _uninit_jvp(primals, tangents, *, shape, dtype):
+    out = uninit_p.bind(shape=shape, dtype=dtype)
+    return out, _jad.Zero(_SA(shape, dtype).to_tangent_aval())
+
+
+_jad.primitive_jvps[uninit_p] = _uninit_jvp
+
+
+def _uninit_batch(args, dims, *, shape, dtype):         # (no operands: never batched)
+    return uninit_p.bind(shape=shape, dtype=dtype), None
+
+
+_batching.primitive_batchers[uninit_p] = _uninit_batch
+
+
 def _buf_new(C, xs):
-    return [jnp.zeros((C,) + tuple(jnp.shape(_phys(x))), _dt(_phys(x))) for x in xs]
+    return [uninit_p.bind(shape=(C,) + tuple(jnp.shape(_phys(x))), dtype=np.dtype(_dt(_phys(x)))) for x in xs]
 
 
 def _buf_set(buf, i, xs):

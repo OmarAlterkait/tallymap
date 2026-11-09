@@ -9,7 +9,7 @@ N (the item count) is a kernel ARGUMENT: one cubin serves every N.
 """
 import numpy as np
 
-from .codegen import CodegenError, Emitter, Local, Scalar, Table, VTally, _size, ctype, elem, unravel
+from .codegen import CodegenError, Emitter, Local, Scalar, Table, VTally, _size, ctype, elem, fill_decl, unravel
 from .op_table import phys
 
 # Every kernel takes ONE by-value struct of buffer pointers.  Up to SJ_SMALL = 504 (4,032 + 8 bytes with n_items)
@@ -318,7 +318,7 @@ def build_source(p, *, block=BLOCK, split=True, inplace=True):
 
     def svar(prefix, j, spec):
         sh, dt, impl = spec
-        return f"  {ctype(dt)} {prefix}{j}{'' if sh == () else f'[{max(1, _size(sh))}]'};\n"
+        return f"  {ctype(dt)} {prefix}{j}{'' if sh == () else f'[{max(1, _size(sh))}]'};{fill_decl(f'{prefix}{j}')}\n"
 
     sp = _split(p.cj) if split else None
     L.mode = "step" if sp is not None else "item"

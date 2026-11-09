@@ -812,6 +812,44 @@ def _(b):
     return "fwd / grad(vmap) programs without fingerprint, grad with; " + msg
 
 
+
+@case("FILL PATTERN: every uninitialised per-thread declaration 0x00 vs 0xFF -> bitwise-equal forward and per-item "
+      "cotangents", ["cuda"])
+def _(b):
+    # The reverse program's checkpoint buffers are tallymap_uninit (declared with no fill) and copies of them are
+    # elided (codegen.Emitter.assign).  Correct only if no slot is read before it is written: filling EVERY
+    # uninitialised per-thread declaration with two different bytes must not move a single bit of what the program
+    # computes (per-item results and per-item cotangents; the tally sums and broadcast-operand cotangents are
+    # atomics, whose float order is the hardware's, so those are compared within tolerance).
+    from tallymap import _diagnostics as D
+    from tallymap.backends.cuda import codegen as CG
+    out = {}
+    try:
+        for fb in (0x00, 0xFF):
+            CG.FILL = fb
+            D.KERNELS.clear()         # (only the kernel history: diagnostics(reset=True) would also zero the replay
+            #                           counters this suite's case() compares before and after every cell)
+            g, gr, info, (f, xs, keys, tab, th, wq, AX, item) = walk_case(b, 64, 100, rev_checkpoints=3)
+            ks = tm.diagnostics()["kernels"]
+            r = f(xs, keys, tab, th)
+            srcs = [open(k["source"]).read() for k in ks]
+            if not any("tallymap_uninit" in k["prims"] for k in ks):
+                raise Fail(f"instrument: no kernel uses tallymap_uninit ({[k['prims'] for k in ks]})")
+            if not all(f"sj_f[sj_e] = {fb};" in sc for sc in srcs):
+                raise Fail(f"instrument: fill {fb:#x} is not in every kernel source")
+            out[fb] = (g, r, gr)
+    finally:
+        CG.FILL = None
+    (g0, r0, gr), (g1, r1, _) = out[0x00], out[0xFF]
+    for nm, a, c in (("per-item w", r0.per_item[0], r1.per_item[0]), ("per-item y", r0.per_item[1], r1.per_item[1]),
+                     ("cotangent x", g0["x"], g1["x"])):
+        a, c = np.asarray(a), np.asarray(c)
+        if not np.array_equal(a, c):
+            raise Fail(f"{nm}: {int((a != c).sum())}/{a.size} differ between fills 0x00 and 0xFF")
+    close(dict(Q=r1.outputs["Q"]), dict(Q=r0.outputs["Q"]), "Q 0xFF vs 0x00")
+    return "per-item + cotangent x bitwise; " + close(g1, g0, "0xFF vs 0x00") + "; " + close(g0, gr, "vs padded")
+
+
 print("\n================ SUMMARY", jax.__version__, "x64" if X64 else "", jax.devices()[0].device_kind)
 for n, b, m in RES:
     print(f"{n:58s} {b:8s} {m[:200]}")

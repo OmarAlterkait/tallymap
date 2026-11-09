@@ -30,6 +30,8 @@ NOT_IN_JAX_EXTEND = {
     "custom_linear_solve": "lax.custom_linear_solve (re-export varies by version)",
     "geqrf": "jax._src.lax.linalg.geqrf (not in jax.lax.linalg either; QR's Householder factorisation)",
     "ormqr": "jax.lax.linalg.ormqr (not re-exported); applies Q of a QR without forming it",
+    # tallymap's own
+    "tallymap_uninit": "an uninitialised reverse-mode checkpoint buffer (_reverse.uninit_p)",
 }
 
 
@@ -45,7 +47,7 @@ def supported_primitives():
     names = set(op_table.RULES) | set(canon.SUGAR) | late | {"tallymap_emit", "tallymap_spawn"}
     rows = []
     for n in sorted(names):
-        how = ("tally" if n.startswith("tallymap_") else "canonicalised" if n in canon.SUGAR else
+        how = ("tally" if n in ("tallymap_emit", "tallymap_spawn") else "canonicalised" if n in canon.SUGAR else
                "expanded" if n in late else "rule")
         rows.append(dict(name=n, how=how))
     return rows

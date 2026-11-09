@@ -254,6 +254,15 @@ error) turn every affected cell into a failure, which is how the matrix is known
   gradient of transport from 15.6 to 7.4 ms, walk-on-spheres from 9.9 to 5.0 ms, and the toy walk at K=100 from
   1.70 to 1.47 ms, with no problem slower. It is also why `rev_checkpoints` used to look so sharply
   non-monotone: at C = 32 the same transport gradient cost 44.9 ms before and 10.7 ms after.
+- **Checkpoint buffers are uninitialised.** The head, the checkpoint buffer and the segment tape are
+  `tallymap_uninit` buffers (`_reverse.uninit_p`): every slot is written before it is read, by construction. The cuda
+  backend declares them with no fill, and a copy of one that has not been written yet emits nothing (a copy of an
+  undefined value is undefined; the step split and loop-carry adoption would otherwise load and keep a second copy
+  of garbage). Every other backend gets zeros. Zero-filling 3C+1 states per item at C = 64 made the cheap-step
+  `benchmarks/vs_jax` gradients up to 5x slower at 2^19 items (random_walk 0.80 -> 3.98 ms; lumen/perf d6cb9fc). The
+  contract is tested, not assumed: `backends/cuda/codegen.FILL` (test-only module constant) fills every
+  uninitialised per-thread declaration with a byte, and tests/reverse.py requires bitwise-equal per-item results
+  and per-item cotangents for 0x00 and 0xFF.
 - **Activity.** Only float loop carries that can depend on a perturbed constant, carry or table token are
   differentiated in a step VJP. The set is a fixpoint probed with symbolic zeros. On a production
   photon-transport workload it removed half of the float carries and about a quarter of the reverse-mode time.

@@ -28,6 +28,18 @@ from ..._jaxpr import is_dropvar, located
 
 UNROLL = 32          # arrays with <= UNROLL elements are emitted as straight-line code
 MAX_LOCAL = 1 << 14  # largest per-thread local array we agree to materialize
+# TEST-ONLY (tests patch it, like _primitive.FUSE_JVP): None, or a byte value every UNINITIALISED per-thread
+# declaration (Emitter.declare, kernel.build_source's carry / state / result variables) is filled with.  A program
+# that never reads an uninitialised value gives bitwise-equal results for FILL = 0x00 and 0xFF (tests/reverse.py).
+FILL = None
+
+
+def fill_decl(n):
+    """the statement that fills the just-declared variable `n` with the FILL byte ('' when FILL is None)."""
+    if FILL is None:
+        return ""
+    return (f" {{ unsigned char* sj_f = (unsigned char*)&{n}; for (int sj_e = 0; sj_e < (int)sizeof({n}); ++sj_e)"
+            f" sj_f[sj_e] = {int(FILL) & 0xFF}; }}")
 _RESERVED = frozenset(f"{p}{b}" for p in "iu" for b in (8, 16, 32, 64))   # the integer typedefs of the kernel template
 
 
@@ -371,15 +383,17 @@ class Emitter:
         ct = ctype(dtype)
         n = self.fresh(p)
         if shape == ():
-            self.line(f"{ct} {n};")
+            self.line(f"{ct} {n};{fill_decl(n)}")
             return Local(n, (), dtype)
         if _size(shape) > MAX_LOCAL:
             raise CodegenError(f"per-item array of shape {shape} is too large for a local array")
-        self.line(f"{ct} {n}[{max(1, _size(shape))}];")   # zero-size arrays get one (never read) slot
+        self.line(f"{ct} {n}[{max(1, _size(shape))}];{fill_decl(n)}")   # zero-size arrays get one (never read) slot
         return Local(n, shape, dtype)
 
     def fill(self, dst, fn):
         """dst[idx] = fn(idx) for all idx (dst: Local)."""
+        if getattr(dst, "undef", False):
+            dst.undef = False              # (written: defined from here on)
         shape = dst.shape
         if shape == ():
             self.line(f"{dst.name} = {fn([])};")
@@ -432,6 +446,8 @@ class Emitter:
         return out
 
     def assign(self, dst, v):
+        if getattr(v, "undef", False):     # an UNDEFINED value (tallymap_uninit, never written): a copy of it is
+            return                         # undefined too, so it costs nothing (no loads of garbage, no extra array)
         self.fill(dst, lambda idx: elem(v, idx))
 
     def mat(self, v, p="v"):

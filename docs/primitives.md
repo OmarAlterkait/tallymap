@@ -8,7 +8,7 @@ substituted after autodiff (`_foreign.expand_late`); `tally` = tallymap's own em
 Any other primitive raises `tm.UnsupportedError` on cuda; the lockstep backend runs every JAX
 primitive.
 
-158 names (133 rules, 18 canonicalised, 5 expanded).
+159 names (134 rules, 18 canonicalised, 5 expanded).
 
 | primitive | how |
 |---|---|
@@ -162,6 +162,7 @@ primitive.
 | `sub` | rule |
 | `tallymap_emit` | tally |
 | `tallymap_spawn` | tally |
+| `tallymap_uninit` | rule |
 | `tan` | rule |
 | `tanh` | rule |
 | `threefry2x32` | rule |

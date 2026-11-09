@@ -74,6 +74,9 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Changed
 
+- Reverse-mode checkpoint buffers are uninitialised on cuda (`tallymap_uninit`): zero-filling them cost the
+  cheap-step `vs_jax` gradients up to 5x. Tested by filling every uninitialised declaration with 0x00 and 0xFF
+  (bitwise-equal results required).
 - cuda step split: an array loop carry of >= 64 elements is updated in place instead of being rebuilt and
   copied back every step.
 
