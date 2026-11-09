@@ -512,7 +512,7 @@ def fold_post(p):
             ci, ce, cy = list(c[:nI]), list(c[nI:nI + nE]), list(c[nI + nE:-2])
             go = cond_f(*cc, *ci)[0]
 
-            def run_post(ci, ce, cy):
+            def run_post(ci, ce, cy, pz):
                 env2 = dict(env)
                 for v, x in zip(we.outvars, ci):
                     if not is_dropvar(v):
@@ -527,10 +527,16 @@ def fold_post(p):
                         ci2[loop_slot[k]] = outs[k]
                     else:
                         ce2[extra.index(k)] = outs[k]
-                return ci2, ce2, [jnp.asarray(o, av.dtype) for o, av in zip(outs[nT:], yav)]
-            ci2, ce2, cy2 = lax.cond(go, lambda ci, ce, cy: (list(body_f(*bc, *ci)), list(ce), list(cy)), run_post,
-                                     ci, ce, cy)
-            return list(ci2) + list(ce2) + list(cy2) + [c[-2], jnp.logical_not(go)]
+                ys = [jnp.asarray(o, av.dtype) for o, av in zip(outs[nT:], yav)]
+                # the post iteration WRITES the probe (the truncation flag, else 0): a carry the body passed through
+                # unchanged would be hoisted out of the loop as a constant by JAX >= 0.7 (loop-invariant carry
+                # forwarding), and the probe would no longer be the carry the adjoint returns its cotangent for
+                pz2 = (jnp.reshape(ys[p.trunc].astype(jnp.float32), (1,)) if p.trunc is not None else
+                       jnp.zeros_like(pz))
+                return ci2, ce2, ys, pz2
+            ci2, ce2, cy2, pz2 = lax.cond(go, lambda ci, ce, cy, pz: (list(body_f(*bc, *ci)), list(ce), list(cy), pz),
+                                          run_post, ci, ce, cy, c[-2])
+            return list(ci2) + list(ce2) + list(cy2) + [pz2, jnp.logical_not(go)]
         y0 = [jnp.zeros(av.shape, av.dtype) for av in yav]
         res = lax.while_loop(lambda c: jnp.logical_not(c[-1]), body2,
                              list(init) + [env[cur[k]] for k in extra] + y0 + [probe, jnp.bool_(False)])
@@ -539,6 +545,10 @@ def fold_post(p):
     avs = [_sds(v.aval) for v in jx.invars]
     avs.insert(nPi, jax.ShapeDtypeStruct((1,), jnp.float32))
     cj2 = _mk(item2, avs)
+    w2 = [e for e in cj2.jaxpr.eqns if e.primitive.name == "while"]
+    if len(w2) != 1 or len(w2[0].outvars) != meta[0] + 2:      # (meta indexes the folded loop's carries)
+        raise AssertionError(f"tallymap: fold_post built {len(w2)} top-level loops / "
+                             f"{[len(e.outvars) for e in w2]} carries, want 1 / {meta[0] + 2} (internal error)")
     check_tallies(cj2, kinds, name=f"fold_post({p.where})")
     return dataclasses.replace(p, cj=cj2, nP=p.nP + 1, tag=p.tag + "+fold"), meta
 
