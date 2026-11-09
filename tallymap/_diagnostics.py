@@ -55,8 +55,20 @@ def record_program(prog):
 def _render(rec):
     """a program record as returned by diagnostics(): the jaxpr as text and the float constants (built now, not at
     bind time)."""
-    from ._primitive import float_consts
     return dict(tag=rec["tag"], jaxpr=str(rec["jaxpr"]), baked_floats=float_consts(rec["consts"]))
+
+
+def float_consts(consts):
+    """[(shape, dtype, size)] of the FLOAT ones among an item program's constants: the values its item function
+    closed over, which a derivative cannot reach (a constant's tangent is zero, silently)."""
+    from ._rewrite import isfloat
+    out = []
+    for c in consts:
+        dt = c.dtype if hasattr(c, "dtype") else np.asarray(c).dtype
+        if isfloat(dt):
+            sh = tuple(np.shape(c))
+            out.append((sh, str(dt), int(np.prod(sh, dtype=np.int64))))
+    return out
 
 
 def record_kernel(rec):
