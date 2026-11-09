@@ -1521,6 +1521,22 @@ def _(b):
     return "leak: " + m.split(".")[1][:60] + "...; explicit argument: jvp matches; outer-jit closure runs"
 
 
+@case("jnp.linalg.solve / inv inside an item: cuda raises the ordinary UnsupportedError (no rule)", ["cuda"])
+def _(b):
+    def mk(op):
+        def item(t, x):
+            A = jnp.eye(4, dtype=F) * (2.0 + x) + 0.1
+            y = op(A)
+            return t.add("Q", 0, jnp.sum(y)), y
+        return item
+    out = []
+    for name, op in (("solve", lambda A: jnp.linalg.solve(A, jnp.ones(4, F))), ("inv", lambda A: jnp.linalg.inv(A)[0])):
+        m = raises(tm.UnsupportedError, lambda op=op: V(mk(op), b)(xs), "is not supported by the tallymap cuda backend")
+        prim = re.search(r"primitive '(\w+)' is not supported", m)
+        out.append(f"{name}: {prim.group(1) if prim else m[:60]}")
+    return "; ".join(out)
+
+
 @case("step split: a large array loop carry is updated in place (no per-step copy), same result", ["cuda"])
 def _(b):
     from tallymap.backends.cuda.kernel import STEP_INPLACE_MIN

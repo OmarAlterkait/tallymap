@@ -146,7 +146,8 @@ def _param(v):
             raise NotImplementedError("tallymap: canonicalising an open sub-jaxpr created constants")
         return c.jaxpr
     if isinstance(v, (tuple, list)) and any(isinstance(b, ClosedJaxpr) or type(b).__name__ == "Jaxpr" for b in v):
-        return type(v)(_param(b) for b in v)
+        out = [_param(b) for b in v]
+        return type(v)(*out) if hasattr(v, "_fields") else type(v)(out)     # a namedtuple: custom_linear_solve
     return v
 
 
