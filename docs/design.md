@@ -48,7 +48,11 @@ because a lane whose item has finished otherwise idles until the longest item in
 exactly ONE top-level while loop is split into pre / cond / body / post
 (`backends/cuda/kernel.py::_split`); anything else runs whole-item. With spawn the order reverses and whole-item
 is the faster of the two, by about half again, so the rule is: step refill unless the program spawns. (A warp is
-the group of 32 GPU threads that execute together on NVIDIA hardware.)
+the group of 32 GPU threads that execute together on NVIDIA hardware.) Under the split, a loop carry is normally rebuilt by
+`sj_body` into a temporary and copied back once per step; an ARRAY carry of at least `STEP_INPLACE_MIN` (64)
+elements (a checkpoint buffer, a state history) is instead passed to `sj_body` by mutable reference and, when the
+body's result is that parameter updated in place, it has no temporary and no copy. Smaller carries keep the copy, so
+kernels without a large carry are unchanged.
 
 That rule was re-measured on every `benchmarks/vs_jax` problem (private `_schedule`, forward and gradient, `div`
 high), as the ratio of step-refill time to whole-item time (below 1: step refill is faster):

@@ -74,6 +74,9 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Changed
 
+- cuda step split: an array loop carry of >= 64 elements is updated in place instead of being rebuilt and
+  copied back every step.
+
 - The cuda kernel cache and the eager-call cache key a program on a structural sha256 digest of its jaxpr
   (`_jaxpr.digest`) instead of its printed text. JAX's pretty-printer cost 95 s per build on a large engine item
   (4.2 s with the digest); the digest also separates literal values the printer rounds (`docs/design.md`

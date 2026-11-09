@@ -593,10 +593,11 @@ class Emitter:
         import re
         return re.search(r"(?<![A-Za-z0-9_])" + re.escape(dst.name) + r"(?![A-Za-z0-9_])", t.replace(own, "")) is None
 
-    def run_top(self, cj, args, fn):
+    def run_top(self, cj, args, fn, mutable=()):
         """Run a top-level ClosedJaxpr: concrete scalar consts become literals, every other const (arrays, and
-        tracers closed over from an enclosing trace) is a dynamic kernel input."""
-        self.freeze(args)
+        tracers closed over from an enclosing trace) is a dynamic kernel input.  mutable: names of argument Locals
+        the function may update in place (mutable reference parameters; kernel.py's step-split body)."""
+        self.freeze([a for a in args if not (isinstance(a, Local) and a.name in mutable)])
         consts = []
         for k, (c, v) in enumerate(zip(cj.consts, cj.jaxpr.constvars)):
             if not isinstance(c, jax.core.Tracer) and np.ndim(c) == 0 and not is_key_dtype(v.aval.dtype):
