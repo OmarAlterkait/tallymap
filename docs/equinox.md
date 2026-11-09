@@ -221,7 +221,7 @@ the one that bites and you get its NaN per item instead of a poisoned tally:
 f = tm.vmap(item, outputs=..., max_steps=16384)     # >= the diffeqsolve max_steps
 ```
 
-`rev_checkpoints` (default 16) trades gradient recomputation against per-item memory.  It is not monotone for a
+`rev_checkpoints` (default `'auto'`: from the loop state's size) trades gradient recomputation against per-item memory.  It is not monotone for a
 heavy item: measure it rather than deriving it from the step count.
 
 ## The measured numbers
@@ -272,7 +272,7 @@ leave registers, while a small C pays quadratic recomputation once the loop is l
 
 MEASURED, `Kvaerno5` gradient in ms, the best C in bold:
 
-| spread | N | C = 4 | C = 8 | C = 16 (default) | C = 32 | C = 64 |
+| spread | N | C = 4 | C = 8 | C = 16 (old default) | C = 32 | C = 64 |
 |---|---|---|---|---|---|---|
 | narrow | 65,536 | **714** | 1,164 | 4,936 | 7,136 | 20,280 |
 | narrow | 262,144 | **2,755** | 4,735 | 21,506 | 30,184 | - |

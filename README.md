@@ -197,7 +197,8 @@ Three sentences, and everything else follows from them.
 2. **Tallies are atomic sums.** There is no per-item output array. Every `t.add` goes into one accumulator, in
    shared memory when the output is small enough and in global memory otherwise. Sums are commutative, so the
    order is not fixed, which is where the float semantics below come from.
-3. **Reverse mode replays each item from its inputs.** The forward pass stores nothing per step. The adjoint
+3. **Reverse mode replays each item from its inputs.** The forward pass stores only the first C states of each
+   loop (an item whose loop is that short is never replayed). The adjoint
    re-runs each item with two-level checkpointing and applies the vector-Jacobian product of one step at a time,
    so **memory is O(1) per item in the trip count** and there is no step cap anywhere. That is the property
    plain JAX cannot give you, and it is the reason to pay for a CUDA emitter in your dependency tree.
@@ -234,7 +235,7 @@ Two costs to know:
   pass, where diffrax's checkpointed adjoint costs about 12x. The gradient margin is therefore one order of
   magnitude where the forward margin is two.
 - `rev_checkpoints` trades recomputation against per-item state, and it is not monotone. On that solver,
-  raising it from the default 16 to 32 made `grad` 3x slower. Measure it per item rather than deriving it from
+  raising it from 16 to 32 made `grad` 3x slower. Measure it per item rather than deriving it from
   the trip count. (Those numbers predate the checkpoint-stride fix, which made C far less sensitive everywhere it
   was re-measured: on the `benchmarks/vs_jax` problems the spread between C = 8, 16, 32 and 64 is now within a
   factor of 1.6, against up to 20 before. The advice stands, but try fewer values.)
@@ -426,7 +427,7 @@ item jaxprs and generated kernels. `tm.diagnostics(f, *args)` reports what `jax.
 | `backend` | `'auto'` | `'auto'`: cuda on a GPU, where a program the cuda emitter cannot compile raises `tm.UnsupportedError` (pass `backend='lockstep'` to run it; it never falls back on its own, because lockstep is about 100x slower); lockstep elsewhere, with a one-time warning. `'cuda'`: cuda or raise. `'lockstep'`: always the plain-JAX interpreter, slow by design, the reference. |
 | `cuda_math` | `'approx'` | cuda f32 division, sqrt and rsqrt. `'approx'`: the PTX XLA:GPU itself emits, so it is the arithmetic a plain JAX program on the same GPU gets. `'ieee'`: correctly rounded, the portable reference, about 1.5x slower. |
 | `lockstep_block` | `2**18` | lockstep backend: lanes per block, which bounds its memory. |
-| `rev_checkpoints` | `16` | reverse mode: checkpoint buffer size C. O(K) work for loops of K <= C^2 steps; 2C states of memory per item. |
+| `rev_checkpoints` | `'auto'` | reverse mode: checkpoint buffer size C. `'auto'`: 16 for a loop state (the carries the step reads) under 128 B, else the largest of 4 ... 64 whose 3C+1 states fit 64 KiB. A loop of K <= C steps is not replayed; O(K) work for K <= C^2; 3C+1 states of memory per item. |
 | `rev_stats` | `False` | reverse mode: report replay mismatches and tree-adjoint counts to the host. Off by default because a host callback takes `jax.jit` off its C++ fast path, which can cost an order of magnitude. |
 
 Any other option name raises. Options starting with `_` are private measurement and negative-control switches
@@ -437,8 +438,8 @@ which defaults to `~/.cache/tallymap`.
 
 **Forward mode** (`jvp`, `jacfwd`, `linearize`): one kernel computes the primal and the tangent together.
 `jacfwd` with P parameters runs one kernel with P dual lanes sharing the primal, the control flow, the gathers
-and the random numbers. **Reverse mode** (`grad`, `vjp`, `jacrev`): the forward kernel stores nothing per step
-and the adjoint replays each item. Large read-only tables receive their cotangents by atomic scatter into one
+and the random numbers. **Reverse mode** (`grad`, `vjp`, `jacrev`): the forward kernel stores the first C states
+of each loop and the adjoint replays each item from there. Large read-only tables receive their cotangents by atomic scatter into one
 accumulator, never a dense per-item copy. Programs that spawn use the tree adjoint, one launch per generation,
 deepest first.
 

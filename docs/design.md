@@ -238,10 +238,22 @@ error) turn every affected cell into a failure, which is how the matrix is known
 ## 3. Reverse mode (`_reverse.py`)
 
 - **Checkpointed loops.** `retrace(rev=...)` replaces every while loop by `checkpointed_while`. The forward pass
-  stores nothing and only counts the steps K; the backward pass replays the loop once storing every m-th state,
-  then walks the segments newest first, refilling a buffer of at most C = `rev_checkpoints` (default 16) states
-  from each segment's checkpoint. That is O(K) work for K <= C^2 and 2C states of memory per item, with no bound
-  on K required anywhere. Toy walk at 65k items, the ratio of grad to forward: 3.0x at K=100. The scheme this
+  counts the steps K and stores the states before steps 0..C-1 in a HEAD buffer; an item of K <= C steps is swept
+  straight off the head, with no replay. Otherwise the backward pass replays the loop once storing every m-th
+  state, then walks the segments newest first, refilling a tape of at most C = `rev_checkpoints` states from each
+  segment's checkpoint (the first C states come from the head). That is O(K) work for K <= C^2 and 3C+1 states of
+  memory per item, with no bound on K required anywhere. Only the carries the step or predicate reads are stored
+  (`_rewrite._live_carries`, read off the loop's jaxprs). A counting pass that stored nothing made every K <= C
+  item replay its whole loop once more: 1.7x slower on lumen SK's gradient and 1.4x on SBND (lumen/perf
+  8c92ee8 / 762da14). The head is a read-only residual, not the segment tape: reusing it as the tape (a carry of
+  the segment loops) made the emitter copy it, a 28 KB against a 12 KB frame on lumen SK, 17% slower.
+- **C is chosen from the state size** (`rev_checkpoints='auto'`, `_reverse.auto_checkpoints`): 16 below 128 B of
+  stored state, else the largest of 4 ... 64 whose 3C+1 states fit 64 KiB of LOGICAL bytes. lumen (306-318 B
+  states, warp-maximum trip counts 16 to 60) is 1.3-1.6x faster at C = 64 than at 16; the `vs_jax` problems
+  (8-25 B) are 1.5-3x slower at 64. The 64 KiB budget ignores the device (the driver reserves the compiled
+  frame for every resident thread): sizing C from the compiled frame against free memory is still to do. An
+  adjoint that is differentiated again (hvp, grad-of-grad) is rebuilt at C = 16 (`_primitive._lean`): its
+  memory goes as C1 x C2, and at C1 = 64 the toy's rev-over-rev kernel needed 290 KB per thread (launch OOM). Toy walk at 65k items, the ratio of grad to forward: 3.0x at K=100. The scheme this
   replaced, replaying from the start for every step, was 13x at K=100 and over 100x at K=1000. A single fused
   reverse loop (one VJP instance for the whole loop) was also tried and was 2 to 5 times slower, because it
   defeats in-place updates; it was reverted.

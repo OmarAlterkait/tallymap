@@ -47,8 +47,8 @@ Terms used in the code, the docs and the error messages.
 
 | term | meaning |
 |---|---|
-| **checkpointed loop** | the reverse-differentiable replacement of every `while_loop` in an adjoint: the forward stores nothing per step; the VJP replays from the initial carry with two-level checkpointing. |
-| **checkpoint buffer** | C states per item (`rev_checkpoints`, default 16): O(K) work for loops of K <= C^2 steps, 2C states of memory. The checkpoint stride is C, so every buffer the sweep allocates is full. |
+| **checkpointed loop** | the reverse-differentiable replacement of every `while_loop` in an adjoint: the forward stores the first C states (the head); the VJP replays from the initial carry with two-level checkpointing when the loop is longer than C. |
+| **checkpoint buffer** | C states per item (`rev_checkpoints`, default `'auto'` from the state size): O(K) work for loops of K <= C^2 steps, 3C+1 states of memory (head, checkpoints, tape). The checkpoint stride is C, so every buffer the sweep allocates is full. |
 | **sparse table cotangent** | the cotangent of a large read-only table (32 elements or more, read only by gathers): an atomic scatter of the read cotangents into ONE accumulator through a threaded cotangent token, never a dense per-item array. |
 | **replay fingerprint** | a per-item hash of the final carries of the top-level loops, computed by the forward kernel and again by the adjoint's replay.  A mismatch makes the call's cotangents NaN. |
 | **tree adjoint** | reverse mode through spawn: the run is recorded generation by generation, then one adjoint launch per generation, deepest first. |

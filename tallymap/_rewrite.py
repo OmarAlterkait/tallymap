@@ -520,15 +520,34 @@ def _while(eqn, ins, fin, ctx, cap, rev, top, itags=None):
     cfn = _notread(ctx, cfn)
     tids = _tids(ctx, btags, [w.body])
     bfl = list(fin[nc:nc + nb])
+    live = _live_carries(w, nc, nb, len(init))
     if not tids:
-        return checkpointed_while(cfn, bfn, list(cc), list(bc), list(init), tflags, ropt, bfl), tflags
+        return checkpointed_while(cfn, bfn, list(cc), list(bc), list(init), tflags, ropt, bfl, live=live), tflags
     n = len(init)
     out = checkpointed_while(lambda cc_, c2: cfn(cc_, c2[:n]), _with_toks(ctx, tids, bfn, n), list(cc), list(bc),
                     list(init) + [ctx["toks"][t] for t in tids], list(tflags) + ["w"] * len(tids),
-                    ropt, bfl)
+                    ropt, bfl, live=live + [False] * len(tids))
     for t, v in zip(tids, out[n:]):
         _set_tok(ctx, t, v)
     return list(out[:n]), tflags
+
+
+def _live_carries(w, nc, nb, n):
+    """per loop carry: does the body or the predicate READ it?  (an operand of any equation, or a result in another
+    carry's slot; a carry the body passes through unchanged and nothing else reads is not read).  From the loop's
+    own jaxprs, so it costs no trace (lumen/perf measured a re-trace of the body for this at 284 s of a 307 s first
+    call on lumen SK: its step has inner loops, each rebuilt and re-traced inside every traced body)."""
+    used = [False] * n
+    for jx, off, own in ((w.body.jaxpr, nb, True), (w.cond.jaxpr, nc, False)):
+        idx = {v: j for j, v in enumerate(jx.invars[off:off + n])}
+        for e in jx.eqns:
+            for v in e.invars:
+                if not isinstance(v, Literal) and v in idx:
+                    used[idx[v]] = True
+        for pos, v in enumerate(jx.outvars):
+            if not isinstance(v, Literal) and v in idx and (not own or idx[v] != pos):
+                used[idx[v]] = True
+    return used
 
 
 def _cond(eqn, ins, fin, ctx, cap, rev, top, itags=None):

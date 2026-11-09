@@ -2,16 +2,24 @@
 
 JAX refuses to reverse-differentiate lax.while_loop (unknown trip count).  _rewrite.retrace(rev=...) replaces every
 while loop (recursively) by a CHECKPOINTED LOOP (checkpointed_while): a custom_vjp loop whose forward stores only
-(consts, initial carry, trip count K) and whose VJP re-creates the states it needs from the initial carry:
+(consts, initial carry, trip count K, the first C states) and whose VJP re-creates any other state it needs from the
+initial carry:
 
-  Two checkpoint buffers of C states per item (option rev_checkpoints).  The forward pass stores NOTHING: it
-    only counts the steps K.  The backward pass replays the loop once, storing every m-th state with a stride of
-    m = max(C, ceil(K/C)) (so at most C checkpoints, and the segment tape below is always full -- see bwd).  It
-    then walks the segments from the last one: it refills a segment's (<= m) states from its checkpoint into the
-    second buffer and applies the VJP of one body step to each, newest first.
-    Work: ~2K body steps + K step-VJPs for K <= C; ~3K + K VJPs for K <= C^2 (O(K)); K^2/(2C^2) + 3K beyond;
-    memory 2C states per item.  No bound on K is needed in advance.  (The original O(K^2) replay-from-the-start
-    scheme was 3.4-13x slower everywhere it was measured and was removed.)
+  Per item, a HEAD buffer of C+1 states, a checkpoint buffer of C states and a segment tape of C states (C: option
+    rev_checkpoints, by default chosen from the state's size, see auto_checkpoints; a state is the carries the step
+    or predicate READS, _rewrite._live_carries).  The forward pass of the loop counts the steps K and stores the
+    states before steps 0..C-1 in the head (slot C is an unconditional scratch sink for k >= C).  The backward
+    pass then:
+      K <= C: sweeps the head directly, newest first: K step VJPs and NO replay.
+      K >  C: replays the loop once, storing every m-th state with a stride of m = max(C, ceil(K/C)) (so at most C
+              checkpoints, every segment tape full); then walks the segments from the last one, refilling a
+              segment's (<= m) states from its checkpoint into the tape (the first C states: straight from the
+              head) and applying the VJP of one body step to each, newest first.
+    Work: K body steps + K step-VJPs for K <= C; ~3K + K VJPs for K <= C^2 (O(K)); K^2/(2C^2) + 3K beyond.  Memory
+    3C+1 states per item.  No bound on K is needed in advance.  (The original O(K^2) replay-from-the-start scheme
+    was 3.4-13x slower everywhere it was measured and was removed; a counting pass that stores nothing -- which
+    makes every K <= C item replay its whole loop once more -- was 1.7x slower on a photon-transport gradient,
+    lumen SK, and 1.4x on SBND.)
 
 Only ACTIVE float carries are differentiated in a step VJP: a carry is active if it can depend on a perturbed
 operand of the loop (a fixpoint over the body, probed with JAX's own symbolic zeros).  Tally carries get a
@@ -48,19 +56,59 @@ LAST = {}          # what the last vjp_prog / checkpointed_while built (instrume
 
 @dataclasses.dataclass(frozen=True)
 class RevOpts:
-    checkpoints: int = 16      # C: states per checkpoint buffer (public option rev_checkpoints)
+    checkpoints: int = 0       # C: states per checkpoint buffer (public option rev_checkpoints); 0 = auto_checkpoints
     sparse_min: int = 32       # tables with >= this many elements get sparse (emitted) cotangents (private)
 
 
 def rev_opts(opts=None):
-    """RevOpts from the tallymap.vmap option rev_checkpoints (public) and _rev_sparse_min (private)."""
+    """RevOpts from the tallymap.vmap option rev_checkpoints (public: an int >= 1, or 'auto' / None) and
+    _rev_sparse_min (private)."""
     if isinstance(opts, RevOpts):
         return opts
     opts = dict(opts or {})
-    r = RevOpts(checkpoints=int(opts.get("rev_checkpoints", 16)), sparse_min=int(opts.get("_rev_sparse_min", 32)))
-    if r.checkpoints < 1:
-        raise ValueError("tallymap: rev_checkpoints must be >= 1")
+    c = opts.get("rev_checkpoints")
+    auto = c is None or (isinstance(c, str) and c == "auto")
+    r = RevOpts(checkpoints=0 if auto else int(c), sparse_min=int(opts.get("_rev_sparse_min", 32)))
+    if not auto and r.checkpoints < 1:
+        raise ValueError("tallymap: rev_checkpoints must be >= 1 (or 'auto' / None)")
     return r
+
+
+# The automatic C (rev_checkpoints unset).  A state of fewer than AUTO_BIG_STATE bytes (the carries the step reads)
+# keeps C = AUTO_C_SMALL; a larger one gets the largest power of two in [AUTO_C_MIN, AUTO_C_MAX] whose 3C+1 states
+# (head C+1, checkpoints C, segment tape C) fit AUTO_CKPT_BYTES.
+#   MEASURED on an L40S (lumen/perf 762da14, 830c071).  lumen's photon transport (states of 306-318 B; per-photon
+#   trip counts K: SK mean 7.1 / warp(32)-max over mean 2.29, SBND 15.0 / 2.35, ANNIE 12.4 / 3.83, longest 1263):
+#   the adjoint runs whole items per warp, a warp pays its LONGEST item, and an item of K <= C steps needs no
+#   replay, so C must cover the warp maximum (16 to 60 steps); C = 64 against 16: SK 0.685 against 0.878 s, ANNIE
+#   5.22 against 8.21 s.  The benchmarks/vs_jax problems (states of 8-25 B; mean K 4.5 to 252): C = 64 was 1.5x to
+#   3x SLOWER than 16 at 2^19 items (random_walk 2.53 against 0.92 ms, transport 3.86 against 1.81).  The emitter
+#   writes arrays of <= 32 elements (codegen.UNROLL) as straight-line code that ptxas can keep in registers: a
+#   scalar's C = 16 buffers can, C >= 32 cannot, while a 28-carry state lives in local memory at any C.
+#   AUTO_BIG_STATE = 128 B lies in the measured gap (25 .. 306 B): nothing in between was measured.
+#   KNOWN LIMIT: AUTO_CKPT_BYTES counts LOGICAL state bytes and ignores the device.  Per-item memory is local
+#   memory, which the CUDA driver reserves for EVERY resident thread outside JAX's pool (bytes/thread x max
+#   threads/SM x SMs); the right rule sizes C from the compiled frame (tm.diagnostics()["kernels"][i]["resources"])
+#   against free device memory.  Not done yet.
+AUTO_BIG_STATE = 128
+AUTO_C_SMALL = 16
+AUTO_C_MIN, AUTO_C_MAX = 4, 64
+AUTO_CKPT_BYTES = 65536          # of LOGICAL state bytes: lumen (306 B per state) gets C = 64
+LEAN_C = 16                      # C of an adjoint that is itself differentiated (second order): _primitive._lean
+
+
+def state_bytes(xs):
+    """bytes of one loop state (the stored carries), as stored in a checkpoint buffer slot"""
+    return int(sum(int(np.prod(jnp.shape(_phys(x)), dtype=np.int64)) * np.dtype(_dt(_phys(x))).itemsize for x in xs))
+
+
+def auto_checkpoints(sb):
+    """C for a loop state of sb bytes (see AUTO_BIG_STATE): AUTO_C_SMALL below AUTO_BIG_STATE bytes, else the largest
+    C <= AUTO_C_MAX whose 3C+1 states fit AUTO_CKPT_BYTES, at least AUTO_C_MIN."""
+    C = AUTO_C_SMALL if sb < AUTO_BIG_STATE else AUTO_C_MAX
+    while C > AUTO_C_MIN and (3 * C + 1) * sb > AUTO_CKPT_BYTES:
+        C //= 2
+    return C
 
 
 # ------------------------------------------------------------------------------------------- replay consistency
@@ -211,11 +259,13 @@ def _active(bfn, bc, init, pb, pc, cand, w_idx):
 
 
 # ------------------------------------------------------------------------------------------- checkpointed_while
-def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None):
+def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None, live=None):
     """cfn(cc, carry) -> bool, bfn(bc, carry) -> carry (lists).
     kinds[j]: None/False = state, True/'o' = output Tally (pass-through cotangent), 'w' = table cotangent token
     (its cotangent is threaded through the backward sweep).  bflags[i]: body const i is a tally (never
-    differentiated: a closed-over tally is a discarded one)."""
+    differentiated: a closed-over tally is a discarded one).  live[j]: does the body or the predicate READ carry j
+    (_rewrite._live_carries; None: all do)?  Only read state carries are stored: one that is never read is restored
+    as its initial value, which no replayed step and no step VJP can tell apart."""
     o = rev_opts(opts)
     btal = list(bflags) if bflags is not None else [False] * len(bc)
     kinds = ["o" if k is True else (k or None) for k in kinds]
@@ -229,26 +279,29 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None):
     def loop(cc, bc, init):
         return lax.while_loop(lambda c: cfn(cc, c), lambda c: bfn(bc, c), init)
 
-    C = max(1, int(o.checkpoints))
+    l_idx = [j for j in s_idx if live is None or live[j]]       # the stored state: the carries the step reads
+    sb = state_bytes([init[j] for j in l_idx])
+    C = int(o.checkpoints) if o.checkpoints else auto_checkpoints(sb)
 
     def fwd(cc, bc, init):
         pb = tuple(bool(x.perturbed) and not t for x, t in zip(bc, btal))
         pc = tuple(bool(x.perturbed) for x in init)
         cc, bc, init = [x.value for x in cc], [x.value for x in bc], [x.value for x in init]
-        # the forward only counts the steps: with a checkpoint stride of C (see bwd) every state the backward
-        # pass reads is either a stride-C checkpoint or refilled from one, so storing states here would be a
-        # local-memory store per step that nothing reads
+        # the forward counts the steps and stores the states before steps 0..C-1 in the HEAD (slot C: a scratch
+        # sink, so the store is unconditional and in place): an item of K <= C steps then needs no replay at all
         def b_(s):
-            k, c = s
-            return k + 1, bfn(bc, c)
-        k, out = lax.while_loop(lambda s: cfn(cc, s[1]), b_, (jnp.int32(0), init))
+            k, c, h = s
+            return k + 1, bfn(bc, c), _buf_set(h, jnp.minimum(k, C), [c[j] for j in l_idx])
+        k, out, head = lax.while_loop(lambda s: cfn(cc, s[1]), b_,
+                                      (jnp.int32(0), init, _buf_new(C + 1, [init[j] for j in l_idx])))
         act = tuple(_active(bfn, bc, init, pb, pc, f_idx, w_idx))
-        LAST.setdefault("loops", []).append(dict(checkpoints=o.checkpoints, n_state=len(s_idx),
-                                                 n_float=len(f_idx), n_active=len(act), n_tok=len(w_idx)))
-        return out, (cc, bc, init, k, _Static((pb, pc, act)))
+        LAST.setdefault("loops", []).append(dict(checkpoints=C, auto=not o.checkpoints, n_state=len(s_idx),
+                                                 n_live=len(l_idx), n_float=len(f_idx), n_active=len(act),
+                                                 n_tok=len(w_idx), state_bytes=sb, ckpt_bytes=(3 * C + 1) * sb))
+        return out, (cc, bc, init, k, head, _Static((pb, pc, act)))
 
     def bwd(res, ct):
-        cc, bc, init, K, st = res
+        cc, bc, init, K, head, st = res
         pb, pc, act = st.v
         act = list(act)
         fb = [i for i, x in enumerate(bc) if pb[i] and isfloat(_dt(x))]
@@ -284,14 +337,14 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None):
             return lax.fori_loop(0, steps, lambda i, c: bfn(bc, c), c)
 
         lst = list(init)
-        likes = [init[j] for j in s_idx]
+        likes = [init[j] for j in l_idx]
 
         def state(c):
-            return [c[j] for j in s_idx]
+            return [c[j] for j in l_idx]
 
         def restore(vals):
             c = list(init)
-            for j, v in zip(s_idx, vals):
+            for j, v in zip(l_idx, vals):
                 c[j] = v
             return c
         # Checkpoint stride.  C, not ceil(K/C): a SEGMENT TAPE of C slots is allocated once per segment, and
@@ -310,8 +363,12 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None):
             return c, _buf_set(b, s, state(c))
         _, buf1 = lax.fori_loop(1, ns, fill1, (lst, _buf_set(_buf_new(C, likes), 0, state(init))))
 
-        # (measured: ONE reverse loop with a select between the two buffers defeats the emitter's in-place
-        # updates and is 2-5x slower than these nested loops; L40S toy bench)
+        # The FIRST tape (states 0..min(K, C)-1) is the head itself, read-only: for K <= C (ns = nsub = 1) that is
+        # the whole sweep, with no replay.  Every other tape is a fresh C-slot buffer refilled from its checkpoint.
+        # (The head and the tape are separate buffers: measured on lumen SK, reusing the head as the tape -- a loop
+        # carry of the segment loops -- made the emitter copy it, a 28 KB stack frame against 12 KB, 17% slower,
+        # and multiplied second-order memory.  ONE reverse loop with a select between two buffers defeats the
+        # emitter's in-place updates and is 2-5x slower than these nested loops; L40S toy bench.)
         def seg(sr, acc):
             s = ns - 1 - sr
             L = jnp.minimum(m, K - s * m)
@@ -321,6 +378,7 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None):
             def sub(ur, acc):
                 u = nsub - 1 - ur
                 LL = jnp.minimum(C, L - u * C)
+                first = (s == 0) & (u == 0)                         # states 0..LL-1: the head's slots 0..LL-1
                 c = adv(c0, u * C)
                 b2 = _buf_set(_buf_new(C, likes), 0, state(c))      # (segment tape)
 
@@ -328,10 +386,13 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None):
                     c, b = cb
                     c = bfn(bc, c)
                     return c, _buf_set(b, v, state(c))
-                _, b2 = lax.fori_loop(1, LL, fill2, (c, b2))
+                _, b2 = lax.fori_loop(1, jnp.where(first, 1, LL), fill2, (c, b2))
 
                 def rv(vr, acc):
-                    return vjp_step(restore(_buf_get(b2, LL - 1 - vr, likes)), acc)
+                    i = LL - 1 - vr
+                    raw = [jnp.where(first, lax.dynamic_index_in_dim(h_, i, 0, keepdims=False),
+                                     lax.dynamic_index_in_dim(t_, i, 0, keepdims=False)) for h_, t_ in zip(head, b2)]
+                    return vjp_step(restore([_unphys(v, l) for v, l in zip(raw, likes)]), acc)
                 return lax.fori_loop(0, LL, rv, acc)
             return lax.fori_loop(0, nsub, sub, acc)
         acc = lax.fori_loop(0, ns, seg, acc0)

@@ -226,7 +226,7 @@ _OPTS = {
     # public
     "cuda_math": "cuda backend, f32 div/sqrt: 'approx' (default) | 'ieee'",
     "lockstep_block": "lockstep backend: lanes per block",
-    "rev_checkpoints": "reverse mode: checkpoint buffer size C",
+    "rev_checkpoints": "reverse mode: checkpoint buffer size C (default 'auto': from the loop state's size)",
     "rev_stats": "reverse mode: report replay mismatches / tree stats to the host (costs jit's fast path)",
     # PRIVATE (measurements / tests / negative controls; not API)
     "_schedule": "cuda: 'step' | 'item' overrides the rule (step unless the program spawns)",
@@ -259,8 +259,11 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
     opts:      cuda_math          cuda f32 div/sqrt: 'approx' (default; XLA:GPU's own PTX) | 'ieee' (correctly
                                   rounded: the portable reference).
                lockstep_block     lockstep backend: lanes per block (default 2^18; bounds its memory).
-               rev_checkpoints    reverse mode: states per checkpoint buffer C (default 16).  O(K) work for loops
-                                  of K <= C^2 steps, 2C states of per-item memory.
+               rev_checkpoints    reverse mode: states per checkpoint buffer C (default 'auto': 16 for a loop state
+                                  -- the carries the step reads -- under 128 B, else the largest of 4, 8, ..., 64
+                                  whose 3C+1 states fit 64 KiB; _reverse.auto_checkpoints).  A loop of K <= C
+                                  steps needs no replay; O(K) work for K <= C^2; 3C+1 states of per-item (local)
+                                  memory.
                rev_stats          reverse mode: report replay mismatches and tree-adjoint stats to the host
                                   (tallymap.diagnostics()['reverse']).  Off by default: a host callback takes jax.jit
                                   off its C++ fast path.  A failed check makes the gradient NaN either way.
