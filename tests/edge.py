@@ -1345,8 +1345,7 @@ def _(b):
 
     from tallymap.backends.cuda import canon, census, op_table
     jaxnames = {v.name for v in vars(P).values() if isinstance(v, Primitive)}
-    from tallymap import _foreign
-    ours = set(op_table.RULES) | set(canon.SUGAR) | set(_foreign._generic())
+    ours = set(op_table.RULES) | set(canon.SUGAR)
     bad = sorted(ours - jaxnames - set(census.NOT_IN_JAX_EXTEND))
     if bad:
         raise Fail(f"op-table names that are neither in jax.extend.core.primitives nor explained: {bad} "
@@ -1358,7 +1357,7 @@ def _(b):
     if keys != {"name", "how"}:
         raise Fail(f"supported_primitives() rows have keys {sorted(keys)}, want name and how only")
     hows = {r["how"] for r in rows}
-    if hows - {"rule", "canonicalised", "expanded", "tally"}:
+    if hows - {"rule", "canonicalised", "tally"}:
         raise Fail(f"unknown 'how' values {sorted(hows)}")
     doc = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "primitives.md")
     if open(doc).read() != census.primitives_table():
@@ -1520,30 +1519,6 @@ def _(b):
     close(jax.jit(outer)(TH, F(2.0))[0], TH * 2.0 * xs.sum(), rtol=1e-5)
     close(jax.jit(jax.grad(lambda q, w: outer(q, w).sum()))(TH, F(2.0)), 2.0 * xs.sum(), rtol=1e-5)
     return "leak: " + m.split(".")[1][:60] + "...; explicit argument: jvp matches; outer-jit closure runs"
-
-
-@case("jnp.linalg.solve / inv inside an item (lu, custom_linear_solve, triangular_solve): fwd, jvp, grad vs dense")
-def _(b):
-    def mk(n):
-        def item(t, x, th):
-            i = jnp.arange(n, dtype=F)
-            A = jnp.eye(n, dtype=F) * (2.0 + x) + th * jnp.cos(i[:, None] * x + i[None, :]) * 0.3
-            A = A[::-1] if n > 3 else A                    # needs pivoting
-            y = jnp.linalg.solve(A, jnp.sin(i * th + x))
-            z = jnp.linalg.inv(A) @ jnp.ones(n, F)
-            return t.add("Q", (x * 7).astype(jnp.int32) % NB, jnp.sum(y) + z[0] * th), y[0]
-        return item
-    out = []
-    for n in (3, 4, 12):
-        f, r = V(mk(n), b, in_axes=(0, None)), R(mk(n), in_axes=(0, None))
-        close(f(xs, TH).outputs["Q"], r(xs, TH).outputs["Q"], rtol=2e-4)
-        close(f(xs, TH).per_item, r(xs, TH).per_item, rtol=2e-4)
-        jv = lambda g: jax.jvp(lambda q: g(xs, q).outputs["Q"], (TH,), (F(1.0),))[1]
-        close(jv(f), jv(r), rtol=1e-3, what=f"jvp n={n}")
-        gr = lambda g: jax.grad(lambda q: jnp.sum(g(xs, q).outputs["Q"] ** 2) + jnp.sum(g(xs, q).per_item))(TH)
-        close(gr(f), gr(r), rtol=1e-3, what=f"grad n={n}")
-        out.append(n)
-    return f"n = {out}: forward, jvp and grad match the dense reference"
 
 
 @case("step split: a large array loop carry is updated in place (no per-step copy), same result", ["cuda"])

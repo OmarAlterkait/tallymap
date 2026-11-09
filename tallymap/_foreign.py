@@ -55,15 +55,6 @@ other rules, and does that by wrapping the call in a second primitive, `_vprim_p
 `jacfwd`, a batch folded into the item axis), and like `linear_solve` it may only be expanded once the rules it
 exists to carry have been used.
 
-## JAX's own linear algebra, expanded late too
-
-`jnp.linalg.solve` (and `inv`, `det`, `lu_factor`/`lu_solve`) binds `lu`, `lu_pivots_to_permutation`,
-`custom_linear_solve` and `triangular_solve`, which XLA lowers to solver-library calls. The cuda backend expands
-them, after autodiff, into JAX's own pure-JAX implementations, the ones JAX lowers them to on a backend without
-a solver library (`_compat.jax_generic_linalg`). `triangular_solve` has no pure-JAX form in JAX (it lowers to
-one HLO op), so it is the one rule written here: substitution, one row per step. Results agree with XLA to
-rounding, not bitwise, like every other cuda op.
-
 Primitives neither table expands are listed in `UNSUPPORTED`, with the advice their error message carries.
 """
 import jax
@@ -82,7 +73,6 @@ NAMES = (
 LATE_NAMES = NAMES + (
     "linear_solve",                                    # lineax/_solve.py (an equinox "vprim")
     "vprim",                                           # equinox/internal/_primitive.py: a vprim under vmap
-    "lu", "lu_pivots_to_permutation", "custom_linear_solve", "triangular_solve", "qr",   # JAX's own (module docstring)
 )
 
 # name -> what to tell the user, appended to the UnsupportedError.  These are foreign primitives whose impl is
@@ -125,77 +115,8 @@ def _expand(eqn, ins):
     return list(outs)
 
 
-def _triangular_solve(a, b, *, left_side, lower, transpose_a, conjugate_a, unit_diagonal):
-    """lax.linalg.triangular_solve in plain JAX: substitution, one row per loop step.  Only the referenced triangle
-    of `a` is read (the other may hold anything, e.g. the U of a packed LU)."""
-    import jax.numpy as jnp
-    from jax import lax
-    if conjugate_a:
-        a = jnp.conj(a)
-    if transpose_a:
-        a, lower = jnp.swapaxes(a, -1, -2), not lower
-    if not left_side:                                    # x a = b  <=>  a^T x^T = b^T
-        a, lower, b = jnp.swapaxes(a, -1, -2), not lower, jnp.swapaxes(b, -1, -2)
-    n = a.shape[-1]
-    col = jnp.arange(n)
-
-    def step(k, x):
-        i = k if lower else n - 1 - k
-        row = lax.dynamic_index_in_dim(a, i, axis=-2, keepdims=False)                     # (..., n)
-        off = jnp.where((col < i) if lower else (col > i), row, jnp.zeros_like(row))
-        r = lax.dynamic_index_in_dim(b, i, axis=-2, keepdims=False) - jnp.einsum("...j,...jm->...m", off, x)
-        if not unit_diagonal:
-            r = r / lax.dynamic_index_in_dim(row, i, axis=-1, keepdims=True)
-        return lax.dynamic_update_index_in_dim(x, r, i, axis=-2)
-    x = lax.fori_loop(0, n, step, jnp.zeros(jnp.broadcast_shapes(a.shape[:-2], b.shape[:-2]) + b.shape[-2:], b.dtype))
-    return jnp.swapaxes(x, -1, -2) if not left_side else x
-
-
-def _custom_linear_solve(*args, **params):
-    """lax.custom_linear_solve's primal, as JAX's own impl computes it: the `solve` jaxpr applied to b (the matvec
-    and transpose jaxprs exist only for its autodiff rules, which have already been applied)."""
-    from jax.extend.core import jaxpr_as_fun
-
-    from ._jaxpr import linear_solve_parts
-    solve, consts, nb = linear_solve_parts(params)
-    return jaxpr_as_fun(solve)(*args[consts], *args[nb:])
-
-
-_GENERIC = None
-
-
-def _generic():
-    global _GENERIC
-    if _GENERIC is None:
-        from ._compat import jax_generic_linalg
-        _GENERIC = dict(jax_generic_linalg(), custom_linear_solve=_custom_linear_solve,
-                        triangular_solve=_triangular_solve)
-    return _GENERIC
-
-
-def _applies_late(eqn):
-    return eqn.primitive.name in _generic() or _applies(eqn)
-
-
-def _expand_late(eqn, ins):
-    if eqn.primitive.name == "lu":       # the same size limit as the cuda backend's own factorisations (op_table.py)
-        from .backends.cuda import dense
-        from .backends.cuda.codegen import CodegenError
-        trail = tuple(eqn.invars[0].aval.shape[-2:])
-        if any(d > dense.MAXD for d in trail):
-            raise CodegenError(f"lu (jnp.linalg.solve / inv / det / lu_factor) on a matrix with a dimension above "
-                               f"{dense.MAXD} is not supported inside an item (this one is {trail}). An item emits "
-                               "the factorisation as straight-line code, which is only worth doing while the system "
-                               "is small; solve a larger system outside tallymap.vmap.")
-    fn = _generic().get(eqn.primitive.name)
-    if fn is None:
-        return _expand(eqn, ins)
-    outs = fn(*ins, **eqn.params)
-    return list(outs) if eqn.primitive.multiple_results else [outs]
-
-
 _TABLE = Sugar("foreign primitive", NAMES, _applies, _expand)
-_LATE = Sugar("foreign primitive (lowering)", LATE_NAMES, _applies_late, _expand_late)
+_LATE = Sugar("foreign primitive (lowering)", LATE_NAMES, _applies, _expand)
 
 
 def expand(cj):

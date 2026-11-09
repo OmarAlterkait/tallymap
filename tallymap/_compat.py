@@ -135,24 +135,3 @@ def random_fold_in(impl, keys, msgs, keys_shape):
 def random_seed(impl, seeds):
     import numpy as np
     return _vmap_n(np.ndim(seeds), impl.seed)(seeds)
-
-
-# ------------------------------------------------------------------------------------------- linear algebra
-def jax_generic_linalg():
-    """{primitive name: fn(*operands, **params) -> outputs}: JAX's OWN pure-JAX implementations of the linear-algebra
-    primitives behind jnp.linalg.solve / inv / det, i.e. the functions JAX itself lowers them to on a backend with no
-    solver library (`mlir.lower_fun(...)` in jax/_src/lax).  Private names, present on every tested version
-    (0.5.3 .. 0.11.2); a missing one simply drops out, and that primitive raises UnsupportedError on cuda as before."""
-    out = {}
-    try:
-        from jax._src.lax import linalg as L
-        out["lu"] = lambda x: L._lu_python(x)
-        out["lu_pivots_to_permutation"] = (
-            lambda swaps, permutation_size: L._generic_lu_pivots_to_permutation(swaps, permutation_size))
-        # jnp.linalg.qr (lineax.QR on 0.0.x): geqrf + householder_product, both cuda rules (pivoting binds geqp3,
-        # which stays unsupported)
-        out["qr"] = lambda a, **p: L._qr_lowering(a, **p)
-    except (ImportError, AttributeError):            # pragma: no cover
-        pass
-    return out
-

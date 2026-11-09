@@ -81,15 +81,6 @@ def scan_parts(eqn):
     return Scan(closed(p["jaxpr"]), nc, nk, int(p["length"]), bool(p["reverse"]), p.get("unroll", 1))
 
 
-def linear_solve_parts(params):
-    """custom_linear_solve params -> (its closed `solve` jaxpr, the slice of the operands that are that jaxpr's
-    constants, the index of the first right-hand-side operand).  The operands are [matvec consts, vecmat consts, solve
-    consts, transpose_solve consts, b]."""
-    cl, js = params["const_lengths"], params["jaxprs"]
-    o = cl.matvec + cl.vecmat
-    return closed(js.solve), slice(o, o + cl.solve), sum(cl)
-
-
 def subjaxprs(eqn):
     """every sub-jaxpr of an equation (closed), whatever its kind."""
     out = []

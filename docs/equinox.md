@@ -190,26 +190,6 @@ solver state, while its jvp rule asserts the state has no tangent and rebuilds t
 through the implicit function theorem.  Expanding it before autodiff silently drops the whole dependence on the
 matrix (MEASURED: a gradient of 0 instead of -0.056).
 
-**2. Dense linear algebra is lowered to plain JAX after autodiff.**  XLA lowers `lu`, `triangular_solve`,
-`cholesky`, `geqrf` and `ormqr` to cuSOLVER / cuBLAS custom calls, which a fused kernel cannot make, and every
-implicit solver needs them: a Kvaerno stage is a Newton solve, and a Newton step is an `lu` plus two
-`triangular_solve`s.  The cuda emitter substitutes plain-JAX algorithms for them on the program it is about to
-emit, after every autodiff rule has been applied, so the derivative is JAX's own:
-
-* `lu`, `lu_pivots_to_permutation` and `custom_linear_solve` (behind `jnp.linalg.solve` / `inv`) become JAX's own
-  pure-JAX implementations, the ones JAX uses on a backend without a solver library; `triangular_solve` becomes a
-  substitution loop (`tallymap/_foreign.py`).  Measured against straight-line versions on a 2080 Ti
-  (`jnp.linalg.solve` of n = 3 / 6 / 12 inside 1M items): faster in 8 of 9 cells (forward, grad, jacfwd) and 9%
-  slower in one.  `lu` has the same size limit as the factorisations below: a matrix dimension above 16 raises.
-* `qr` (behind `jnp.linalg.qr`, and `lineax.QR` on Lineax 0.0.x) becomes JAX's own lowering onto `geqrf` and
-  `householder_product` (Q's first columns: `ormqr` applied to the identity); without this it raised on cuda.
-* `cholesky`, `geqrf` and `ormqr`, which JAX has no pure-JAX form of, are textbook unblocked algorithms with
-  LAPACK's conventions, unrolled in Python (`tallymap/backends/cuda/dense.py`).  MEASURED against LAPACK through
-  `jax.lax.linalg` itself, in float32 and float64, for 1x1 to 16x16 and three rectangular shapes: the factors and
-  `taus` agree to 1e-11 (f64) and 2e-4 (f32).  Straight-line code pays only while the matrix is small, so a
-  dimension above 16 raises with a message saying so; one leading batch axis of up to 64 is mapped over, which is
-  what a vmapped factorisation needs (`jacfwd`'s tangent lanes, a batch folded into the item axis).
-
 ## Sizing and the step budget
 
 `max_steps` on `tm.vmap` caps every top-level `while_loop` in the item, which for a diffrax solve is the solver's
@@ -340,6 +320,5 @@ hand-written item when the gradient is the inner loop of a fit.
 * `examples/diffrax_ensemble.py` - the example above, with the check and the timing.
 * `tests/equinox_compat.py` - every row of "What works", as a test.
 * `tallymap/_foreign.py` - the expansion, and the argument for each primitive in it.
-* `tallymap/backends/cuda/dense.py` - the Cholesky and QR factorisations and their conventions.
 * `docs/float_semantics.md` - what "agrees with `jax.vmap`" means in general.
 * `docs/design.md` - the checkpointed replay loop that makes the gradient exist.

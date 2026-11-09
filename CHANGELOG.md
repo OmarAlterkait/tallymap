@@ -8,9 +8,6 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Added
 
-- cuda: `jnp.linalg.qr` inside an item (JAX's own `qr` lowering onto `geqrf` + a new `householder_product`
-  rule); it raised `UnsupportedError` before. Found by the first CI run with the Equinox family installed
-  (`lineax.QR` / `optimistix` least squares on Lineax 0.0.8, JAX 0.5.3).
 - `tm.diagnostics(...)["programs"][i]["baked_floats"]`: shape, dtype and size of every FLOAT constant the item
   function closed over -- the values a derivative cannot reach (a captured parameter's tangent is silently
   zero). Built when diagnostics are read, not at bind. From lumen/next b8fabe4 (= the private engine line's
@@ -22,10 +19,6 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   as source size to the power 1.8 to 2.3 between 99 KB and 706 KB of generated source
   (18 s to 725 s).
 
-- `jnp.linalg.solve`, `inv`, `det` and `lu_factor` / `lu_solve` run inside an item on cuda: `lu`,
-  `lu_pivots_to_permutation`, `custom_linear_solve` and `triangular_solve` are lowered after autodiff to JAX's own
-  pure-JAX implementations (and a substitution loop), so the derivative is JAX's own. `supported_primitives()`
-  lists them as `expanded`.
 - `tm.diagnostics()["kernels"]` reports each kernel's compile time and, once it has run, its measured
   resources: registers and local memory per thread, resident blocks per SM, and the local memory the CUDA driver
   reserves outside JAX's pool (what an out-of-memory error at launch is about).
@@ -34,6 +27,13 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Removed
 
+- Linear algebra inside an item on cuda: the emission rules for `lu`, `lu_pivots_to_permutation`,
+  `triangular_solve`, `cholesky`, `geqrf` and `ormqr` and their straight-line algorithms
+  (`backends/cuda/dense.py`, with its size limits `MAXD` / `MAXB`). `jnp.linalg.solve`, `inv`, `det`,
+  `cholesky`, `qr` and every other `lax.linalg` primitive inside an item now raise `tm.UnsupportedError` on cuda,
+  like any other primitive the emitter has no rule for. The lockstep backend is unchanged: XLA runs these
+  primitives there. Write a small solve out by hand (Cramer's rule, an unrolled elimination), as
+  `examples/demos/stiff_ode/kv3.py` does, or run the item with `backend='lockstep'`.
 - The public option `rev_step_segments` (recompute each loop step in S checkpointed segments inside its VJP).
   Passing it now raises, like any unknown option. Four independent measurements on a 2080 Ti found no benefit:
   the six `benchmarks/vs_jax` gradient cells (0.98-1.05 at S = 4 and 8), the toy walk at 1M items
@@ -181,10 +181,6 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 - An error re-raised with the item function and source line appended (tally misuse, unsupported operations)
   keeps every attribute of the original exception; it kept only the message. No library exception carries one
   today; the private engine line lost `CodegenError.nbytes` this way (8fe2295).
-- cuda: `jnp.linalg.solve` / `inv` / `det` / `lu_factor` on a matrix with a dimension above 16 raises
-  `UnsupportedError` naming the size, as `cholesky` and `qr` already did; the late LU expansion had no size check
-  and compiled silently (a 24x24 solve: a 16.8 KB local frame per thread on an L40S). The 16x16 solve (255
-  registers, about 19x off the trend) is still pinned as an XFAIL in `tests/invariants.py`.
 - `jax.jvp` / `jacfwd` of a spawning program in which a `spawn` site's float child leaves are all constants (no
   tangent reaches it): JAX binds that spawn without calling its jvp rule, so it carries only the primal leaves.
   The lockstep backend raised a `while_loop` carry-structure TypeError; the cuda backend wrote nothing into the

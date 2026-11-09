@@ -3,12 +3,11 @@
 Generated from `tallymap.supported_primitives()` by
 `tallymap.backends.cuda.census.primitives_table()` (a test checks that this file is current).
 `how`: `rule` = one emission rule in `backends/cuda/op_table.py`; `canonicalised` = rewritten into rule
-primitives by `backends/cuda/canon.py` before emission; `expanded` = JAX's own pure-JAX implementation,
-substituted after autodiff (`_foreign.expand_late`); `tally` = tallymap's own emit / spawn.
+primitives by `backends/cuda/canon.py` before emission; `tally` = tallymap's own emit / spawn.
 Any other primitive raises `tm.UnsupportedError` on cuda; the lockstep backend runs every JAX
 primitive.
 
-159 names (134 rules, 18 canonicalised, 5 expanded).
+150 names (130 rules, 18 canonicalised).
 
 | primitive | how |
 |---|---|
@@ -30,7 +29,6 @@ primitive.
 | `cbrt` | rule |
 | `ceil` | rule |
 | `checkpoint` | rule |
-| `cholesky` | rule |
 | `clamp` | canonicalised |
 | `closed_call` | rule |
 | `clz` | rule |
@@ -50,7 +48,6 @@ primitive.
 | `cumsum` | rule |
 | `custom_jvp_call` | rule |
 | `custom_lin` | rule |
-| `custom_linear_solve` | expanded |
 | `custom_vjp_call` | rule |
 | `custom_vjp_call_jaxpr` | rule |
 | `device_put` | canonicalised |
@@ -72,9 +69,7 @@ primitive.
 | `floor` | rule |
 | `gather` | rule |
 | `ge` | rule |
-| `geqrf` | rule |
 | `gt` | rule |
-| `householder_product` | rule |
 | `imag` | rule |
 | `integer_pow` | canonicalised |
 | `iota` | rule |
@@ -90,8 +85,6 @@ primitive.
 | `logistic` | rule |
 | `lt` | rule |
 | `lt_to` | canonicalised |
-| `lu` | expanded |
-| `lu_pivots_to_permutation` | expanded |
 | `max` | rule |
 | `min` | rule |
 | `mul` | rule |
@@ -103,13 +96,11 @@ primitive.
 | `one_minus_square` | canonicalised |
 | `optimization_barrier` | canonicalised |
 | `or` | rule |
-| `ormqr` | rule |
 | `pad` | rule |
 | `pjit` | rule |
 | `platform_index` | rule |
 | `population_count` | rule |
 | `pow` | rule |
-| `qr` | expanded |
 | `random_bits` | rule |
 | `random_clone` | rule |
 | `random_fold_in` | rule |
@@ -167,7 +158,6 @@ primitive.
 | `tanh` | rule |
 | `threefry2x32` | rule |
 | `transpose` | rule |
-| `triangular_solve` | expanded |
 | `unstack` | canonicalised |
 | `while` | rule |
 | `xor` | rule |

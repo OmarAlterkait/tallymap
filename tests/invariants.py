@@ -14,8 +14,8 @@ Sections (cell name prefixes):
            PASSES when the stale reuse is detected.
   [tdep]   tangent-dependent control flow: a while loop whose trip count follows the tangent-carrying primal;
            lineax.CG under jacfwd (the _foreign.lanes_unsafe case; skipped without lineax).
-  [size]   run-or-raise: dense solve / cholesky / qr and per-item carries on a size ladder either run and match
-           jax.vmap, or raise a tallymap error that names the size.  cuda: no silent register-capped kernel.
+  [size]   run-or-raise: per-item carries on a size ladder either run and match jax.vmap, or raise a tallymap
+           error that names the size.
   [ad]     AD self-consistency without finite differences: <u, J v> by jvp == by vjp; jacfwd == jacrev; the
            gradient does not depend on rev_checkpoints.
   [trunc]  truncation (max_steps): flags, n_truncated, partial integer tallies, poisoned float tallies and per-item
@@ -880,129 +880,12 @@ def _kernel_resources():
 
 def _tm_error(e, size):
     """a CLEAR tallymap error for a size limit: tallymap's own exception class (or a message naming tallymap) that
-    names the offending size (`size`: the exact text, e.g. '(24, 24)')"""
+    names the offending size (`size`: the exact text, e.g. ' 2048')"""
     return (isinstance(e, tm.UnsupportedError) or "tallymap" in str(e)) and str(size) in str(e)
-
-
-def run_or_raise(b, item, args, in_axes, ref_fn, rtol, limit=None):
-    """-> (message, resources).  Runs tm.vmap(item); it must match ref_fn or raise a tallymap error naming the size
-    (`limit`: a string that the message must contain, e.g. '24')."""
-    f = tm.vmap(item, outputs={"Q": tm.Sum((1,), F)}, in_axes=in_axes, backend=b)
-    _D.KERNELS.clear()
-    try:
-        r = jax.block_until_ready(f(*args))
-    except Exception as e:
-        if not _tm_error(e, limit):
-            raise Fail(f"raised without naming the size {limit}: {type(e).__name__}: {str(e)[:200]}") from None
-        raise Expected(f"{type(e).__name__}: {str(e).splitlines()[0][:160]}") from None
-    res = _kernel_resources() if b == "cuda" else []
-    want_y = ref_fn(*args)
-    m = near(r.per_item, want_y, rtol, "per-item vs jax.vmap")
-    near(r.outputs["Q"], jnp.sum(want_y).reshape(1), rtol, "tally vs jax.vmap")
-    return m, res
 
 
 def _res_str(res):
     return "; ".join(f"regs {r['regs']} local {r['local_bytes']} B" for r in res) or "no kernel info"
-
-
-REG_CAP = 255          # the per-thread register file limit: a kernel AT the cap spills (the plan's "silent 255-reg")
-
-
-def _solve_inputs(n):
-    rng = np.random.default_rng(n)
-    M = jnp.asarray(rng.normal(size=(n, n)) * 0.3 + n * np.eye(n), F)
-    rhs = jnp.asarray(rng.normal(size=(n,)), F)
-    xs = jnp.linspace(0.5, 1.5, NS).astype(F)
-    return xs, M, rhs
-
-
-def solve_item(t, x, M, rhs):
-    y = jnp.linalg.solve(M + x * jnp.eye(M.shape[0], dtype=M.dtype), rhs)
-    return t.add("Q", 0, jnp.sum(y)), y
-
-
-def solve_ref(xs, M, rhs):
-    return jax.jit(jax.vmap(lambda x: jnp.linalg.solve(M + x * jnp.eye(M.shape[0], dtype=M.dtype), rhs)))(xs)
-
-
-MAXD = 16              # tallymap.backends.cuda.dense.MAXD (not imported: the CPU suite must not need the cuda backend)
-_SOLVE16_XFAIL = ("plan section 4: the n=16 solve (late LU expansion, _foreign.expand_late) compiles silently to a "
-                  "register-capped kernel (MEASURED L40S: 255 registers, 4.8 KB local frame; plan: ~19x off the "
-                  "trend) instead of running within the trend or raising")
-for n in (4, 8, 16, 24):
-    @case(f"[size] jnp.linalg.solve n={n}: runs and matches jax.vmap, or raises naming the size",
-          xfail={"cuda": _SOLVE16_XFAIL} if n == MAXD else None)
-    def _(b, n=n):
-        m, res = run_or_raise(b, solve_item, _solve_inputs(n), (0, None, None), solve_ref,
-                              1e-9 if X64 else 2e-4, limit=f"({n}, {n})")
-        if b == "cuda":
-            if not res:
-                raise Fail("instrument: no kernel resources recorded")
-            if n > MAXD:                    # the contract above MAXD is a clear error, as cholesky / qr give
-                raise Fail(f"n={n} > MAXD={MAXD} compiled silently ({_res_str(res)}) instead of raising")
-            if any(r["regs"] >= REG_CAP for r in res):
-                raise Fail(f"silent register-capped kernel: {_res_str(res)}")
-        return f"{m}; {_res_str(res)}" if b == "cuda" else m
-
-
-def _spd_inputs(n):
-    rng = np.random.default_rng(100 + n)
-    a = rng.normal(size=(n, n)) * 0.3
-    M = jnp.asarray(a @ a.T + n * np.eye(n), F)
-    return jnp.linspace(0.5, 1.5, NS).astype(F), M
-
-
-def chol_item(t, x, M):
-    d = jnp.diag(jnp.linalg.cholesky(M + x * jnp.eye(M.shape[0], dtype=M.dtype)))
-    return t.add("Q", 0, jnp.sum(d)), d
-
-
-def chol_ref(xs, M):
-    return jax.jit(jax.vmap(lambda x: jnp.diag(jnp.linalg.cholesky(M + x * jnp.eye(M.shape[0], dtype=M.dtype)))))(xs)
-
-
-def _geqrf(a):
-    """lax.linalg.geqrf: the Householder QR primitive dense.py implements (not exported by jax.lax.linalg in the
-    tested JAX versions; jnp.linalg.qr binds the `qr` primitive instead, see the cell below)"""
-    f = getattr(lax.linalg, "geqrf", None)
-    if f is None:
-        from jax._src.lax import linalg as _lin
-        f = _lin.geqrf
-    return f(a)
-
-
-def qr_item(t, x, M):        # Householder QR through the geqrf primitive (|diag R|: sign-free)
-    d = jnp.abs(jnp.diag(_geqrf(M + x * jnp.eye(M.shape[0], dtype=M.dtype))[0]))
-    return t.add("Q", 0, jnp.sum(d)), d
-
-
-def qr_ref(xs, M):
-    return jax.jit(jax.vmap(lambda x: jnp.abs(jnp.diag(_geqrf(M + x * jnp.eye(M.shape[0], dtype=M.dtype))[0]))))(xs)
-
-
-@case("[size] jnp.linalg.qr n=4 (the `qr` primitive): runs and matches jax.vmap, or raises naming the primitive")
-def _(b):
-    # the cuda backend implements geqrf / ormqr (dense.py) but not the `qr` primitive jnp.linalg.qr binds: today a
-    # clear UnsupportedError naming it (a coverage gap, not a wrong answer)
-    def item(t, x, M):
-        d = jnp.abs(jnp.diag(jnp.linalg.qr(M + x * jnp.eye(4, dtype=M.dtype), mode="r")))
-        return t.add("Q", 0, jnp.sum(d)), d
-    ref = lambda xs, M: jax.jit(jax.vmap(lambda x: jnp.abs(jnp.diag(jnp.linalg.qr(M + x * jnp.eye(4, dtype=M.dtype),
-                                                                                    mode="r")))))(xs)
-    m, res = run_or_raise(b, item, _spd_inputs(4), (0, None), ref, 1e-9 if X64 else 2e-4, limit="'qr'")
-    return m
-
-
-for _name, _item, _ref in (("cholesky", chol_item, chol_ref), ("qr (geqrf)", qr_item, qr_ref)):
-    for n in (16, 24):
-        @case(f"[size] {_name} n={n}: runs and matches jax.vmap, or raises naming the size (MAXD={MAXD})")
-        def _(b, n=n, item=_item, ref=_ref):
-            m, res = run_or_raise(b, item, _spd_inputs(n), (0, None), ref, 1e-9 if X64 else 2e-4,
-                                  limit=f"({n}, {n})")
-            if b == "cuda" and n > MAXD:
-                raise Fail(f"n={n} > MAXD={MAXD} ran instead of raising")
-            return f"{m}; {_res_str(res)}" if b == "cuda" else m
 
 
 def mk_carry(S):

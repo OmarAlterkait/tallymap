@@ -495,27 +495,6 @@ def _(b):
     return "DirectAdjoint grad ran: " + close(g, gf, 1e-4, what="grad vs jacfwd")
 
 
-@case("a matrix above the dense limit is refused with a reason", backends=["cuda"])
-def _(b):
-    # Cholesky: the dense limit guards cholesky / QR.  lineax.LU goes through the late LU expansion, which has no size
-    # check yet (plan section 4); invariants.py [size] pins that as an XFAIL, so it is not tested twice here.
-    big = 24
-
-    def it(t, p):
-        m = jnp.eye(big, dtype=jnp.float32) * (1.0 + p) + 0.01
-        op = lx.MatrixLinearOperator(m, lx.positive_semidefinite_tag)
-        y = lx.linear_solve(op, jnp.ones((big,), jnp.float32), solver=lx.Cholesky()).value[0]
-        return t.add("S", 0, y), y
-    f = tm.vmap(it, outputs={"S": tm.Sum((1,))}, backend="cuda")
-    try:
-        f(params(0.5, 0.4))
-    except tm.UnsupportedError as e:
-        if "16" not in str(e):
-            raise Fail(f"no size in the message: {str(e)[:300]}")
-        return "UnsupportedError names the limit"
-    raise Fail("a 24x24 Cholesky inside an item did not raise")
-
-
 print("\n================ SUMMARY", jax.__version__, "x64" if jax.config.jax_enable_x64 else "",
       jax.devices()[0].device_kind, "N", N)
 for _n, _b, _m in RES:
