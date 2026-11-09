@@ -54,6 +54,12 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Removed
 
+- The nvcc fallback compiler (`compile.find_nvcc`, `_nvcc_compile`, the `NVCC` environment variable and
+  `compile.compiler()`): the cuda backend compiles with NVRTC only, and raises an error naming the
+  `nvidia-cuda-nvrtc-cu12` wheel when no libnvrtc is found. The `cuda` extra now requires that wheel, since
+  `jax[cuda12]` brings it directly only from JAX 0.6.2. NVRTC was the compiler in use in both tested environments
+  (the JAX 0.5.3 container: wheel 12.1.105; JAX 0.11.2: 12.9.86), whose nvcc wheels hold only `ptxas`.
+  `tm.diagnostics()['cuda']['compiler']` is the NVRTC build.
 - Constant folding in the cuda emitter (`codegen.FOLD_MIN`, `Emitter._try_fold`, `fold_table`, `flush_pools`):
   array equations whose inputs were all compile-time constants were evaluated on the host and hoisted into
   read-only tables, pooled into one kernel buffer per dtype. With it off, lumen's value and jvp outputs were

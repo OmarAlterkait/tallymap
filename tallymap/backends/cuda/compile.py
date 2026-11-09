@@ -1,10 +1,10 @@
-"""CUDA C -> CUBIN (NVRTC via ctypes, or nvcc), the on-disk cubin cache, and the generic FFI launch shim.
+"""CUDA C -> CUBIN (NVRTC via ctypes), the on-disk cubin cache, and the generic FFI launch shim.
 
-Cache keys contain everything that determines the binary besides the source text: the compiler BUILD (NVRTC
-realpath + version + size/mtime, or `nvcc --version`), arch, options, and the tallymap / jax / jaxlib versions (the
-jaxpr -> C mapping depends on JAX's primitive semantics).  The shim key adds the FFI headers, the host compiler and
-libc.  Cache directory: env TALLYMAP_CUDA_CACHE, else ~/.cache/tallymap (cubins are small); toolchain discovery:
-NVCC, CXX (NVRTC is used when found, else nvcc).  $CXX names the HOST C++ compiler that builds the FFI shim.
+Cache keys contain everything that determines the binary besides the source text: the NVRTC BUILD (realpath +
+version + size/mtime), arch, options, and the tallymap / jax / jaxlib versions (the jaxpr -> C mapping depends on
+JAX's primitive semantics).  The shim key adds the FFI headers, the host compiler and libc.  Cache directory: env
+TALLYMAP_CUDA_CACHE, else ~/.cache/tallymap (cubins are small).  NVRTC comes from the nvidia-cuda-nvrtc-cu12 wheel
+(tallymap's `cuda` extra), else a CUDA toolkit's libnvrtc; $CXX names the HOST C++ compiler that builds the FFI shim.
 """
 import ctypes
 import ctypes.util
@@ -50,6 +50,8 @@ _NVRTC = []
 
 
 def nvrtc():
+    """-> (ctypes library, path) of NVRTC: the nvidia-cuda-nvrtc-cu12 wheel, else a CUDA toolkit's libnvrtc.  Raises
+    a tallymap error naming the wheel when there is none (the cuda backend compiles with NVRTC only)."""
     if not _NVRTC:
         cands = []
         try:
@@ -70,14 +72,12 @@ def nvrtc():
             except OSError:
                 continue
         _NVRTC.append(found)
+    if _NVRTC[0][0] is None:
+        raise RuntimeError("tallymap: the cuda backend compiles with NVRTC, and no libnvrtc was found (neither the "
+                           "nvidia-cuda-nvrtc-cu12 wheel nor /usr/local/cuda/lib64 nor the loader path).  Fix: pip "
+                           "install 'tallymap[cuda]' (or nvidia-cuda-nvrtc-cu12), or put a CUDA 12 toolkit's lib64 "
+                           "on LD_LIBRARY_PATH; or run with backend='lockstep'.")
     return _NVRTC[0]
-
-
-def find_nvcc():
-    for p in (os.environ.get("NVCC"), "/usr/local/cuda/bin/nvcc", shutil.which("nvcc")):
-        if p and os.path.exists(p):
-            return p
-    return None
 
 
 def host_cxx():
@@ -100,27 +100,20 @@ def host_cxx():
     return p
 
 
-def compiler():
-    return "nvrtc" if nvrtc()[0] is not None else "nvcc"
+_IDENT = []
 
 
-_IDENT = {}
-
-
-def compiler_identity(comp):
-    if comp not in _IDENT:
-        if comp == "nvrtc":
-            lib, path = nvrtc()
-            a, b = ctypes.c_int(), ctypes.c_int()
-            lib.nvrtcVersion(ctypes.byref(a), ctypes.byref(b))
-            rp = os.path.realpath(path) if path and os.path.exists(path) else str(path)
-            st = os.stat(rp) if os.path.exists(rp) else None
-            stamp = f"{st.st_size}:{int(st.st_mtime)}" if st else "?:?"
-            _IDENT[comp] = f"nvrtc|{a.value}.{b.value}|{rp}|{stamp}"
-        else:
-            nv = find_nvcc()
-            _IDENT[comp] = f"nvcc|{nv}|{_cmd([nv, '--version']) if nv else None}"
-    return _IDENT[comp]
+def compiler_identity():
+    """the NVRTC build: version, realpath, size and mtime (part of every cubin cache key)."""
+    if not _IDENT:
+        lib, path = nvrtc()
+        a, b = ctypes.c_int(), ctypes.c_int()
+        lib.nvrtcVersion(ctypes.byref(a), ctypes.byref(b))
+        rp = os.path.realpath(path) if path and os.path.exists(path) else str(path)
+        st = os.stat(rp) if os.path.exists(rp) else None
+        stamp = f"{st.st_size}:{int(st.st_mtime)}" if st else "?:?"
+        _IDENT.append(f"nvrtc|{a.value}.{b.value}|{rp}|{stamp}")
+    return _IDENT[0]
 
 
 def _nvrtc_compile(src, arch, opts):
@@ -144,22 +137,6 @@ def _nvrtc_compile(src, arch, opts):
     return buf.raw
 
 
-def _nvcc_compile(src, arch, opts):
-    nv = find_nvcc()
-    if nv is None:
-        raise RuntimeError("no nvcc found and NVRTC unavailable")
-    with tempfile.TemporaryDirectory(dir=os.environ.get("LSCRATCH") or None) as td:
-        cu, out = os.path.join(td, "tallymap.cu"), os.path.join(td, "tallymap.cubin")
-        with open(cu, "w") as f:
-            f.write(src)
-        cmd = [nv, "-cubin", f"-arch=sm_{arch}", *[x.replace("--std=", "-std=") for x in opts], cu, "-o", out]
-        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
-        if r.returncode:
-            raise RuntimeError(f"nvcc failed:\n{' '.join(cmd)}\n{r.stdout}\n{r.stderr}")
-        with open(out, "rb") as f:
-            return f.read()
-
-
 def _versions():
     import jax
     import jaxlib
@@ -170,15 +147,14 @@ def _versions():
 
 def compile_cubin(src, arch, extra=()):
     """-> (cubin bytes, info).  Disk-cached."""
-    comp = compiler()
     opts = [o for o in OPTS if o.split("=")[0] not in {e.split("=")[0] for e in extra}] + extra
-    h = hashlib.sha256(f"{compiler_identity(comp)}|{arch}|{opts}|{_versions()}\n{src}".encode()).hexdigest()[:24]
+    h = hashlib.sha256(f"{compiler_identity()}|{arch}|{opts}|{_versions()}\n{src}".encode()).hexdigest()[:24]
     path = os.path.join(cache_dir(), f"{h}.cubin")
     if os.path.exists(path):
         with open(path, "rb") as f:
             return f.read(), dict(hash=h, cached=True, seconds=0.0)
     t = time.perf_counter()
-    cubin = _nvrtc_compile(src, arch, opts) if comp == "nvrtc" else _nvcc_compile(src, arch, opts)
+    cubin = _nvrtc_compile(src, arch, opts)
     dt = time.perf_counter() - t
     _atomic_write(os.path.join(cache_dir(), f"{h}.cu"), src.encode())
     _atomic_write(path, cubin)

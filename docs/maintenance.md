@@ -5,8 +5,9 @@ and how a release is made.
 
 ## Supported
 
-- Python >= 3.10. CUDA 12 with NVRTC, NVIDIA's runtime compiler (`jax[cuda12]` brings it; `nvcc` is used as a
-  fallback if one is found), plus a C++17 compiler once, to build the `jax.ffi` launch shim
+- Python >= 3.10. CUDA 12 with NVRTC, NVIDIA's runtime compiler, the only compiler the cuda backend uses (the
+  `cuda` extra installs the `nvidia-cuda-nvrtc-cu12` wheel; a CUDA toolkit's `libnvrtc` works too), plus a C++17
+  compiler once, to build the `jax.ffi` launch shim
   (`backends/cuda/shim.cc`, cached per toolchain and jaxlib version).
 - GPUs tested: compute capability 7.5 (RTX 2080 Ti) and 8.9 (L40S). A100 and H200 are untested. The spawn queue
   needs compute capability 7.0 or newer, for `__nanosleep`.

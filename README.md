@@ -127,7 +127,7 @@ through a `lax.while_loop` without choosing a cap, and memory proportional to th
 
 ```
 pip install tallymap                 # CPU: the lockstep backend, plain JAX
-pip install 'tallymap[cuda]'         # + JAX's CUDA 12 plugin (quote it: zsh treats [] as a glob)
+pip install 'tallymap[cuda]'         # + JAX's CUDA 12 plugin and NVRTC (quote it: zsh treats [] as a glob)
 ```
 
 A **C++17 compiler is needed once**, the first time you use the GPU backend, to build the `jax.ffi` launch shim.

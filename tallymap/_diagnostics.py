@@ -8,7 +8,7 @@ Keys:
   versions   tallymap / jax / jaxlib / numpy / python
   env        TALLYMAP_CUDA_CACHE, JAX_PLATFORMS, XLA_FLAGS, CUDA_VISIBLE_DEVICES (when set), machine
   platform   jax.default_backend(), devices; on a GPU: name, compute capability, driver
-  cuda       compiler (NVRTC build or nvcc), cubin cache directory
+  cuda       compiler (the NVRTC build), cubin cache directory
   reverse    single = whether the last adjoint built is the single-loop one (T3), and if not why not;
              tree   = stats of the last tree adjoint (reverse through spawn), filled only by tm.vmap(...,
                       rev_stats=True) calls (a host callback costs jax.jit's C++ fast path): generations, particles,
@@ -117,8 +117,7 @@ def _platform():
 def _cuda():
     try:
         from .backends.cuda import compile as C
-        comp = C.compiler()
-        return dict(compiler=C.compiler_identity(comp), cache_dir=C.cache_dir())
+        return dict(compiler=C.compiler_identity(), cache_dir=C.cache_dir())
     except Exception as e:                                   # no CUDA toolchain on this machine
         return dict(error=f"{type(e).__name__}: {e}")
 

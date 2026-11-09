@@ -46,12 +46,13 @@ Issues = "https://github.com/OmarAlterkait/tallymap/issues"
 Changelog = "https://github.com/OmarAlterkait/tallymap/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-# cuda backend: JAX's CUDA plugin, which already brings NVRTC for runtime compilation
-# (jax[cuda12] -> jax-cuda12-plugin[with-cuda] -> nvidia-cuda-nvrtc-cu12; MEASURED on 0.6.2 and 0.11.2),
-# and nvcc as a fallback if one is found.  A C++17 compiler is needed once, to build the jax.ffi launch shim
+# cuda backend: JAX's CUDA plugin and NVRTC, the only compiler the backend uses.  NVRTC is named here because
+# jax[cuda12] requires nvidia-cuda-nvrtc-cu12 directly only from 0.6.2 (0.5.3 - 0.6.1 get it only through
+# nvidia-cublas-cu12 >= 12.8.5.5).  A C++17 compiler is needed once, to build the jax.ffi launch shim
 # (tallymap/backends/cuda/shim.cc).
 cuda = [
     "jax[cuda12]>=0.5.3",
+    "nvidia-cuda-nvrtc-cu12",
 ]
 # tests/run_all.py needs nothing beyond jax + numpy, except the jax.export cell (flatbuffers on some versions)
 test = ["flatbuffers"]
