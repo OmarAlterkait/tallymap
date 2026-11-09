@@ -264,9 +264,16 @@ error) turn every affected cell into a failure, which is how the matrix is known
   gives a relative error of 0.79 to 0.89, so the test has power. This is the difference between a large
   interpolation table costing nothing extra in reverse mode and a dense per-item copy of it, which runs out of
   memory on a GPU and takes seconds and gigabytes on the lockstep backend.
-- **In-place updates.** The CUDA emitter updates a dead per-item array in place in `dynamic_update_slice`, using
-  liveness over all active scopes, with loop constants, pass-through carries, predicate inputs and function
-  parameters frozen. Checkpoint stores were O(C * state) copies before that: 3.3 ms to 0.47 ms at K=100.
+- **In-place updates.** The CUDA emitter updates a dead per-item array in place in `dynamic_update_slice` and in
+  `scatter` (`x.at[i].set(v)` with a traced `i` is a scatter), using liveness over all active scopes, with loop
+  constants, pass-through carries, predicate inputs and function parameters frozen, and never when the update or
+  the indices read the operand's own storage (an element-by-element write would read elements it had already
+  overwritten). Checkpoint stores were O(C * state) copies before that: 3.3 ms to 0.47 ms at K=100. Scatter
+  copied its operand every time before (Unreleased): on DTRAX's mode-2 item (g0102, 2080 Ti) that was 17 copies of its
+  float64[34,23] step carry per step and a 178,160 B frame (11.6 GiB of local reservation: out of memory on the
+  2080 Ti), 71,440 B in place (the private engine line: 70,160 B); `sEM1_lar_e` 557,248 B (over the 512 KiB
+  limit) -> 156,496 B. Digests unchanged (`tab=85bce7a5ff627c27`, `97ceb69adae09286`). LUCiD's two kernels
+  (fwd, jac6) are byte-identical with and without it (same `.cu` sha256; job 43897628).
 - **Replay fingerprint.** Reverse mode uses a variant of the forward ItemProgram that carries a hidden per-item
   uint32 hash of the final carries of every top-level loop, computed with ordinary jaxpr operations (a
   forward-only call does not compute it: section 11). The adjoint receives the forward kernel's value as an
@@ -719,9 +726,9 @@ commit it came from; the measurements are on that private engine.
   at most 1.8%. v4 (materialise the small lazy readers that block an in-place update) and scan-carry aliasing gave
   an identical cubin and v6 (an elementwise result overwrites a dead operand) 0.98x, so they were not ported. On a
   2080 Ti the same rules are 1.016x on DTRAX, and on the photon-transport engine (LUCiD) 0.97x (v3 never fires
-  there; +7 KB of frame). Not ported either: the base's other aliasing (`scatter` in place, a cond output that
-  every branch returns as the same live operand's storage), which no switch turned off and the measurement
-  therefore did not isolate. The rule acts at a `while` / `cond` equation the emitter sees: an item whose only
+  there; +7 KB of frame). Not ported either: a cond output that every branch returns as the same live operand's
+  storage, which no switch turned off and the measurement therefore did not isolate. (`scatter` in place, the
+  other unswitched rule, was ported (Unreleased) once DTRAX's frame isolated it: see "In-place updates".) The rule acts at a `while` / `cond` equation the emitter sees: an item whose only
   loop is its single top-level `while` is split into step functions (section 1b) whose parameters are never
   mutated, and there it does not fire, in `wavefront-state` either (checked on the generated source). `tests/edge.py`
   therefore nests the loop, and compares against the rule patched off.

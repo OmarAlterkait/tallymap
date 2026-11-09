@@ -79,7 +79,8 @@ def run(p, pi, bc, cuda_math="approx", _schedule=None, _cuda_inplace=True, **_):
     the program spawns (whole items); the measurements behind the rule are in docs/design.md section 1b.  Private
     _schedule 'step' | 'item' overrides it (measurements and A/B checks only).
     Private _cuda_inplace=False: never update a
-    per-item array in place (every dynamic_update_slice copies; the A/B control of the emitter's aliasing analysis).
+    per-item array in place (every dynamic_update_slice and scatter copies; the A/B control of the emitter's
+    aliasing analysis).
     cuda_math: 'approx' (DEFAULT: div.full / sqrt.approx / rsqrt.approx, the PTX XLA:GPU itself emits for f32;
     measured 1.5x fwd / 1.65x jvp faster than ieee; validated by the pre-registered compare runs,
     docs/validation.md) |

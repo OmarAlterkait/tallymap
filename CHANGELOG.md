@@ -166,6 +166,12 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Fixed
 
+- cuda: `scatter` (`x.at[i].set(v)` / `.add` with a traced index) updates a dead operand in place, as
+  `dynamic_update_slice` already did; it copied the operand every time. On DTRAX's mode-2 item (2080 Ti) the
+  per-thread frame goes from 178,160 to 71,440 B (`g0102`: it ran out of memory on the 2080 Ti, now launches) and
+  from 557,248 to 156,496 B (`sEM1_lar_e`: over the 512 KiB limit, now launches), digests bitwise unchanged; the
+  private engine line's frames are 70,160 / 155,200 B. LUCiD's kernels are byte-identical. Neither rule writes in
+  place when the update or the indices read the operand's own storage.
 - cuda: a kernel whose per-thread local memory (the item's frame: per-item arrays and register spills) is over
   CUDA's 512 KiB per-thread limit raises `UnsupportedError` before its first launch, naming the bytes, the limit
   and the item function. The frame is read from the cubin's own `.nv.info` records, so no launch is needed. It

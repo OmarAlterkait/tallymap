@@ -656,6 +656,61 @@ def _(b):
     close(q[0], 2 * float(xs.sum()))
 
 
+@case("in-place updates: a dead array is updated in place; an update that reads it is not (overlapping copies)")
+def _(b):
+    """x.at[k + arange(3)].set(...) with a traced k is a SCATTER, lax.dynamic_update_slice a DUS: the cuda backend
+    writes both into a dead operand's storage.  Each step also copies x[k-1 : k+2] onto x[k : k+3] -- the update
+    READS the storage it writes, so an element-by-element write in place would copy x[k-1] three times -- and
+    accumulates into a second array in place.  The loop is NESTED (a single top-level while is split into step
+    functions whose parameters are never mutated, and nothing would be updated in place).  Copies are exact:
+    per-item results must equal jax.vmap bitwise.  Instrument (cuda): strictly fewer 12-element arrays are
+    declared than with _cuda_inplace=False, i.e. the in-place rule fired."""
+    import re
+    S = 12
+
+    def one(x, k0):
+        def inner(c):
+            i, h, a = c
+            k = 1 + (k0 + i) % (S - 4)
+            h = lax.dynamic_update_slice(h, lax.dynamic_slice(h, (k - 1,), (3,)), (k,))
+            h = h.at[k + 1 + jnp.arange(3)].set(lax.dynamic_slice(h, (k,), (3,)) * 2)
+            a = a.at[k].set(h[k - 1] + a[k]).at[(k + 5) % S].add(x)
+            return i + 1, h, a
+
+        def outer(c):
+            m, h, a = c
+            _, h, a = lax.while_loop(lambda c: c[0] < 5, inner, (m, h, a))
+            return m + 1, h, a
+        _, h, a = lax.while_loop(lambda c: c[0] < 2, outer, (0, jnp.arange(S, dtype=F) * x, jnp.zeros((S,), F)))
+        return h, a
+
+    def item(t, x, k0):
+        h, a = one(x, k0)
+        return t.add("Q", 0, h[0] + a[1]), (h, a)
+    xs = jnp.linspace(0.5, 1.5, 64).astype(F)
+    ks = jnp.arange(64, dtype=jnp.int32) % 7
+    want = jax.jit(jax.vmap(one))(xs, ks)
+
+    def run(**o):
+        tm.diagnostics(reset=True)
+        r = tm.vmap(item, outputs={"Q": tm.Sum((1,), F)}, backend=b, **o)(xs, ks)
+        for got, w, nm in zip(r.per_item, want, ("h", "a")):
+            if not np.array_equal(np.asarray(got), np.asarray(w)):
+                bad = int((np.asarray(got) != np.asarray(w)).sum())
+                raise Fail(f"{nm} ({o or 'default'}): {bad} elements differ from jax.vmap "
+                           "(an update read storage it had already overwritten)")
+        ks_ = tm.diagnostics()["kernels"]
+        src = open(ks_[-1]["source"]).read() if ks_ else ""
+        return len(re.findall(r"\b(?:float|double) \w+\[12\];", src))
+    n_in = run()
+    if b != "cuda":
+        return ""
+    n_cp = run(_cuda_inplace=False)
+    if not n_in < n_cp:
+        raise Fail(f"instrument: {n_in} 12-element arrays declared in place, {n_cp} copying: the rule did not fire")
+    return f"12-element arrays: {n_in} in place, {n_cp} copying"
+
+
 @case("exact=True: order-independent, run-to-run bitwise; overflow counted and poisons the exact sums")
 def _(b):
     if b == "lockstep" and not jax.config.jax_enable_x64:

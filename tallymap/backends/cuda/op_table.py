@@ -648,12 +648,20 @@ def _dynamic_slice(em, eqn, ins, slice_sizes):
     return View(src, pshape, lambda idx: [ia(s, i) for s, i in zip(st, idx)])
 
 
+def _in_place(em, op, readers):
+    """may a dynamic_update_slice / scatter write straight into its operand's storage (no copy)?  Only when the
+    operand is dead after this equation (Emitter.can_mutate) and no other input of the equation -- the update,
+    the indices -- reads that storage: the update is written element by element, so such an input would see
+    elements this same equation already overwrote (x = dus(x, x[k-1:k+2], k))."""
+    return em.can_mutate(em.cur_invars[0], op) and not any(_refs(em, r, op.name) for r in readers)
+
+
 @rule("dynamic_update_slice")
 def _dus(em, eqn, ins, **p):
     src, upd, starts = ins[0], ins[1], ins[2:]
     st = [_clamp_start(em, s, src.shape[d] - upd.shape[d]) for d, s in enumerate(starts)]
     st += [0] * (len(src.shape) - len(st))
-    out = src if em.can_mutate(em.cur_invars[0], src) else em.mat_copy(src)
+    out = src if _in_place(em, src, [upd] + list(starts)) else em.mat_copy(src)
 
     def body(idx):
         em.line(f"{out.name}[{ravel([ia(s, i) for s, i in zip(st, idx)], src.shape)}] = {elem(upd, idx)};")
@@ -1099,7 +1107,10 @@ def _scatter(em, eqn, ins, dimension_numbers, mode=None, **p):
     iwd = set(dn.inserted_window_dims) | set(obd)
     sdod = tuple(dn.scatter_dims_to_operand_dims)
     m = _mode(mode)
-    out = em.mat_copy(op)
+    # in place when the operand is dead (the dynamic_update_slice rule).  x.at[i].set(v) with a traced i is a
+    # scatter, not a dynamic_update_slice; copying it every time cost DTRAX's g0102 item 17 copies of its
+    # float64[34,23] step carry (106 KB of its 178 KB frame; the private engine line has done this since 6f5d0cf)
+    out = op if _in_place(em, op, [ind, upd]) else em.mat_copy(op)
     t = ctype(op.dtype)
     usd = [d for d in range(len(upd.shape)) if d not in uwd]
     wdims = [d for d in range(len(op.shape)) if d not in iwd]
