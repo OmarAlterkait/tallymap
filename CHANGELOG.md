@@ -126,6 +126,12 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   also shows the call's operands against the sub-jaxpr's invars, with the slot each position carries; inside a
   reverse program, the program's slot legend (user tallies, cotangent tallies, cotangent tokens). Text only.
   From the private engine line (0863aa1, c033ea8).
+- cuda: a program may use up to 2048 buffers (operand leaves, constant tables, tallies, results); the limit was
+  504, a hard failure for an engine item with ~540 constant tables. A program with at most 504 buffers emits
+  exactly the source it did (one 4 KB by-value parameter block); a larger one gets a 16 KB block, which needs
+  CUDA 12.1+ large kernel parameters (compute capability 7.0+, a 12.1+ toolkit and driver). MEASURED on a
+  2080 Ti (7.5) and an L40S (8.9), driver API 12.9, with NVRTC 12.1 (JAX 0.5.3) and 12.9 (JAX 0.11.2): 600 and
+  2000 broadcast tables run and match the analytic sum; 2100 raise naming the limit.
 - `jacfwd` / `jacrev` with more tangent lanes than one kernel takes split them evenly across kernels (26 lanes:
   13 + 13, not 16 + 16 with 6 padded); every chunk recomputes the primal, so padding cost a primal's worth of
   lanes.

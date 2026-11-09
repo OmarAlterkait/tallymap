@@ -12,6 +12,13 @@ import numpy as np
 from .codegen import CodegenError, Emitter, Local, Scalar, Table, VTally, _size, ctype, elem, unravel
 from .op_table import phys
 
+# Every kernel takes ONE by-value struct of buffer pointers.  Up to SJ_SMALL = 504 (4,032 + 8 bytes with n_items)
+# it fits the classic 4 KB kernel-parameter limit every toolkit / driver / GPU supports, and its source is unchanged.
+# A program with more buffers gets SJ_MAXP = 2048 (16,392 bytes): CUDA 12.1+ large kernel parameters (up to 32,764
+# bytes on compute capability 7.0+ with a 12.1+ toolkit and driver).
+SJ_SMALL, SJ_MAXP = 504, 2048
+
+
 PRELUDE = r"""
 typedef signed char i8; typedef unsigned char u8; typedef short i16; typedef unsigned short u16;
 typedef int i32; typedef unsigned int u32; typedef long long i64; typedef unsigned long long u64;
@@ -408,11 +415,12 @@ def build_source(p, *, block=BLOCK, split=True, inplace=True):
     L.r_ys = list(range(r, r + len(yav)))
     r += len(yav)
     L.n_buf = r
-    if r > 504:
-        raise CodegenError(f"too many buffers ({r} > 504)")
+    if r > SJ_MAXP:
+        raise CodegenError(f"too many buffers ({r} > {SJ_MAXP})")
     L.pav, L.yav = pav, yav
 
-    src = [PRELUDE, f"#define SJ_CONST(j) (P.p[{base_const} + (j)])", f"#define SJ_STATS ((i32*)P.p[{L.r_stats}])"]
+    src = [PRELUDE if r <= SJ_SMALL else PRELUDE.replace(f"SJ_MAXP {SJ_SMALL}", f"SJ_MAXP {SJ_MAXP}"),
+           f"#define SJ_CONST(j) (P.p[{base_const} + (j)])", f"#define SJ_STATS ((i32*)P.p[{L.r_stats}])"]
     if spawn is not None:
         src.append(f"#define SJ_QCTL ((u32*)P.p[{L.r_qctl}])\n#define SJ_SEQ ((u32*)P.p[{L.r_seq}])\n"
                    f"#define SJ_QBUF(i) (P.p[{L.r_q[0] if L.r_q else 0} + (i)])")

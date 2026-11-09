@@ -1009,6 +1009,32 @@ def _(b):
     return str(n)[-60:]
 
 
+@case("kernel parameters: a program with more than 504 buffers runs (CUDA large kernel parameters); over 2048 "
+      "raises", ["cuda"])
+def _(b):
+    def mk(nt):
+        def item(t, x, tabs):
+            i = (x * 3).astype(jnp.int32) % 4
+            return t.add("Q", 0, x * sum(tb[i] for tb in tabs))
+        return tm.vmap(item, outputs={"Q": tm.Sum((1,), F)}, in_axes=(0, None), backend=b)
+    msg = []
+    for nt in (8, 600, 2000):
+        tabs = tuple(jnp.arange(4, dtype=F) * F(1 + j % 7) for j in range(nt))
+        d = tm.diagnostics(lambda x, ts: mk(nt)(x, ts).outputs["Q"], xs, tabs)
+        src = open(d["kernels"][0]["source"]).read()
+        want = 504 if nt <= 500 else 2048
+        if f"#define SJ_MAXP {want}" not in src:
+            raise Fail(f"{nt} tables: the kernel source does not declare SJ_MAXP {want}")
+        got = np.asarray(mk(nt)(xs, tabs).outputs["Q"])        # every table pointer is read: tab_j[i] = i (1 + j % 7)
+        i = np.asarray((xs * 3).astype(jnp.int32) % 4)
+        want_q = float(np.sum(np.asarray(xs, np.float64) * i) * sum(1 + j % 7 for j in range(nt)))
+        close(got, np.array([want_q]), rtol=1e-4, what=f"{nt} tables")
+        msg.append(f"{nt}: SJ_MAXP {want}")
+    tabs = tuple(jnp.arange(4, dtype=F) for _ in range(2100))
+    m = raises(tm.UnsupportedError, lambda: mk(2100)(xs, tabs), "too many buffers")
+    return "; ".join(msg) + "; 2100: " + m[:40]
+
+
 QT_NK = 8
 
 
