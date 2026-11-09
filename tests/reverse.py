@@ -706,12 +706,19 @@ def _(b):
 
 
 def _replay_item(NB):
-    def item(t, x):                       # trajectory decided by a sqrt/div-driven continuous state (ulp-sensitive)
+    """the differentiated state y is smooth; WHEN the loop stops is decided by a chaotic f32 state z (a logistic map
+    with a sqrt / div term, from a stop_gradient'ed x): any changed bit of a div / sqrt result is amplified ~2x per
+    step, so after the first 40 steps the step count of an item hangs on the exact div / sqrt bits.  One step more
+    or fewer moves d y_final / d x by ~1/K."""
+    def item(t, x):
         def body(c):
-            k, y, w, t = c
-            y2 = y + 0.013 * jnp.sqrt(y + 0.1) / (x + 0.37) + 0.001 * jnp.sin(37.0 * y)
-            return k + 1, y2, w * 0.999, t.add("Q", (k * 7) % NB, w * y2)
-        k, y, w, t = lax.while_loop(lambda c: (c[1] < 3.0) & (c[0] < 5000), body, (0, x * 0.5, x, t))
+            k, y, z, w, t = c
+            y2 = y + 0.013 * jnp.sqrt(y + 0.1) / (x + 0.37)
+            z2 = jnp.mod(3.99 * z * (1.0 - z) + 0.001 * jnp.sqrt(z + 0.01) / (1.3 + z), 1.0)
+            return k + 1, y2, z2, w * 0.999, t.add("Q", (k * 7) % NB, w * y2)
+        z0 = jnp.mod(lax.stop_gradient(x) * 7.31, 1.0)
+        k, y, z, w, t = lax.while_loop(lambda c: (c[0] < 300) & ((c[0] < 40) | (c[2] <= 0.9)), body,
+                                       (0, x * 0.5, z0, x, t))
         return t, (k, y)
     return item
 
@@ -720,11 +727,12 @@ def _replay_item(NB):
       "NEGATIVE CONTROL adjoint math=approx must fail it", ["cuda"])
 def _(b):
     """the adjoint differentiates the trajectory the forward kernel ran (what the removed runtime replay check
-    compared).  Here the step count of every item hangs on f32 sqrt / div bits, so an adjoint that replays a
-    different trajectory gets a different per-item derivative (one step more or fewer is ~1/150 of it), which the
-    forward-mode derivative (the fused jvp kernel, the forward's own trajectory) exposes item by item.  The negative
-    control compiles only the adjoint with approx div / sqrt: the gate must flag about the items whose step count
-    approx changes."""
+    compared).  The step count of every item hangs on f32 div / sqrt bits (_replay_item), so an adjoint that replays
+    a different trajectory gets a different per-item derivative, which the forward-mode derivative (the fused jvp
+    kernel, the forward's own trajectory) exposes item by item.  The negative control compiles only the adjoint
+    with approx div / sqrt (instrument: a different adjoint cubin, and approx changes the step count of many
+    items): the gate must flag at least half of the items whose step count approx changes."""
+    from tallymap import _diagnostics as D
     if X64:     # the control flips f32 div / sqrt PTX; an f64 item does not use them (the control would be void)
         return "skipped under x64 (the negative control needs f32 arithmetic)"
     NB, n = 64, 4096
@@ -733,16 +741,19 @@ def _(b):
     ki = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend="cuda", cuda_math="ieee")(xs).per_item[0]
     ka = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend="cuda", cuda_math="approx")(xs).per_item[0]
     ndiff = int(np.sum(np.asarray(ki) != np.asarray(ka)))
-    if ndiff == 0:
-        raise Fail("instrument: approx vs ieee changes no step count here; the negative control would be void")
-    s0, out = _reverse.SINGLE, {}
+    if ndiff < n // 8:
+        raise Fail(f"instrument: approx vs ieee changes the step count of only {ndiff}/{n} items here; the negative "
+                   "control would be void")
+    s0, out, hashes = _reverse.SINGLE, {}, {}
     try:
         for single in ("off", "force"):
             for adj in (None, "approx"):
                 f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend="cuda", cuda_math="ieee",
                             **(dict(_adj_math=adj) if adj else {}))
                 _reverse.SINGLE = single
+                D.KERNELS.clear()
                 gr = np.asarray(jax.jit(jax.grad(lambda x: jnp.sum(f(x).per_item[1])))(xs))
+                hashes[single, adj] = {k["hash"] for k in D.KERNELS if "vjp" in k["tag"]}
                 if _reverse.LAST_SINGLE.get("used") != (single == "force"):
                     raise Fail(f"instrument: SINGLE={single} but {_reverse.LAST_SINGLE}")
                 gf = jax.jit(lambda x: jax.jvp(lambda x_: f(x_).per_item[1], (x,), (jnp.ones_like(x),))[1])(xs)
@@ -751,12 +762,15 @@ def _(b):
     finally:
         _reverse.SINGLE = s0
     for single in ("off", "force"):
+        h0, h1 = hashes[single, None], hashes[single, "approx"]
+        if not h0 or not h1 or h0 & h1:
+            raise Fail(f"instrument ({single}): the control did not change the adjoint cubin: {h0} vs {h1}")
         if out[single, None]:
             raise Fail(f"{single}: {out[single, None]}/{n} items' reverse derivative differs from forward mode")
         if out[single, "approx"] < ndiff // 2:
             raise Fail(f"NEGATIVE CONTROL ({single}): {out[single, 'approx']} items flagged, {ndiff} change step count")
-    return (f"clean 0/{n} (nested and T3); approx changes {ndiff} step counts; control flags nested "
-            f"{out['off', 'approx']}, T3 {out['force', 'approx']}")
+    return (f"clean 0/{n} (nested and T3); approx changes {ndiff} step counts; adjoint cubins differ; control "
+            f"flags nested {out['off', 'approx']}, T3 {out['force', 'approx']}")
 
 
 @case("grad(vmap) of a call == per-member grads (the batching rule's folded / mapped adjoint)")

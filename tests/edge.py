@@ -714,44 +714,7 @@ def _(b):
     return f"12-element arrays: {n_in} in place, {n_cp} copying"
 
 
-@case("exact=True: order-independent, run-to-run bitwise; overflow counted, poisons its own bin (primal and tangent)")
-def _(b):
-    if b == "lockstep" and not jax.config.jax_enable_x64:
-        raises(NotImplementedError, lambda: tm.vmap(walk, outputs={"Q": tm.Sum((NB,), F, exact=True)}, in_axes=AX,
-                                                      backend=b)(xs, keys, tab, TH), "x64")
-        return "needs x64 on lockstep (raises clearly)"
-    out = {"Q": tm.Sum((NB,), F, exact=True, scale=2.0 ** 20)}
-    n = 4096
-    x2 = jnp.linspace(0.1, 3.0, n).astype(F)
-    k2 = jax.random.split(jax.random.PRNGKey(5), n)
-    f = tm.vmap(walk, outputs=out, in_axes=AX, backend=b)
-    a1 = np.asarray(f(x2, k2, tab, TH).outputs["Q"])
-    a2 = np.asarray(f(x2[::-1], k2[::-1], tab, TH).outputs["Q"])          # different item order
-    if not np.array_equal(a1, a2):
-        raise Fail("exact output depends on item order")
-    big = tm.vmap(lambda t, x: t.add("Q", 0, x * 1e15), outputs=out, backend=b)(x2)
-    if int(big.stats["exact_overflow"]) != n:
-        raise Fail(f"overflow count {int(big.stats['exact_overflow'])} != {n}")
-    # an overflow poisons the BIN it was emitted to, nothing else: other bins, other exact outputs and non-exact
-    # outputs stay as they are
-    mix = {"Q": tm.Sum((NB,), F, exact=True, scale=2.0 ** 20), "E": tm.Sum((2,), F, exact=True, scale=2.0 ** 20),
-           "P": tm.Sum((1,), F)}
-
-    def ovf(t, x, s):
-        return t.add("Q", 0, x * s).add("Q", 1, x).add("E", 1, x).add("P", 0, x)
-    g = tm.vmap(ovf, outputs=mix, in_axes=(0, None), backend=b)
-    r = g(x2, F(1e15))
-    q = np.asarray(r.outputs["Q"])
-    if not (np.isnan(q[0]) and np.isfinite(q[1:]).all() and np.isfinite(np.asarray(r.outputs["E"])).all()):
-        raise Fail(f"exact_overflow={int(r.stats['exact_overflow'])}: want only Q[0] NaN, got Q {q[:3]} "
-                   f"E {np.asarray(r.outputs['E'])}")
-    close(r.outputs["P"][0], float(x2.sum()))
-    ok = g(x2, F(1.0))
-    if int(ok.stats["exact_overflow"]) != 0 or not np.isfinite(np.asarray(ok.outputs["Q"])).all():
-        raise Fail("an exact call with no overflow was poisoned")
-    return _tangent_overflow(b, x2) + "; " + _f32_bins(b, x2, k2)
-
-
+# (helpers of the next cell, defined first: @case runs its cell at decoration time)
 def _tangent_overflow(b, x2):
     """(G7) only the TANGENT overflows: emit x*(s0-1)*1e15 + x*s1 at s = (1, 1) -> primal x (finite), tangent
     column 0 x*1e15 (unrepresentable), column 1 x.  On every jvp path the column-0 tangent bin is NaN, the column-1
@@ -807,6 +770,44 @@ def _f32_bins(b, x2, k2):
     f1 = np.asarray(fl(x2, k2, tab, TH).outputs["Q"])
     f2 = np.asarray(fl(x2[::-1], k2[::-1], tab, TH).outputs["Q"])
     return f"f32 atomics order-dependent bins: {int((f1 != f2).sum())}/{NB}"
+
+
+@case("exact=True: order-independent, run-to-run bitwise; overflow counted, poisons its own bin (primal and tangent)")
+def _(b):
+    if b == "lockstep" and not jax.config.jax_enable_x64:
+        raises(NotImplementedError, lambda: tm.vmap(walk, outputs={"Q": tm.Sum((NB,), F, exact=True)}, in_axes=AX,
+                                                      backend=b)(xs, keys, tab, TH), "x64")
+        return "needs x64 on lockstep (raises clearly)"
+    out = {"Q": tm.Sum((NB,), F, exact=True, scale=2.0 ** 20)}
+    n = 4096
+    x2 = jnp.linspace(0.1, 3.0, n).astype(F)
+    k2 = jax.random.split(jax.random.PRNGKey(5), n)
+    f = tm.vmap(walk, outputs=out, in_axes=AX, backend=b)
+    a1 = np.asarray(f(x2, k2, tab, TH).outputs["Q"])
+    a2 = np.asarray(f(x2[::-1], k2[::-1], tab, TH).outputs["Q"])          # different item order
+    if not np.array_equal(a1, a2):
+        raise Fail("exact output depends on item order")
+    big = tm.vmap(lambda t, x: t.add("Q", 0, x * 1e15), outputs=out, backend=b)(x2)
+    if int(big.stats["exact_overflow"]) != n:
+        raise Fail(f"overflow count {int(big.stats['exact_overflow'])} != {n}")
+    # an overflow poisons the BIN it was emitted to, nothing else: other bins, other exact outputs and non-exact
+    # outputs stay as they are
+    mix = {"Q": tm.Sum((NB,), F, exact=True, scale=2.0 ** 20), "E": tm.Sum((2,), F, exact=True, scale=2.0 ** 20),
+           "P": tm.Sum((1,), F)}
+
+    def ovf(t, x, s):
+        return t.add("Q", 0, x * s).add("Q", 1, x).add("E", 1, x).add("P", 0, x)
+    g = tm.vmap(ovf, outputs=mix, in_axes=(0, None), backend=b)
+    r = g(x2, F(1e15))
+    q = np.asarray(r.outputs["Q"])
+    if not (np.isnan(q[0]) and np.isfinite(q[1:]).all() and np.isfinite(np.asarray(r.outputs["E"])).all()):
+        raise Fail(f"exact_overflow={int(r.stats['exact_overflow'])}: want only Q[0] NaN, got Q {q[:3]} "
+                   f"E {np.asarray(r.outputs['E'])}")
+    close(r.outputs["P"][0], float(x2.sum()))
+    ok = g(x2, F(1.0))
+    if int(ok.stats["exact_overflow"]) != 0 or not np.isfinite(np.asarray(ok.outputs["Q"])).all():
+        raise Fail("an exact call with no overflow was poisoned")
+    return _tangent_overflow(b, x2) + "; " + _f32_bins(b, x2, k2)
 
 
 @case("exact: cuda == lockstep bitwise; jvp == jacfwd column bitwise", ["cuda"])
