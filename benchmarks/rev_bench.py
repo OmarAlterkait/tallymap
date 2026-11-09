@@ -1,6 +1,6 @@
 """Reverse-mode cost: time and memory of primal / jvp / jacfwd(P) / grad (checkpointed) vs path length K,
 parameter count P and backend.  python benchmarks/rev_bench.py
-env: RB_N (65536)  RB_KS (10,30,100,300,1000)  RB_PS (1,10,tab)  RB_BACKENDS (cuda,lockstep)  RB_MATH (ieee,approx)
+env: RB_N (65536)  RB_KS (10,30,100,300,1000)  RB_PS (1,10,tab)  RB_BACKENDS (cuda,xla)  RB_MATH (ieee,approx)
      RB_MODES (fwd,jvp,jacfwd,ckpt,dense)  RB_REPS (5)  RB_TAB (11096)  RB_SLOTS (16: rev_checkpoints, comma list)
 Rows: 'ROW {json}'.  Instrument: every arm records the kernel hash(es) it built (cuda) and the vjp program summary
 (tallymap._reverse.LAST); arms that must differ are asserted to have different kernels.
@@ -26,7 +26,7 @@ GPU = jax.default_backend() == "gpu"
 N = int(os.environ.get("RB_N", 65536))
 KS = [int(k) for k in os.environ.get("RB_KS", "10,30,100,300,1000").split(",")]
 PS = os.environ.get("RB_PS", "1,10,tab").split(",")
-BACKENDS = os.environ.get("RB_BACKENDS", "cuda,lockstep" if GPU else "lockstep").split(",")
+BACKENDS = os.environ.get("RB_BACKENDS", "cuda,xla" if GPU else "xla").split(",")
 MATHS = os.environ.get("RB_MATH", "ieee,approx").split(",")
 MODES = os.environ.get("RB_MODES", "fwd,jvp,jacfwd,ckpt,dense").split(",")
 REPS = int(os.environ.get("RB_REPS", 5))

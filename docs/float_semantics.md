@@ -6,23 +6,23 @@ math modes, schedules and JAX versions.
 ## Guarantees
 
 1. **RNG is bit-exact.**  `jax.random` inside an item (threefry2x32, typed and raw keys) is emitted bitwise by the
-   cuda backend; the lockstep backend runs JAX's own ops.  `tests/ops.py` checks bits / uniform / split / randint
+   cuda backend; the xla backend runs JAX's own ops.  `tests/ops.py` checks bits / uniform / split / randint
    bitwise against `jax.jit(jax.vmap(op))`.
-2. **Per-item results do not depend on scheduling.**  Each item is a pure function of its inputs; step refill, block
+2. **Per-item results do not depend on scheduling.**  Each item is a pure function of its inputs; the schedule (item or step), block
    size, the item count N and the claim order do not change an item's trajectory on the cuda backend.
 3. **f32 sums agree within float reassociation.**  Sum outputs are accumulated with atomics (cuda) or a scatter-add
-   (lockstep; on a GPU also atomic), so their summation order, and their last bits, change from run to run on a GPU.
+   (xla; on a GPU also atomic), so their summation order, and their last bits, change from run to run on a GPU.
    CPU runs are deterministic.
-4. **`Sum(exact=True)` is order-independent and exact.**  Each value is rounded to int64 fixed point
+4. **`Sum(fixed_point=True)` is order-independent.**  Each value is rounded to int64 fixed point
    (`round(v * scale)`) before an integer add: bitwise results across schedules, `vmap`, and the two backends.  On the
-   lockstep backend it needs `jax_enable_x64`.  Unrepresentable values are dropped and counted
-   (`stats['exact_overflow']`), and the bin each was emitted to is NaN (primal and tangent bins each by their own emits).
+   xla backend it needs `jax_enable_x64`.  Unrepresentable values are dropped and counted
+   (`stats['fixed_point_overflow']`), and the bin each was emitted to is NaN (primal and tangent bins each by their own emits).
 5. **Forward, tangent and adjoint share one item program.**  The adjoint replays the same jaxpr with the same options
    (same math), so a replay is bit-exact on the same backend (gated in tests/reverse.py, "REPLAY GATE").
 
 ## Arithmetic per backend
 
-- **lockstep**: whatever XLA emits for the platform (it is plain JAX).
+- **xla**: whatever XLA emits for the platform (it is plain JAX).
 - **cuda, `cuda_math='approx'` (default)**: f32 division, sqrt and rsqrt use the PTX that XLA:GPU itself emits
   (`div.full.f32`, `sqrt.approx.f32`, `rsqrt.approx.f32`).  Everything else is as in `ieee`.  The justification for
   the default is that sentence: it is the arithmetic a plain JAX program on the same GPU already gets, so choosing
@@ -30,10 +30,10 @@ math modes, schedules and JAX versions.
   pre-registered `compare` validation (`validation.md`), because IEEE division and square root were the whole gap
   to a hand-tuned kernel.
 - **cuda, `cuda_math='ieee'`**: correctly rounded f32 add / sub / mul / div / sqrt (round to nearest), rsqrt as
-  rcp(sqrt) (two roundings), the portable reference.  Use it when portability matters more than speed.
+  rcp(sqrt) (two roundings): the portable choice.  Use it when portability matters more than speed.
 - **Both cuda modes**: no FMA contraction (`-fmad=false`), no flush-to-zero (`--ftz=false`); transcendentals call the
   CUDA math library (libdevice) with its documented maximum ulp errors; f64 arithmetic is IEEE.  No attempt is made
-  to reproduce XLA's own algebraic rewrites or polynomial approximations, so cuda and lockstep agree statistically,
+  to reproduce XLA's own algebraic rewrites or polynomial approximations, so cuda and xla agree statistically,
   not bitwise.
 - `cuda_math` is an option only (no environment default: a process-global numerics switch is a hidden input).  A
   driver frozen with the old default passes `cuda_math='ieee'` explicitly.
@@ -46,7 +46,7 @@ version in `tests/ops_baseline.json`.
 
 - Set `jax_default_matmul_precision='highest'` for any GPU parity test: JAX's default TF32 matmul on A100 / L40S
   biases results.
-- For run-to-run bitwise sums on a GPU, use `Sum(exact=True)`.
+- For run-to-run bitwise sums on a GPU, use `Sum(fixed_point=True)`.
 - Compare per-output vectors, never scalar ratios.  Rerun the same keys as a control before blaming a difference.
 - `grad` and `jacfwd` (or two backends) agree to rounding only when the derivative is well conditioned.  Through
   an adaptive step-size controller it is not.  An ODE ensemble's f32 gradient had the opposite sign to its f64

@@ -51,42 +51,44 @@ def _call_site(fallback=None):
 # ------------------------------------------------------------------------------------------- user specs
 @dataclasses.dataclass(frozen=True)
 class Sum:
-    """A commutative (sum) output.  exact=True accumulates round(v * scale) in int64: bitwise order-independent
-    (needs jax_enable_x64 on the lockstep backend).  |v * scale| >= 9.2e18 cannot be represented: such an emit is
-    dropped, counted in Result.stats['exact_overflow'], and the BIN it was emitted to becomes NaN (every kernel
-    flags its own bins: a primal bin by the primal's emits, a jvp / jacfwd tangent bin by that tangent's emits, on
-    every path).  A jvp / vjp tangent tally of this output uses the same scale."""
+    """A commutative (sum) output.  fixed_point=True accumulates round(v * scale) in int64 fixed point: bitwise
+    order-independent, each value rounded to a multiple of 1/scale (needs jax_enable_x64 on the xla backend).
+    |v * scale| >= 9.2e18 cannot be represented: such an emit is dropped, counted in
+    Result.stats['fixed_point_overflow'], and the BIN it was emitted to becomes NaN (every kernel flags its own bins: a
+    primal bin by the primal's emits, a jvp / jacfwd tangent bin by that tangent's emits, on every path).  A jvp /
+    vjp tangent tally of this output uses the same scale."""
     shape: Any
     dtype: Any = jnp.float32
-    exact: bool = False
+    fixed_point: bool = False
     scale: float = 2.0 ** 32
 
 
 @dataclasses.dataclass(frozen=True)
 class Queue:
     """Spawn queue of `capacity` pending children (ring buffer).  A child that does not fit is dropped and counted
-    in stats['dropped'].  The capacity is a tallymap resource limit, so a dropped child makes every float tally of
-    the call NaN (never a silently truncated shower; integer tallies cannot be NaN, so they are left as they are:
-    check stats['dropped']).  Reverse mode (the tree adjoint) records every child of the call, so it needs
-    capacity >= the TOTAL number of children; a larger tree gives a NaN gradient (never a wrong one).
+    in stats['children_dropped'].  The capacity is a tallymap resource limit, so a dropped child makes every float
+    tally of the call NaN (never a silently truncated shower; integer tallies cannot be NaN, so they are left as they
+    are: check stats['children_dropped']).  Reverse mode (the tree adjoint) records every child of the call, so it
+    needs capacity >= the TOTAL number of children; a larger tree gives a NaN gradient (never a wrong one).
     Sizing: README.md, "Sizing the Queue"."""
     capacity: int
 
 
 class Result(NamedTuple):
     """What a tallymap.vmap function returns.  When a tallymap resource limit intervened (max_steps, the spawn
-    Queue capacity) every float output is NaN; an exact=True bin an unrepresentable emit was dropped from is NaN.
+    Queue capacity) every float output is NaN; a fixed_point=True bin an unrepresentable emit was dropped from is
+    NaN.
     The counters in `stats` say which limit it was."""
     outputs: dict        # name -> summed output (float: NaN when a resource limit intervened)
     per_item: Any        # pytree of [N, ...] per-item results (None if the item returns only its tally)
     truncated: Any       # bool[N]: the item hit max_steps in a top-level while loop
-    stats: dict          # n_truncated, dropped_emits, exact_overflow; with spawn also spawned / dropped /
-                         # children_truncated
+    stats: dict          # n_truncated, dropped_emits, fixed_point_overflow; with spawn also spawned /
+                         # children_dropped / children_truncated
 
 
 class UnsupportedError(NotImplementedError):
-    """A backend cannot run this program.  backend='auto' on a GPU raises it too (it never falls back to the lockstep
-    backend: pass backend='lockstep' for that)."""
+    """A backend cannot run this program.  backend='auto' on a GPU raises it too (it never falls back to the xla
+    backend: pass backend='xla' for that)."""
 
 
 # ------------------------------------------------------------------------------------------- programs
@@ -96,7 +98,7 @@ class TSpec:
     S: int                 # flat size
     dtype: Any
     lead: tuple = ()       # extra leading dims (dual tangent lanes)
-    exact: bool = False
+    fixed_point: bool = False
     kind: str = "sum"      # 'sum' | 'spawn' | 'discard'
     scale: float = 2.0 ** 32
 
@@ -196,8 +198,8 @@ def _poison_tally(t, bad):
     """the tally t with NaN emitted into every bin when the item's `bad` (its truncation flag) is set.  The primal
     outputs of a truncated call are poisoned by _poison_primal, whose tangent is the identity (so that jax.grad needs
     no forward launch); the tangent sums are poisoned here, inside the tangent / fused / dual-lane kernel, by the
-    items that were truncated (per item, so per batch member when a batch is folded).  An exact sum flags the NaN
-    emits as overflows (stats['exact_overflow'] then counts them too)."""
+    items that were truncated (per item, so per batch member when a batch is folded).  A fixed-point sum flags the
+    NaN emits as overflows (stats['fixed_point_overflow'] then counts them too)."""
     from ._rewrite import emit_p_bind
     nan = jnp.full(t.shape[:-1], np.nan, t.dtype)
     return lax.cond(bad, lambda t: lax.fori_loop(0, t.shape[-1], lambda i, t: emit_p_bind(t, i, nan), t),
@@ -212,8 +214,8 @@ _WARNED = set()
 
 
 def _out_tallies(p):
-    """backend outputs: [these sum tallies] + [stats int32[5]: spawned, dropped, children_truncated,
-    exact_overflow, dropped_emits] + [per-item results]."""
+    """backend outputs: [these sum tallies] + [stats int32[5]: spawned, children_dropped, children_truncated,
+    fixed_point_overflow, dropped_emits] + [per-item results]."""
     return [i for i, s in enumerate(p.tallies) if s.kind == "sum"]
 
 
@@ -222,7 +224,7 @@ _OPTS = {
     # public
     "cuda_math": "cuda backend, f32 div/sqrt: 'approx' (default) | 'ieee'",
     "schedule": "cuda backend: 'item' (default: a thread runs whole items) | 'step' (refill at loop-step granularity)",
-    "lockstep_block": "lockstep backend: lanes per block",
+    "xla_batch_size": "xla backend: items per batch",
     "rev_checkpoints": "reverse mode: checkpoint buffer size C (default 'auto': from the loop state's size)",
     "rev_stats": "reverse through spawn: report the tree adjoint's stats to the host (costs jit's fast path)",
     # PRIVATE (measurements / tests / negative controls; not API)
@@ -234,7 +236,7 @@ _OPTS = {
     "_rev_gen_capacity": "tree adjoint: largest generation (default Queue capacity; memory lever)",
     "_tree_neg": "NEGATIVE CONTROL of the tree adjoint: 'detach' | 'replay'",
 }
-BACKENDS = ("auto", "cuda", "lockstep")
+BACKENDS = ("auto", "cuda", "xla")
 
 
 def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="auto", **opts):
@@ -242,23 +244,23 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
 
     Meaning: jax.vmap(fn) over the items followed by a sum of their tallies.  Every JAX transformation works.
 
-    outputs:   {name: tallymap.Sum(shape, dtype=float32, exact=False)}
+    outputs:   {name: tallymap.Sum(shape, dtype=float32, fixed_point=False)}
     in_axes:   0 (mapped) or None (broadcast, e.g. tables) per positional arg, like jax.vmap
     max_steps: cap on every top-level while_loop.  None (the default) is exactly jax.vmap: no cap, and an item
                that does not terminate does not terminate.  Setting it is the recommended safety net; an item that
                hits the cap is flagged in Result.truncated and POISONS every float tally of the call (see below)
     spawn:     tallymap.Queue(capacity) to allow tally.spawn(child)
-    backend:   'auto': cuda on a GPU (a program it cannot compile raises UnsupportedError; backend='lockstep' runs
-               it), the lockstep backend elsewhere (with a one-time warning) | 'cuda' | 'lockstep'
+    backend:   'auto': cuda on a GPU (a program it cannot compile raises UnsupportedError; backend='xla' runs
+               it), the xla backend elsewhere (with a one-time warning) | 'cuda' | 'xla'
     opts:      cuda_math          cuda f32 div/sqrt: 'approx' (default; XLA:GPU's own PTX) | 'ieee' (correctly
-                                  rounded: the portable reference).
+                                  rounded and portable).
                schedule           cuda: 'item' (default: a thread runs one whole item, then claims the next) |
                                   'step' (the step schedule: a thread is refilled with a new item at loop-STEP
                                   granularity, so a thread whose item ended does not idle until its warp's longest
                                   item ends).  'step' needs an item with exactly one top-level while loop and
                                   raises UnsupportedError otherwise; derived kernels (jvp, lanes, an adjoint) use it
                                   wherever they split.  Which is faster depends on the workload: measure.
-               lockstep_block     lockstep backend: lanes per block (default 2^18; bounds its memory).
+               xla_batch_size     xla backend: items per batch (default 2^18; bounds its memory).
                rev_checkpoints    reverse mode: states per checkpoint buffer C (default 'auto': 16 for a loop step
                                   of fewer than 1000 equations, else the largest of 4, 8, ..., 64 whose 3C+1
                                   (single-loop adjoint: 2C+1) states fit 64 KiB; _reverse.auto_checkpoints).  A loop
@@ -275,7 +277,8 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
     Resource limits.  The result is exactly jax.vmap(fn) over the items followed by a sum, and deviates only where
     a tallymap resource limit intervenes: max_steps, or the spawn Queue capacity.  When one of them does, every
     float tally of the call is NaN, so a truncated or dropped item is never silently missing from a sum.  Which
-    limit it was is in Result.stats: n_truncated (and children_truncated) for max_steps, dropped for the Queue.
+    limit it was is in Result.stats: n_truncated (and children_truncated) for max_steps, children_dropped for the
+    Queue.
     Integer tallies cannot be NaN, so they are left as they are and their counter is the only signal.  Per-item
     outputs are not poisoned: they carry their own per-item flag (Result.truncated) in the same Result.  Gradients
     of a poisoned tally are NaN, and nothing else about them changes.  There is no opt-out: a deliberate step
@@ -335,7 +338,7 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
         shapes = {n: (outs_spec[n].shape,) if isinstance(outs_spec[n].shape, int) else tuple(outs_spec[n].shape)
                   for n in names}
         tspecs = [TSpec(n, int(np.prod(shapes[n], dtype=np.int64)), np.dtype(outs_spec[n].dtype), (),
-                        bool(outs_spec[n].exact), "sum", float(outs_spec[n].scale)) for n in names]
+                        bool(outs_spec[n].fixed_point), "sum", float(outs_spec[n].scale)) for n in names]
         if spawn is not None:
             tspecs.append(TSpec("__spawn__", 1, np.dtype(np.int32), (), False, "spawn"))
         nT = len(tspecs)
@@ -395,9 +398,9 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
         nt = len(_out_tallies(prog))
         tvals, st, ys = flat[:nt], flat[nt], flat[nt + 1:]
         res_out = {n: tvals[i].reshape(shapes[n]) for i, n in enumerate(names)}
-        stats = {"exact_overflow": st[3], "dropped_emits": st[4]}
+        stats = {"fixed_point_overflow": st[3], "dropped_emits": st[4]}
         if spawn is not None:
-            stats.update(spawned=st[0], dropped=st[1], children_truncated=st[2])
+            stats.update(spawned=st[0], children_dropped=st[1], children_truncated=st[2])
         if max_steps is not None:
             trunc = ys[-1]
             ys = ys[:-1]

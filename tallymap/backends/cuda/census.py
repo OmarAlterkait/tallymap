@@ -33,8 +33,8 @@ NOT_IN_JAX_EXTEND = {
 def supported_primitives():
     """-> [dict(name, how)] for every primitive the cuda backend compiles, sorted by name.
     how: 'rule' (one emission rule in op_table.py), 'canonicalised' (rewritten into rule primitives by canon.py),
-    'tally' (tallymap's own emit / spawn).  Anything else raises tm.UnsupportedError on cuda (the lockstep backend runs
-    every JAX primitive)."""
+    'tally' (tallymap's own emit / spawn).  Anything else raises tm.UnsupportedError on cuda (the xla backend runs every
+    JAX primitive)."""
     from . import canon, op_table
     names = set(op_table.RULES) | set(canon.SUGAR) | {"tallymap_emit", "tallymap_spawn"}
     rows = []
@@ -52,7 +52,7 @@ def primitives_table():
            "`tallymap.backends.cuda.census.primitives_table()` (a test checks that this file is current).",
            "`how`: `rule` = one emission rule in `backends/cuda/op_table.py`; `canonicalised` = rewritten into rule",
            "primitives by `backends/cuda/canon.py` before emission; `tally` = tallymap's own emit / spawn.",
-           "Any other primitive raises `tm.UnsupportedError` on cuda; the lockstep backend runs every JAX",
+           "Any other primitive raises `tm.UnsupportedError` on cuda; the xla backend runs every JAX",
            "primitive.", "",
            f"{len(rows)} names ({sum(r['how'] == 'rule' for r in rows)} rules, "
            f"{sum(r['how'] == 'canonicalised' for r in rows)} canonicalised).", "",

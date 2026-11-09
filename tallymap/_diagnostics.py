@@ -11,11 +11,11 @@ Keys:
   cuda       compiler (the NVRTC build), cubin cache directory
   reverse    single = whether the last adjoint built is the single-loop one (T3), and if not why not;
              tree   = stats of the last tree adjoint (reverse through spawn), filled only by tm.vmap(...,
-                      rev_stats=True) calls (a host callback costs jax.jit's C++ fast path): generations, particles,
-                      launches, overflow, drop_risk, replay_mismatch, fwd_mismatch (any of the last four -> NaN
-                      gradient)
-  programs   the last item programs bound by tm.vmap: tag, item jaxpr (text), and baked_floats: [(shape, dtype,
-             size)] of the FLOAT constants the item function closed over, the values a derivative cannot reach
+                      rev_stats=True) calls (a host callback costs jax.jit's C++ fast path): generations, children,
+                      launches, generation_overflow, drop_risk, replay_mismatch, fwd_mismatch (any of the last four
+                      -> NaN gradient)
+  programs   the last item programs bound by tm.vmap: tag, item jaxpr (text), and closed_over_floats: [(shape,
+             dtype, size)] of the FLOAT constants the item function closed over, the values a derivative cannot reach
              (a constant's tangent is zero, silently): anything you differentiate must be an argument
   kernels    the last cuda kernels used: tag, schedule, cubin hash, cached CUDA source (.cu), primitives, compile
              seconds, and once a kernel has run `resources`: registers and local memory per thread, static shared
@@ -54,7 +54,7 @@ def record_program(prog):
 def _render(rec):
     """a program record as returned by diagnostics(): the jaxpr as text and the float constants (built now, not at
     bind time)."""
-    return dict(tag=rec["tag"], jaxpr=str(rec["jaxpr"]), baked_floats=float_consts(rec["consts"]))
+    return dict(tag=rec["tag"], jaxpr=str(rec["jaxpr"]), closed_over_floats=float_consts(rec["consts"]))
 
 
 def float_consts(consts):

@@ -12,7 +12,7 @@ capacity per generation, children compacted in (parent, ordinal) order).  jax.gr
 tree adjoint must reproduce (ulp-level).  Also compared: tallymap jacfwd / jvp through spawn at the same keys.
 
 python tests/reverse_spawn.py
-env: TREE_BACKEND (lockstep|cuda|auto)  TREE_X64 (0|1)  TREE_N roots (48)  TREE_CG (512)  TREE_TOT (4096)
+env: TREE_BACKEND (xla|cuda|auto)  TREE_X64 (0|1)  TREE_N roots (48)  TREE_CG (512)  TREE_TOT (4096)
 """
 import json
 import os
@@ -35,7 +35,7 @@ if os.environ.get("TX_UNFUSED") == "1":                 # run_all --unfused: the
     from tallymap import _primitive as _P0
     _P0.FUSE_JVP = False
 
-BK = os.environ.get("TREE_BACKEND", "lockstep")
+BK = os.environ.get("TREE_BACKEND", "xla")
 N = int(os.environ.get("TREE_N", 128))
 CG = int(os.environ.get("TREE_CG", 2048))
 TOT = int(os.environ.get("TREE_TOT", 32768))
@@ -229,7 +229,8 @@ gens = sum(1 for s in sizes if s > 0)
 hr = np.asarray(o_ref["h"])
 fd = dict(h=float(np.abs(np.asarray(r.outputs["h"]) - hr).max() / np.abs(hr).max()),
           y_equal=bool(np.array_equal(np.asarray(r.per_item), np.asarray(y_ref))), spawned=int(r.stats["spawned"]),
-          ref_children=int(sum(sizes)), generations=gens, max_gen=max(sizes), dropped=int(r.stats["dropped"]))
+          ref_children=int(sum(sizes)), generations=gens, max_gen=max(sizes),
+          children_dropped=int(r.stats["children_dropped"]))
 report("forward tallymap == dense reference",
        fd["h"] < (1e-9 if X64 else 1e-4) and fd["y_equal"] and fd["spawned"] == fd["ref_children"], **fd)
 print("generation sizes", sizes, flush=True)
@@ -285,8 +286,9 @@ tm.diagnostics(reset=True)
 _, g_o = grad_tallymap(TH, X0, tallymap_fn(cg=max(8, max(sizes) // 2)))
 jax.block_until_ready(g_o)
 st = tm.diagnostics()["reverse"]["tree"]
-report("overflow (_rev_gen_capacity < largest generation) -> NaN", bool(st["overflow"]) and np.isnan(flat(g_o)).all(),
-       overflow=bool(st["overflow"]))
+report("overflow (_rev_gen_capacity < largest generation) -> NaN",
+       bool(st["generation_overflow"]) and np.isnan(flat(g_o)).all(),
+       generation_overflow=bool(st["generation_overflow"]))
 
 # 7. queue capacity below the tree size -> the forward may have dropped children -> NaN (drop_risk)
 tm.diagnostics(reset=True)

@@ -1,5 +1,5 @@
 """Transformation composability matrix.  python tests/transforms.py
-env: BACKENDS=lockstep,cuda  TEST_X64=1  ONLY=substr  NDEV=2 (pmap/shard_map cells; CPU: XLA_FLAGS host device count)
+env: BACKENDS=xla,cuda  TEST_X64=1  ONLY=substr  NDEV=2 (pmap/shard_map cells; CPU: XLA_FLAGS host device count)
      TX_UNFUSED=1 (the two-node jvp design that runs when JAX drops the partial-eval registries)
 
 A BIG function contains tm.vmap calls with pre/post-processing, a second tallymap call fed by the first one's output,
@@ -58,7 +58,7 @@ if NEG:
         _C.fold_prog = _bad_fold
     print("NEGATIVE CONTROL", NEG, flush=True)
 GPU = jax.default_backend() == "gpu"
-BACKENDS = os.environ.get("BACKENDS", "lockstep,cuda" if GPU else "lockstep").split(",")
+BACKENDS = os.environ.get("BACKENDS", "xla,cuda" if GPU else "xla").split(",")
 ONLY = os.environ.get("ONLY", "")
 F = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
 print("jax", jax.__version__, jax.__file__, jax.devices(), "x64", jax.config.jax_enable_x64, flush=True)

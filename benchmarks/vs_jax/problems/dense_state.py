@@ -26,7 +26,7 @@ GROUP = "bad-fit"
 AXIS = "d"
 SWEEP = {"full": (4, 8, 16, 24, 32, 48, 64), "quick": (8, 32)}
 DIVS = ("none",)
-ARMS = ("tm_cuda", "tm_lockstep", "jax_while", "jax_scan")
+ARMS = ("tm_cuda", "tm_xla", "jax_while", "jax_scan")
 MODES = ("fwd", "grad")
 CHECK_VAL = 8
 
@@ -61,7 +61,7 @@ def sim_of(ctx, arm, maxs):
             c = lax.while_loop(cond, lambda c: step(c, mat), (jnp.int32(0), x))
             return t.add("s", 0, jnp.sum(c[1])), None
         f = tm.vmap(item, outputs={"s": tm.Sum((1,))}, in_axes=(0, None),
-                    backend="cuda" if arm == "tm_cuda" else "lockstep")
+                    backend="cuda" if arm == "tm_cuda" else "xla")
         return lambda mat: f(x0, mat).outputs["s"]
 
     def one(x, mat):

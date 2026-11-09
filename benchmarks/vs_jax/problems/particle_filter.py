@@ -41,7 +41,7 @@ GROUP = "interacting"
 AXIS = "n"
 SWEEP = {"full": (1 << 12, 1 << 14, 1 << 16, 1 << 18), "quick": (1 << 8, 1 << 10)}
 DIVS = ("mid", "low", "high")
-ARMS = ("tm_cuda", "tm_lockstep", "jax_while", "jax_scan", "jax_scan2x", "jax_ckpt", "jax_ckpt2x")
+ARMS = ("tm_cuda", "tm_xla", "jax_while", "jax_scan", "jax_scan2x", "jax_ckpt", "jax_ckpt2x")
 MODES = ("fwd", "grad")
 CHECK_VAL = 1 << 8
 DIV_VAL = 1 << 16      # the other divergence levels are measured at this one size
@@ -132,7 +132,7 @@ def propagate_of(ctx, arm, maxs):
             lw = logw_of(xn, y)
             return t.add("w", 0, jnp.exp(lw)), (xn, lw, c[3])
         f = tm.vmap(item, outputs={"w": tm.Sum((1,))}, in_axes=(0, 0, None, None),
-                    backend="cuda" if arm == "tm_cuda" else "lockstep")
+                    backend="cuda" if arm == "tm_cuda" else "xla")
 
         def call(x, nz, th, y):
             r = f(x, nz, th, y)

@@ -53,8 +53,8 @@ batch, an adjoint) use the step schedule wherever they split and the item schedu
 in `tm.diagnostics()['kernels']` names the schedule that ran. Spawn works under both. (A warp is the group of 32
 GPU threads that execute together on NVIDIA hardware.)
 
-Why the item schedule is the default: the old rule, step refill unless the program spawns, came from a
-production photon-transport workload where step refill won by about a third. Re-measured on the applications:
+Why the item schedule is the default: the old rule, the step schedule unless the program spawns, came from a
+production photon-transport workload where the step schedule won by about a third. Re-measured on the applications:
 LUCiD's forward is 3.0x SLOWER under the step schedule and its 6-column Jacobian 2.85x slower, with bitwise equal
 outputs (L40S, job 43935228), while lumen's value, jvp and jacfwd are 1.01-1.39x FASTER under it (job 43935227).
 Neither schedule wins everywhere, so the default is the one that never splits the item and the step schedule is
@@ -100,10 +100,10 @@ photon-transport engine at the same commit it was 0.81x (0.052 against 0.043 s),
 particle-shower engine (the step cut into phases) was 0.50x and 0.77x on a 2080 Ti and hung on one
 configuration. An earlier inner-loop variant was 1.03-1.82x SLOWER on four toys built as its best case.
 
-A lane claims ONE item per claim, warp-aggregated: the needy lanes of a warp take one contiguous run of item
-indices between them, so the claim counter sees one atomic per warp rather than one per lane. Claiming a RUN of
+A thread claims ONE item per claim, warp-aggregated: the needy threads of a warp take one contiguous run of item
+indices between them, so the claim counter sees one atomic per warp rather than one per thread. Claiming a RUN of
 up to 16 items per lane (a chunk sized from the item count and the grid) was in the kernel and is removed: it
-leaves the last claims holding several items each, which is a tail every other lane waits for. Measured on a
+leaves the last claims holding several items each, which is a tail every other thread waits for. Measured on a
 2080 Ti over all 18 `benchmarks/vs_jax` forward and gradient cells, one item per claim is 1.46x faster on
 random_walk's forward pass, 1.14 to 1.18x on transport forward, random_walk gradient and uniform gradient,
 1.09x on ode, and never slower (worst cell 1.002).
@@ -121,9 +121,9 @@ the consequence that an item which never terminates does not terminate.
 
 ### 1c. Spawn
 
-`t = t.spawn(child_args, when)`: the child is a new item with the same per-item input structure. The lockstep
+`t = t.spawn(child_args, when)`: the child is a new item with the same per-item input structure. The xla
 backend uses a ring buffer processed in later blocks (children first); the CUDA backend uses a bounded
-multiple-producer multiple-consumer ticket queue. Overflow drops the child, counts it (`stats['dropped']`) and
+multiple-producer multiple-consumer ticket queue. Overflow drops the child, counts it (`stats['children_dropped']`) and
 makes the float tallies NaN. There is no stall: a stalled mid-item step cannot be replayed. Forward-mode
 derivatives with spawn give children tangents for every float per-item leaf. Reverse mode uses the tree adjoint
 (section 4).
@@ -132,19 +132,19 @@ derivatives with spawn give children tangents for every float per-item leaf. Rev
 
 - One CUDA emitter: IEEE round-to-nearest arithmetic without fused-multiply-add contraction, transcendental
   functions from the CUDA math library, and the `cuda_math` choice for f32 division, square root and reciprocal
-  square root (`docs/float_semantics.md`). The CUDA and lockstep backends agree statistically, not bitwise;
+  square root (`docs/float_semantics.md`). The CUDA and xla backends agree statistically, not bitwise;
   the `compare` protocol is the contract (`docs/validation.md`).
 - `backend='auto'`: CUDA on a GPU; a program the emitter does not support raises `UnsupportedError` there, with
-  the advice to pass `backend='lockstep'`, because a silent change to the reference interpreter is a silent
-  factor-of-100 slowdown. On every other platform it is lockstep with a one-time warning. `backend='cuda'` raises
+  the advice to pass `backend='xla'`, because a silent change to the portable interpreter is a silent
+  factor-of-100 slowdown. On every other platform it is xla with a one-time warning. `backend='cuda'` raises
   the same way. Compile errors from NVRTC (NVIDIA's runtime CUDA compiler) are
   bugs and raise. A compiled kernel whose per-thread local memory is over CUDA's 512 KiB per-thread limit raises
   `UnsupportedError` with the bytes and the limit before it is launched (`compile.check_frame`, read from the
   cubin's `.nv.info` records); the driver would refuse it with `invalid argument`. Effects, such as `jax.debug.print` or an input/output callback, raise on both backends.
 - N, the number of items, is a runtime kernel argument: neither the compiled kernel nor the in-memory kernel cache
   key contains it. One call takes fewer than 2^31 items.
-- `Sum(exact=True)`: int64 fixed point, `round(v * scale)`, with one scale per output. Unrepresentable values,
-  meaning `|v * scale| >= 9.2e18`, are dropped AND counted (`stats['exact_overflow']`, per launch) on both backends,
+- `Sum(fixed_point=True)`: int64 fixed point, `round(v * scale)`, with one scale per output. Unrepresentable values,
+  meaning `|v * scale| >= 9.2e18`, are dropped AND counted (`stats['fixed_point_overflow']`, per launch) on both backends,
   and flag their bin, which the kernel writes as NaN. The flag is per bin of the launch's own outputs, so a fused
   jvp's tangent overflow never poisons its primal, and an unfused tangent node poisons its own bins. A fixed
   2^32 scale was tried first and wraps silently for tangents of order 1e11, so the scale is per output.  A
@@ -152,8 +152,8 @@ derivatives with spawn give children tangents for every float per-item leaf. Rev
 - Keys: tallymap invents no randomness. Typed and raw uint32 keys both work. Results do not depend on scheduling.
 - `n_active`: `f(*args, n_active=k)` runs only items `i < k`, so a fixed capacity with a varying count never
   recompiles.
-- The lockstep backend's results may depend on its block width at the level of one unit in the last place,
-  because XLA (JAX's compiler) compiles the same body differently for a different lane count. `lockstep_block` is
+- The xla backend's results may depend on its batch size at the level of one unit in the last place,
+  because XLA (JAX's compiler) compiles the same body differently for a different batch size. `xla_batch_size` is
   therefore fixed by default, at 2^18.
 
 ## 2. One primitive, so every transformation composes
@@ -182,13 +182,13 @@ ITEM function and binds the primitive again, so the rules recurse to any order o
 - **batching**: when only operands the node is linear in are batched, which is the `jacfwd`, `jacrev` and
   vmap-of-JVP case, the result is a `dual_lanes` node: one kernel with T dual lanes per item. Otherwise it is a
   `folded_batch` node, which runs B*N items in ONE launch with member b's emits offset to the slice
-  `[b*S, (b+1)*S)` by a retrace emit hook. Folding requires that there is no spawn and no exact output, that
+  `[b*S, (b+1)*S)` by a retrace emit hook. Folding requires that there is no spawn and no fixed-point output, that
   every batched broadcast operand is small (at most 4096 elements per member) and, on CUDA, that ONE member's
   launch of N items could not fill the device by itself (N below the multiprocessor count times 1024, the
   smallest maximum-resident-threads-per-multiprocessor of any tested architecture, so the bound is a floor).
   Otherwise it falls back to `lax.map`, one launch per member.
 - **lowering** is per platform: `'cuda'` goes to the CUDA backend for `backend='auto'` and `'cuda'`, every other
-  platform to lockstep. `backend='cuda'` lowered for another platform raises.
+  platform to xla. `backend='cuda'` lowered for another platform raises.
 - **impl** (eager, outside `jit`): one `jax.jit` per node STRUCTURE, in a 64-entry cache, so repeated eager calls
   with new values do not recompile. `disable_jit`, `debug_nans` and `debug_infs` run the backend operation by
   operation.
@@ -243,7 +243,7 @@ GPU by themselves. Measured on the toy walk, B=8, 2080 Ti (68 multiprocessors, s
 The old rule refused the 2.2x at 65k items and 1,024 bins (that tally never fits shared memory, so folding
 could not change its status) and allowed a loss that grows with N -- 2.5x at a million items and 5.8 to 6.9x
 at four million (a 64-bin tally is privatised folded or not, so it passed the old rule at every N). The new
-rule removes both, and gives up 1.35 to 1.37x at 262k items, which is inside the bar. On lockstep there is no occupancy and no such reversal -- folding is one masked pass over B*N lanes
+rule removes both, and gives up 1.35 to 1.37x at 262k items, which is inside the bar. On the xla backend there is no occupancy and no such reversal -- folding is one masked pass over B*N items
 instead of B passes, 1.27 to 1.44 times faster at 16k and 65k items (CPU, 8 cores) -- so there it is always
 taken.
 
@@ -289,7 +289,7 @@ error) turn every affected cell into a failure, which is how the matrix is known
 - **Checkpoint buffers are uninitialised.** The head, the checkpoint buffer and the segment tape are
   `tallymap_uninit` buffers (`_reverse.uninit_p`): every slot is written before it is read, by construction. The cuda
   backend declares them with no fill, and a copy of one that has not been written yet emits nothing (a copy of an
-  undefined value is undefined; the step split and loop-carry adoption would otherwise load and keep a second copy
+  undefined value is undefined; the step schedule and loop-carry adoption would otherwise load and keep a second copy
   of garbage). Every other backend gets zeros. Zero-filling 3C+1 states per item at C = 64 made the cheap-step
   `benchmarks/vs_jax` gradients up to 5x slower at 2^19 items (random_walk 0.80 -> 3.98 ms; lumen/perf d6cb9fc). The
   contract is tested, not assumed: `backends/cuda/codegen.FILL` (test-only module constant) fills every
@@ -305,7 +305,7 @@ error) turn every affected cell into a failure, which is how the matrix is known
   ALL of its uses; the detection happens at trace time. The negative control is dropping the detection, which
   gives a relative error of 0.79 to 0.89, so the test has power. This is the difference between a large
   interpolation table costing nothing extra in reverse mode and a dense per-item copy of it, which runs out of
-  memory on a GPU and takes seconds and gigabytes on the lockstep backend.
+  memory on a GPU and takes seconds and gigabytes on the xla backend.
 - **In-place updates.** The CUDA emitter updates a dead per-item array in place in `dynamic_update_slice` and in
   `scatter` (`x.at[i].set(v)` with a traced `i` is a scatter), using liveness over all active scopes, with loop
   constants, pass-through carries, predicate inputs and function parameters frozen, and never when the update or
@@ -417,9 +417,9 @@ Removed from the public surface before the first release (API decisions, so no m
 - `tm.assert_arms_differ` (and its `artifacts`), the A/B rule: measurement hygiene for the library's own
   developers, built entirely on `tm.diagnostics`. It is now `tests/ab_rule.py`, used by the tests and by
   `benchmarks/perf_negative_control.py`.
-- The option `allow_fallback` (run lockstep with a warning when `backend='auto'` on a GPU cannot compile a
+- The option `allow_fallback` (run xla with a warning when `backend='auto'` on a GPU cannot compile a
   program), with `_lockstep_cannot_run`, which kept its error from suggesting a fallback that could not run
-  either. `backend='lockstep'` is the same thing, explicit, and the cuda error now says to pass it.
+  either. `backend='xla'` is the same thing, explicit, and the cuda error now says to pass it.
 
 Dual-lanes chunking, measured on the shower-shaped program: one kernel with T lanes cost 1.34, 1.99, 2.27 and
 2.57 times the forward pass for T = 1 to 4, but 14, 23 and 32 times for T = 6, 8 and 10. Chunking into the
@@ -445,8 +445,8 @@ it with chunking by the local-memory budget is open (2026-11-04).
   extra spills offset the occupancy); carrying one segment buffer instead of allocating a fresh one per segment
   (slower); a flat K <= C sweep under a `lax.cond` (slower).
 - **Refuted: one kernel per phase, with a bounded global buffer.** Every adjoint program has exactly three
-  top-level while loops (the replay, the checkpoint pass, the sweep), so the step split, which needs exactly one,
-  never applies to an adjoint: it always runs whole-item and always gets one register allocation for all three
+  top-level while loops (the replay, the checkpoint pass, the sweep), so the step schedule, which needs exactly one,
+  never applies to an adjoint: it always runs the item schedule and always gets one register allocation for all three
   phases. Cutting the adjoint jaxpr at its top-level loops into one ItemProgram per loop, with the values that
   cross a cut as per-item results of one piece and per-item operands of the next (items in chunks of M, so the
   buffer is O(M * crossing state), 584 bytes per item on the toy walk), was implemented and measured on a
@@ -455,9 +455,9 @@ it with chunking by the local-memory budget is open (2026-11-04).
   14.2 against 10.2, ode 34.3 against 25.4, barrier 19.3 against 15.4, particle filter 31.0 against 22.1, at 20
   times the peak memory (264 MB against 12 MB on transport). Two reasons, both measured: the crossing state is a
   write and a read of the whole checkpoint buffer per item through global memory, plus a copy of it in the piece
-  that updates it; and under the step split the buffer becomes per-lane state that lives in the main kernel,
+  that updates it; and under the step schedule the buffer becomes per-lane state that lives in the main kernel,
   where ptxas puts it in registers -- phases 0 and 1 compiled to 248-255 registers with spills, and forcing
-  whole-item pieces instead (which costs the scheduling the split was for) only brought them back to 64. The
+  item-schedule pieces instead (which costs the scheduling the step schedule was for) only brought them back to 64. The
   prototype this came from was faster because its FORWARD kernel wrote the checkpoints, so it had no replay phase
   at all; that needs a residual output of the forward node, which is O(N * C * state) and so is the one thing the
   chunking cannot bound.
@@ -485,7 +485,7 @@ it with chunking by the local-memory budget is open (2026-11-04).
   forward: scheduling 1.26x, halving the warp occupancy 1.37 to 1.46x, and the rest split between the forward
   replay with its local buffer, sweeping the primal steps, and the transposes, in roughly equal thirds with the
   sweep largest. A user-level two-kernel prototype (the forward writes the first C states to a global buffer; one
-  reverse kernel does step refill over active carries only) was about twice as fast as the library's adjoint. It
+  reverse kernel refills at step granularity over active carries only) was about twice as fast as the library's adjoint. It
   is not in the library: it needs the K > C path and a residual output of the forward node at partial-evaluation
   time.
 - **The same decomposition on the public problems** (`benchmarks/vs_jax` at its sweep sizes, 2080 Ti, measured
@@ -505,7 +505,7 @@ it with chunking by the local-memory budget is open (2026-11-04).
   The replay and the checkpoint pass are half of the adjoint and the transposes about a third; on barrier and the
   particle filter a primal step costs as much as the step VJP, so `primal` is not below `grad` there and the
   transposes are free. The replay alone is 3 to 4 times the forward kernel for the same arithmetic, because the
-  adjoint runs whole items where the forward refills lanes at step granularity.
+  adjoint runs the item schedule where the forward ran the step schedule.
 - **Case taxonomy** (cost per item, with the forward pass as 1):
 
   | the parameter enters as | what it costs, and what to use |
@@ -543,7 +543,7 @@ from it are worth recording, because they are reproducible here:
 Everything in this section has a test.
 
 - **No silent failure modes left on the default path.** `backend='auto'` raises on a GPU instead of falling back
-  to the roughly 100 times slower lockstep backend (`backend='lockstep'` asks for it explicitly). A dropped spawn
+  to the roughly 100 times slower xla backend (`backend='xla'` asks for it explicitly). A dropped spawn
   child or an item truncated at `max_steps` makes the float tallies NaN by multiplying them by
   `where(affected > 0, nan, 1)`, which is exact when nothing was affected. Integer tallies cannot be NaN, so for
   those the counter in `stats` is the only signal. Out-of-range emit indices are dropped, exactly as JAX's own
@@ -712,8 +712,8 @@ commit it came from; the measurements are on that private engine.
   cliff). Measured on this tree through tallymap's own compiler path (NVRTC 12.1, sm_75, job 43057989): the spawning
   item of wavefront's `test_mulchain.py` compiles in 60.7 s at chain depth 16 and 60.8 s at 24 without the cut, 1.7 s
   with it (nvcc: 52.6 / 53.5 s -> 0.9 / 1.0 s); depth 12 is 5.3 -> 1.7 s; results bitwise equal with and without the
-  cut and to lockstep. A flat item with the same chains does not cliff (1.6-1.8 s either way), so the CI test
-  `tests/mulchain.py` is structural only (cuts present, bitwise vs lockstep, compile time a sanity bound).
+  cut and to xla. A flat item with the same chains does not cliff (1.6-1.8 s either way), so the CI test
+  `tests/mulchain.py` is structural only (cuts present, bitwise vs xla, compile time a sanity bound).
 - **A lazy value used more than once is materialised when its expression is long** (prototype `TM_MAT_MULTI` in
   the GDML calibration study's codegen patch, 2026-10-18). The emitter keeps one-use elementwise results and cheap
   ops on large table gathers lazy (`op_table._ew_rule`, rules (a) and (b)), and a lazy value is re-inlined into

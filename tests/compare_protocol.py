@@ -1,5 +1,5 @@
 """The pre-registered `compare` protocol (docs/validation.md): the statistical comparison of two implementations of
-the same item program on the same per-item keys (common random numbers), e.g. backend='cuda' vs backend='lockstep'.
+the same item program on the same per-item keys (common random numbers), e.g. backend='cuda' vs backend='xla'.
 A test protocol, not library API.  The criteria (criteria()) were pre-registered and are frozen.
 
     from compare_protocol import compare
@@ -29,7 +29,7 @@ def _ulp(a):
 
 
 def compare(f, *args, other, floor_fn, perturb=_ulp, rtol=1e-4, k_floor=5.0, verbose=True):
-    """f, other: callables returning tallymap.Result for the same item program (e.g. backend='cuda' vs 'lockstep').
+    """f, other: callables returning tallymap.Result for the same item program (e.g. backend='cuda' vs 'xla').
     The control is `other` run on 1-ulp perturbed float inputs (perturb).  floor_fn: the same item program with
     every emitted value squared (its tallies are the per-bin sums of w^2), usually on other's backend.
     Criteria (criteria()), all required:

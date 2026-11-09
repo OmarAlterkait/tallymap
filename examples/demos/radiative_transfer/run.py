@@ -21,7 +21,7 @@ on `PYTHONPATH`, or point `--raytrax` at the clone; see this demo's README.
   jax_ckpt          `jax_scan_shared` with a recursively checkpointed (nested, remat'd) scan.
   tm                tallymap: item = one ray, tally = `Sum((G^3,))`, and the ray's own `while_loop` stops when
                     it leaves the box.
-  tm_exact          the same with `Sum(..., exact=True)`, the int64 fixed-point accumulator.
+  tm_exact          the same with `Sum(..., fixed_point=True)`, the int64 fixed-point accumulator.
 
 The step function is written once in this file and every arm calls it, except the two library arms, which call
 the library.  `--quick` checks all of them against each other and against an f64 run of the same program.
@@ -60,7 +60,7 @@ DS = 0.5                        # ray-march step in grid units (Ray-trax's defau
 HORIZON = {"low": 1.0, "mid": 2.0, "high": 4.0}
 BATCH_BYTES = 1 << 30           # cap for ONE micro-batch of per-ray grids in the raytrax_b arm
 RAY_ARMS = ("tm", "tm_exact", "raytrax", "raytrax_b", "jax_scan_shared", "jax_ckpt")
-RAY_LABEL = {"tm": "tallymap", "tm_exact": "tallymap, exact=True", "raytrax": "Ray-trax (shipped)",
+RAY_LABEL = {"tm": "tallymap", "tm_exact": "tallymap, fixed_point=True", "raytrax": "Ray-trax (shipped)",
              "raytrax_b": "Ray-trax (micro-batched)", "jax_scan_shared": "plain-JAX shared scan",
              "jax_ckpt": "shared scan + remat"}
 
@@ -141,7 +141,7 @@ def march_step(G, jf, kf, x, y, z, I, tau):
     return I2, tau + dtau, [(ii, wi * dep) for wi, ii in zip(w, idx)]
 
 
-def ray_tm(G, maxs, exact=False, **o):
+def ray_tm(G, maxs, fixed_point=False, **o):
     def ray(t, d, jf, kf, src):
         def body(c):
             x, y, z, I, tau, k, t = c
@@ -152,7 +152,7 @@ def ray_tm(G, maxs, exact=False, **o):
         c = (src[0], src[1], src[2], jnp.float32(0.0), jnp.float32(0.0), jnp.int32(0), t)
         x, y, z, I, tau, k, t = lax.while_loop(lambda c: inside_box(G, c[0], c[1], c[2]), body, c)
         return t, k
-    return tm.vmap(ray, outputs={"J": tm.Sum((G ** 3,), exact=exact)}, in_axes=(0, None, None, None),
+    return tm.vmap(ray, outputs={"J": tm.Sum((G ** 3,), fixed_point=fixed_point)}, in_axes=(0, None, None, None),
                    max_steps=maxs, **o)
 
 
@@ -212,7 +212,7 @@ def ray_setup(a):
 def ray_sims(arm, a, G, maxs, dirs, src, batch, seg):
     """-> (sim(jf, kf) -> flat J, steps_fn or None)."""
     if arm in ("tm", "tm_exact"):
-        f = ray_tm(G, maxs, exact=(arm == "tm_exact"))
+        f = ray_tm(G, maxs, fixed_point=(arm == "tm_exact"))
         return (lambda jf_, kf_: f(dirs, jf_, kf_, src).outputs["J"],
                 lambda jf_, kf_: np.asarray(jax.jit(lambda j, k: f(dirs, j, k, src).per_item)(jf_, kf_)))
     if arm in ("jax_scan_shared", "jax_ckpt"):

@@ -40,7 +40,7 @@ GROUP = "natural"
 AXIS = "n"
 SWEEP = {"full": (1 << 12, 1 << 14, 1 << 16, 1 << 18), "quick": (1 << 7, 1 << 9)}
 DIVS = ("mid", "low", "high")
-ARMS = ("tm_cuda", "tm_lockstep", "jax_gen", "jax_gen2x")
+ARMS = ("tm_cuda", "tm_xla", "jax_gen", "jax_gen2x")
 MODES = ("fwd", "grad")
 CHECK_VAL = 1 << 7
 DIV_VAL = 1 << 16      # the other divergence levels are measured at this one size
@@ -140,7 +140,7 @@ def sim_of(ctx, arm, maxs):
             s, t = lax.while_loop(lambda c: cond(c[0]), body, (s, t))
             return t
         f = tm.vmap(particle, outputs={"dep": tm.Sum((NZ,))}, in_axes=(0, None), spawn=tm.Queue(queue_capacity(ctx)),
-                    backend="cuda" if arm == "tm_cuda" else "lockstep")
+                    backend="cuda" if arm == "tm_cuda" else "xla")
         return lambda th: f(roots, th).outputs["dep"]
 
     caps = capacities(ctx, arm, ctx.get("populations") or [n] * (DEPTH + 1))
@@ -211,12 +211,12 @@ def check(ctx, maxs):
     import tallymap as _tm
     f = tm.vmap(lambda t, s, th: _particle_for_stats(t, s, th, ctx["psplit"]),
                 outputs={"dep": tm.Sum((NZ,))}, in_axes=(0, None), spawn=tm.Queue(queue_capacity(ctx)),
-                backend="lockstep", rev_stats=True)
+                backend="xla", rev_stats=True)
     r = jax.jit(f)(ctx["roots"], ctx["th"])
     jax.jit(jax.grad(lambda th: jnp.sum(ctx["wz"] * f(ctx["roots"], th).outputs["dep"])))(ctx["th"])
     tree = _tm.diagnostics()["reverse"].get("tree", {})
     out.update(queue_capacity=queue_capacity(ctx), spawned=int(r.stats["spawned"]),
-               dropped=int(r.stats["dropped"]), drop_risk=bool(tree.get("drop_risk", True)),
+               dropped=int(r.stats["children_dropped"]), drop_risk=bool(tree.get("drop_risk", True)),
                replay_mismatch=int(tree.get("replay_mismatch", -1)))
     return out
 

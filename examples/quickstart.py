@@ -1,6 +1,6 @@
 """tallymap in one page: a random walk per item, results summed into a histogram (a "tally").
 
-    python examples/quickstart.py          # CPU: the lockstep backend; GPU: one CUDA kernel
+    python examples/quickstart.py          # CPU: the xla backend; GPU: one CUDA kernel
 
 Each item (a walker) runs its own while_loop with its own number of steps.  tallymap.vmap maps the item over N
 walkers; its meaning is exactly jax.vmap(item) followed by a sum over items, and every JAX transformation works.

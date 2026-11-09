@@ -29,7 +29,7 @@ GROUP = "natural"
 AXIS = "n"
 SWEEP = {"full": (1 << 14, 1 << 16, 1 << 19, 1 << 22), "quick": (1 << 10, 1 << 12)}
 DIVS = ("mid", "low", "high")
-ARMS = ("tm_cuda", "tm_lockstep", "jax_while", "jax_scan", "jax_scan2x", "jax_ckpt", "jax_ckpt2x")
+ARMS = ("tm_cuda", "tm_xla", "jax_while", "jax_scan", "jax_scan2x", "jax_ckpt", "jax_ckpt2x")
 MODES = ("fwd", "jvp", "jacfwd", "grad")
 CHECK_VAL = 1 << 12
 DIV_VAL = 1 << 19      # the other divergence levels are measured at this one size
@@ -80,7 +80,7 @@ def sim_of(ctx, arm, maxs):
             k, w, t = lax.while_loop(lambda c: c[1] > WMIN, body, (jnp.int32(0), jnp.float32(1.0), t))
             return t, k
         f = tm.vmap(walker, outputs={"hist": tm.Sum((NB,))}, in_axes=(0, 0, None),
-                    backend="cuda" if arm == "tm_cuda" else "lockstep")
+                    backend="cuda" if arm == "tm_cuda" else "xla")
         return lambda th: f(keys, decay, th).outputs["hist"]
 
     vstep = jax.vmap(step, in_axes=((0, 0), 0, 0, None))

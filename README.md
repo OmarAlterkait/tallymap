@@ -6,9 +6,9 @@ Dr.Jit-style per-thread execution of divergent Monte Carlo loops, as a JAX primi
 You write one ordinary JAX function of ONE item, with its own `lax.while_loop`, its own trip count, its own
 gathers and its own `jax.random` draws: one walker, one photon, one trajectory, one chain. `tm.vmap` maps it over
 N independent items whose results go into commutative sums, called tallies. On an NVIDIA GPU the item compiles to
-a single CUDA kernel in which a lane picks up a new item as soon as its current one finishes, so a batch costs
-the *average* item rather than the longest. Everywhere else it runs the lockstep backend, a masked plain-JAX
-interpreter over lanes that doubles as the reference implementation. Because it is all one JAX primitive, `jit`, `vmap`,
+a single CUDA kernel in which each GPU thread runs one item at that item's own trip count and then claims the
+next, so a batch does not cost its longest item times the batch size. Everywhere else it runs the xla backend, a
+masked plain-JAX interpreter. Because it is all one JAX primitive, `jit`, `vmap`,
 `grad`, `jvp`, `jacfwd`, `jacrev`, `hessian`, `checkpoint` and `shard_map` work on it, and the result means
 exactly `jax.vmap(item)` followed by a sum. tallymap was built for in-house photon-transport and particle-shower
 engines and has nothing in it about either.
@@ -98,7 +98,7 @@ Uniform loops still gain 1.8 to 2.9x here, but nothing like the divergent cases.
   tallymap. On the one workload where that was measured, a hand-tuned kernel was slightly ahead. The claim is
   that you get close to that without writing CUDA, and you get `jvp`, `vmap`, `grad` and `hessian` for free.
 - **`jax.experimental.pallas`.** The one that looks like it should be the answer. Pallas on GPU lowers through
-  Triton, which is built around uniform block-level control flow; a per-lane data-dependent `while_loop` with a
+  Triton, which is built around uniform block-level control flow; a per-thread data-dependent `while_loop` with a
   work queue is not that programming model, and Pallas is explicitly experimental.
 
 <!-- perf:begin libraries -->
@@ -117,7 +117,7 @@ JAX 0.11.2; each demo's README states where the margin shrinks or tallymap loses
 | `adaptive_quadrature` | quadax 0.3.0 `quadgk` | 3-18x forward, 12x gradient, 98-380x less memory |
 | `branching_epidemic` | a plain-JAX generation-frontier program | 4-14x forward, 5-8x `jacfwd`; reverse is a tie |
 
-**On CPU** there is only the lockstep backend, which is plain JAX. Measured at N = 65,536, its forward pass is
+**On CPU** there is only the xla backend, which is plain JAX. Measured at N = 65,536, its forward pass is
 within 0.7x to 1.3x of the best plain-JAX program on the natural problems. Its gradient is 3x to 7x SLOWER than a
 padded `lax.scan` given the oracle step cap (`docs/performance.md`, "cpu"). What it buys you there is a gradient
 through a `lax.while_loop` without choosing a cap, and memory proportional to the outputs. It does not buy speed.
@@ -126,7 +126,7 @@ through a `lax.while_loop` without choosing a cap, and memory proportional to th
 ## Install
 
 ```
-pip install tallymap                 # CPU: the lockstep backend, plain JAX
+pip install tallymap                 # CPU: the xla backend, plain JAX
 pip install 'tallymap[cuda]'         # + JAX's CUDA 12 plugin and NVRTC (quote it: zsh treats [] as a glob)
 ```
 
@@ -188,9 +188,10 @@ A tally indexed by a TUPLE is the right way to get per-item vector outputs: `Sum
 
 Three sentences, and everything else follows from them.
 
-1. **One item is one GPU thread running its own loop.** Not one lane of a wide batch: a real thread with its own
-   trip count, whose state lives in registers. When it finishes, the lane takes the next item. This is why the
-   batch costs the average item and not the longest one, and why a per-item state of tens of scalars is fast
+1. **One item is one GPU thread running its own loop.** Not one element of a wide batch: a real thread with its
+   own trip count, whose state lives in registers. When it finishes, the thread takes the next item (with
+   `schedule='step'`, already at the end of each loop step). This is why the batch does not cost its longest item
+   times the batch size, and why a per-item state of tens of scalars is fast
    while a per-item D x D matrix is not.
 2. **Tallies are atomic sums.** There is no per-item output array. Every `t.add` goes into one accumulator, in
    shared memory when the output is small enough and in global memory otherwise. Sums are commutative, so the
@@ -211,7 +212,7 @@ loop level recursively, so memory stays O(1) per item.
 This matters most for numerical methods that are themselves iterative inside each step. An implicit (stiff) ODE
 solver has three nested loops: adaptive time steps, the Runge-Kutta stages of each step, and a Newton or chord
 solve inside each stage. Under `jax.vmap` every one of those loops runs to the batch maximum, and each finished
-lane executes masked iterations. In a tallymap item each loop runs exactly as often as that item needs.
+item executes masked iterations. In a tallymap item each loop runs exactly as often as that item needs.
 
 Measured on one L40S. The workload is an ensemble of stiff 3-state ODEs integrated with a Kvaerno3 / chord /
 PID-controller algorithm, written as a tallymap item, against `jax.vmap(diffrax.diffeqsolve(...))` with the same
@@ -247,7 +248,7 @@ Measured (XLA temp memory, CPU, JAX 0.5.3 and 0.11.2 identical). The setup is a 
 | `cond(p, while-loop reading the table, 0)` under `jax.vmap` | 1,152 MiB | 9,216 MiB (1.00 copy per item) |
 | the same work with `p` moved into the trip count, no `cond` | 0.0 MiB | 0.1 MiB |
 | `cond` around straight-line reads | 0.0 MiB | 0.0 MiB |
-| tallymap, lockstep backend (the cuda backend runs a real branch) | 0.0 MiB | 0.3 MiB |
+| tallymap, xla backend (the cuda backend runs a real branch) | 0.0 MiB | 0.3 MiB |
 
 A ray tracer that tests a BVH leaf's triangles in an inner loop hits exactly this. With 32,768 triangles,
 `jax.vmap` asked for 104 GiB at 65,536 rays, and 6.5 TiB at 4.2M.
@@ -292,24 +293,25 @@ non-zero count almost always means an off-by-one in your binning: `(x * NB).asty
 
 ### f32 tally accumulation
 
-`tm.Sum(shape, dtype=float32, exact=False)`. f32 sums over millions of emits lose low-order bits, and forward and
+`tm.Sum(shape, dtype=float32, fixed_point=False)`. f32 sums over millions of emits lose low-order bits, and forward and
 reverse mode accumulate in different orders, so their derivatives agree only to that accumulation error, which
-can be 1e-4 relative on a large tree and varies from run to run on a GPU. With `exact=True` the sum is
-accumulated in int64 fixed point: bitwise order-independent, identical across backends and schedules (the
-lockstep backend needs `jax_enable_x64` for it). Unrepresentable values are dropped and counted in
-`stats['exact_overflow']`, and the bin they were emitted to is NaN. Each kernel flags its own bins, so a tangent
-overflow makes that tangent bin NaN on every jvp / jacfwd / linearize path and leaves the primal finite. Use `exact=True` when derivatives of very large sums must agree tightly, or when you
+can be 1e-4 relative on a large tree and varies from run to run on a GPU. With `fixed_point=True` the sum is
+accumulated in int64 fixed point (each value rounded to a multiple of `1/scale`): bitwise order-independent,
+identical across backends and schedules (the xla backend needs `jax_enable_x64` for it). Unrepresentable values
+are dropped and counted in `stats['fixed_point_overflow']`, and the bin they were emitted to is NaN. Each kernel
+flags its own bins, so a tangent overflow makes that tangent bin NaN on every jvp / jacfwd / linearize path and
+leaves the primal finite. Use `fixed_point=True` when derivatives of very large sums must agree tightly, or when you
 need run-to-run reproducibility on a GPU.
 
 ### Sizing the spawn Queue
 
 `t.spawn(child, when=...)` needs `tm.vmap(..., spawn=tm.Queue(capacity))`. The child runs the same function and
 its per-item result is discarded. The Queue holds the **pending** children, not all of them. A child that does
-not fit is dropped, counted in `stats['dropped']`, and makes the call's float tallies NaN.
+not fit is dropped, counted in `stats['children_dropped']`, and makes the call's float tallies NaN.
 
 How many children are pending at once depends on your program and on the scheduling, so **measure it once per
 configuration**: run with a large Queue, read `stats['spawned']` (the tree size), then size the Queue and confirm
-`stats['dropped'] == 0`. As a rule of thumb the forward pass needs a power of two at least 0.65 times the
+`stats['children_dropped'] == 0`. As a rule of thumb the forward pass needs a power of two at least 0.65 times the
 children per call. **Reverse mode needs capacity >= ALL children of the call**, because the tree adjoint records
 the whole tree, and a tree larger than the capacity gives a NaN gradient rather than a wrong one. The tree
 adjoint's memory is proportional to capacity times the per-item state size, which is what bounds how much of a
@@ -400,7 +402,7 @@ common cause is first:
    for overflow or a division by zero in the tangent of your own program, which is easy to produce in a diverging
    iteration.
 2. **Otherwise look at `stats`.** A truncated item (`stats['n_truncated']`) or a dropped spawn child
-   (`stats['dropped']`) poisons float tallies on purpose, and the forward pass is NaN too.
+   (`stats['children_dropped']`) poisons float tallies on purpose, and the forward pass is NaN too.
 3. **Only then suspect a reverse-mode check.** Reverse mode through spawn (the tree adjoint) checks that the
    recorded tree fits the Queue and that its two recording passes agree; a failed check makes that call's float
    cotangents NaN, so a gradient is never silently wrong. Rerun with `rev_stats=True` and read the counters:
@@ -417,10 +419,10 @@ item jaxprs and generated kernels. `tm.diagnostics(f, *args)` reports what `jax.
 
 | option | default | meaning |
 |---|---|---|
-| `backend` | `'auto'` | `'auto'`: cuda on a GPU, where a program the cuda emitter cannot compile raises `tm.UnsupportedError` (pass `backend='lockstep'` to run it; it never falls back on its own, because lockstep is about 100x slower); lockstep elsewhere, with a one-time warning. `'cuda'`: cuda or raise. `'lockstep'`: always the plain-JAX interpreter, slow by design, the reference. |
-| `cuda_math` | `'approx'` | cuda f32 division, sqrt and rsqrt. `'approx'`: the PTX XLA:GPU itself emits, so it is the arithmetic a plain JAX program on the same GPU gets. `'ieee'`: correctly rounded, the portable reference, about 1.5x slower. |
+| `backend` | `'auto'` | `'auto'`: cuda on a GPU, where a program the cuda emitter cannot compile raises `tm.UnsupportedError` (pass `backend='xla'` to run it; it never falls back on its own, because the xla backend is about 100x slower); the xla backend elsewhere, with a one-time warning. `'cuda'`: cuda or raise. `'xla'`: always the plain-JAX interpreter, slow by design. |
+| `cuda_math` | `'approx'` | cuda f32 division, sqrt and rsqrt. `'approx'`: the PTX XLA:GPU itself emits, so it is the arithmetic a plain JAX program on the same GPU gets. `'ieee'`: correctly rounded and portable, about 1.5x slower. |
 | `schedule` | `'item'` | cuda: `'item'`, a thread runs one whole item at a time. `'step'`, the step schedule: a thread is refilled with a new item at loop-step granularity, so it does not idle while the longest item of its warp finishes. `'step'` needs an item with exactly one top-level `while_loop` and raises `tm.UnsupportedError` (saying why) otherwise. Neither wins everywhere (3.0x either way on real workloads), so measure yours; `tm.diagnostics()['kernels']` names the schedule each kernel ran. |
-| `lockstep_block` | `2**18` | lockstep backend: lanes per block, which bounds its memory. |
+| `xla_batch_size` | `2**18` | xla backend: items per batch, which bounds its memory. |
 | `rev_checkpoints` | `'auto'` | reverse mode: checkpoint buffer size C. `'auto'`: 16 for a loop step of fewer than 1000 equations, else the largest of 4 ... 64 whose 3C+1 states (single-loop adjoint: 2C+1) fit 64 KiB. A loop of K <= C steps is not replayed; O(K) work for K <= C^2. |
 | `rev_stats` | `False` | reverse through spawn: report the tree adjoint's counts to the host. Off by default because a host callback takes `jax.jit` off its C++ fast path, which can cost an order of magnitude. |
 
@@ -458,10 +460,10 @@ except through the spawn tree adjoint, which raises.
 
 What is explicitly out of scope, so that you do not have to find out by trying:
 
-- **No TPU and no ROCm.** Any non-CUDA platform runs the lockstep backend, which is correct and about 100x
+- **No TPU and no ROCm.** Any non-CUDA platform runs the xla backend, which is correct and about 100x
   slower than the CUDA backend.
 - **`jax.export` of a CUDA program is unsupported.** Its custom call is not on JAX's export allow-list and its
-  kernels are registered per process, so a deserialised CUDA program is not portable. Lockstep programs export
+  kernels are registered per process, so a deserialised CUDA program is not portable. Programs on the xla backend export
   normally.
 - **No second-order derivatives through spawn.** The tree adjoint raises for them.
 - **A100 and H200 are untested.** Nothing suggests they will not work; no tuning constant was measured on them.
@@ -470,7 +472,7 @@ What is explicitly out of scope, so that you do not have to find out by trying:
   AROUND a call (that is JAX's own limitation, not tallymap's), 2^31 items or more in one call, and unknown
   option names.
 - **An `UnsupportedError` on a primitive the CUDA emitter does not know is a normal bug report**, not a dead end.
-  Add `backend='lockstep'` and your program will run; attach `tm.diagnostics()` to the issue. Adding a primitive
+  Add `backend='xla'` and your program will run; attach `tm.diagnostics()` to the issue. Adding a primitive
   is usually one rule plus one test row (`CONTRIBUTING.md`).
 
 ## Tests, examples, citation, licence

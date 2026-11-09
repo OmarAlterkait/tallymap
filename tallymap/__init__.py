@@ -22,7 +22,7 @@ from ._tally import Tally
 
 def supported_primitives():
     """-> [dict(name, how)]: every primitive the cuda backend compiles, and how ('rule' | 'canonicalised' |
-    'tally').  Anything else raises UnsupportedError on cuda; the lockstep backend runs every JAX primitive.
+    'tally').  Anything else raises UnsupportedError on cuda; the xla backend runs every JAX primitive.
     The same table: docs/primitives.md."""
     from .backends.cuda.census import supported_primitives as f
     return f()

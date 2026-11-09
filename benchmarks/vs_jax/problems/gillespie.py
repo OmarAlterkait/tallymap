@@ -31,7 +31,7 @@ GROUP = "natural"
 AXIS = "n"
 SWEEP = {"full": (1 << 14, 1 << 16, 1 << 18, 1 << 20), "quick": (1 << 7, 1 << 9)}
 DIVS = ("mid", "low", "high")
-ARMS = ("tm_cuda", "tm_lockstep", "jax_while", "jax_scan", "jax_scan2x")
+ARMS = ("tm_cuda", "tm_xla", "jax_while", "jax_scan", "jax_scan2x")
 MODES = ("fwd", "score")
 CHECK_VAL = 1 << 7
 DIV_VAL = 1 << 18      # the other divergence levels are measured at this one size
@@ -111,7 +111,7 @@ def sim_of(ctx, arm, maxs, score=False):
         if score:
             outs["dmean"] = tm.Sum((1,))
         f = tm.vmap(real, outputs=outs, in_axes=(0, 0, None),
-                    backend="cuda" if arm == "tm_cuda" else "lockstep")
+                    backend="cuda" if arm == "tm_cuda" else "xla")
         def tm_call(c):
             r = f(x0, keys, c)
             return (r.outputs["hist"], r.outputs["dmean"][0] / n) if score else r.outputs["hist"]

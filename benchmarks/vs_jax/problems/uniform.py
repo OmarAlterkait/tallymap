@@ -39,7 +39,7 @@ GROUP = "floor"
 AXIS = "n"
 SWEEP = {"full": (1 << 14, 1 << 16, 1 << 19, 1 << 22), "quick": (1 << 10, 1 << 12)}
 DIVS = ("end_only", "per_step")
-ARMS = ("tm_cuda", "tm_lockstep", "jax_while", "jax_scan", "jax_scan2x", "jax_ckpt", "jax_ckpt2x")
+ARMS = ("tm_cuda", "tm_xla", "jax_while", "jax_scan", "jax_scan2x", "jax_ckpt", "jax_ckpt2x")
 MODES = ("fwd", "jvp", "jacfwd", "grad")
 CHECK_VAL = 1 << 12
 DIV_VAL = 1 << 19      # the other level is measured at this one size
@@ -79,7 +79,7 @@ def sim_of(ctx, arm, maxs):
                 t = t.add("hist", b, v)
             return t, k
         f = tm.vmap(walker, outputs={"hist": tm.Sum((NB,))}, in_axes=(0, None),
-                    backend="cuda" if arm == "tm_cuda" else "lockstep")
+                    backend="cuda" if arm == "tm_cuda" else "xla")
         return lambda th: f(keys, th).outputs["hist"]
 
     if not per_step:

@@ -8,7 +8,7 @@
 Both take the value they "modify" as an operand and return its successor, so the user threads the Tally through
 their loops like a PRNG key.  This data dependency is what keeps emits alive through every JAX transformation
 (no effects system, no DCE hazards), and it gives emit_p a plain dense meaning: outside tallymap.vmap, a Tally is just
-an array and jax.vmap(item)(xs) followed by a sum over items IS the reference semantics.
+an array and jax.vmap(item)(xs) followed by a sum over items IS the semantics (tm.reference computes it).
 """
 import jax
 import jax.numpy as jnp
@@ -50,9 +50,9 @@ def _emit_dense(t, idx, val):
 def _emit_abstract(t, idx, val):
     L = t.shape[:-1]
     if tuple(val.shape) != tuple(L) + tuple(idx.shape):
-        raise TypeError(f"tallymap emit: value shape {val.shape} != tally lead {L} + index shape {idx.shape}")
+        raise TypeError(f"tallymap: t.add(...): value shape {val.shape} != tally lead {L} + index shape {idx.shape}")
     if not jnp.issubdtype(idx.dtype, jnp.integer):
-        raise TypeError(f"tallymap emit: index dtype {idx.dtype} is not an integer")
+        raise TypeError(f"tallymap: t.add(...): index dtype {idx.dtype} is not an integer")
     return ShapedArray(t.shape, t.dtype)
 
 
@@ -201,7 +201,7 @@ class Tally:
             flat = flat.astype(jnp.int32)
         if (not jnp.issubdtype(t.dtype, jnp.inexact) and not isinstance(value, (int, float))
                 and jnp.issubdtype(jnp.asarray(value).dtype, jnp.inexact)):
-            raise TypeError(f"tallymap: float value emitted into integer output {name!r}")
+            raise TypeError(f"tallymap: t.add({name!r}, ...): a float value added to an integer output")
         val = jnp.broadcast_to(jnp.asarray(value), t.shape[:-1] + flat.shape)
         return self._with(name, emit_p.bind(t, flat, val.astype(t.dtype)))
 
@@ -221,5 +221,5 @@ class Tally:
 
 def _check_int(i):
     if not jnp.issubdtype(jnp.asarray(i).dtype, jnp.integer):
-        raise TypeError(f"tallymap: emit index must be an integer array, got {jnp.asarray(i).dtype}")
+        raise TypeError(f"tallymap: t.add(...): the index must be an integer array, got {jnp.asarray(i).dtype}")
 

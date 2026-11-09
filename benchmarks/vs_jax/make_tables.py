@@ -31,7 +31,7 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 # arm -> (colour, marker, label).  Fixed per entity, never assigned by rank.
 ARM = {
     "tm_cuda":     ("#2a78d6", "o", "tallymap (cuda)"),
-    "tm_lockstep": ("#7c4dbd", "v", "tallymap (lockstep)"),
+    "tm_xla": ("#7c4dbd", "v", "tallymap (xla)"),
     "jax_while":   ("#eb6834", "s", "jax.vmap + while_loop"),
     "jax_scan":    ("#1baf7a", "^", "padded scan (oracle)"),
     "jax_scan2x":  ("#1baf7a", "^", "padded scan (2x cap)"),
@@ -159,7 +159,7 @@ def panel(rows, problem, mode, field, ylabel, out, plat, div):
     return name
 
 
-def best_baseline(rows, problem, mode, val, div, plat, exclude=("tm_cuda", "tm_lockstep")):
+def best_baseline(rows, problem, mode, val, div, plat, exclude=("tm_cuda", "tm_xla")):
     """The FASTEST plain-JAX arm at this point: the number tallymap actually has to beat."""
     rs = [r for r in sel(rows, status="ok", problem=problem, mode=mode, val=val, div=div,
                          platform=plat[0], jax=plat[1]) if r["arm"] not in exclude and r.get("ms")]
@@ -230,11 +230,11 @@ def pad_table(rows, problem, div, plat):
 
 def speedups(rows, problem, div, plat):
     """-> list of (val, mode, tm ms, best baseline arm, best baseline ms, ratio).  The tallymap arm is the cuda
-    backend, or the lockstep backend on a platform without one (the CPU rows)."""
+    backend, or the xla backend on a platform without one (the CPU rows)."""
     out = []
     for mode in ("fwd", "grad"):
         tm = [ok(rows, problem=problem, mode=mode, arm=a, div=div, platform=plat[0], jax=plat[1])
-              for a in ("tm_cuda", "tm_lockstep")]
+              for a in ("tm_cuda", "tm_xla")]
         for r in tm[0] or tm[1]:
             b = best_baseline(rows, problem, mode, r["val"], div, plat)
             if b:
@@ -323,7 +323,7 @@ repository.
 | arm | what it is | modes |
 |---|---|---|
 | `tallymap (cuda)` | `tm.vmap`, one persistent-thread CUDA kernel | all |
-| `tallymap (lockstep)` | `tm.vmap`, the masked reference interpreter (the only backend on CPU) | all |
+| `tallymap (xla)` | `tm.vmap`, the masked plain-JAX interpreter (the only backend on CPU) | all |
 | `jax.vmap + while_loop` | `jax.vmap` of the SAME item with its `lax.while_loop`, then one `.at[].add` | forward only |
 | `padded scan` | `jax.vmap` of the same item rewritten as a masked `lax.scan` | all |
 | `padded scan + remat` | the same with a nested `jax.checkpoint`-ed inner scan | all |
@@ -358,7 +358,7 @@ These are f32 programs. Two arms sum the same per-item values in a different ord
 reassociation-level agreement, not bitwise equality. The tolerances the agreement cell is read against:
 
 * **a tally, arm against arm: 1e-6 relative.** One f32 ulp is about 1.2e-7, and a sum over millions of emits
-  loses a few more low-order bits. `tm.Sum(exact=True)` is the fix when bit-reproducibility matters.
+  loses a few more low-order bits. `tm.Sum(fixed_point=True)` is the fix when bit-reproducibility matters.
 * **a tally whose index comes from a comparison: 1e-4 relative.** An escape sensor or a knock-out decision can
   flip on a 1-ulp difference. The items that flip are the ones sitting on the boundary and they contribute
   almost nothing to the tally, but the relative figure is larger than an ulp.
@@ -399,7 +399,7 @@ NOTES = {
                    "persistent-thread kernel runs a D x D matvec as scalar code; `jax.vmap` turns it into one "
                    "batched GEMM. The crossover in D is the number to quote, and the gradient crosses over "
                    "much earlier than the forward pass does. Note also the agreement: this is the one problem "
-                   "where the cuda backend and the lockstep backend differ by more than an ulp (about 4e-3). "
+                   "where the cuda backend and the xla backend differ by more than an ulp (about 4e-3). "
                    "A D x D matvec is a `dot_general`, the cuda backend lowers it as scalar code, XLA sums it "
                    "in a different order, and eight `tanh` steps amplify the difference. It is a reassociation "
                    "difference, not a defect, and it is another reason this shape belongs to `jax.vmap`.",
@@ -507,11 +507,11 @@ def main():
                    "other arms share, so diffrax is given the realistic 2x cap rather than the oracle one.\n")
         for mode in ("fwd", "jvp", "jacfwd", "grad"):
             doc.append(table(rows, "ode_ensemble", mode, "mid", dfx,
-                             ["tm_cuda", "tm_lockstep", "jax_scan2x", "jax_ckpt2x", "diffrax"]))
+                             ["tm_cuda", "tm_xla", "jax_scan2x", "jax_ckpt2x", "diffrax"]))
         doc.append(table(rows, "ode_ensemble", "grad", "mid", dfx,
                          ["tm_cuda", "jax_ckpt2x", "diffrax"], field="peak_mb", unit="peak MB"))
     doc.append("\n## Other platforms\n\n"
-               "The same `fwd` and `grad` rows on every machine measured. The CPU rows have only the lockstep "
+               "The same `fwd` and `grad` rows on every machine measured. The CPU rows have only the xla "
                "backend: the cuda backend needs a GPU, and `tm.vmap` says so.\n\n"
                "A CPU row is a shared machine: 16 cores of a 64-core node, with other jobs on the rest of it. "
                "Every arm of one problem is measured in the same job, one cell after another, so a RATIO within "
@@ -521,7 +521,7 @@ def main():
         doc.append(f"\n### {pl[0]}, JAX {pl[1]}\n")
         doc.append(headline(rows, pl))
     doc.append("\n## Cross-arm agreement\n\n"
-               "`rel_<arm>` is the largest relative difference between that arm's tally and the lockstep "
+               "`rel_<arm>` is the largest relative difference between that arm's tally and the xla "
                "backend's, at the problem's check size with every arm in one process. `rel_grad_vs_jacfwd` is "
                "reverse against forward mode of the same tallymap program. One f32 ulp is about 1e-7.\n")
     doc.append(agreement(rows, prim))

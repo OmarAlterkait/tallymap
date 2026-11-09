@@ -32,7 +32,7 @@ GROUP = "natural"
 AXIS = "n"
 SWEEP = {"full": (1 << 14, 1 << 16, 1 << 19, 1 << 22), "quick": (1 << 10, 1 << 12)}
 DIVS = ("mid", "low", "high")
-ARMS = ("tm_cuda", "tm_lockstep", "jax_while", "jax_scan", "jax_scan2x", "jax_ckpt", "jax_ckpt2x")
+ARMS = ("tm_cuda", "tm_xla", "jax_while", "jax_scan", "jax_scan2x", "jax_ckpt", "jax_ckpt2x")
 MODES = ("fwd", "jvp", "jacfwd", "grad")
 CHECK_VAL = 1 << 12
 DIV_VAL = 1 << 19      # the other divergence levels are measured at this one size
@@ -88,7 +88,7 @@ def sim_of(ctx, arm, maxs):
             t = t.add("ko", 0, (~c[2]).astype(jnp.float32))
             return t, (p[NK // 2], c[0])
         f = tm.vmap(path, outputs={"price": tm.Sum((NK,)), "ko": tm.Sum((1,))}, in_axes=(0, None, None),
-                    backend="cuda" if arm == "tm_cuda" else "lockstep")
+                    backend="cuda" if arm == "tm_cuda" else "xla")
         return lambda th: f(keys, th, strikes).outputs["price"] / n
 
     def one(key, th):

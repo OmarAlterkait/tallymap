@@ -6,8 +6,7 @@ body:
     attributes:
       value: |
         Two things make a report quick to act on: the output of `tm.diagnostics()`, and whether the problem also
-        happens with `backend='lockstep'`. The lockstep backend is plain JAX and is the reference
-        implementation, so it tells us immediately whether the problem is in the CUDA emitter or in the
+        happens with `backend='xla'`. The xla backend is plain JAX, so it tells us immediately whether the problem is in the CUDA emitter or in the
         library's semantics.
 
         Before filing a NaN gradient, please check the order in the README section "When a gradient is NaN,
@@ -46,11 +45,11 @@ body:
       required: true
 
   - type: dropdown
-    id: lockstep
+    id: xla
     attributes:
-      label: Does it also happen with backend='lockstep'?
+      label: Does it also happen with backend='xla'?
       options:
-        - "Yes, lockstep too"
+        - "Yes, the xla backend too"
         - "No, only the cuda backend"
         - "Not applicable (it raises before a backend is chosen)"
         - "Not tried"

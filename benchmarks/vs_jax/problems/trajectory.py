@@ -24,7 +24,7 @@ GROUP = "bad-fit"
 AXIS = "L"
 SWEEP = {"full": (8, 16, 32, 64, 128, 256), "quick": (16, 64)}
 DIVS = ("none",)
-ARMS = ("tm_cuda", "tm_lockstep", "jax_scan")      # the trip count is fixed: a while_loop arm
+ARMS = ("tm_cuda", "tm_xla", "jax_scan")      # the trip count is fixed: a while_loop arm
                                                    # would be the same program as the scan one
 MODES = ("fwd",)
 CHECK_VAL = 16
@@ -56,7 +56,7 @@ def sim_of(ctx, arm, maxs):
                                (jnp.int32(0), jnp.float32(1.0), jnp.zeros((ell,), jnp.float32)))
             return t.add("s", 0, c[1]), c[2]
         f = tm.vmap(item, outputs={"s": tm.Sum((1,))}, in_axes=(0, None),
-                    backend="cuda" if arm == "tm_cuda" else "lockstep")
+                    backend="cuda" if arm == "tm_cuda" else "xla")
         return lambda th: f(keys, th).per_item
 
     def one(key, th):
@@ -76,7 +76,7 @@ def measured(ctx, arm, mode, maxs):
 
 
 def check(ctx, maxs):
-    ref = jax.jit(sim_of(ctx, "tm_lockstep", maxs))(ctx["th"])
+    ref = jax.jit(sim_of(ctx, "tm_xla", maxs))(ctx["th"])
     out = {}
     for arm in ("tm_cuda", "jax_scan"):
         try:

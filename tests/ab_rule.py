@@ -1,5 +1,5 @@
 """The A/B rule (docs/validation.md): before comparing two arms of an option (timings, numerics), assert that they
-compiled to different programs -- different cuda kernels, or for the lockstep backend different StableHLO.
+compiled to different programs -- different cuda kernels, or for the xla backend different StableHLO.
 Comparing two identical programs measures noise.  Measurement hygiene for the library's own developers, not API.
 
     from ab_rule import assert_arms_differ
@@ -16,7 +16,7 @@ def artifacts(fn, *args, **kwargs):
 
 def assert_arms_differ(fn_a, fn_b, *args, **kwargs):
     """The A/B rule: two arms of an option comparison must compile to different programs (else the comparison is
-    void).  cuda: the kernels' cubin hashes differ; lockstep (no kernels): the StableHLO differs.  -> the two
+    void).  cuda: the kernels' cubin hashes differ; xla (no kernels): the StableHLO differs.  -> the two
     artifacts; raises AssertionError when they are identical."""
     ka, ha = artifacts(fn_a, *args, **kwargs)
     kb, hb = artifacts(fn_b, *args, **kwargs)

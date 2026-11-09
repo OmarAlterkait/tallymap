@@ -26,7 +26,7 @@ from ..._errors import ad_advice
 from ..._jaxpr import is_dropvar, located
 
 UNROLL = 32          # arrays with <= UNROLL elements are emitted as straight-line code
-MAX_LOCAL = 1 << 14  # largest per-thread local array we agree to materialize
+MAX_LOCAL = 1 << 14  # largest per-thread local array we agree to materialise
 # TEST-ONLY (tests patch it, like _primitive.FUSE_JVP): None, or a byte value every UNINITIALISED per-thread
 # declaration (Emitter.declare, kernel.build_source's carry / state / result variables) is filled with.  A program
 # that never reads an uninitialised value gives bitwise-equal results for FILL = 0x00 and 0xFF (tests/reverse.py).
@@ -353,7 +353,7 @@ class Emitter:
         self.ind -= 1
         self.line(s)
 
-    # ------------------------------------------------------------ materialization
+    # ------------------------------------------------------------ materialisation
     def declare(self, shape, dtype, p="v"):
         """Uninitialized Local / Scalar variable (for outputs assigned in blocks)."""
         ct = ctype(dtype)
@@ -427,7 +427,7 @@ class Emitter:
         self.fill(dst, lambda idx: elem(v, idx))
 
     def mat(self, v, p="v"):
-        """Materialize v into a Scalar variable or a Local array."""
+        """Materialise v into a Scalar variable or a Local array."""
         if isinstance(v, (Local,)):
             return v
         if isinstance(v, Scalar):
@@ -586,7 +586,7 @@ class Emitter:
     def run_top(self, cj, args, fn, mutable=()):
         """Run a top-level ClosedJaxpr: concrete scalar consts become literals, every other const (arrays, and
         tracers closed over from an enclosing trace) is a dynamic kernel input.  mutable: names of argument Locals
-        the function may update in place (mutable reference parameters; kernel.py's step-split body)."""
+        the function may update in place (mutable reference parameters; kernel.py's step-schedule body)."""
         self.freeze([a for a in args if not (isinstance(a, Local) and a.name in mutable)])
         consts = []
         for k, (c, v) in enumerate(zip(cj.consts, cj.jaxpr.constvars)):

@@ -30,7 +30,7 @@ GROUP = "natural"
 AXIS = "n"
 SWEEP = {"full": (1 << 14, 1 << 16, 1 << 18, 1 << 20), "quick": (1 << 8, 1 << 10)}
 DIVS = ("mid", "low", "high")
-ARMS = ("tm_cuda", "tm_lockstep", "jax_while", "jax_scan", "jax_scan2x", "jax_ckpt", "jax_ckpt2x", "diffrax")
+ARMS = ("tm_cuda", "tm_xla", "jax_while", "jax_scan", "jax_scan2x", "jax_ckpt", "jax_ckpt2x", "diffrax")
 MODES = ("fwd", "jvp", "jacfwd", "grad")
 CHECK_VAL = 1 << 8
 DIV_VAL = 1 << 18      # the other divergence levels are measured at this one size
@@ -144,7 +144,7 @@ def sim_of(ctx, arm, maxs, mode="fwd"):
             o = obs(c[1])
             return t_.add("obs", g, o), (o, c[3] + c[4])
         f = tm.vmap(traj, outputs={"obs": tm.Sum((G,))}, in_axes=(0, 0, 0, None),
-                    backend="cuda" if arm == "tm_cuda" else "lockstep")
+                    backend="cuda" if arm == "tm_cuda" else "xla")
         return lambda th: f(y0, mu, gid, th).outputs["obs"] / w
 
     def one(y, m, th):

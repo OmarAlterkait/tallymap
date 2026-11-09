@@ -101,8 +101,8 @@ def _walk1(jaxpr, in_slots, kinds, where):
             use(v, "returned")
     for v, st in state.items():
         if st == "live" and lin(slot[v]) and v not in jaxpr.invars:
-            e = TallyError(f"tallymap: the result of an emit/spawn is discarded (in {where}); thread the returned "
-                           "Tally through (a dropped Tally would silently disagree with the dense meaning)")
+            e = TallyError(f"tallymap: the Tally returned by t.add / t.spawn is discarded (in {where}); thread it "
+                           "through (a dropped Tally would silently disagree with the dense meaning)")
             if v in prod:
                 e._tm_eqn = prod[v]
             raise e
@@ -120,7 +120,7 @@ def _walk_eqn(eqn, slot, state, prod, tslots, use, lin, kinds, where):
             raise TallyError(f"tallymap: {name} on a value that is not this tallymap.vmap's Tally (in {where}); "
                              "nested tallymap.vmap tallies cannot be written from an inner item function")
         if any(s is not None for s in ins[1:]):
-            raise TallyError(f"tallymap: a Tally is used as an emitted value / spawned input (in {where})")
+            raise TallyError(f"tallymap: a Tally is used as a t.add value / spawned input (in {where})")
         want = "spawn" if name == "tallymap_spawn" else ("sum", "discard")
         if kinds[ins[0]] not in want:
             raise TallyError(f"tallymap: {name} applied to the wrong kind of tally leaf (in {where})")
@@ -178,8 +178,8 @@ def _walk_eqn(eqn, slot, state, prod, tslots, use, lin, kinds, where):
         tops = [s for s in ops if s is not None]
         sig = lambda r: ([s if lin(s) else None for s in r[0]], [u for u, s in zip(r[1], tops) if lin(s)])
         if any(sig(r) != sig(res[0]) for r in res[1:]):
-            raise TallyError(f"tallymap: cond/switch branches must use each Tally the same way (all emit-chain "
-                             f"and return it, or none touch it) (in {where})")
+            raise TallyError(f"tallymap: cond/switch branches must use each Tally the same way (all t.add and "
+                             f"return it, or none touch it) (in {where})")
         _consume(eqn.invars[1:], ops, res[0][1], use, name)
         merged = [next((r[0][j] for r in res if r[0][j] is not None), None) for j in range(len(eqn.outvars))]
         _bind_out(eqn.outvars, merged, slot, state)      # (an inert discard tally may meet a filler value)
@@ -188,7 +188,8 @@ def _walk_eqn(eqn, slot, state, prod, tslots, use, lin, kinds, where):
             raise TallyError(f"tallymap: primitive {name!r} reads a Tally (in {where}); tallies are write-only "
                              "(emit with .add, return it, thread it through control flow); "
                              + _which(eqn, ins, kinds, prod))
-        raise TallyError(f"tallymap: emit/spawn inside an unsupported higher-order primitive {name!r} (in {where})")
+        raise TallyError(f"tallymap: t.add / t.spawn inside an unsupported higher-order primitive {name!r} "
+                         f"(in {where})")
 
 
 def _which(eqn, ins, kinds, prod):

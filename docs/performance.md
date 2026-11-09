@@ -28,7 +28,7 @@ tables are regenerated from a full sweep, not patched, so they will carry the ol
 | arm | what it is | modes |
 |---|---|---|
 | `tallymap (cuda)` | `tm.vmap`, one persistent-thread CUDA kernel | all |
-| `tallymap (lockstep)` | `tm.vmap`, the masked reference interpreter (the only backend on CPU) | all |
+| `tallymap (xla)` | `tm.vmap`, the masked plain-JAX interpreter (the only backend on CPU) | all |
 | `jax.vmap + while_loop` | `jax.vmap` of the SAME item with its `lax.while_loop`, then one `.at[].add` | forward only |
 | `padded scan` | `jax.vmap` of the same item rewritten as a masked `lax.scan` | all |
 | `padded scan + remat` | the same with a nested `jax.checkpoint`-ed inner scan | all |
@@ -63,7 +63,7 @@ These are f32 programs. Two arms sum the same per-item values in a different ord
 reassociation-level agreement, not bitwise equality. The tolerances the agreement cell is read against:
 
 * **a tally, arm against arm: 1e-6 relative.** One f32 ulp is about 1.2e-7, and a sum over millions of emits
-  loses a few more low-order bits. `tm.Sum(exact=True)` is the fix when bit-reproducibility matters.
+  loses a few more low-order bits. `tm.Sum(fixed_point=True)` is the fix when bit-reproducibility matters.
 * **a tally whose index comes from a comparison: 1e-4 relative.** An escape sensor or a knock-out decision can
   flip on a 1-ulp difference. The items that flip are the ones sitting on the boundary and they contribute
   almost nothing to the tally, but the relative figure is larger than an ulp.
@@ -114,7 +114,7 @@ The tally is written every step, so the plain-JAX arms cannot put the loop insid
 
 Forward, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|---|
 | 16,384 | 0.102 | 2.19 | 2.18 | 1.05 | 2.04 | 1.08 | 2.11 |
 | 65,536 | 0.111 | 2.73 | 3.9 | 2.26 | 4.5 | 2.29 | 4.59 |
@@ -123,19 +123,19 @@ Forward, divergence `mid` (ms):
 
 Forward, divergence `high` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|---|
 | 524,288 | 0.49 | 16.3 | 39.5 | 35.1 | 70.1 | 37 | 71.1 |
 
 Forward, divergence `low` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|---|
 | 524,288 | 0.338 | 9.91 | 9.77 | 8.73 | 17.3 | 8.75 | 18.6 |
 
 Reverse-mode gradient, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.16 | 11.6 | 2.18 | 4.26 | 2.68 | 5.29 |
 | 65,536 | 0.247 | 14.1 | 2.6 | 5.33 | 3.11 | 6.13 |
@@ -144,7 +144,7 @@ Reverse-mode gradient, divergence `mid` (ms):
 
 Reverse-mode gradient, divergence `mid` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.314 | 8.19 | 32.2 | 64.2 | 4.19 | 8.19 |
 | 65,536 | 1.75 | 32.8 | 129 | 257 | 16.8 | 32.8 |
@@ -153,31 +153,31 @@ Reverse-mode gradient, divergence `mid` (peak MB):
 
 Reverse-mode gradient, divergence `high` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 524,288 | 1.46 | 123 | 42.4 | 84.7 | 46.2 | 89.7 |
 
 Reverse-mode gradient, divergence `high` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 524,288 | 12 | 262 | 1.5e+03 | 2.98e+03 | 262 | 262 |
 
 Reverse-mode gradient, divergence `low` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 524,288 | 1.06 | 43.9 | 10.5 | 20.9 | 10.5 | 22.7 |
 
 Reverse-mode gradient, divergence `low` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 524,288 | 12 | 262 | 384 | 748 | 134 | 262 |
 
 Forward-mode jvp, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.115 | 2.01 | 1.45 | 2.85 | 1.5 | 2.93 |
 | 65,536 | 0.133 | 3.23 | 3.95 | 7.82 | 4.01 | 7.96 |
@@ -186,7 +186,7 @@ Forward-mode jvp, divergence `mid` (ms):
 
 jacfwd over all parameters, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.134 | 2.34 | 1.64 | 3.19 | 1.49 | 2.88 |
 | 65,536 | 0.146 | 3.9 | 5.94 | 11.8 | 4.3 | 8.59 |
@@ -227,7 +227,7 @@ Measured trip counts, divergence `low`, and the padding each arm was given:
 
 Forward, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|---|
 | 16,384 | 0.128 | 2.23 | 2.1 | 0.718 | 1.36 | 0.782 | 1.45 |
 | 65,536 | 0.157 | 2.54 | 2.56 | 0.897 | 1.71 | 0.943 | 1.85 |
@@ -236,19 +236,19 @@ Forward, divergence `mid` (ms):
 
 Forward, divergence `high` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|---|
 | 524,288 | 1.44 | 20.2 | 13.5 | 9.44 | 18.6 | 9.72 | 19.1 |
 
 Forward, divergence `low` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|---|
 | 524,288 | 0.176 | 2.72 | 1.85 | 1.33 | 2.45 | 1.43 | 2.48 |
 
 Reverse-mode gradient, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.282 | 13.4 | 2.1 | 4.15 | 3.15 | 5.98 |
 | 65,536 | 0.448 | 20.8 | 3.18 | 6.44 | 4.05 | 8.29 |
@@ -257,7 +257,7 @@ Reverse-mode gradient, divergence `mid` (ms):
 
 Reverse-mode gradient, divergence `mid` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.377 | 16.3 | 64.3 | 128 | 16.3 | 16.3 |
 | 65,536 | 1.5 | 65 | 257 | 338 | 65 | 65 |
@@ -266,31 +266,31 @@ Reverse-mode gradient, divergence `mid` (peak MB):
 
 Reverse-mode gradient, divergence `high` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 524,288 | 11.2 | 579 | 34 | 67.7 | 43.9 | 90.6 |
 
 Reverse-mode gradient, divergence `high` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 524,288 | 12 | 264 | 5.04e+03 | 1e+04 | 542 | 750 |
 
 Reverse-mode gradient, divergence `low` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 524,288 | 1.56 | 73.5 | 4.26 | 8.36 | 5.84 | 10.7 |
 
 Reverse-mode gradient, divergence `low` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 524,288 | 12 | 264 | 638 | 1.25e+03 | 264 | 282 |
 
 Forward-mode jvp, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.147 | 2.23 | 0.73 | 1.37 | 0.815 | 1.48 |
 | 65,536 | 0.169 | 2.57 | 0.929 | 1.73 | 0.979 | 1.9 |
@@ -299,7 +299,7 @@ Forward-mode jvp, divergence `mid` (ms):
 
 jacfwd over all parameters, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.134 | 2.31 | 0.722 | 1.38 | 0.796 | 1.47 |
 | 65,536 | 0.162 | 2.58 | 0.958 | 1.8 | 1 | 1.96 |
@@ -340,7 +340,7 @@ Measured trip counts, divergence `low`, and the padding each arm was given:
 
 Forward, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|---|
 | 16,384 | 0.0975 | 1.12 | 1.23 | 0.551 | 1.03 | 0.603 | 1.07 |
 | 65,536 | 0.122 | 1.77 | 2.03 | 0.725 | 1.37 | 0.783 | 1.44 |
@@ -349,19 +349,19 @@ Forward, divergence `mid` (ms):
 
 Forward, divergence `high` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|---|
 | 524,288 | 0.357 | 6.36 | 4.25 | 2.79 | 5.44 | 3.02 | 5.48 |
 
 Forward, divergence `low` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|---|
 | 524,288 | 0.21 | 3.35 | 2.26 | 1.5 | 2.87 | 1.67 | 3.04 |
 
 Reverse-mode gradient, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.206 | 8.42 | 1.28 | 2.5 | 1.94 | 3.54 |
 | 65,536 | 0.34 | 14 | 1.56 | 3.18 | 2.46 | 4.65 |
@@ -370,7 +370,7 @@ Reverse-mode gradient, divergence `mid` (ms):
 
 Reverse-mode gradient, divergence `mid` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.502 | 16.3 | 16.3 | 32.3 | 4.31 | 8.31 |
 | 65,536 | 2 | 65.3 | 129 | 129 | 33.3 | 33.3 |
@@ -379,31 +379,31 @@ Reverse-mode gradient, divergence `mid` (peak MB):
 
 Reverse-mode gradient, divergence `high` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 524,288 | 1.59 | 106 | 6.43 | 12.7 | 9.22 | 17.6 |
 
 Reverse-mode gradient, divergence `high` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 524,288 | 16 | 266 | 761 | 1.49e+03 | 266 | 266 |
 
 Reverse-mode gradient, divergence `low` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 524,288 | 1.04 | 62.4 | 3.32 | 6.57 | 4.85 | 9.21 |
 
 Reverse-mode gradient, divergence `low` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 524,288 | 16 | 266 | 522 | 774 | 138 | 266 |
 
 Forward-mode jvp, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.11 | 1.13 | 0.548 | 1.02 | 0.62 | 1.09 |
 | 65,536 | 0.134 | 1.83 | 0.738 | 1.37 | 0.82 | 1.51 |
@@ -412,7 +412,7 @@ Forward-mode jvp, divergence `mid` (ms):
 
 jacfwd over all parameters, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.112 | 1.36 | 0.627 | 1.2 | 0.69 | 1.24 |
 | 65,536 | 0.14 | 1.59 | 0.794 | 1.49 | 0.862 | 1.57 |
@@ -453,7 +453,7 @@ Measured trip counts, divergence `low`, and the padding each arm was given:
 
 Forward, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|---|
 | 16,384 | 0.226 | 6.29 | 6.67 | 2.95 | 5.89 | 3.05 | 5.96 |
 | 65,536 | 0.336 | 6.66 | 6.68 | 3.55 | 7.09 | 3.68 | 7.17 |
@@ -462,19 +462,19 @@ Forward, divergence `mid` (ms):
 
 Forward, divergence `high` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|---|
 | 262,144 | 1.2 | 14.1 | 14.1 | 8.79 | 17.4 | 8.88 | 17.7 |
 
 Forward, divergence `low` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|---|
 | 262,144 | 0.612 | 5.78 | 5.78 | 3.66 | 7.18 | 3.78 | 7.41 |
 
 Reverse-mode gradient, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.896 | 67.2 | 20.9 | 42 | 24.1 | 46.9 |
 | 65,536 | 1.77 | 90 | 23.3 | 46.7 | 25 | 50.8 |
@@ -483,7 +483,7 @@ Reverse-mode gradient, divergence `mid` (ms):
 
 Reverse-mode gradient, divergence `mid` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.439 | 16.3 | 512 | 801 | 32.3 | 64.3 |
 | 65,536 | 1.75 | 65 | 1.6e+03 | 3.2e+03 | 129 | 257 |
@@ -492,31 +492,31 @@ Reverse-mode gradient, divergence `mid` (peak MB):
 
 Reverse-mode gradient, divergence `high` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 262,144 | 7.12 | 390 | 65.5 | 131 | 70 | 161 |
 
 Reverse-mode gradient, divergence `high` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 262,144 | 7 | 260 | 9.59e+03 | 1.92e+04 | 544 | 770 |
 
 Reverse-mode gradient, divergence `low` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 262,144 | 3.2 | 160 | 26.6 | 53.5 | 28.6 | 57.5 |
 
 Reverse-mode gradient, divergence `low` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 262,144 | 7 | 260 | 3.91e+03 | 7.81e+03 | 360 | 516 |
 
 Forward-mode jvp, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.247 | 9.39 | 4.34 | 8.61 | 4.48 | 8.79 |
 | 65,536 | 0.402 | 9.42 | 4.94 | 9.73 | 5.16 | 9.97 |
@@ -525,7 +525,7 @@ Forward-mode jvp, divergence `mid` (ms):
 
 jacfwd over all parameters, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.269 | 8.77 | 5 | 9.85 | 5.09 | 9.87 |
 | 65,536 | 0.488 | 9.46 | 6.9 | 13.7 | 7.02 | 13.7 |
@@ -568,7 +568,7 @@ A jump process has no pathwise derivative of its histogram with respect to the r
 
 Forward, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) |
 |---|---|---|---|---|---|
 | 16,384 | 2.89 | 99.9 | 112 | 47.1 | 94 |
 | 65,536 | 4.74 | 114 | 115 | 56.2 | 112 |
@@ -577,19 +577,19 @@ Forward, divergence `mid` (ms):
 
 Forward, divergence `high` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) |
 |---|---|---|---|---|---|
 | 262,144 | 19 | 236 | 237 | 132 | 264 |
 
 Forward, divergence `low` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) |
 |---|---|---|---|---|---|
 | 262,144 | 5.03 | 64.6 | 64.6 | 36.2 | 72.1 |
 
 Forward with the score carry, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) |
 |---|---|---|---|---|
 | 16,384 | 2.87 | 133 | 40.5 | 80.9 |
 | 65,536 | 4.82 | 144 | 46.6 | 93 |
@@ -598,13 +598,13 @@ Forward with the score carry, divergence `mid` (ms):
 
 Forward with the score carry, divergence `high` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) |
 |---|---|---|---|---|
 | 262,144 | 19.5 | 236 | 131 | 262 |
 
 Forward with the score carry, divergence `low` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) |
 |---|---|---|---|---|
 | 262,144 | 5.24 | 64.8 | 35.9 | 71.6 |
 
@@ -640,7 +640,7 @@ Measured trip counts, divergence `low`, and the padding each arm was given:
 
 Forward, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | generation vmap + compaction (oracle) | generation vmap + compaction (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | generation vmap + compaction (oracle) | generation vmap + compaction (2x cap) |
 |---|---|---|---|---|
 | 4,096 | 0.806 | 4.21 | 1.37 | 2.63 |
 | 16,384 | 0.929 | 7.24 | 1.64 | 3.14 |
@@ -649,19 +649,19 @@ Forward, divergence `mid` (ms):
 
 Forward, divergence `high` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | generation vmap + compaction (oracle) | generation vmap + compaction (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | generation vmap + compaction (oracle) | generation vmap + compaction (2x cap) |
 |---|---|---|---|---|
 | 65,536 | 1.32 | 9.88 | 3.75 | 7.45 |
 
 Forward, divergence `low` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | generation vmap + compaction (oracle) | generation vmap + compaction (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | generation vmap + compaction (oracle) | generation vmap + compaction (2x cap) |
 |---|---|---|---|---|
 | 65,536 | 0.786 | 6.65 | 2.17 | 4.16 |
 
 Reverse-mode gradient, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | generation vmap + compaction (oracle) | generation vmap + compaction (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | generation vmap + compaction (oracle) | generation vmap + compaction (2x cap) |
 |---|---|---|---|---|
 | 4,096 | 1.89 | 26.5 | 3.81 | 7.32 |
 | 16,384 | 2.21 | 32.6 | 4.29 | 8.52 |
@@ -670,7 +670,7 @@ Reverse-mode gradient, divergence `mid` (ms):
 
 Reverse-mode gradient, divergence `mid` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | generation vmap + compaction (oracle) | generation vmap + compaction (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | generation vmap + compaction (oracle) | generation vmap + compaction (2x cap) |
 |---|---|---|---|---|
 | 4,096 | 16.1 | 128 | 4.1 | 8.1 |
 | 16,384 | 64.4 | 512 | 16.4 | 32.4 |
@@ -679,25 +679,25 @@ Reverse-mode gradient, divergence `mid` (peak MB):
 
 Reverse-mode gradient, divergence `high` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | generation vmap + compaction (oracle) | generation vmap + compaction (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | generation vmap + compaction (oracle) | generation vmap + compaction (2x cap) |
 |---|---|---|---|---|
 | 65,536 | 5.07 | 52.6 | 8.05 | 15.8 |
 
 Reverse-mode gradient, divergence `high` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | generation vmap + compaction (oracle) | generation vmap + compaction (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | generation vmap + compaction (oracle) | generation vmap + compaction (2x cap) |
 |---|---|---|---|---|
 | 65,536 | 258 | 585 | 65.6 | 130 |
 
 Reverse-mode gradient, divergence `low` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | generation vmap + compaction (oracle) | generation vmap + compaction (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | generation vmap + compaction (oracle) | generation vmap + compaction (2x cap) |
 |---|---|---|---|---|
 | 65,536 | 2.91 | 34.1 | 4.93 | 9.68 |
 
 Reverse-mode gradient, divergence `low` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | generation vmap + compaction (oracle) | generation vmap + compaction (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | generation vmap + compaction (oracle) | generation vmap + compaction (2x cap) |
 |---|---|---|---|---|
 | 65,536 | 258 | 585 | 65.6 | 130 |
 
@@ -737,7 +737,7 @@ A knock-out is discontinuous in theta, so the pathwise Greeks measured here are 
 
 Forward, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|---|
 | 16,384 | 0.178 | 4.4 | 4.8 | 0.926 | 1.84 | 1.01 | 1.92 |
 | 65,536 | 0.235 | 5.02 | 4.92 | 1.06 | 2.07 | 1.12 | 2.11 |
@@ -746,19 +746,19 @@ Forward, divergence `mid` (ms):
 
 Forward, divergence `high` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|---|
 | 524,288 | 0.667 | 10.7 | 5.03 | 2.27 | 4.45 | 2.36 | 4.61 |
 
 Forward, divergence `low` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|---|
 | 524,288 | 1.01 | 10.7 | 5.02 | 2.27 | 4.49 | 2.36 | 4.56 |
 
 Reverse-mode gradient, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.503 | 25.8 | 4.07 | 8.15 | 5.29 | 10.2 |
 | 65,536 | 0.819 | 33.3 | 4.47 | 9.01 | 5.41 | 10.6 |
@@ -767,7 +767,7 @@ Reverse-mode gradient, divergence `mid` (ms):
 
 Reverse-mode gradient, divergence `mid` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.314 | 16.1 | 64.1 | 128 | 8.13 | 16.1 |
 | 65,536 | 2 | 64.5 | 257 | 513 | 32.5 | 64.5 |
@@ -776,31 +776,31 @@ Reverse-mode gradient, divergence `mid` (peak MB):
 
 Reverse-mode gradient, divergence `high` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 524,288 | 4.11 | 116 | 10.4 | 20.7 | 11.6 | 24.6 |
 
 Reverse-mode gradient, divergence `high` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 524,288 | 12 | 260 | 1.65e+03 | 3.29e+03 | 260 | 264 |
 
 Reverse-mode gradient, divergence `low` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 524,288 | 4.9 | 116 | 10.4 | 20.7 | 11.6 | 24.5 |
 
 Reverse-mode gradient, divergence `low` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 524,288 | 12 | 260 | 1.65e+03 | 3.29e+03 | 260 | 264 |
 
 Forward-mode jvp, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.199 | 4.45 | 0.95 | 1.81 | 1.05 | 1.96 |
 | 65,536 | 0.267 | 5.16 | 1.06 | 2.06 | 1.12 | 2.12 |
@@ -809,7 +809,7 @@ Forward-mode jvp, divergence `mid` (ms):
 
 jacfwd over all parameters, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.227 | 5.99 | 1.9 | 3.73 | 1.97 | 3.81 |
 | 65,536 | 0.314 | 6.65 | 2.31 | 4.53 | 2.39 | 4.62 |
@@ -852,7 +852,7 @@ An INTERACTING system. The interaction is between calls, not inside one: an oute
 
 Forward, divergence `clustered` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) | padded neighbour list (oracle) | padded neighbour list (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) | padded neighbour list (oracle) | padded neighbour list (2x cap) |
 |---|---|---|---|---|---|---|---|---|---|
 | 4,096 | 0.256 | 3.25 | 4.16 | 1.5 | 2.78 | 1.62 | 2.95 | 0.167 | 0.181 |
 | 16,384 | 0.327 | 5.71 | 6.13 | 2.12 | 4.06 | 2.17 | 4.1 | 0.241 | 0.298 |
@@ -861,13 +861,13 @@ Forward, divergence `clustered` (ms):
 
 Forward, divergence `uniform` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) | padded neighbour list (oracle) | padded neighbour list (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) | padded neighbour list (oracle) | padded neighbour list (2x cap) |
 |---|---|---|---|---|---|---|---|---|---|
 | 65,536 | 0.269 | 1.17 | 1.14 | 0.622 | 1.03 | 0.668 | 1.08 | 0.336 | 0.457 |
 
 Reverse-mode gradient, divergence `clustered` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) | padded neighbour list (oracle) | padded neighbour list (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) | padded neighbour list (oracle) | padded neighbour list (2x cap) |
 |---|---|---|---|---|---|---|---|---|
 | 4,096 | 6.42 | 264 | 90.9 | 186 | 108 | 208 | 3.36 | 4.08 |
 | 16,384 | 9.46 | 360 | 160 | 355 | 160 | 309 | 7.69 | 17.2 |
@@ -876,7 +876,7 @@ Reverse-mode gradient, divergence `clustered` (ms):
 
 Reverse-mode gradient, divergence `clustered` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) | padded neighbour list (oracle) | padded neighbour list (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) | padded neighbour list (oracle) | padded neighbour list (2x cap) |
 |---|---|---|---|---|---|---|---|---|
 | 4,096 | 1.97 | 4.06 | 64.1 | 128 | 8.06 | 8.06 | 32.1 | 64.1 |
 | 16,384 | 8.25 | 16.3 | 290 | 577 | 32.3 | 64.3 | 128 | 256 |
@@ -885,13 +885,13 @@ Reverse-mode gradient, divergence `clustered` (peak MB):
 
 Reverse-mode gradient, divergence `uniform` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) | padded neighbour list (oracle) | padded neighbour list (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) | padded neighbour list (oracle) | padded neighbour list (2x cap) |
 |---|---|---|---|---|---|---|---|---|
 | 65,536 | 7.75 | 107 | 35.3 | 71.4 | 40.3 | 71.1 | 10.3 | 27.3 |
 
 Reverse-mode gradient, divergence `uniform` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) | padded neighbour list (oracle) | padded neighbour list (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) | padded neighbour list (oracle) | padded neighbour list (2x cap) |
 |---|---|---|---|---|---|---|---|---|
 | 65,536 | 33 | 65 | 257 | 373 | 65 | 129 | 257 | 257 |
 
@@ -924,7 +924,7 @@ An INTERACTING system. Resampling is an all-to-all over the particles and stays 
 
 Forward, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|---|
 | 4,096 | 2.28 | 13.4 | 14.4 | 8.46 | 15 | 9.72 | 16.6 |
 | 16,384 | 2.5 | 18.1 | 18.6 | 8.86 | 15.7 | 9.82 | 16.7 |
@@ -933,19 +933,19 @@ Forward, divergence `mid` (ms):
 
 Forward, divergence `high` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|---|
 | 65,536 | 3.17 | 23.4 | 26.1 | 10.2 | 24 | 11.2 | 18.9 |
 
 Forward, divergence `low` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|---|
 | 65,536 | 3.02 | 15.1 | 16.2 | 10.2 | 17.6 | 11.2 | 19 |
 
 Reverse-mode gradient, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 4,096 | 5.53 | 135 | 66.2 | 129 | 84.2 | 155 |
 | 16,384 | 6.28 | 164 | 73.1 | 146 | 88.9 | 161 |
@@ -954,7 +954,7 @@ Reverse-mode gradient, divergence `mid` (ms):
 
 Reverse-mode gradient, divergence `mid` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 4,096 | 0.74 | 4.02 | 32 | 64 | 4.02 | 8.02 |
 | 16,384 | 4.06 | 16.1 | 128 | 256 | 16.1 | 32.1 |
@@ -963,25 +963,25 @@ Reverse-mode gradient, divergence `mid` (peak MB):
 
 Reverse-mode gradient, divergence `high` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 65,536 | 9.15 | 251 | 115 | 250 | 120 | 220 |
 
 Reverse-mode gradient, divergence `high` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 65,536 | 16.3 | 64.3 | 522 | 1.04e+03 | 128 | 128 |
 
 Reverse-mode gradient, divergence `low` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 65,536 | 8.49 | 173 | 115 | 250 | 120 | 221 |
 
 Reverse-mode gradient, divergence `low` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 65,536 | 16.3 | 64.3 | 522 | 1.04e+03 | 128 | 128 |
 
@@ -1021,7 +1021,7 @@ THE FLOOR of what tallymap buys, in two shapes. Every item runs exactly 64 steps
 
 Forward, divergence `end_only` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|---|
 | 16,384 | 0.0797 | 1.44 | 0.518 | 0.521 | 1.01 | 0.556 | 1.08 |
 | 65,536 | 0.0987 | 1.6 | 0.566 | 0.581 | 1.07 | 0.609 | 1.14 |
@@ -1030,13 +1030,13 @@ Forward, divergence `end_only` (ms):
 
 Forward, divergence `per_step` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|---|
 | 524,288 | 0.32 | 12 | 10.5 | 9.85 | 19.6 | 9.87 | 20.2 |
 
 Reverse-mode gradient, divergence `end_only` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.142 | 7.99 | 1.01 | 1.91 | 1.54 | 2.97 |
 | 65,536 | 0.199 | 9.82 | 0.996 | 1.9 | 1.59 | 3 |
@@ -1045,7 +1045,7 @@ Reverse-mode gradient, divergence `end_only` (ms):
 
 Reverse-mode gradient, divergence `end_only` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.252 | 8.13 | 8.13 | 16.1 | 0.817 | 2 |
 | 65,536 | 1 | 32.5 | 32.5 | 64.5 | 4.5 | 4.5 |
@@ -1054,19 +1054,19 @@ Reverse-mode gradient, divergence `end_only` (peak MB):
 
 Reverse-mode gradient, divergence `per_step` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 524,288 | 1.19 | 51.5 | 7.55 | 15.1 | 11.6 | 24.1 |
 
 Reverse-mode gradient, divergence `per_step` (peak MB):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 524,288 | 12 | 260 | 516 | 780 | 132 | 132 |
 
 Forward-mode jvp, divergence `end_only` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.0897 | 1.01 | 0.319 | 0.543 | 0.368 | 0.628 |
 | 65,536 | 0.128 | 1.06 | 0.362 | 0.595 | 0.402 | 0.674 |
@@ -1075,7 +1075,7 @@ Forward-mode jvp, divergence `end_only` (ms):
 
 jacfwd over all parameters, divergence `end_only` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (oracle) | padded scan (2x cap) | padded scan + remat (oracle) | padded scan + remat (2x cap) |
 |---|---|---|---|---|---|---|
 | 16,384 | 0.117 | 1.47 | 0.436 | 0.769 | 0.477 | 0.828 |
 | 65,536 | 0.118 | 1.64 | 0.511 | 0.906 | 0.56 | 0.989 |
@@ -1107,11 +1107,11 @@ Measured trip counts, divergence `per_step`, and the padding each arm was given:
 
 ### dense_state (bad-fit)
 
-A BAD FIT, measured on purpose. The sweep axis is the state dimension D, not N. A persistent-thread kernel runs a D x D matvec as scalar code; `jax.vmap` turns it into one batched GEMM. The crossover in D is the number to quote, and the gradient crosses over much earlier than the forward pass does. Note also the agreement: this is the one problem where the cuda backend and the lockstep backend differ by more than an ulp (about 4e-3). A D x D matvec is a `dot_general`, the cuda backend lowers it as scalar code, XLA sums it in a different order, and eight `tanh` steps amplify the difference. It is a reassociation difference, not a defect, and it is another reason this shape belongs to `jax.vmap`.
+A BAD FIT, measured on purpose. The sweep axis is the state dimension D, not N. A persistent-thread kernel runs a D x D matvec as scalar code; `jax.vmap` turns it into one batched GEMM. The crossover in D is the number to quote, and the gradient crosses over much earlier than the forward pass does. Note also the agreement: this is the one problem where the cuda backend and the xla backend differ by more than an ulp (about 4e-3). A D x D matvec is a `dot_general`, the cuda backend lowers it as scalar code, XLA sums it in a different order, and eight `tanh` steps amplify the difference. It is a reassociation difference, not a defect, and it is another reason this shape belongs to `jax.vmap`.
 
 Forward, divergence `none` (ms):
 
-| D | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) |
+| D | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) |
 |---|---|---|---|---|
 | 4 | 0.0589 | 0.262 | 0.103 | 0.0993 |
 | 8 | 0.0593 | 0.261 | 0.112 | 0.108 |
@@ -1123,7 +1123,7 @@ Forward, divergence `none` (ms):
 
 Reverse-mode gradient, divergence `none` (ms):
 
-| D | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) |
+| D | tallymap (cuda) | tallymap (xla) | padded scan (oracle) |
 |---|---|---|---|
 | 4 | 0.164 | 1.65 | 0.265 |
 | 8 | 0.366 | 1.85 | 0.295 |
@@ -1135,7 +1135,7 @@ Reverse-mode gradient, divergence `none` (ms):
 
 Reverse-mode gradient, divergence `none` (peak MB):
 
-| D | tallymap (cuda) | tallymap (lockstep) | padded scan (oracle) |
+| D | tallymap (cuda) | tallymap (xla) | padded scan (oracle) |
 |---|---|---|---|
 | 4 | 0.5 | 64.8 | 64.8 |
 | 8 | 1 | 66 | 66 |
@@ -1169,7 +1169,7 @@ A BAD FIT, measured on purpose. The item must return all L of its samples, not a
 
 Forward, divergence `none` (ms):
 
-| L | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) |
+| L | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) |
 |---|---|---|---|---|
 | 8 | 0.054 | 0.227 | 0.116 | 0.117 |
 | 16 | 0.0527 | 0.372 | 0.171 | 0.167 |
@@ -1197,7 +1197,7 @@ A BAD FIT, measured on purpose. At N = 1 there is one GPU thread and no parallel
 
 Forward, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | jax.vmap + while_loop | padded scan (oracle) |
+| N | tallymap (cuda) | tallymap (xla) | jax.vmap + while_loop | padded scan (oracle) |
 |---|---|---|---|---|
 | 1 | 0.158 | 2.08 | 3.37 | 1.46 |
 | 4 | 0.158 | 2.48 | 2.48 | 0.94 |
@@ -1233,7 +1233,7 @@ One finding before the numbers: diffrax's default adjoint, `RecursiveCheckpointA
 
 Forward, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (2x cap) | padded scan + remat (2x cap) | diffrax |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (2x cap) | padded scan + remat (2x cap) | diffrax |
 |---|---|---|---|---|---|
 | 16,384 | 0.237 | 6.27 | 6.71 | 6.82 | 29 |
 | 65,536 | 0.34 | 9.36 | 8.18 | 8.29 | 34 |
@@ -1242,7 +1242,7 @@ Forward, divergence `mid` (ms):
 
 Forward-mode jvp, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (2x cap) | padded scan + remat (2x cap) | diffrax |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (2x cap) | padded scan + remat (2x cap) | diffrax |
 |---|---|---|---|---|---|
 | 16,384 | 0.259 | 8.82 | 8.64 | 8.75 | 30.7 |
 | 65,536 | 0.404 | 9.47 | 10.4 | 10.4 | 40.7 |
@@ -1251,7 +1251,7 @@ Forward-mode jvp, divergence `mid` (ms):
 
 jacfwd over all parameters, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (2x cap) | padded scan + remat (2x cap) | diffrax |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (2x cap) | padded scan + remat (2x cap) | diffrax |
 |---|---|---|---|---|---|
 | 16,384 | 0.269 | 8.9 | 10.4 | 10.5 | 40.4 |
 | 65,536 | 0.496 | 12.5 | 14.6 | 14.7 | 51.5 |
@@ -1260,7 +1260,7 @@ jacfwd over all parameters, divergence `mid` (ms):
 
 Reverse-mode gradient, divergence `mid` (ms):
 
-| N | tallymap (cuda) | tallymap (lockstep) | padded scan (2x cap) | padded scan + remat (2x cap) | diffrax |
+| N | tallymap (cuda) | tallymap (xla) | padded scan (2x cap) | padded scan + remat (2x cap) | diffrax |
 |---|---|---|---|---|---|
 | 16,384 | 0.926 | 68.1 | 79.1 | 83.6 | 189 |
 | 65,536 | 1.79 | 101 | 71.4 | 64.7 | 501 |
@@ -1278,7 +1278,7 @@ Reverse-mode gradient, divergence `mid` (peak MB):
 
 ## Other platforms
 
-The same `fwd` and `grad` rows on every machine measured. The CPU rows have only the lockstep backend: the cuda backend needs a GPU, and `tm.vmap` says so.
+The same `fwd` and `grad` rows on every machine measured. The CPU rows have only the xla backend: the cuda backend needs a GPU, and `tm.vmap` says so.
 
 A CPU row is a shared machine: 16 cores of a 64-core node, with other jobs on the rest of it. Every arm of one problem is measured in the same job, one cell after another, so a RATIO within a problem is sound, but the same code measured in two jobs has come out up to 2.6x apart, so a CPU ratio should not be compared against the same ratio from an earlier run of this table.
 
@@ -1322,7 +1322,7 @@ A CPU row is a shared machine: 16 cores of a 64-core node, with other jobs on th
 
 ## Cross-arm agreement
 
-`rel_<arm>` is the largest relative difference between that arm's tally and the lockstep backend's, at the problem's check size with every arm in one process. `rel_grad_vs_jacfwd` is reverse against forward mode of the same tallymap program. One f32 ulp is about 1e-7.
+`rel_<arm>` is the largest relative difference between that arm's tally and the xla backend's, at the problem's check size with every arm in one process. `rel_grad_vs_jacfwd` is reverse against forward mode of the same tallymap program. One f32 ulp is about 1e-7.
 
 | problem | divergence | diffrax | grad_vs_jacfwd | grad_vs_jax_gen | grad_vs_jax_scan | jax_ckpt | jax_gen | jax_pad | jax_scan | jax_while | tm_cuda |
 |---|---|---|---|---|---|---|---|---|---|---|---|

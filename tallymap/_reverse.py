@@ -82,7 +82,7 @@ def rev_opts(opts=None):
 # 3C+1 states (head C+1, checkpoints C, segment tape C; T3: 2C+1) fit AUTO_CKPT_BYTES.
 #   MEASURED on an L40S (lumen/perf 762da14, 830c071).  lumen's photon transport (states of 306-318 B; per-photon
 #   trip counts K: SK mean 7.1 / warp(32)-max over mean 2.29, SBND 15.0 / 2.35, ANNIE 12.4 / 3.83, longest 1263):
-#   the adjoint runs whole items per warp, a warp pays its LONGEST item, and an item of K <= C steps needs no
+#   the adjoint runs the item schedule, a warp pays its LONGEST item, and an item of K <= C steps needs no
 #   replay, so C must cover the warp maximum (16 to 60 steps); C = 64 against 16: SK 0.685 against 0.878 s, ANNIE
 #   5.22 against 8.21 s.  The benchmarks/vs_jax problems (states of 8-25 B; mean K 4.5 to 252): C = 64 was 1.5x to
 #   3x SLOWER than 16 at 2^19 items (random_walk 2.53 against 0.92 ms, transport 3.86 against 1.81).  The emitter
@@ -402,9 +402,9 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None, li
 
 # ------------------------------------------------------------------------------------------- T3: single-loop adjoint
 # The adjoint of checkpointed_while is a nest of loops (count pass; checkpoint pass; per segment: advance, fill,
-# sweep), so the cuda backend runs it whole-item: every phase costs the warp its LONGEST item (lumen: warp max /
-# mean trip count 2.3-3.8), and the step is instantiated five times (NVRTC time).  Here the adjoint of an item's ONE
-# top-level loop is ONE while loop whose iteration is one MICRO-STEP of a per-lane state machine:
+# sweep), so the cuda backend runs it under the item schedule: every phase costs the warp its LONGEST item (lumen:
+# warp max / mean trip count 2.3-3.8), and the step is instantiated five times (NVRTC time).  Here the adjoint of an
+# item's ONE top-level loop is ONE while loop whose iteration is one MICRO-STEP of a per-item state machine:
 #
 #   COUNT  x = c          store x in the head (slot min(k, C))       c = step(x)     until the loop's predicate fails
 #   CKPT   x = c          store x as checkpoint j/m when m | j       c = step(x)     (only K > C)
@@ -616,7 +616,7 @@ def checkpointed_while_single(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=N
             return jnp.zeros(jnp.shape(x), _dt(x)) if c is None or isinstance(c, SymbolicZero) else c
         ct = list(ct)
         # the tally cotangents are built INSIDE the micro-step: a value computed before the machine loop and read in
-        # it is per-lane state of the step split, so a symbolic-zero tally cotangent instantiated here would be a
+        # it is per-thread state of the step schedule, so a symbolic-zero tally cotangent instantiated here would be a
         # tally-sized local array per lane (lumen SK: (88768,), "too large")
         ct_o_of = lambda: [inst(ct[j], init[j]) for j in o_idx]
         acc0 = ([inst(ct[j], init[j]) for j in act], [inst(ct[j], init[j]) for j in w_idx],

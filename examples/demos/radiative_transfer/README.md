@@ -52,7 +52,7 @@ faithful plain-JAX port of the same item function.
 | `jax_scan_shared` | the best plain-JAX rewrite: ONE shared grid in a `lax.scan` carry with the rays vectorised inside the step, so `O(grid)` memory instead of `O(rays x grid)`, still padded to the horizon |
 | `jax_ckpt` | `jax_scan_shared` with a recursively checkpointed (nested, remat'd) scan |
 | `tm` | item = one ray, tally = `Sum((G^3,))`, and the ray's own `while_loop` stops when it leaves the box |
-| `tm_exact` | the same with `Sum(..., exact=True)`, the int64 fixed-point accumulator |
+| `tm_exact` | the same with `Sum(..., fixed_point=True)`, the int64 fixed-point accumulator |
 
 `--prog mc`: `tm`, `jax_while` (forward only), `jax_scan` (padded to the observed maximum), `jax_ckpt`.
 
@@ -89,7 +89,7 @@ Ray-trax at commit `89347946fba4` (github.com/lorenzobranca/Ray-trax).
 
 32^3 grid (32,768 voxels), horizon padded to the observed longest exit.
 
-| rays | tallymap (ms) | tallymap, exact=True (ms) | Ray-trax (shipped) (ms) | Ray-trax (micro-batched) (ms) | plain-JAX shared scan (ms) | shared scan + remat (ms) | x vs best baseline | x vs Ray-trax | march steps mean / max |
+| rays | tallymap (ms) | tallymap, fixed_point=True (ms) | Ray-trax (shipped) (ms) | Ray-trax (micro-batched) (ms) | plain-JAX shared scan (ms) | shared scan + remat (ms) | x vs best baseline | x vs Ray-trax | march steps mean / max |
 |---|---|---|---|---|---|---|---|---|---|
 | 1,024 | 0.125 | 0.145 | 1.27 | 1.27 | 0.86 | 0.875 | **6.89x** | 10.2x | 38.4 / 54 |
 | 4,096 | 0.159 | 0.163 | 2.62 | 2.62 | 0.953 | 0.967 | **6x** | 16.5x | 38.4 / 54 |
@@ -98,7 +98,7 @@ Ray-trax at commit `89347946fba4` (github.com/lorenzobranca/Ray-trax).
 
 Peak device memory on the same runs:
 
-| rays | tallymap (MB) | tallymap, exact=True (MB) | Ray-trax (shipped) (MB) | Ray-trax (micro-batched) (MB) | plain-JAX shared scan (MB) | shared scan + remat (MB) | x less than Ray-trax |
+| rays | tallymap (MB) | tallymap, fixed_point=True (MB) | Ray-trax (shipped) (MB) | Ray-trax (micro-batched) (MB) | plain-JAX shared scan (MB) | shared scan + remat (MB) | x less than Ray-trax |
 |---|---|---|---|---|---|---|---|
 | 1,024 | 64.5 | 64.5 | 273 | 273 | 0.794 | 0.795 | **4.23x** |
 | 4,096 | 64.5 | 64.5 | 545 | 545 | 0.923 | 0.924 | **8.44x** |
@@ -114,7 +114,7 @@ Peak device memory on the same runs:
 A weighted least-squares loss against a target field, differentiated with respect to **both** 3-D fields, so
 65,536 parameters at G = 32.
 
-| rays | tallymap (ms) | tallymap, exact=True (ms) | Ray-trax (shipped) (ms) | Ray-trax (micro-batched) (ms) | plain-JAX shared scan (ms) | shared scan + remat (ms) | x vs best baseline | x vs Ray-trax | tallymap peak MB | Ray-trax peak MB | shared scan peak MB |
+| rays | tallymap (ms) | tallymap, fixed_point=True (ms) | Ray-trax (shipped) (ms) | Ray-trax (micro-batched) (ms) | plain-JAX shared scan (ms) | shared scan + remat (ms) | x vs best baseline | x vs Ray-trax | tallymap peak MB | Ray-trax peak MB | shared scan peak MB |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | 1,024 | 0.338 | 0.361 | 3.25 | 3.2 | 2.34 | 2.98 | **6.92x** | 9.62x | 64.5 | 273 | 9.01 |
 | 4,096 | 0.386 | 0.395 | 5.53 | 5.53 | 2.75 | 3.35 | **7.12x** | 14.3x | 64.5 | 545 | 33 |
@@ -189,7 +189,7 @@ With respect to both fields (8,192 parameters) and the three global parameters.
 - **f32 atomics are the least accurate arm.**  `--quick` compares every arm against an f64 run of the same program.
   tallymap's global f32 atomic sums and the plain-JAX shared scan are the least accurate arms there, and Ray-trax's
   tree-reduced per-ray grids are the most accurate, which is the other side of not materialising a per-ray grid.
-  `Sum(exact=True)` matches Ray-trax's accuracy, and here it costs nothing: 0.784 ms against 1.11 ms forward at 65,536
+  `Sum(fixed_point=True)` matches Ray-trax's accuracy, and here it costs nothing: 0.784 ms against 1.11 ms forward at 65,536
   rays.
 - **The Monte-Carlo gradient margin falls as N grows.**  7.8x at 1,048,576 photons against 42.1x at 65,536. The memory
   margin goes the other way and is the durable one.

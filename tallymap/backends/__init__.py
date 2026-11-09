@@ -1,1 +1,1 @@
-"""Backends: lockstep (plain JAX, every platform; the reference) and cuda (one NVRTC kernel per item program)."""
+"""Backends: xla (plain JAX, every platform) and cuda (one NVRTC kernel per item program)."""

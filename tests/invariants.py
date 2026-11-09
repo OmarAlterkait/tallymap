@@ -1,11 +1,11 @@
 """Invariants the library must keep whatever it does internally.  python tests/invariants.py
-env: BACKENDS=lockstep,cuda  TEST_X64=1  ONLY=substr
+env: BACKENDS=xla,cuda  TEST_X64=1  ONLY=substr
 
 docs: the consolidation plan's section 9 ("fundamental tests") -- the suite that makes removing internal paths safe.
 Sections (cell name prefixes):
   [sched]  schedule invariance: schedule step/item (also through spawn), _fold, _lanes chunking under jacfwd
-           (T = 1/16/17/33, MAX_LANES = 16), _cuda_inplace, lockstep vs cuda, item order.  BITWISE wherever the
-           arithmetic is the same program (exact and integer tallies, per-item results); a float tally is a sum
+           (T = 1/16/17/33, MAX_LANES = 16), _cuda_inplace, xla vs cuda, item order.  BITWISE wherever the
+           arithmetic is the same program (fixed-point and integer tallies, per-item results); a float tally is a sum
            whose ORDER the schedule decides, so it is held to the stated reassociation tolerance FT.
   [key]    cache-key soundness: programs that differ only in a closed-over array's values, a closed-over Python
            scalar, dtype, shape, an option, max_steps or table contents never share a compiled program (one process,
@@ -18,7 +18,7 @@ Sections (cell name prefixes):
   [ad]     AD self-consistency without finite differences: <u, J v> by jvp == by vjp; jacfwd == jacrev; the
            gradient does not depend on rev_checkpoints.
   [trunc]  truncation (max_steps): flags, n_truncated, partial integer tallies, poisoned float tallies and per-item
-           results agree between cuda, lockstep and the dense reference, with n_active and across cuda schedules.
+           results agree between cuda, xla and the dense reference, with n_active and across cuda schedules.
   (Replay: gated by tests/reverse.py, cell "REPLAY GATE" with its NEGATIVE CONTROL (_reverse.REPLAY_SHIFT).  Not
   duplicated here.)
 
@@ -68,11 +68,11 @@ jax.config.update("jax_default_matmul_precision", "highest")
 X64 = bool(jax.config.jax_enable_x64)
 F = jnp.float64 if X64 else jnp.float32
 GPU = jax.default_backend() == "gpu"
-BACKENDS = os.environ.get("BACKENDS", "lockstep,cuda" if GPU else "lockstep").split(",")
+BACKENDS = os.environ.get("BACKENDS", "xla,cuda" if GPU else "xla").split(",")
 ONLY = os.environ.get("ONLY", "")
-# exact=True outputs: the lockstep backend accumulates them in int64, so it needs jax_enable_x64 (edge.py).
-EXACT = {"lockstep": X64, "cuda": True}
-# FT: a float tally is a SUM whose order the schedule decides (atomics on cuda, block / lane order on lockstep), so
+# fixed_point=True outputs: the xla backend accumulates them in int64, so it needs jax_enable_x64 (edge.py).
+FIXED = {"xla": X64, "cuda": True}
+# FT: a float tally is a SUM whose order the schedule decides (atomics on cuda, block / lane order on xla), so
 # two schedules agree only up to reassociation.  The sums here have at most a few hundred positive terms of similar
 # size: reassociation moves a bin by a few ulps of the bin, 1e-5 (f32) leaves 2 orders of margin, and a LOGIC error
 # (an emit lost, doubled or landing in the wrong bin) moves a bin by >= one term / bin total ~ 1e-2.
@@ -177,7 +177,7 @@ def near(a, b, rtol, what, atol=0.0):
 
 
 def split_res(r):
-    """Result -> (float outputs, exact / integer outputs, per-item float leaves, per-item int leaves, stats)"""
+    """Result -> (float outputs, fixed-point / integer outputs, per-item float leaves, per-item int leaves, stats)"""
     fo = {k: v for k, v in r.outputs.items() if k == "Q"}
     xo = {k: v for k, v in r.outputs.items() if k != "Q"}
     pl = jax.tree_util.tree_leaves(r.per_item)
@@ -192,7 +192,7 @@ def agree(A, B, what, per_item="bitwise", pi_tol=None):
     (per_item='bitwise': the same per-item arithmetic) or within pi_tol (another compiler)."""
     fa, xa, pfa, pia, sa = split_res(A)
     fb, xb, pfb, pib, sb = split_res(B)
-    same(xa, xb, f"{what} exact/int tallies")
+    same(xa, xb, f"{what} fixed-point/int tallies")
     same(pia, pib, f"{what} per-item int")
     same(A.truncated, B.truncated, f"{what} truncated flags")
     for k in sa:
@@ -209,7 +209,7 @@ def bits(key, k):
 
 
 # Per-item TANGENTS of a laned program vs the single-column jvp.  cuda: each lane executes the same emitted scalar
-# arithmetic as the one-column kernel (no FMA contraction, -fmad=false) -> bitwise.  lockstep: the laned program is a
+# arithmetic as the one-column kernel (no FMA contraction, -fmad=false) -> bitwise.  xla: the laned program is a
 # different XLA program (jax.vmap of the item), and XLA:CPU is free to vectorise / fuse it differently (MEASURED,
 # JAX 0.11.2 CPU: 11/37 per-item tangents differ by <= 1.5e-8 for T=1; JAX 0.5.3: bitwise) -> a few ulps.
 PI_LANE_TOL = 1e-13 if X64 else 1e-6
@@ -225,9 +225,9 @@ def kernel_hashes():
 
 # =================================================================================================== [sched]
 # A divergent walk: the trip count is decided by the item's RNG bits (integer-exact, so every backend takes the same
-# path), a table read per step, emits into a float tally Q, an integer tally C and (where supported) an exact tally
+# path), a table read per step, emits into a float tally Q, an integer tally C and (where supported) a fixed-point tally
 # E, a per-item array h updated in place every step (the _cuda_inplace path), and per-item results (w, k, h).  The
-# emitted weights use only IEEE +, * (no div / sqrt / transcendental), so cuda_math does not enter and the exact
+# emitted weights use only IEEE +, * (no div / sqrt / transcendental), so cuda_math does not enter and the fixed-point
 # tally can be compared bitwise across compilers.
 N1 = 37
 XS = jnp.linspace(0.5, 1.5, N1).astype(F)
@@ -236,7 +236,7 @@ TAB = (0.5 + 0.25 * jnp.arange(NB)).astype(F)
 AX1 = (0, 0, None, None)
 
 
-def mk_walk(exact):
+def mk_walk(fixed_point):
     def item(t, x, key, tab, th):
         P = th.shape[0]
 
@@ -245,7 +245,7 @@ def mk_walk(exact):
             i = (bits(key, k) % NB).astype(jnp.int32)
             v = w * tab[i] * th[k % P]
             t = t.add("Q", i, v).add("C", i, 1)
-            if exact:
+            if fixed_point:
                 t = t.add("E", i, v)
             # two dynamic_update_slices: the first copies the loop carry (a carry is never mutated), the second
             # updates that fresh copy IN PLACE -- the path _cuda_inplace=False switches off
@@ -259,15 +259,15 @@ def mk_walk(exact):
     return item
 
 
-def outs1(b, exact=True):
+def outs1(b, fixed_point=True):
     o = {"Q": tm.Sum((NB,), F), "C": tm.Sum((NB,), jnp.int32)}
-    if exact and EXACT[b]:
-        o["E"] = tm.Sum((NB,), F, exact=True, scale=2.0 ** 20)
+    if fixed_point and FIXED[b]:
+        o["E"] = tm.Sum((NB,), F, fixed_point=True, scale=2.0 ** 20)
     return o
 
 
-def walk_fn(b, exact=True, **opts):
-    o = outs1(b, exact)
+def walk_fn(b, fixed_point=True, **opts):
+    o = outs1(b, fixed_point)
     return tm.vmap(mk_walk("E" in o), outputs=o, in_axes=AX1, backend=b, **opts)
 
 
@@ -281,7 +281,7 @@ def _(b):
     k = np.asarray(r.per_item[1])
     if len(set(k.tolist())) < 4:
         raise Fail(f"instrument: trip counts {sorted(set(k.tolist()))} are not divergent enough")
-    return f"trip counts {k.min()}..{k.max()} ({len(set(k.tolist()))} distinct); exact tally {'E' in r.outputs}"
+    return f"trip counts {k.min()}..{k.max()} ({len(set(k.tolist()))} distinct); fixed-point tally {'E' in r.outputs}"
 
 
 @case("[sched] schedule step == item (cuda)", ["cuda"])
@@ -312,8 +312,8 @@ def _(b):
         raise Fail("schedule='steps' was accepted")
     f = tm.vmap(two_loops, outputs=outs1(b, False), in_axes=AX1, backend=b, schedule="step")
     if b != "cuda":
-        jax.block_until_ready(f(XS, KEYS, TAB, th_of(3)))                      # lockstep has no schedules
-        return "lockstep ignores schedule"
+        jax.block_until_ready(f(XS, KEYS, TAB, th_of(3)))                      # xla has no schedules
+        return "xla ignores schedule"
     try:
         jax.block_until_ready(f(XS, KEYS, TAB, th_of(3)))
     except tm.UnsupportedError as e:
@@ -359,19 +359,19 @@ def _(b):
     return agree(fa(XS, KEYS, TAB, th), fb(XS, KEYS, TAB, th), "inplace on vs off")
 
 
-@case("[sched] lockstep == cuda (exact/int bitwise, float to tol)", ["cuda"])
+@case("[sched] xla == cuda (fixed-point/int bitwise, float to tol)", ["cuda"])
 def _(b):
     th = th_of(3)
-    A = walk_fn("cuda", exact=X64)(XS, KEYS, TAB, th)        # (the lockstep exact tally needs x64)
-    B = walk_fn("lockstep", exact=X64)(XS, KEYS, TAB, th)
+    A = walk_fn("cuda", fixed_point=X64)(XS, KEYS, TAB, th)        # (the xla fixed-point tally needs x64)
+    B = walk_fn("xla", fixed_point=X64)(XS, KEYS, TAB, th)
     # Two compilers (NVRTC vs XLA:GPU).  The item uses only IEEE +, * without contraction (cuda: -fmad=false), so the
     # per-item floats are expected to agree to the last bit; held to 1e-6 rather than bitwise because XLA is free to
     # pick its own (exactly rounded, but differently associated) evaluation of a fused expression.
-    m = agree(A, B, "cuda vs lockstep", per_item="tol", pi_tol=1e-12 if X64 else 1e-6)
-    return m + ("; exact E bitwise" if X64 else "; (no exact tally: lockstep exact needs x64)")
+    m = agree(A, B, "cuda vs xla", per_item="tol", pi_tol=1e-12 if X64 else 1e-6)
+    return m + ("; fixed-point E bitwise" if X64 else "; (no fixed-point tally: the xla backend needs x64 for it)")
 
 
-@case("[sched] permuted items: exact/int tallies bitwise, per-item permuted bitwise")
+@case("[sched] permuted items: fixed-point/int tallies bitwise, per-item permuted bitwise")
 def _(b):
     perm = np.random.default_rng(1).permutation(N1)
     f = walk_fn(b)
@@ -380,14 +380,15 @@ def _(b):
     B = f(XS[perm], KEYS[perm], TAB, th)
     Ap = A._replace(per_item=jax.tree_util.tree_map(lambda v: v[perm], A.per_item), truncated=A.truncated[perm])
     m = agree(Ap, B, "permuted")
-    return m + ("; exact E bitwise" if "E" in A.outputs else "; (no exact tally: lockstep without x64)")
+    return m + ("; fixed-point E bitwise" if "E" in A.outputs else "; (no fixed-point tally: xla without x64)")
 
 
 @case("[sched] _fold on == off under jax.vmap of tm.vmap")
 def _(b):
-    # exact outputs are never folded (_can_fold: stats['exact_overflow'] is per launch), so this program has none
+    # fixed-point outputs are never folded (_can_fold: stats['fixed_point_overflow'] is per launch): this program has
+    # none
     ths = jnp.stack([th_of(3) * s for s in (1.0, 1.1, 0.95)])
-    fo, fn = walk_fn(b, exact=False), walk_fn(b, exact=False, _fold=False)
+    fo, fn = walk_fn(b, fixed_point=False), walk_fn(b, fixed_point=False, _fold=False)
     g = lambda f: jax.jit(jax.vmap(lambda th: f(XS, KEYS, TAB, th)))
     jo, jn = str(jax.make_jaxpr(jax.vmap(lambda th: fo(XS, KEYS, TAB, th)))(ths)), \
         str(jax.make_jaxpr(jax.vmap(lambda th: fn(XS, KEYS, TAB, th)))(ths))
@@ -440,8 +441,8 @@ for T in (1, 16, 17, 33):
                 ref = jax.tree_util.tree_map(lambda *c: jnp.stack(c, -1), *cols)
             o, (w, h) = J
             ro, (rw, rh) = ref
-            if "E" in o:          # the exact tangent tally: integer accumulation, order-free -> bitwise
-                same(o["E"], ro["E"], f"{name} exact tangent tally")
+            if "E" in o:          # the fixed-point tangent tally: integer accumulation, order-free -> bitwise
+                same(o["E"], ro["E"], f"{name} fixed-point tangent tally")
             mq = near(o["Q"], ro["Q"], FT, f"{name} Q tangent")
             # the per-item tangents: each lane runs the same tangent arithmetic as the single-column jvp
             mp = lanes_same(b, (w, h), (rw, rh), f"{name} per-item tangents")
@@ -680,7 +681,7 @@ def _coarse_kernel_key(kind):
     def avals_only(p, opts):               # operand / result avals and the tally layout: no program text at all
         return ("NEG", tuple((tuple(v.aval.shape), str(v.aval.dtype)) for v in p.cj.jaxpr.invars),
                 tuple((tuple(v.aval.shape), str(v.aval.dtype)) for v in p.cj.jaxpr.outvars),
-                tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.exact, s.kind) for s in p.tallies),
+                tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.fixed_point, s.kind) for s in p.tallies),
                 p.nP, p.nB, p.trunc, len(p.cj.consts))
     return {"text": text_only, "digest": digest_only, "avals": avals_only}[kind]
 
@@ -696,7 +697,7 @@ NEG_EXPECT = {"text": {"closed-over array values", "table contents (closed-over 
 
 
 @case("[key] _jaxpr.digest: equal where str(jaxpr) is equal, different where it differs or a literal's bytes do",
-      ["lockstep"])
+      ["xla"])
 def _(b):
     from tallymap._jaxpr import digest
     S, I = jax.ShapeDtypeStruct((4,), F), jax.ShapeDtypeStruct((), jnp.int32)
@@ -789,7 +790,7 @@ for _kind in ("text", "digest", "avals"):
             _P._EAGER.clear()
         return _neg_verdict(kind, res, expect, none)
 
-    @case(f"[key] NEGATIVE CONTROL: eager-cache Node.key = {_kind} only must be caught", ["lockstep"])
+    @case(f"[key] NEGATIVE CONTROL: eager-cache Node.key = {_kind} only must be caught", ["xla"])
     def _(b, kind=_kind):
         real = _P.Node.key
         ck = _coarse_kernel_key(kind)
@@ -1053,7 +1054,7 @@ _TOKEN_XFAIL = ("round-2 band-aid audit A5: a reverse program's sparse-table cot
 
 
 @case("[ad] reverse cond: a cotangent token that meets a same-aval array at a cond output is not refused",
-      ["lockstep"], xfail={"lockstep": _TOKEN_XFAIL})
+      ["xla"], xfail={"xla": _TOKEN_XFAIL})
 def _(b):
     # hand-built, as the reverse program builds it (dtrax tests_wavefront/test_revtables.py T4)
     from tallymap import _rewrite
@@ -1084,7 +1085,7 @@ def _(b):
     # only its primal leaves; the backends write the missing tangent leaves as zero.  Generations alternate a traced
     # child (x * 0.5) and a CONSTANT child (0.25); 8 roots, depth 6 = 48 children through a 24-slot ring, so constant
     # children land in slots that traced children wrote before (a stale tangent would show).  (Found by
-    # tests/dice.py's 'noinherit' plant: lockstep raised a while_loop carry-structure TypeError, cuda wrote nothing
+    # tests/dice.py's 'noinherit' plant: xla raised a while_loop carry-structure TypeError, cuda wrote nothing
     # into the tangent slot.)
     def item(t, g, x):
         t = t.add("Q", 0, x)
@@ -1094,8 +1095,8 @@ def _(b):
     xs = jnp.linspace(0.5, 1.5, 8).astype(F)
     g0 = jnp.zeros((8,), jnp.int32)
     r = f(g0, xs)
-    _check(int(r.stats["spawned"]) == 48 and int(r.stats["dropped"]) == 0,
-           f"spawned {int(r.stats['spawned'])} dropped {int(r.stats['dropped'])}")
+    _check(int(r.stats["spawned"]) == 48 and int(r.stats["children_dropped"]) == 0,
+           f"spawned {int(r.stats['spawned'])} dropped {int(r.stats['children_dropped'])}")
     d = jax.jvp(lambda s: f(g0, xs * s).outputs["Q"], (F(1),), (F(1),))[1]
     # d/ds: the roots (sum xs) and their traced children (sum xs / 2); every later generation descends from a
     # constant child, so its tangent is exactly 0
@@ -1106,7 +1107,7 @@ def _(b):
 CAP = 10
 
 
-def trunc_item_of(exact):
+def trunc_item_of(fixed_point):
     def item(t, x, key):
         L = 2 + (bits(key, 7) % 19).astype(jnp.int32)         # 2..20 steps; CAP = 10 truncates about half
 
@@ -1114,7 +1115,7 @@ def trunc_item_of(exact):
             k, w, t = c
             i = (bits(key, k) % NB).astype(jnp.int32)
             t = t.add("Q", i, w).add("C", i, 1)
-            if exact:
+            if fixed_point:
                 t = t.add("E", i, w)
             return k + 1, w * 0.75 + 0.125, t
         k, w, t = lax.while_loop(lambda c: c[0] < L, body, (jnp.int32(0), x, t))
@@ -1122,13 +1123,13 @@ def trunc_item_of(exact):
     return item
 
 
-def trunc_fn(b, exact=True, **opts):
-    o = outs1(b, exact)
+def trunc_fn(b, fixed_point=True, **opts):
+    o = outs1(b, fixed_point)
     return tm.vmap(trunc_item_of("E" in o), outputs=o, backend=b, max_steps=CAP, **opts)
 
 
 def trunc_check(r, what):
-    """the resource-limit rule itself: float tallies NaN (exact included), integer tallies partial and finite"""
+    """the resource-limit rule itself: float tallies NaN (fixed-point included), integer tallies partial and finite"""
     nt = int(r.stats["n_truncated"])
     _check(nt == int(np.sum(np.asarray(r.truncated))), f"{what}: n_truncated {nt} != sum(truncated)")
     _check(0 < nt < len(np.asarray(r.truncated)), f"instrument: {nt} truncated items (want some, not all)")
@@ -1144,7 +1145,7 @@ def trunc_check(r, what):
 def _(b):
     A = trunc_fn(b)(XS, KEYS)
     nt = trunc_check(A, b)
-    Rr = reference(trunc_item_of(False), outputs=outs1(b, exact=False), max_steps=CAP)(XS, KEYS)
+    Rr = reference(trunc_item_of(False), outputs=outs1(b, fixed_point=False), max_steps=CAP)(XS, KEYS)
     same(A.truncated, Rr.truncated, "truncated flags vs reference")
     # (values only: under x64 tm.reference returns an int32 Sum as int64 -- its jnp.sum promotes -- while tm.vmap
     # keeps the declared int32)
@@ -1155,13 +1156,13 @@ def _(b):
     return f"{nt}/{N1} truncated; per-item w {m}"
 
 
-@case("[trunc] max_steps: cuda == lockstep (flags, counts, partial tallies, per-item)", ["cuda"])
+@case("[trunc] max_steps: cuda == xla (flags, counts, partial tallies, per-item)", ["cuda"])
 def _(b):
-    A, B = trunc_fn("cuda", exact=X64)(XS, KEYS), trunc_fn("lockstep", exact=X64)(XS, KEYS)
+    A, B = trunc_fn("cuda", fixed_point=X64)(XS, KEYS), trunc_fn("xla", fixed_point=X64)(XS, KEYS)
     trunc_check(A, "cuda")
-    trunc_check(B, "lockstep")
-    # per-item floats: two compilers, IEEE +, * only (see the [sched] lockstep == cuda cell)
-    return agree(A, B, "cuda vs lockstep", per_item="tol", pi_tol=1e-12 if X64 else 1e-6)
+    trunc_check(B, "xla")
+    # per-item floats: two compilers, IEEE +, * only (see the [sched] xla == cuda cell)
+    return agree(A, B, "cuda vs xla", per_item="tol", pi_tol=1e-12 if X64 else 1e-6)
 
 
 @case("[trunc] max_steps: schedule step == item (cuda)", ["cuda"])

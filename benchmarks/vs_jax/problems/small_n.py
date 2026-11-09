@@ -24,7 +24,7 @@ GROUP = "bad-fit"
 AXIS = "n"
 SWEEP = {"full": (1, 4, 16, 64, 256, 1 << 10, 1 << 12, 1 << 14, 1 << 16), "quick": (1, 256)}
 DIVS = ("mid",)
-ARMS = ("tm_cuda", "tm_lockstep", "jax_while", "jax_scan")
+ARMS = ("tm_cuda", "tm_xla", "jax_while", "jax_scan")
 MODES = ("fwd",)
 CHECK_VAL = 256
 
@@ -51,7 +51,7 @@ def sim_of(ctx, arm, maxs):
             pay = jnp.maximum(c[1] - th[2], 0.0) * c[2].astype(jnp.float32)
             return t.add("p", 0, pay), c[0]
         f = tm.vmap(path, outputs={"p": tm.Sum((1,))}, in_axes=(0, None),
-                    backend="cuda" if arm == "tm_cuda" else "lockstep")
+                    backend="cuda" if arm == "tm_cuda" else "xla")
         return lambda th: f(keys, th).outputs["p"]
 
     def one(key, th):

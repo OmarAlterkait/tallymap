@@ -24,7 +24,7 @@ typedef signed char i8; typedef unsigned char u8; typedef short i16; typedef uns
 typedef int i32; typedef unsigned int u32; typedef long long i64; typedef unsigned long long u64;
 #define SJ_MAXP 504
 struct SjParams { void* p[SJ_MAXP]; };
-#ifndef TALLYMAP_APPROX_DIVSQRT   // cuda_math='ieee': correctly rounded (the portable reference)
+#ifndef TALLYMAP_APPROX_DIVSQRT   // cuda_math='ieee': correctly rounded (portable)
 #define SJ_FDIV(a, b) __fdiv_rn(a, b)
 #define SJ_FSQRT(x) __fsqrt_rn(x)
 #define SJ_FRSQRT(x) __frcp_rn(__fsqrt_rn(x))
@@ -233,7 +233,7 @@ def _split(cj):
 
 
 BLOCK = 128          # threads per block (measured: 64 / 128 / 256 within 1%)
-STEP_INPLACE_MIN = 64    # step split: array loop carries of at least this many elements are updated in place
+STEP_INPLACE_MIN = 64    # step schedule: array loop carries of at least this many elements are updated in place
 PRIV_BYTES = 4096    # shared-memory budget for privatised sum tallies per block
 
 
@@ -461,7 +461,7 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False, inplace=True)
         tot = int(np.prod(s.lead, dtype=np.int64)) * s.S
         dst = f"(({ot}*)P.p[{L.r_out[k]}])"
         at = _acc_t(s)
-        if s.exact:
+        if s.fixed_point:
             gp = f"((u64*)P.p[{L.r_scr[k]}])"
             sc = float(s.scale)
             # an emit that cannot be represented is dropped, counted, and flags its bin (u32 flags after the
@@ -618,11 +618,11 @@ extern "C" __global__ void {lb} sj_main(const SjParams P, const i64 n_items) {{
 
 
 def _scratch(s):
-    return np.int64 if s.exact else None
+    return np.int64 if s.fixed_point else None
 
 
 def _acc_t(s):
-    if s.exact:
+    if s.fixed_point:
         return "u64"
     ot = ctype(s.dtype)
     return "u64" if ot in ("i64", "u64") else ot
@@ -678,7 +678,7 @@ def _spawn_rule(em, p, ins, pav):
                            "(internal error)")
     for i, (sh, dt, _) in enumerate(pav):
         # (missing trailing leaves: the tangents of a spawn JAX bound without calling its jvp rule, i.e. zero;
-        # written as zero, since the queue slot is reused -- see lockstep._check_tail)
+        # written as zero, since the queue slot is reused -- see xla._check_tail)
         x = leaves[i] if i < len(leaves) else None
         n = _size(sh)
         qp = f"(({ctype(dt)}*)SJ_QBUF({i}))"

@@ -7,7 +7,7 @@ Two questions, kept apart, and the one frozen statistical contract between imple
 - **A. Mechanics.** Is the derivative the exact derivative of the program as written?
   - Compare against the same transformation of the dense reference (`tm.reference`, which is `jax.vmap(item)`
     with real per-item tally arrays, summed) at small N.
-  - Use the same keys, use f64 or `Sum(exact=True)` wherever bitwise agreement is expected, and compare reverse
+  - Use the same keys, use f64 or `Sum(fixed_point=True)` wherever bitwise agreement is expected, and compare reverse
     mode against forward mode (`jacfwd`) on the same keys.
   - tallymap is responsible for A. `tests/` checks it: `tests/edge.py`, `tests/transforms.py`,
     `tests/reverse.py`, `tests/reverse_spawn.py`.
@@ -32,8 +32,8 @@ used to answer a B question.
   on the host. The inputs then differ by one unit in the last place from the jitted ones, and chaotic Monte Carlo
   paths diverge from there to O(1) differences. This has produced more false alarms than any other mistake on
   this list.
-- Expect bitwise agreement only from deterministic sums: CPU, or `Sum(exact=True)` (int64 fixed point). f32
-  tallies on a GPU are accumulated with atomics on the CUDA backend and with a GPU scatter-add on the lockstep
+- Expect bitwise agreement only from deterministic sums: CPU, or `Sum(fixed_point=True)` (int64 fixed point). f32
+  tallies on a GPU are accumulated with atomics on the CUDA backend and with a GPU scatter-add on the xla
   backend, so their summation order, and their last bits, change from run to run. Rerun the same keys twice as
   the control before blaming a difference on anything else.
 - Set `jax_default_matmul_precision='highest'` for any GPU parity test. JAX's default on recent NVIDIA GPUs is a
@@ -46,7 +46,7 @@ used to answer a B question.
 ## The `compare` criterion
 
 `compare(f, *args, other=..., floor_fn=...)` in `tests/compare_protocol.py` compares two implementations of the
-same item program, for example `backend='cuda'` against `backend='lockstep'`, on the same per-item keys. It is a
+same item program, for example `backend='cuda'` against `backend='xla'`, on the same per-item keys. It is a
 test protocol, not library API; `tests/edge.py` runs it on the CUDA backend. It is a statistical test, not an
 equality check, because the two backends do not produce bitwise identical f32 sums by design
 (`docs/float_semantics.md`).
@@ -94,7 +94,7 @@ they were run on. Nothing in this repository depends on them.
 | the spawn tree adjoint against `jax.grad` of a dense plain-JAX reference, with four negative controls | `tests/reverse_spawn.py` |
 | per-operation parity of the CUDA emitter against `jax.jit(jax.vmap(op))` and the host-exact result, with a bound per class and a per-GPU baseline | `tests/ops.py`, `tests/ops_baseline.json` |
 | edge cases and every documented failure mode | `tests/edge.py` |
-| a long chain of 64-bit integer multiplies compiles in seconds and matches lockstep bitwise | `tests/mulchain.py` |
+| a long chain of 64-bit integer multiplies compiles in seconds and matches xla bitwise | `tests/mulchain.py` |
 | speed, against a recorded baseline, as a regression net | `benchmarks/perf.py`, `benchmarks/perf_baseline.json` |
 | speed and memory against plain JAX | `docs/performance.md` |
 

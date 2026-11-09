@@ -11,8 +11,8 @@ and how a release is made.
   (`backends/cuda/shim.cc`, cached per toolchain and jaxlib version).
 - GPUs tested: compute capability 7.5 (RTX 2080 Ti) and 8.9 (L40S). A100 and H200 are untested. The spawn queue
   needs compute capability 7.0 or newer, for `__nanosleep`.
-- Every other platform runs the lockstep backend: `backend='auto'` warns once, `backend='cuda'` raises. TPU and
-  ROCm are untested. The lockstep backend is the reference interpreter, slow by design, about 100 times the CUDA
+- Every other platform runs the xla backend: `backend='auto'` warns once, `backend='cuda'` raises. TPU and
+  ROCm are untested. The xla backend is the portable interpreter, slow by design, about 100 times the CUDA
   backend.
 
 ## Version policy
@@ -84,7 +84,7 @@ deliberate: it is what makes an upgrade a bounded job.
 | typed-key randomness fails on cuda (`random_bits`, `split`, `fold_in`) | the pseudo-random implementation object or `dtype._impl` changed | adapt `_compat.key_impl` and the `random_*` shims; the RNG rows of `tests/ops.py` check it bitwise; meanwhile users can pass raw uint32 keys |
 | the shim does not build or does not load | a new jaxlib FFI header, or a different host compiler | `shim.cc` is about 200 lines and its cache key contains the headers, so a stale shared object is never reused; check `$CXX` first |
 | `tests/ops.py` reports CHANGED rows | the CUDA emitter, NVRTC or the CUDA math library changed the numbers | if the change was intended: rerun the `compare` protocol (`docs/validation.md`), then re-record `tests/ops_baseline.json` in a commit of its own |
-| `stats['dropped'] > 0` and the float tallies are NaN | the spawn Queue is too small | size it (README, "Sizing the Queue") |
+| `stats['children_dropped'] > 0` and the float tallies are NaN | the spawn Queue is too small | size it (README, "Sizing the Queue") |
 | `stats['n_truncated'] > 0` and the float tallies are NaN | items hit `max_steps` | raise it, or put the budget in the loop condition if it is deliberate (README, `max_steps`) |
 | `stats['dropped_emits'] > 0` | an emit index was negative or at least the output size | an off-by-one in your binning; clip the index |
 | a NaN gradient | in this order: your own arithmetic, a resource limit, then a reverse-mode check | if `jvp` or `jacfwd` is NaN too it is your arithmetic (look for overflow); else check `stats` for truncation and dropped children; through spawn, rerun with `rev_stats=True` and read `tm.diagnostics()['reverse']['tree']` |
@@ -104,7 +104,7 @@ deliberate: it is what makes an upgrade a bounded job.
 | `rev_checkpoints` default (`T3_MIN_EQNS`, `AUTO_C_SMALL`, `AUTO_CKPT_BYTES`, `LEAN_C`) | 'auto': 16 for a step under 1000 equations, else up to 64 within 64 KiB; 16 at second order | `_reverse.py` | L40S: lumen SK / SBND / ANNIE (306-318 B states) 1.3-1.6x faster at 64; `vs_jax` (8-25 B) 1.5-3x slower at 64 |
 | `sparse_min` | 32 elements | `_reverse.py` | L40S, toy walk |
 | `MIN_BUCKET` (tree adjoint) | 256 | `_reverse_spawn.py` | L40S |
-| lockstep `BLOCK` | 2^18 lanes | `backends/lockstep.py` | CPU and L40S, memory bound |
+| xla `BLOCK` (`xla_batch_size` default) | 2^18 items | `backends/xla.py` | CPU and L40S, memory bound |
 | `EAGER_CACHE` | 64 programs | `_primitive.py` | the eager-call jit cache size |
 
 None was measured on A100 or H200. The CUDA grid is the occupancy-derived persistent grid of the device, not a
@@ -124,7 +124,7 @@ constant.
 
 - **`jax.export` of a CUDA program is not portable.** Its custom call is not on JAX's export allow-list
   (`DisabledSafetyCheck.custom_call("tallymap_cuda_launch")` exports it anyway) and the cubin registry is per
-  process, so a deserialised CUDA program only runs in a process that built the same kernels. Lockstep programs
+  process, so a deserialised CUDA program only runs in a process that built the same kernels. Programs on the xla backend
   export normally.
 - **shard_map**: the primitive follows shard_map's varying-axes typing. If a JAX release changes that type before
   the adapter does, `shard_map(..., check_vma=False)` (`check_rep=False` on 0.5.3) is the escape hatch.
@@ -147,7 +147,7 @@ one host callback in the program).
 
 Before comparing two arms of an option, for timings or for numerics, assert that they compiled to different
 programs: `assert_arms_differ(f_a, f_b, *args)` from `tests/ab_rule.py` (on CUDA it compares the cubin hashes,
-on lockstep the StableHLO). Comparing two identical programs measures noise. Before a negative control, measure that the injected
+on xla the StableHLO). Comparing two identical programs measures noise. Before a negative control, measure that the injected
 defect changes the observable at all.
 
 ## Tests and CI
@@ -157,7 +157,7 @@ because each needs fresh JAX state.
 
 | flag | what it adds |
 |---|---|
-| `--gpu` | the CUDA backend as well as lockstep, the spawn tree adjoint, `tests/ops.py` (per-operation parity) and `tests/mulchain.py` |
+| `--gpu` | the CUDA backend as well as xla, the spawn tree adjoint, `tests/ops.py` (per-operation parity) and `tests/mulchain.py` |
 | `--x64` | `jax_enable_x64` |
 | `--unfused` | the two-node JVP design, which is what runs if JAX drops the partial-evaluation registries |
 | `--canary` | DeprecationWarning and FutureWarning become errors: the JAX-upgrade canary |

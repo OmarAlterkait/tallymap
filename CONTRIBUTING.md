@@ -6,7 +6,7 @@ for anything that touches speed or numbers, a measurement of both arms.
 ## Running the tests
 
 ```
-python tests/run_all.py                      # CPU: the lockstep backend
+python tests/run_all.py                      # CPU: the xla backend
 python tests/run_all.py --gpu                # + the CUDA backend, the spawn tree adjoint, per-operation parity
 python tests/run_all.py --only edge,reverse  # one or more suites
 python tests/run_all.py --x64                # with jax_enable_x64
@@ -81,8 +81,8 @@ or renamed JAX primitive in a user's program shows up as
 5. The edge cell "op table: names are JAX primitives" checks every table name against
    `jax.extend.core.primitives`, so a typo in a rule name fails a test rather than lying dormant.
 
-The lockstep backend needs no work for a new primitive: it is plain JAX, so it already runs everything JAX can
-run. That is also why `backend='lockstep'` is the workaround for any `UnsupportedError`.
+The xla backend needs no work for a new primitive: it is plain JAX, so it already runs everything JAX can
+run. That is also why `backend='xla'` is the workaround for any `UnsupportedError`.
 
 ## The A/B rule for performance and numerics
 
@@ -91,7 +91,7 @@ job**, and an assertion that the two arms are genuinely different programs:
 
 ```python
 from ab_rule import assert_arms_differ      # tests/ab_rule.py (tests/ on sys.path)
-assert_arms_differ(f_a, f_b, *args)         # cuda: the cubin hashes; lockstep: the StableHLO
+assert_arms_differ(f_a, f_b, *args)         # cuda: the cubin hashes; xla: the StableHLO
 ```
 
 Comparing two identical programs measures noise, and it is an easy mistake to make, because an option can be
@@ -105,7 +105,7 @@ silently ignored. Then:
   on the host, the inputs then differ by one unit in the last place, and chaotic Monte Carlo paths diverge from
   there (`docs/validation.md`).
 - For a numerics change, compare per-output **vectors**, not scalar ratios, and rerun the same keys twice first
-  as the control. f32 tally sums on a GPU are not reproducible run to run by design; `Sum(exact=True)` is.
+  as the control. f32 tally sums on a GPU are not reproducible run to run by design; `Sum(fixed_point=True)` is.
 - **Before a negative control, measure that the injected defect changes the observable at all.** A negative
   control that passes because it changed nothing has tested nothing. This has happened here.
 
@@ -142,5 +142,5 @@ designs, a sentence about the one you did not pick is worth more than a paragrap
 
 Open an issue with the output of `tm.diagnostics()`, which carries the versions, the GPU, the compute capability,
 the driver, the CUDA compiler, the relevant counters and the last generated kernels. There is a template that
-asks for it. A smaller reproducer is always better, and the lockstep backend (`backend='lockstep'`) is usually
+asks for it. A smaller reproducer is always better, and the xla backend (`backend='xla'`) is usually
 the fastest way to find out whether a problem is in the CUDA emitter or in the library's semantics.

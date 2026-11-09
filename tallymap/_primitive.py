@@ -25,10 +25,10 @@ they recurse to any order.  Node kinds:
   batching     only linear operands batched (jacfwd, jacrev, vmap of jvp/vjp tangents; for a fused_jvp node: only its
                tangents) -> `dual_lanes`: T dual lanes per item, the primal computed once; on cuda in chunks of at
                most MAX_LANES (16) lanes whose lane-dependent loop arrays stay < LANES_MAX_LOCAL (512) elements, one
-               launch per chunk.  Otherwise, when no spawn / exact outputs, every batched broadcast operand is small
-               (<= FOLD_MAX_BC elements per member) and (cuda) one member's N items cannot fill the device
+               launch per chunk.  Otherwise, when no spawn / fixed-point outputs, every batched broadcast operand is
+               small (<= FOLD_MAX_BC elements per member) and (cuda) one member's N items cannot fill the device
                -> `folded_batch`: ONE launch over B*N items; anything else -> lax.map (one launch per member).
-  lowering     per PLATFORM: on 'cuda' the cuda backend (backend='auto'|'cuda'), elsewhere the lockstep backend.
+  lowering     per PLATFORM: on 'cuda' the cuda backend (backend='auto'|'cuda'), elsewhere the xla backend.
   impl         eager calls go through a jax.jit cached on the node's structure.
 
 Registries used (the same ones emit_p uses): Primitive, ad.primitive_jvps, ad.primitive_transposes,
@@ -98,7 +98,7 @@ class Node:
             p = self.prog
             k = (digest(p.cj.jaxpr), tuple(id(c) for c in p.cj.consts),
                  tuple(id(c) for c in host_callbacks(p.cj.jaxpr)),
-                 tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.exact, s.scale, s.kind) for s in p.tallies),
+                 tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.fixed_point, s.scale, s.kind) for s in p.tallies),
                  p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), self.backend, self.opts)
             object.__setattr__(self, "_key", k)
         return k
@@ -172,29 +172,29 @@ tallymap_jvp_p.def_abstract_eval(_abstract)
 
 # ------------------------------------------------------------------------------------------- lowering / impl
 def _run(node, args, platform):
-    from .backends import lockstep as LB
+    from .backends import xla as XB
     p = node.prog
     pi, bc = _split(node, args)
     opts = dict(node.opts)
     b = node.backend
     if b == "auto" and platform != "cuda":
-        _warn_once("tallymap: no CUDA GPU on this platform; running the lockstep backend (plain JAX)", node.site)
-    if b == "lockstep" or (b == "auto" and platform != "cuda"):
-        return list(LB.run(p, pi, bc, **opts))
+        _warn_once("tallymap: no CUDA GPU on this platform; running the xla backend (plain JAX)", node.site)
+    if b == "xla" or (b == "auto" and platform != "cuda"):
+        return list(XB.run(p, pi, bc, **opts))
     if b not in ("cuda", "auto"):
         raise ValueError(f"tallymap: unknown backend {b!r}")
     if platform != "cuda":
         raise UnsupportedError("tallymap: backend='cuda' needs a CUDA GPU, and there is none on this platform "
-                               f"(this computation is lowered for {platform!r}); pass backend='lockstep' to run "
+                               f"(this computation is lowered for {platform!r}); pass backend='xla' to run "
                                "the same program in plain JAX, or run it on a CUDA GPU")
     from .backends import cuda as CB
     try:
         return list(CB.run(p, pi, bc, **opts))
     except UnsupportedError as e:
-        # (C1) backend='auto' never falls back: the lockstep backend is the reference interpreter, not a fast path
-        # (measured: a 7 ms cuda program took 678 ms on lockstep), so a silent fallback is a silent ~100x slowdown
+        # (C1) backend='auto' never falls back: the xla backend is the portable interpreter, not a fast path
+        # (measured: a 7 ms cuda program took 678 ms on it), so a silent fallback is a silent ~100x slowdown
         raise UnsupportedError(f"{e}\ntallymap: the cuda backend cannot compile this program; pass "
-                               "backend='lockstep' to run it in plain JAX (the reference interpreter, ~100x slower; "
+                               "backend='xla' to run it in plain JAX (the portable interpreter, ~100x slower; "
                                "it runs every JAX primitive that has no side effects)") from None
 
 
@@ -727,11 +727,11 @@ def _can_fold(node, args, dims, bat, size):
     p = node.prog
     if dict(node.opts).get("_fold", True) is False or p.spawn is not None:
         return False            # spawn: one shared queue per launch would change capacity semantics
-    if any(s.exact for s in p.tallies if s.kind == "sum"):
-        return False            # stats['exact_overflow'] is per launch, not per batch member
+    if any(s.fixed_point for s in p.tallies if s.kind == "sum"):
+        return False            # stats['fixed_point_overflow'] is per launch, not per batch member
     for k in range(p.nP, len(args)):
         if bat[k] and int(np.prod(args[k].shape, dtype=np.int64)) // max(size, 1) > FOLD_MAX_BC:
-            return False        # a large batched table would be indexed per item (lockstep backend: gathered per lane)
+            return False        # a large batched table would be indexed per item (xla backend: gathered per item)
     if _gpu(node):
         # Folding costs B copies of every per-item operand and runs ONE launch of B*N items, so it pays only while
         # one member's launch of N items cannot fill the device by itself.  MEASURED (2080 Ti, 68 SMs = 69,632

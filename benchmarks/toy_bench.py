@@ -1,5 +1,5 @@
 """Cost measurements for the toy walk program (GPU).  env:
-BK=cuda|lockstep, N (items), MODES=fwd,jvp,jacfwd,grad,vmap,host,second,second2  LANES=off|auto|force
+BK=cuda|xla, N (items), MODES=fwd,jvp,jacfwd,grad,vmap,host,second,second2  LANES=off|auto|force
 Prints one line per measurement: name, ms (median of 7 after warmup), plus the compiled-HLO hash so A/B runs can
 assert they compiled different programs."""
 import hashlib

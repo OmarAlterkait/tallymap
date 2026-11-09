@@ -1025,7 +1025,7 @@ def _fill_default(dt):
     return np.iinfo(dt).max
 
 
-LAZY_GATHER = 16   # 0 = always materialize gathers
+LAZY_GATHER = 16   # 0 = always materialise gathers
 
 
 @rule("gather")

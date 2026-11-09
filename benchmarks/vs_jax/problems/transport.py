@@ -27,7 +27,7 @@ GROUP = "natural"
 AXIS = "n"
 SWEEP = {"full": (1 << 14, 1 << 16, 1 << 19, 1 << 22), "quick": (1 << 10, 1 << 12)}
 DIVS = ("mid", "low", "high")
-ARMS = ("tm_cuda", "tm_lockstep", "jax_while", "jax_scan", "jax_scan2x", "jax_ckpt", "jax_ckpt2x")
+ARMS = ("tm_cuda", "tm_xla", "jax_while", "jax_scan", "jax_scan2x", "jax_ckpt", "jax_ckpt2x")
 MODES = ("fwd", "jvp", "jacfwd", "grad")
 CHECK_VAL = 1 << 12
 DIV_VAL = 1 << 19      # the other divergence levels are measured at this one size
@@ -106,7 +106,7 @@ def exit_of(ctx, arm, maxs):
             i, v = deposit(c, ef)
             return t.add("Q", i, v), (i, c[3], v, c[2])
         f = tm.vmap(packet, outputs={"Q": tm.Sum((NS,))}, in_axes=(0, 0, None, None),
-                    backend="cuda" if arm == "tm_cuda" else "lockstep")
+                    backend="cuda" if arm == "tm_cuda" else "xla")
         return lambda th: f(p0, keys, th, eff).per_item
     return lambda th: jax.vmap(one, in_axes=(0, 0, None))(p0, keys, th)
 
@@ -119,7 +119,7 @@ def sim_of(ctx, arm, maxs):
             i, v = deposit(c, ef)
             return t.add("Q", i, v), c[3]
         f = tm.vmap(packet, outputs={"Q": tm.Sum((NS,))}, in_axes=(0, 0, None, None),
-                    backend="cuda" if arm == "tm_cuda" else "lockstep")
+                    backend="cuda" if arm == "tm_cuda" else "xla")
         return lambda th: f(p0, keys, th, eff).outputs["Q"]
 
     def one(p, key, th, ef):
@@ -147,7 +147,7 @@ def check(ctx, maxs):
     out = A.cross_arm_check(lambda a: sim_of(ctx, a, maxs),
                             lambda a: (lambda t: jnp.sum((sim_of(ctx, a, maxs)(t) - ctx["tgt"]) ** 2) / NS),
                             ctx["th"])
-    ref = [np.asarray(x) for x in jax.jit(exit_of(ctx, "tm_lockstep", maxs))(ctx["th"])]
+    ref = [np.asarray(x) for x in jax.jit(exit_of(ctx, "tm_xla", maxs))(ctx["th"])]
     for arm in ("tm_cuda", "jax_while", "jax_scan"):
         try:
             i, k, v, w = (np.asarray(x) for x in jax.jit(exit_of(ctx, arm, maxs))(ctx["th"]))

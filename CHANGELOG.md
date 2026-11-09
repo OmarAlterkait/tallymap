@@ -6,6 +6,30 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ## Unreleased
 
+### Renamed (a clean break: the old spellings raise)
+
+0.5.0 was tagged but never published, so these renames break no released code and get no deprecation release:
+every old spelling below raises like any unknown option, `Sum` field or backend, or is simply absent (a stats or
+diagnostics key). The entries further down use the new names.
+
+| old | new |
+|---|---|
+| `tm.Sum(..., exact=True)` | `tm.Sum(..., fixed_point=True)` ("exact" promised no error; it rounds every value to a multiple of `1/scale`) |
+| `Result.stats['exact_overflow']` | `Result.stats['fixed_point_overflow']` |
+| `Result.stats['dropped']` (spawn Queue full) | `Result.stats['children_dropped']` |
+| `backend='lockstep'` | `backend='xla'` |
+| option `lockstep_block` | option `xla_batch_size` |
+| module `tallymap.backends.lockstep` | `tallymap.backends.xla` |
+| `tm.diagnostics()['programs'][i]['baked_floats']` | `['closed_over_floats']` |
+| `tm.diagnostics()['reverse']['tree']['particles']` | `['children']` |
+| `tm.diagnostics()['reverse']['tree']['overflow']` | `['generation_overflow']` |
+| `tm.diagnostics()['kernels'][i]['mode']` | `['schedule']` |
+| private option `_schedule` | public option `schedule` (see below) |
+
+Error messages name the call the user wrote (`t.add(...)`, `t.spawn`) instead of "emit". The docs use "lane" only
+for a tangent (or cotangent) direction of a dual-lanes kernel, "reference" only for `tm.reference`, one name pair
+for the schedules ("item schedule" / "step schedule"), and the spelling "materialise".
+
 ### Changed (schedule)
 
 - The cuda schedule is a public option, `schedule='item' | 'step'`, and the default is `'item'` (a thread runs
@@ -25,7 +49,7 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 - Reverse mode: the single-loop adjoint (T3, from lumen/perf 6a70383 / b38db3f / 22e615d / e58e216, re-implemented
   on dev) for an item whose one top-level loop has a step of >= 1000 equations (`_reverse.T3_MIN_EQNS`): ONE
-  while loop of micro-steps, so the cuda backend refills lanes at step granularity and the step is instantiated
+  while loop of micro-steps, so the step schedule can split it and the step is instantiated
   once. lumen/perf measured grad / value 2.66 / 2.78 / 3.31x against 3.99 / 5.78 / 8.46x nested (SK / SBND /
   ANNIE, L40S). Not taken from lumen/perf: the custom-rule guard (the single loop advances states with the
   linearized step's primal, which is what `jax.grad` itself evaluates), the `_rev_single` option and the
@@ -42,15 +66,15 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Fixed
 
-- `Sum(exact=True)`: a TANGENT-only overflow was silently dropped on every unfused jvp path (FUSE_JVP off,
-  linearize, jacfwd with lanes refused), and the fused jvp's single counter made the correct PRIMAL exact outputs
+- `Sum(fixed_point=True)`: a TANGENT-only overflow was silently dropped on every unfused jvp path (FUSE_JVP off,
+  linearize, jacfwd with lanes refused), and the fused jvp's single counter made the correct PRIMAL fixed-point outputs
   NaN. Each kernel now flags the bins an unrepresentable emit was dropped from and writes them as NaN (cuda and
-  lockstep); the call-level exact poison is gone. A primal overflow no longer poisons other exact outputs or the
+  xla); the call-level fixed-point poison is gone. A primal overflow no longer poisons other fixed-point outputs or the
   (correct) tangent.
 
 ### Added
 
-- `tm.diagnostics(...)["programs"][i]["baked_floats"]`: shape, dtype and size of every FLOAT constant the item
+- `tm.diagnostics(...)["programs"][i]["closed_over_floats"]`: shape, dtype and size of every FLOAT constant the item
   function closed over -- the values a derivative cannot reach (a captured parameter's tangent is silently
   zero). Built when diagnostics are read, not at bind. From lumen/next b8fabe4 (= the private engine line's
   7abbc71), which built it at every bind.
@@ -95,9 +119,9 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   `triangular_solve`, `cholesky`, `geqrf` and `ormqr` and their straight-line algorithms
   (`backends/cuda/dense.py`, with its size limits `MAXD` / `MAXB`). `jnp.linalg.solve`, `inv`, `det`,
   `cholesky`, `qr` and every other `lax.linalg` primitive inside an item now raise `tm.UnsupportedError` on cuda,
-  like any other primitive the emitter has no rule for. The lockstep backend is unchanged: XLA runs these
+  like any other primitive the emitter has no rule for. The xla backend is unchanged: XLA runs these
   primitives there. Write a small solve out by hand (Cramer's rule, an unrolled elimination), as
-  `examples/demos/stiff_ode/kv3.py` does, or run the item with `backend='lockstep'`.
+  `examples/demos/stiff_ode/kv3.py` does, or run the item with `backend='xla'`.
 - The public option `rev_step_segments` (recompute each loop step in S checkpointed segments inside its VJP).
   Passing it now raises, like any unknown option. Four independent measurements on a 2080 Ti found no benefit:
   the six `benchmarks/vs_jax` gradient cells (0.98-1.05 at S = 4 and 8), the toy walk at 1M items
@@ -118,9 +142,9 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 - `tm.assert_arms_differ` (and `_diagnostics.artifacts`): the A/B rule is developer measurement hygiene built on
   `tm.diagnostics`, and moved to `tests/ab_rule.py` (used by `tests/` and `benchmarks/perf_negative_control.py`).
 - The public option `allow_fallback` (and `_primitive._lockstep_cannot_run`). Passing it now raises, like any
-  unknown option. `backend='lockstep'` is the explicit equivalent, and the `UnsupportedError` for a program the
+  unknown option. `backend='xla'` is the explicit equivalent, and the `UnsupportedError` for a program the
   cuda backend cannot compile now says to pass it, for `backend='cuda'` as well as `'auto'`.
-- `tm.Sum(..., tangent_scale=)`, the fixed-point scale of the TANGENT tally of an `exact=True` output. Nothing
+- `tm.Sum(..., tangent_scale=)`, the fixed-point scale of the TANGENT tally of an `fixed_point=True` output. Nothing
   in the tests, benchmarks, examples or documentation ever set it and no number was ever recorded for it; a
   tangent tally now always uses its primal output's `scale`, which is what every program that did not set it
   already got, so no result changes. Passing it raises `TypeError`, as any unknown `tm.Sum` field does.
@@ -138,11 +162,11 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Changed
 
-- `Sum(exact=True)`: an emit too large for the int64 fixed point (`stats['exact_overflow'] > 0`) makes every
-  exact float output of the call NaN, tangents and cotangents included, like every other resource limit
+- `Sum(fixed_point=True)`: an emit too large for the int64 fixed point (`stats['fixed_point_overflow'] > 0`) makes every
+  fixed-point float output of the call NaN, tangents and cotangents included, like every other resource limit
   (`max_steps`, the spawn Queue). It was dropped and only counted, so an overflowed sum came back finite and
-  wrong. The counter is per call, so all exact outputs are poisoned, not only the one that overflowed;
-  non-exact outputs are unchanged.
+  wrong. The counter is per call, so all fixed-point outputs are poisoned, not only the one that overflowed;
+  other outputs are unchanged.
 - Reverse mode (from lumen/perf 8c92ee8, 762da14, 830c071): the forward pass of a checkpointed loop stores the
   states before steps 0..C-1 in a head buffer, so an item of K <= C steps is never replayed; the first segment
   tape reads the head. Only the carries the step or predicate reads are stored (liveness read off the loop's
@@ -177,8 +201,8 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   L40S (`docs/design.md` section 10).
 
 - The cuda kernel claims ONE item per warp-aggregated claim. It used to claim a run of up to
-  `clamp(N / (16 * grid * block), 1, 16)` items per lane, which left the last claims holding several items each
-  — a tail the other lanes wait for. Measured over all 18 `benchmarks/vs_jax` forward and gradient cells on a
+  `clamp(N / (16 * grid * block), 1, 16)` items per thread, which left the last claims holding several items each
+  — a tail the other threads wait for. Measured over all 18 `benchmarks/vs_jax` forward and gradient cells on a
   2080 Ti: one item per claim is 1.46x faster on random_walk forward, 1.14-1.18x on transport forward,
   random_walk gradient and uniform gradient, and never slower (worst cell 1.002). Three fitted constants and
   two kernel variables go with it.
@@ -192,7 +216,7 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   cells and is 1.32x and 2.21x faster (256 and 1,024 bins); at a million items it stops folding two cells and
   is 2.46x and 2.48x faster (64 and 4,096 bins) and at four million 6.85x and 5.83x; at 262,144 items it gives
   up 1.35 to 1.37x. `lax.map` cells
-  and lockstep are unchanged (`docs/design.md` section 2). `kernel.privatised()` loses its `B=` parameter.
+  and xla are unchanged (`docs/design.md` section 2). `kernel.privatised()` loses its `B=` parameter.
 
 - cuda compile time: lazily inlined element expressions are capped at 32 nodes (was 256). On a large
   photon-transport item this took the forward compile from 1543 to 834 s and the run from 9.04 to 6.87 s on a
@@ -247,11 +271,11 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   today; the private engine line lost `CodegenError.nbytes` this way (8fe2295).
 - `jax.jvp` / `jacfwd` of a spawning program in which a `spawn` site's float child leaves are all constants (no
   tangent reaches it): JAX binds that spawn without calling its jvp rule, so it carries only the primal leaves.
-  The lockstep backend raised a `while_loop` carry-structure TypeError; the cuda backend wrote nothing into the
+  The xla backend raised a `while_loop` carry-structure TypeError; the cuda backend wrote nothing into the
   child's tangent slots, so the child read whatever an earlier child had left in that ring slot (zero only until
   the ring wraps). Both now write those tangents as zero. Found by the DiCE tests ported from the private engine
   line.
-- `tm.diagnostics(f, ...)["stablehlo_sha256"]` (and `tests/ab_rule.py`, which compares it for the lockstep
+- `tm.diagnostics(f, ...)["stablehlo_sha256"]` (and `tests/ab_rule.py`, which compares it for the xla
   backend) is the same on every lowering of a program with a host callback. On JAX < 0.7 a callback lowers
   with the address of its Python callable, new every time, so the raw text never hashed the same twice; the
   descriptors are now replaced by their ordinal before hashing. From the private engine line (48eea82).

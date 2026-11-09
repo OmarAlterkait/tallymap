@@ -54,7 +54,7 @@ PROBLEMS = ["random_walk", "transport", "walk_on_spheres", "ode_ensemble", "gill
 KEYS = ("problem", "arm", "mode", "val", "div")
 # --quick is a smoke test, not a measurement: one divergence level, one small size, forward and gradient only,
 # and one baseline of each kind.  It has to finish on a CPU in under five minutes.
-QUICK_ARMS = ("tm_cuda", "tm_lockstep", "jax_while", "jax_scan2x", "jax_pad2x", "jax_gen2x")
+QUICK_ARMS = ("tm_cuda", "tm_xla", "jax_while", "jax_scan2x", "jax_pad2x", "jax_gen2x")
 QUICK_MODES = ("fwd", "grad", "score")
 
 
@@ -187,7 +187,7 @@ def drive(args):
                 maxs_by_val[v] = int(r["steps_max"])
                 probe_by_val[v] = json.dumps({k: r[k] for k in getattr(p, "PROBE_KEYS", ()) if k in r})
                 if r.get("backend") != "gpu" and "tm_cuda" in plist:
-                    plist = [a for a in plist if a != "tm_cuda"]      # CPU: only the lockstep backend exists
+                    plist = [a for a in plist if a != "tm_cuda"]      # CPU: only the xla backend exists
                 print(f"  probe {name:16s} {div:5s} val={v:<9} steps mean {r['steps_mean']:.1f} "
                       f"max {r['steps_max']}", flush=True)
             if args.check and hasattr(p, "check"):
@@ -247,7 +247,7 @@ def main(argv):
     ap.add_argument("--reps", type=int, default=0, help="0 = 7, or 3 with --quick")
     ap.add_argument("--timeout", type=int, default=1800)
     ap.add_argument("--max-val", dest="max_val", type=int, default=0,
-                    help="skip sweep points above this (the CPU sweep, where only the lockstep backend exists)")
+                    help="skip sweep points above this (the CPU sweep, where only the xla backend exists)")
     ap.add_argument("--check", type=int, default=1)
     ap.add_argument("--cell", action="store_true", help="internal: run ONE measurement in this process")
     ap.add_argument("--arm", default="tm_cuda")

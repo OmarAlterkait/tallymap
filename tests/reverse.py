@@ -1,5 +1,5 @@
 """Reverse-mode matrix.  python tests/reverse.py
-env: BACKENDS=lockstep,cuda  TEST_X64=1  ONLY=substr  KS=1,10,100,1000
+env: BACKENDS=xla,cuda  TEST_X64=1  ONLY=substr  KS=1,10,100,1000
 
 Every gradient is compared, as full VECTORS, against jax.grad of a PADDED-SCAN version of the same item (dense
 per-item tallies, jax.vmap + sum: tallymap.reference), and where cheap against jacfwd / jvp of
@@ -35,7 +35,7 @@ jax.config.update("jax_default_matmul_precision", "highest")
 X64 = bool(jax.config.jax_enable_x64)
 F = jnp.float64 if X64 else jnp.float32
 GPU = jax.default_backend() == "gpu"
-BACKENDS = os.environ.get("BACKENDS", "lockstep,cuda" if GPU else "lockstep").split(",")
+BACKENDS = os.environ.get("BACKENDS", "xla,cuda" if GPU else "xla").split(",")
 ONLY = os.environ.get("ONLY", "")
 KS = [int(k) for k in os.environ.get("KS", "1,10,100,1000").split(",")]
 N = int(os.environ.get("RV_N", 48))
@@ -426,7 +426,7 @@ def _(b):
     return close(g, gr, "mixed")
 
 
-@case("NEGATIVE CONTROL: mixed use with dense detection disabled MUST differ", ["lockstep"])
+@case("NEGATIVE CONTROL: mixed use with dense detection disabled MUST differ", ["xla"])
 def _(b):
     g, gr, _ = branchy_case(b, 256, mixed=True)
     gb, _, info = branchy_case(b, 256, mixed=True, _rev_nodense=True)

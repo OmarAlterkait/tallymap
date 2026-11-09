@@ -37,11 +37,11 @@ forward dropped nothing; that is GUARANTEED when the total number of children <=
 total), so a larger tree poisons the gradient (NaN) and is reported (stats 'drop_risk').  Replay or forward
 mismatches poison too.  Never silently wrong.
 
-Capacities are derived from the Queue capacity Q (the user sets nothing): the tree holds up to Q non-root
-particles (exactly the bound under which the forward provably dropped nothing), a generation up to Q (private
-option _rev_gen_capacity lowers it to save memory; a larger generation then poisons: stats 'overflow'), depth up to
-Q.  Generation launches use capacity buckets Cg, Cg/2, Cg/4, ... (>= 256) so a small generation does not pay for Cg
-idle items.  Private _tree_neg ('detach' | 'replay') are the negative controls.
+Capacities are derived from the Queue capacity Q (the user sets nothing): the tree holds up to Q children
+(non-root items: exactly the bound under which the forward provably dropped nothing), a generation up to Q (private
+option _rev_gen_capacity lowers it to save memory; a larger generation then poisons: stats 'generation_overflow'),
+depth up to Q.  Generation launches use capacity buckets Cg, Cg/2, Cg/4, ... (>= 256) so a small generation does
+not pay for Cg idle items.  Private _tree_neg ('detach' | 'replay') are the negative controls.
 Stats of the last tree adjoint (host side, via jax.debug.callback, OPT-IN: rev_stats=True -- a host callback takes
 jax.jit off its C++ dispatch path): tallymap.diagnostics()['reverse']['tree'] (= _reverse_spawn.LAST[-1]).
 Second order through this adjoint raises (the recorded payloads are bit-cast, they carry no tangent).
@@ -294,8 +294,8 @@ def tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N):
     o = dict(node.opts)
     Q = int(base.spawn.capacity)
     Cg = min(int(o.get("_rev_gen_capacity", Q)), Q)
-    TOT = Q                     # all non-root particles: more than Q -> the forward may have dropped (drop_risk)
-    GMAX = Q + 1                # depth <= particles + 1: never the binding limit
+    TOT = Q                     # all children (non-root items): more than Q -> the forward may have dropped (drop_risk)
+    GMAX = Q + 1                # depth <= children + 1: never the binding limit
     neg = o.get("_tree_neg", "")
     R, count, write, adj, T, pert_pi, pert_bc = _progs(base, Cg, U_bc, o)
     nP, nB = base.nP, base.nB
@@ -378,7 +378,7 @@ def tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N):
     s = lax.while_loop(f_cond, f_body, (jnp.int32(1), FB, FC, FH, goff, ng, ovf, fmm0, sums0))
     G, FB, FC, FH, goff, ng, ovf, fmm, sums = s
     ovf = ovf | (ng[jnp.minimum(G, GMAX + 1)] > 0)          # stopped by rev_max_generations (or overflow)
-    total = goff[G]                                          # all non-root particles (recorded)
+    total = goff[G]                                          # all children (non-root items, recorded)
     drop_risk = total + ng[jnp.minimum(G, GMAX + 1)] > Q      # (+ a generation not recorded: tree > Queue capacity)
 
     # ---- reverse: generations G-1 .. 1, then the roots
@@ -428,7 +428,8 @@ def tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N):
     g_bc = [None] * nB
     for k, i in enumerate(ib):
         g_bc[i] = poison(gt[k]).reshape(bav[i].shape)
-    st_ = dict(generations=G - 1, particles=total, max_generation=jnp.max(ng), overflow=ovf, drop_risk=drop_risk,
+    st_ = dict(generations=G - 1, children=total, max_generation=jnp.max(ng), generation_overflow=ovf,
+               drop_risk=drop_risk,
                replay_mismatch=mm.astype(jnp.int32), fwd_mismatch=fmm, n_roots=jnp.int32(N),
                launches=2 * G + G)       # (count + write) per forward generation + one adjoint per generation
     if o.get("rev_stats"):

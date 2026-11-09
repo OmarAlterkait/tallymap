@@ -76,7 +76,7 @@ def nvrtc():
         raise RuntimeError("tallymap: the cuda backend compiles with NVRTC, and no libnvrtc was found (neither the "
                            "nvidia-cuda-nvrtc-cu12 wheel nor /usr/local/cuda/lib64 nor the loader path).  Fix: pip "
                            "install 'tallymap[cuda]' (or nvidia-cuda-nvrtc-cu12), or put a CUDA 12 toolkit's lib64 "
-                           "on LD_LIBRARY_PATH; or run with backend='lockstep'.")
+                           "on LD_LIBRARY_PATH; or run with backend='xla'.")
     return _NVRTC[0]
 
 
@@ -284,7 +284,7 @@ def check_frame(cubin, where="", note=""):
             f"thread ({k}: the item's per-thread frame, its local arrays and register spills), over CUDA's limit "
             f"of {LOCAL_LIMIT:,} bytes (512 KiB) per thread, so it cannot launch on any GPU.  {note}"
             f"Make the per-item state smaller (fewer or smaller per-item arrays live at once), or run it with "
-            f"backend='lockstep'.")
+            f"backend='xla'.")
 
 
 def register_kernel(cubin, note=""):

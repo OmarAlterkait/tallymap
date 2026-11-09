@@ -48,7 +48,7 @@ GROUP = "interacting"
 AXIS = "n"
 SWEEP = {"full": (1 << 12, 1 << 14, 1 << 16, 1 << 18), "quick": (1 << 9, 1 << 10)}
 DIVS = ("clustered", "uniform")
-ARMS = ("tm_cuda", "tm_lockstep", "jax_while", "jax_scan", "jax_scan2x", "jax_ckpt", "jax_ckpt2x",
+ARMS = ("tm_cuda", "tm_xla", "jax_while", "jax_scan", "jax_scan2x", "jax_ckpt", "jax_ckpt2x",
         "jax_pad", "jax_pad2x")
 MODES = ("fwd", "grad")
 CHECK_VAL = 1 << 9
@@ -202,7 +202,7 @@ def forces_of(ctx, arm, maxs):
     if arm.startswith("tm_"):
         f = tm.vmap(lambda t, xi, order, start, pos, th: _tm_item(t, xi, order, start, pos, th, nc, h, side),
                     outputs={"u": tm.Sum((NG,))}, in_axes=(0, None, None, None, None),
-                    backend="cuda" if arm == "tm_cuda" else "lockstep")
+                    backend="cuda" if arm == "tm_cuda" else "xla")
 
         def call(pos, th):
             order, start = cell_list(pos, nc, side)

@@ -1,5 +1,5 @@
 """DiCE through tallymap: gradients of DISCRETE outcomes, with float score leaves carried through spawn.
-python tests/dice.py   (env: BACKENDS=lockstep,cuda  TEST_X64=1  ONLY=substr)
+python tests/dice.py   (env: BACKENDS=xla,cuda  TEST_X64=1  ONLY=substr)
 
 Ported from the private dtrax line (tests_wavefront/test_dice.py a49dd83 + 3e8fd86, test_dice_baseline.py
 e9c99ac + 02da99e + 68c0c6e, programs from grad_progs.py), adapted to this suite's cell format.  Two programs whose
@@ -11,7 +11,7 @@ and a closed form tells a right answer from a plausible one:
   branch  an item spawns at most one child with probability sigmoid(theta), to depth D; the child INHERITS its
           ancestors' score as a per-item FLOAT LEAF of the spawn payload.  E[n] = sum_g p^g.
 
-References: R1 the lockstep backend (cuda's tangent must equal it to float tolerance; GPU only), R3 the analytic
+References: R1 the xla backend (cuda's tangent must equal it to float tolerance; GPU only), R3 the analytic
 derivative as a z-score against the estimator's OWN standard error.  A z-score cell whose standard error cannot
 separate the answer from zero (se / |scale| > 0.34) is UNRESOLVED, which is not a PASS.
 The factored-score cells (R2) check, in this order: the score tally is exactly 0.0 forward; E[dS_k] = 0 per decision
@@ -45,10 +45,10 @@ if os.environ.get("TX_T3") == "1":                      # run_all --t3: the sing
     from tallymap import _reverse as _R0
     _R0.SINGLE = "force"
 GPU = jax.default_backend() == "gpu"
-BACKENDS = os.environ.get("BACKENDS", "lockstep,cuda" if GPU else "lockstep").split(",")
-B0 = "cuda" if "cuda" in BACKENDS else "lockstep"       # the backend under test; lockstep is R1's reference
+BACKENDS = os.environ.get("BACKENDS", "xla,cuda" if GPU else "xla").split(",")
+B0 = "cuda" if "cuda" in BACKENDS else "xla"       # the backend under test; xla is R1's reference
 ONLY = os.environ.get("ONLY", "")
-EX = bool(jax.config.jax_enable_x64)                    # exact tallies need x64 on the lockstep backend
+EX = bool(jax.config.jax_enable_x64)                    # fixed-point tallies need x64 on the xla backend
 F = jnp.float64 if EX else jnp.float32
 TOL = 3e-5 if EX else 3e-3
 print("jax", jax.__version__, jax.__file__, jax.devices(), "x64", EX, "backend", B0, flush=True)
@@ -207,8 +207,8 @@ def branch_fac_truth(th0):
 
 
 def fac_outputs(K):
-    o = {n: tm.Sum((NG * K,), F, exact=EX) for n in ("S", "FS", "NS")}
-    o["m"] = tm.Sum((NG * 2,), F, exact=EX)
+    o = {n: tm.Sum((NG * K,), F, fixed_point=EX) for n in ("S", "FS", "NS")}
+    o["m"] = tm.Sum((NG * 2,), F, fixed_point=EX)
     return o
 
 
@@ -219,8 +219,8 @@ TH_S, DTH = jnp.asarray([0.9, 0.0, 0.0], F), jnp.asarray([1.0, 0.0, 0.0], F)
 
 
 def slab_run(backend, dice=True):
-    f = tm.vmap(lambda t, k, th: slab(t, k, th, dice), outputs={"T": tm.Sum((2,), F, exact=EX)}, in_axes=(0, None),
-                backend=backend)
+    f = tm.vmap(lambda t, k, th: slab(t, k, th, dice), outputs={"T": tm.Sum((2,), F, fixed_point=EX)},
+                in_axes=(0, None), backend=backend)
     p, d = jvp_of(lambda th: f(SKEYS, th).outputs["T"], TH_S, DTH)
     return np.asarray(p, np.float64), np.asarray(d, np.float64)
 
@@ -254,10 +254,10 @@ def _slab():
     return _SLAB
 
 
-@case("[G4] slab R1: cuda tangent == lockstep", gpu_only=True)
+@case("[G4] slab R1: cuda tangent == xla", gpu_only=True)
 def _():
     pc, tc = _slab()["main"]
-    pl, tl = slab_run("lockstep")
+    pl, tl = slab_run("xla")
     r = rel(tc, tl)
     if r >= TOL:
         raise Fail(f"max rel {r:.3e}")
@@ -301,7 +301,7 @@ TH_B = jnp.asarray([0.4, 0.0, 0.0], F)
 
 
 def branch_f(backend, cap=1 << 20):
-    return tm.vmap(branch, outputs={"n": tm.Sum((1,), F, exact=EX)}, in_axes=(0, None), spawn=tm.Queue(cap),
+    return tm.vmap(branch, outputs={"n": tm.Sum((1,), F, fixed_point=EX)}, in_axes=(0, None), spawn=tm.Queue(cap),
                    backend=backend)
 
 
@@ -320,13 +320,13 @@ def _branch():
     return _BR["main"]
 
 
-@case("[G4] branch R1: cuda tangent == lockstep (spawn, inherited float score leaf)", gpu_only=True)
+@case("[G4] branch R1: cuda tangent == xla (spawn, inherited float score leaf)", gpu_only=True)
 def _():
     pc, tc = _branch()
-    pl, tl = branch_run("lockstep", branch_inputs(N_BR))
+    pl, tl = branch_run("xla", branch_inputs(N_BR))
     r = rel(tc, tl)
     if r >= TOL:
-        raise Fail(f"max rel {r:.3e} (cuda {tc[0] / N_BR:+.6g}, lockstep {tl[0] / N_BR:+.6g} per root)")
+        raise Fail(f"max rel {r:.3e} (cuda {tc[0] / N_BR:+.6g}, xla {tl[0] / N_BR:+.6g} per root)")
     return f"max rel {r:.3e}"
 
 

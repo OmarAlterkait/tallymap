@@ -44,15 +44,15 @@ w = jnp.linspace(1.0, 2.0, NZ, dtype=jnp.float32)
 
 r = jax.jit(f)(roots, theta)
 print("deposit profile", np.round(np.asarray(r.outputs["dep"]), 1))
-print("spawned", int(r.stats["spawned"]), " dropped", int(r.stats["dropped"]))
+print("spawned", int(r.stats["spawned"]), " dropped", int(r.stats["children_dropped"]))
 loss = lambda th, roots: jnp.sum(f(roots, th).outputs["dep"] * w)
 g = jax.jit(jax.grad(loss))(theta, roots)
 J = jax.jit(jax.jacfwd(loss))(theta, roots)
 st = tm.diagnostics()["reverse"]["tree"]
 err = float(jnp.max(jnp.abs(g - J)) / jnp.max(jnp.abs(J)))
 print("grad", np.asarray(g), " jacfwd", np.asarray(J), f" rel {err:.1e}")
-print("tree adjoint: generations", int(st["generations"]), " particles", int(st["particles"]),
+print("tree adjoint: generations", int(st["generations"]), " children", int(st["children"]),
       " drop_risk", bool(st["drop_risk"]), " replay mismatches", int(st["replay_mismatch"]))
-assert int(r.stats["dropped"]) == 0 and not bool(st["drop_risk"]) and int(st["replay_mismatch"]) == 0
+assert int(r.stats["children_dropped"]) == 0 and not bool(st["drop_risk"]) and int(st["replay_mismatch"]) == 0
 assert np.all(np.isfinite(np.asarray(g))) and err < 1e-4, err
 print("SHOWER_TOY OK")

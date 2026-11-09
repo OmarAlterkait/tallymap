@@ -270,7 +270,7 @@ def one(a):
         rt = jax.jit(lambda th: ftm(roots, th))(theta)
         off = np.asarray(rt.outputs["off"])
         D.row(**base, status="ok", tm_spawned=int(rt.stats["spawned"]),
-              tm_dropped=int(rt.stats["dropped"]), tm_gen_max=int(np.max(np.asarray(rt.outputs["gen"]))),
+              tm_dropped=int(rt.stats["children_dropped"]), tm_gen_max=int(np.max(np.asarray(rt.outputs["gen"]))),
               tm_front_needed=int(np.max(np.asarray(rt.outputs["offgen"]))),
               tm_max_offspring=int(np.max(np.nonzero(off)[0])),
               tm_off_overflow=float(off[NOFF - 1]),
@@ -293,7 +293,7 @@ def one(a):
                  finite=bool(np.all(np.isfinite(np.asarray(out)))))
         if a.arm == "tm":
             res = jax.jit(lambda th: ftm(roots, th))(theta)
-            r.update(tm_spawned=int(res.stats["spawned"]), tm_dropped=int(res.stats["dropped"]),
+            r.update(tm_spawned=int(res.stats["spawned"]), tm_dropped=int(res.stats["children_dropped"]),
                      n_truncated=int(res.stats["n_truncated"]),
                      size_per_root=float(res.outputs["cum"][0]) / n)
         else:
@@ -318,9 +318,9 @@ def quick(a):
     need = int(np.max(np.asarray(rp.outputs["offgen"])))
     front = max(n, int(1.05 * need) + 1)
     checks.append((f"the spawn tree measures what the frontier arm must be sized for (front={front:,})",
-                   int(rp.stats["dropped"]) == 0,
+                   int(rp.stats["children_dropped"]) == 0,
                    f"{int(rp.stats['spawned']):,} children spawned, {need:,} drawn in the largest "
-                   f"generation, {int(rp.stats['dropped'])} dropped"))
+                   f"generation, {int(rp.stats['children_dropped'])} dropped"))
 
     ftm = make_tm(sigma, 1 << 22)
     gj = make_front(sigma, front)
@@ -355,7 +355,7 @@ def quick(a):
     small = make_tm(sigma, 1 << 8, rev_stats=True)
     gs = np.asarray(jax.jit(jax.grad(lambda th: small(roots, th).outputs["smooth"][0] / n))(theta))
     tr = tm.diagnostics()["reverse"]["tree"]
-    ov = bool(tr["overflow"]) if tr is not None else None
+    ov = bool(tr["generation_overflow"]) if tr is not None else None
     checks.append(("an undersized spawn Queue gives NaN, not a wrong number",
                    bool(np.any(~np.isfinite(gs))) and ov is True,
                    f"grad = {np.array2string(gs, precision=3)}, diagnostics overflow = {ov}"))

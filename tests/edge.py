@@ -1,4 +1,4 @@
-"""Phase-2 edge-case matrix.  python tests/edge.py  (env: BACKENDS=lockstep,cuda  TEST_X64=1  ONLY=substr)
+"""Phase-2 edge-case matrix.  python tests/edge.py  (env: BACKENDS=xla,cuda  TEST_X64=1  ONLY=substr)
 Prints one line per (case, backend): PASS / FAIL <why> / RAISE <exception> and a summary table."""
 import os
 import re
@@ -29,7 +29,7 @@ if os.environ.get("TX_T3") == "1":                      # run_all --t3: the sing
 
 jax.config.update("jax_default_matmul_precision", "highest")
 GPU = jax.default_backend() == "gpu"
-BACKENDS = os.environ.get("BACKENDS", "lockstep,cuda" if GPU else "lockstep").split(",")
+BACKENDS = os.environ.get("BACKENDS", "xla,cuda" if GPU else "xla").split(",")
 ONLY = os.environ.get("ONLY", "")
 F = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
 print("jax", jax.__version__, jax.__file__, jax.devices(), "x64", jax.config.jax_enable_x64, flush=True)
@@ -174,7 +174,7 @@ def _(b):
     close(m, want)
 
 
-@case("spawn without Queue / spawn outside", ["lockstep"])
+@case("spawn without Queue / spawn outside", ["xla"])
 def _(b):
     raises(ValueError, lambda: V(lambda t, x: t.spawn(x), b)(xs), "Queue")
     def item(t, x):
@@ -182,15 +182,22 @@ def _(b):
     raises(ValueError, lambda: jax.jit(lambda x: R(item)(x))(xs), "Queue")
 
 
-@case("API: unknown or renamed options / backends and removed aliases raise", ["lockstep"])
+@case("API: unknown or renamed options / backends and removed aliases raise", ["xla"])
 def _(b):
     f = lambda t, x: t.add("Q", 0, x)
     for kw in (dict(math="ieee"), dict(min_blocks=4), dict(block=8), dict(rev_slots=4), dict(rev_remat=2),
                dict(ad="forward"), dict(bogus=1), dict(_occ_cap=2), dict(_replay_check=False),
                dict(cuda_min_blocks=2), dict(_rev_phase="skip"), dict(_tree_phase="fwd"),
-               dict(rev_step_segments=8)):
+               dict(rev_step_segments=8), dict(lockstep_block=8), dict(_schedule="step")):
         raises(ValueError, lambda: V(f, b, **kw), "unknown option")
-    raises(ValueError, lambda: tm.vmap(f, outputs={"Q": tm.Sum((NB,), F)}, backend="xla"), "unknown backend")
+    for bk in ("lockstep", "jax"):                                     # 'lockstep' is the old name of 'xla'
+        raises(ValueError, lambda: tm.vmap(f, outputs={"Q": tm.Sum((NB,), F)}, backend=bk), "unknown backend")
+    raises(TypeError, lambda: tm.Sum((NB,), F, exact=True), "exact")    # renamed fixed_point=
+    r = tm.vmap(lambda t, x: t.spawn(x, when=x > 9.0).add("Q", 0, x), outputs={"Q": tm.Sum((NB,), F)},
+                spawn=tm.Queue(4), backend=b)(xs)
+    if set(r.stats) != {"fixed_point_overflow", "dropped_emits", "spawned", "children_dropped", "children_truncated",
+                        "n_truncated"}:
+        raise Fail(f"stats keys {sorted(r.stats)}")
     from tallymap import _tally
     for mod, name in ((tm, "emit"), (tm, "spawn"), (tm, "check"), (tm, "reverse_stats"), (_tally, "emit"),
                       (_tally, "spawn")):
@@ -232,12 +239,12 @@ def _(b):
 @case("nested tm.vmap (self-contained inner)")
 def _(b):
     def outer(t, x):
-        r = tm.vmap(lambda ti, y: ti.add("Q", 0, y * x), outputs={"Q": tm.Sum((NB,), F)}, backend="lockstep")(
+        r = tm.vmap(lambda ti, y: ti.add("Q", 0, y * x), outputs={"Q": tm.Sum((NB,), F)}, backend="xla")(
             jnp.stack([x, 2 * x]))
         return t.add("Q", 3, r.outputs["Q"][0])
     if b == "cuda":
-        raises(tm.UnsupportedError, lambda: V(outer, b)(xs), "backend='lockstep'")
-        b = "lockstep"
+        raises(tm.UnsupportedError, lambda: V(outer, b)(xs), "backend='xla'")
+        b = "xla"
     q = V(outer, b)(xs).outputs["Q"]
     close(q[3], 3 * float((xs ** 2).sum()))
 
@@ -280,7 +287,7 @@ def _(b):
 
 @case("N=0, N=1, N not a multiple of block")
 def _(b):
-    f = V(walk, b, in_axes=AX, lockstep_block=8)
+    f = V(walk, b, in_axes=AX, xla_batch_size=8)
     for n in (0, 1, 13):
         A = f(xs[:n], keys[:n], tab, TH)
         if n == 0:
@@ -291,13 +298,13 @@ def _(b):
             close(A, R(walk, in_axes=AX)(xs[:n], keys[:n], tab, TH), what=f"N={n}")
 
 
-@case("N >= 2^31 rejected with a clear error", ["lockstep"])
+@case("N >= 2^31 rejected with a clear error", ["xla"])
 def _(b):
     f = V(lambda t, x: t.add("Q", 0, x), b)
     raises(ValueError, lambda: jax.eval_shape(f, jax.ShapeDtypeStruct((2 ** 31,), F)), "2^31")
 
 
-@case("large N (2^22 items, ids folded into one key)", ["cuda"] if GPU else ["lockstep"])
+@case("large N (2^22 items, ids folded into one key)", ["cuda"] if GPU else ["xla"])
 def _(b):
     n = 1 << 22
     ids = jnp.arange(n, dtype=jnp.uint32)
@@ -406,17 +413,17 @@ def _(b):
     close(jax.vmap(lambda s: f1(xs * s, idx).outputs["Q"])(ss),
           jax.vmap(lambda s: r1(xs * s, idx).outputs["Q"])(ss), what="vmap")
     msg = f"{want} of {2 * N} emits dropped"
-    if b == "cuda" or jax.config.jax_enable_x64:                   # exact=True needs x64 on the lockstep backend
-        E = tm.vmap(mk(1), outputs={"Q": tm.Sum((NB,), F, exact=True, scale=2.0 ** 20)}, backend=b)(xs, idx)
-        if int(E.stats["dropped_emits"]) != want or int(E.stats["exact_overflow"]) != 0:
-            raise Fail(f"exact tally: dropped_emits {int(E.stats['dropped_emits'])} (want {want}), overflow "
-                       f"{int(E.stats['exact_overflow'])}")
-        msg += "; exact tally too"
+    if b == "cuda" or jax.config.jax_enable_x64:                   # fixed_point=True needs x64 on the xla backend
+        E = tm.vmap(mk(1), outputs={"Q": tm.Sum((NB,), F, fixed_point=True, scale=2.0 ** 20)}, backend=b)(xs, idx)
+        if int(E.stats["dropped_emits"]) != want or int(E.stats["fixed_point_overflow"]) != 0:
+            raise Fail(f"fixed-point tally: dropped_emits {int(E.stats['dropped_emits'])} (want {want}), overflow "
+                       f"{int(E.stats['fixed_point_overflow'])}")
+        msg += "; fixed-point tally too"
     return msg
 
 
 @case("dual lanes: the lane guard decides T on the unbatched program; a refused T-lane program is never built",
-      ["lockstep"])
+      ["xla"])
 def _(b):
     # Traced with backend='cuda' (the guard is the cuda one), never lowered, so it runs on every host.  Every
     # dual_lanes_prog call made by _dual_lanes is recorded with the lane state it really has, which must be T x the
@@ -640,7 +647,7 @@ def _(b):
     close(V(item, b)(xs), R(item)(xs))
 
 
-@case("debug.print raises clearly; pure_callback -> cuda unsupported (cuda and auto raise, pointing to lockstep)")
+@case("debug.print raises clearly; pure_callback -> cuda unsupported (cuda and auto raise, pointing to xla)")
 def _(b):
     def dbg(t, x):
         jax.debug.print("x={x}", x=x)
@@ -651,9 +658,9 @@ def _(b):
         y = jax.pure_callback(lambda v: np.asarray(v * 2), jax.ShapeDtypeStruct((), F), x, vmap_method="sequential")
         return t.add("Q", 0, y)
     if b == "cuda":
-        raises(tm.UnsupportedError, lambda: V(cb, "cuda")(xs), "backend='lockstep'")
-        raises(tm.UnsupportedError, lambda: V(cb, "auto")(xs), "backend='lockstep'")
-        q = V(cb, "lockstep")(xs).outputs["Q"]
+        raises(tm.UnsupportedError, lambda: V(cb, "cuda")(xs), "backend='xla'")
+        raises(tm.UnsupportedError, lambda: V(cb, "auto")(xs), "backend='xla'")
+        q = V(cb, "xla")(xs).outputs["Q"]
     else:
         q = V(cb, b)(xs).outputs["Q"]
     close(q[0], 2 * float(xs.sum()))
@@ -720,7 +727,7 @@ def _tangent_overflow(b, x2):
     column 0 x*1e15 (unrepresentable), column 1 x.  On every jvp path the column-0 tangent bin is NaN, the column-1
     bin and every primal bin are finite, and the primal is bitwise the plain call's."""
     from tallymap import _primitive as P_
-    out = {"Q": tm.Sum((NB,), F, exact=True, scale=2.0 ** 20)}
+    out = {"Q": tm.Sum((NB,), F, fixed_point=True, scale=2.0 ** 20)}
     s0 = jnp.ones((2,), F)
     eye = jnp.eye(2, dtype=F)
 
@@ -772,13 +779,14 @@ def _f32_bins(b, x2, k2):
     return f"f32 atomics order-dependent bins: {int((f1 != f2).sum())}/{NB}"
 
 
-@case("exact=True: order-independent, run-to-run bitwise; overflow counted, poisons its own bin (primal and tangent)")
+@case("fixed_point=True: order-independent, run-to-run bitwise; overflow counted, poisons its own bin "
+      "(primal and tangent)")
 def _(b):
-    if b == "lockstep" and not jax.config.jax_enable_x64:
-        raises(NotImplementedError, lambda: tm.vmap(walk, outputs={"Q": tm.Sum((NB,), F, exact=True)}, in_axes=AX,
+    if b == "xla" and not jax.config.jax_enable_x64:
+        raises(NotImplementedError, lambda: tm.vmap(walk, outputs={"Q": tm.Sum((NB,), F, fixed_point=True)}, in_axes=AX,
                                                       backend=b)(xs, keys, tab, TH), "x64")
-        return "needs x64 on lockstep (raises clearly)"
-    out = {"Q": tm.Sum((NB,), F, exact=True, scale=2.0 ** 20)}
+        return "needs x64 on xla (raises clearly)"
+    out = {"Q": tm.Sum((NB,), F, fixed_point=True, scale=2.0 ** 20)}
     n = 4096
     x2 = jnp.linspace(0.1, 3.0, n).astype(F)
     k2 = jax.random.split(jax.random.PRNGKey(5), n)
@@ -786,14 +794,14 @@ def _(b):
     a1 = np.asarray(f(x2, k2, tab, TH).outputs["Q"])
     a2 = np.asarray(f(x2[::-1], k2[::-1], tab, TH).outputs["Q"])          # different item order
     if not np.array_equal(a1, a2):
-        raise Fail("exact output depends on item order")
+        raise Fail("fixed-point output depends on item order")
     big = tm.vmap(lambda t, x: t.add("Q", 0, x * 1e15), outputs=out, backend=b)(x2)
-    if int(big.stats["exact_overflow"]) != n:
-        raise Fail(f"overflow count {int(big.stats['exact_overflow'])} != {n}")
-    # an overflow poisons the BIN it was emitted to, nothing else: other bins, other exact outputs and non-exact
+    if int(big.stats["fixed_point_overflow"]) != n:
+        raise Fail(f"overflow count {int(big.stats['fixed_point_overflow'])} != {n}")
+    # an overflow poisons the BIN it was emitted to, nothing else: other bins, other fixed-point outputs and float
     # outputs stay as they are
-    mix = {"Q": tm.Sum((NB,), F, exact=True, scale=2.0 ** 20), "E": tm.Sum((2,), F, exact=True, scale=2.0 ** 20),
-           "P": tm.Sum((1,), F)}
+    mix = {"Q": tm.Sum((NB,), F, fixed_point=True, scale=2.0 ** 20),
+           "E": tm.Sum((2,), F, fixed_point=True, scale=2.0 ** 20), "P": tm.Sum((1,), F)}
 
     def ovf(t, x, s):
         return t.add("Q", 0, x * s).add("Q", 1, x).add("E", 1, x).add("P", 0, x)
@@ -801,30 +809,30 @@ def _(b):
     r = g(x2, F(1e15))
     q = np.asarray(r.outputs["Q"])
     if not (np.isnan(q[0]) and np.isfinite(q[1:]).all() and np.isfinite(np.asarray(r.outputs["E"])).all()):
-        raise Fail(f"exact_overflow={int(r.stats['exact_overflow'])}: want only Q[0] NaN, got Q {q[:3]} "
+        raise Fail(f"exact_overflow={int(r.stats['fixed_point_overflow'])}: want only Q[0] NaN, got Q {q[:3]} "
                    f"E {np.asarray(r.outputs['E'])}")
     close(r.outputs["P"][0], float(x2.sum()))
     ok = g(x2, F(1.0))
-    if int(ok.stats["exact_overflow"]) != 0 or not np.isfinite(np.asarray(ok.outputs["Q"])).all():
-        raise Fail("an exact call with no overflow was poisoned")
+    if int(ok.stats["fixed_point_overflow"]) != 0 or not np.isfinite(np.asarray(ok.outputs["Q"])).all():
+        raise Fail("a fixed-point call with no overflow was poisoned")
     return _tangent_overflow(b, x2) + "; " + _f32_bins(b, x2, k2)
 
 
-@case("exact: cuda == lockstep bitwise; jvp == jacfwd column bitwise", ["cuda"])
+@case("fixed_point: cuda == xla bitwise; jvp == jacfwd column bitwise", ["cuda"])
 def _(b):
     if not jax.config.jax_enable_x64:
-        return "skipped (needs x64 for the lockstep side)"
-    out = {"Q": tm.Sum((NB,), F, exact=True, scale=2.0 ** 24)}
+        return "skipped (needs x64 for the xla side)"
+    out = {"Q": tm.Sum((NB,), F, fixed_point=True, scale=2.0 ** 24)}
     fc = tm.vmap(walk, outputs=out, in_axes=AX, backend="cuda")
-    fx = tm.vmap(walk, outputs=out, in_axes=AX, backend="lockstep")
+    fx = tm.vmap(walk, outputs=out, in_axes=AX, backend="xla")
     a, c = np.asarray(fc(xs, keys, tab, TH).outputs["Q"]), np.asarray(fx(xs, keys, tab, TH).outputs["Q"])
     p = jnp.concatenate([tab, jnp.array([TH])])
     jv = jax.jvp(lambda th: fc(xs, keys, tab, th).outputs["Q"], (TH,), (F(1),))[1]
     J = jax.jacfwd(lambda p: fc(xs, keys, p[:NB], p[NB]).outputs["Q"])(p)
     if not np.array_equal(a, c):
-        raise Fail(f"exact cuda != lockstep in {int((a != c).sum())}/{NB} bins")
+        raise Fail(f"fixed-point cuda != xla in {int((a != c).sum())}/{NB} bins")
     if not np.array_equal(np.asarray(jv), np.asarray(J[:, NB])):
-        raise Fail("exact: jvp != jacfwd column bitwise")
+        raise Fail("fixed-point: jvp != jacfwd column bitwise")
     # int64 tallies (u64 atomics): per-item values above 2^32 exercise the high word
     big = (jnp.arange(N, dtype=jnp.int64) + 1) * (1 << 33)
     q = tm.vmap(lambda t, v: t.add("I", (v >> 33) % NB, v), outputs={"I": tm.Sum((NB,), jnp.int64)},
@@ -833,7 +841,7 @@ def _(b):
     np.add.at(want, (np.asarray(big) >> 33) % NB, np.asarray(big))
     if not np.array_equal(np.asarray(q), want):
         raise Fail(f"int64 tally {np.asarray(q)} != {want}")
-    return f"cuda==lockstep bitwise {NB}/{NB} bins; jvp==jacfwd column bitwise; int64 tally exact"
+    return f"cuda==xla bitwise {NB}/{NB} bins; jvp==jacfwd column bitwise; int64 tally exact"
 
 
 @case("spawn: cascade counts, overflow counted, children truncated, jvp")
@@ -849,11 +857,11 @@ def _(b):
     S = float(xs.sum())
     want = np.array([S, 0.75 * S, 0.75 ** 2 * S, 0.75 ** 3 * S, 0, 0, 0, 0])
     close(A.outputs["Q"], want, what="cascade")
-    if int(A.stats["spawned"]) != N * (2 + 4 + 8) or int(A.stats["dropped"]) != 0:
-        raise Fail(f"spawned {int(A.stats['spawned'])} dropped {int(A.stats['dropped'])}")
+    if int(A.stats["spawned"]) != N * (2 + 4 + 8) or int(A.stats["children_dropped"]) != 0:
+        raise Fail(f"spawned {int(A.stats['spawned'])} dropped {int(A.stats['children_dropped'])}")
     Bq = tm.vmap(item, outputs=out, spawn=tm.Queue(16), backend=b)(g0, xs)
-    tot = int(Bq.stats["spawned"]) + int(Bq.stats["dropped"])
-    if int(Bq.stats["dropped"]) == 0:
+    tot = int(Bq.stats["spawned"]) + int(Bq.stats["children_dropped"])
+    if int(Bq.stats["children_dropped"]) == 0:
         raise Fail("tiny queue dropped nothing")
     if not np.all(np.isnan(np.asarray(Bq.outputs["Q"]))):
         raise Fail(f"dropped children did not NaN-poison the float tally: {np.asarray(Bq.outputs['Q'])}")
@@ -875,7 +883,7 @@ def _(b):
         raise Fail(f"children_truncated {int(C.stats['children_truncated'])} n_truncated {int(C.stats['n_truncated'])}")
     if not np.all(np.isnan(np.asarray(C.outputs["Q"]))):
         raise Fail("truncated items / children did not poison the float tally")
-    return f"small queue: spawned {int(Bq.stats['spawned'])}, dropped {int(Bq.stats['dropped'])} (of {tot})"
+    return f"small queue: spawned {int(Bq.stats['spawned'])}, dropped {int(Bq.stats['children_dropped'])} (of {tot})"
 
 
 @case("reverse with spawn (tree adjoint) == jacfwd; second order through it raises")
@@ -901,7 +909,7 @@ def _(b):
     close(jax.jit(jax.hessian(loss(f)))(p), Hr, what="hessian")
 
 
-@case("compare protocol (tests/compare_protocol.py): cuda vs lockstep (CRN, ulp control, Poisson floor)",
+@case("compare protocol (tests/compare_protocol.py): cuda vs xla (CRN, ulp control, Poisson floor)",
       ["cuda"])
 def _(b):
     from compare_protocol import compare
@@ -918,8 +926,8 @@ def _(b):
     n = 1 << 14
     x2 = jnp.linspace(0.1, 3.0, n).astype(F)
     k2 = jax.random.split(jax.random.PRNGKey(7), n)
-    ok, rep = compare(V(walk, "cuda", in_axes=AX), x2, k2, tab, TH, other=V(walk, "lockstep", in_axes=AX),
-                      floor_fn=V(walk_sq, "lockstep", in_axes=AX), verbose=False)
+    ok, rep = compare(V(walk, "cuda", in_axes=AX), x2, k2, tab, TH, other=V(walk, "xla", in_axes=AX),
+                      floor_fn=V(walk_sq, "xla", in_axes=AX), verbose=False)
     if not ok:
         raise Fail(str(rep))
     return f"flip {rep['flip_rate']:.2e} (ctrl {rep['flip_rate_control']:.2e}); rms_z {rep['Q']['rms_z']:.2e}"
@@ -958,7 +966,7 @@ def _(b):
     if b == "cuda":
         same, diff = (dict(cuda_math="approx"), dict()), (dict(schedule="step"), dict(schedule="item"))
     else:
-        same, diff = (dict(cuda_math="ieee"), dict()), (dict(lockstep_block=8), dict())
+        same, diff = (dict(cuda_math="ieee"), dict()), (dict(xla_batch_size=8), dict())
     raises(AssertionError, lambda: assert_arms_differ(g(**same[0]), g(**same[1]), xs, keys, tab, TH), "identical")
     (ka, ha), (kb, hb) = assert_arms_differ(g(**diff[0]), g(**diff[1]), xs, keys, tab, TH)
     return f"arms {diff}: kernels {len(ka)}/{len(kb)}, hlo {ha[:8]} vs {hb[:8]}"
@@ -989,8 +997,8 @@ def _(b):
     return f"sha {h1[:12]} twice, two callbacks {h3[:12]}; raw texts {'equal' if raw_same else 'DIFFER'}"
 
 
-@case("backend='auto': GPU raises on an unsupported program (the error points to backend='lockstep'); "
-      "elsewhere lockstep with a one-time warning", ["lockstep"])
+@case("backend='auto': GPU raises on an unsupported program (the error points to backend='xla'); "
+      "elsewhere xla with a one-time warning", ["xla"])
 def _(b):
     from tallymap import _api
     def cb(t, x):
@@ -998,8 +1006,8 @@ def _(b):
         return t.add("Q", 0, y)
     want = 2 * float(xs.sum())
     if GPU:
-        m = raises(tm.UnsupportedError, lambda: V(cb, "auto")(xs), "pass backend='lockstep'")
-        close(V(cb, "lockstep")(xs).outputs["Q"][0], want)
+        m = raises(tm.UnsupportedError, lambda: V(cb, "auto")(xs), "pass backend='xla'")
+        close(V(cb, "xla")(xs).outputs["Q"][0], want)
         close(V(walk, "auto", in_axes=AX)(xs, keys, tab, TH), R(walk, in_axes=AX)(xs, keys, tab, TH))
 
         def dbg(t, x):                      # an effect: the error says no backend runs it
@@ -1013,11 +1021,11 @@ def _(b):
         line = sys._getframe().f_lineno + 1
         close(V(cb, "auto")(xs).outputs["Q"][0], want)
         close(V(walk, "auto", in_axes=AX)(xs, keys, tab, TH), R(walk, in_axes=AX)(xs, keys, tab, TH))
-    ws = [x for x in w if "lockstep backend" in str(x.message)]
+    ws = [x for x in w if "xla backend" in str(x.message)]
     if len(ws) != 1:
-        raise Fail(f"expected ONE lockstep warning, got {[str(x.message) for x in ws]}")
+        raise Fail(f"expected ONE xla warning, got {[str(x.message) for x in ws]}")
     msg = str(ws[0].message)
-    if msg != "tallymap: no CUDA GPU on this platform; running the lockstep backend (plain JAX)":
+    if msg != "tallymap: no CUDA GPU on this platform; running the xla backend (plain JAX)":
         raise Fail(f"CPU warning text: {msg!r}")
     if os.path.basename(ws[0].filename) != os.path.basename(__file__) or ws[0].lineno != line:
         raise Fail(f"warning attributed to {ws[0].filename}:{ws[0].lineno}, want this file line {line}")
@@ -1026,7 +1034,7 @@ def _(b):
         warnings.simplefilter("always")
         jline = sys._getframe().f_lineno + 1
         jax.jit(V(cb, "auto"))(xs).outputs["Q"].block_until_ready()
-    wj = [x for x in w2 if "lockstep backend" in str(x.message)]
+    wj = [x for x in w2 if "xla backend" in str(x.message)]
     if len(wj) != 1 or os.path.basename(wj[0].filename) != os.path.basename(__file__) or wj[0].lineno != jline:
         raise Fail(f"jit: {[(x.filename, x.lineno) for x in wj]}, want this file line {jline}")
     m = raises(tm.UnsupportedError, lambda: V(walk, "cuda", in_axes=AX)(xs, keys, tab, TH), "needs a CUDA GPU")
@@ -1074,7 +1082,7 @@ def _(b):
 
 
 @case("a tally refusal names the operand, slot and kind; inside a call, the position alignment; a reverse "
-      "program's slot legend", ["lockstep"])
+      "program's slot legend", ["xla"])
 def _(b):
     def reader(t, x):
         return t, t._a["Q"].sum() * x
@@ -1103,8 +1111,8 @@ def _ix(xi):                 # a TRACED table index (a constant index would fold
     return (xi * 8).astype(jnp.int32) % 32
 
 
-@case("diagnostics baked_floats: a captured float table is listed, the same table as an operand is not",
-      ["lockstep"])
+@case("diagnostics closed_over_floats: a captured float table is listed, the same table as an operand is not",
+      ["xla"])
 def _(b):
     tabc = jnp.linspace(0.5, 1.5, 32, dtype=F)
     out = {"Q": tm.Sum((1,), F)}
@@ -1112,18 +1120,20 @@ def _(b):
     opr = tm.vmap(lambda t, xi, tb: t.add("Q", 0, xi * tb[_ix(xi)]), outputs=out, in_axes=(0, None), backend=b)
     pc = tm.diagnostics(lambda x: cap(x).outputs["Q"], xs)["programs"]
     po = tm.diagnostics(lambda x, tb: opr(x, tb).outputs["Q"], xs, tabc)["programs"]
-    if not pc or not any(sh == (32,) and n == 32 for r in pc for sh, _, n in r["baked_floats"]):
-        raise Fail(f"the captured table is not listed: {[r['baked_floats'] for r in pc]}")
-    if not po or any(r["baked_floats"] for r in po):
-        raise Fail(f"an operand is listed as baked: {[r['baked_floats'] for r in po]}")
-    if "baked_floats" in tm.diagnostics()["programs"][-1] and "consts" in tm.diagnostics()["programs"][-1]:
+    if not pc or not any(sh == (32,) and n == 32 for r in pc for sh, _, n in r["closed_over_floats"]):
+        raise Fail(f"the captured table is not listed: {[r['closed_over_floats'] for r in pc]}")
+    if not po or any(r["closed_over_floats"] for r in po):
+        raise Fail(f"an operand is listed as closed over: {[r['closed_over_floats'] for r in po]}")
+    if any("baked_floats" in r for r in pc):
+        raise Fail("the old key baked_floats is still in the record")
+    if "closed_over_floats" in tm.diagnostics()["programs"][-1] and "consts" in tm.diagnostics()["programs"][-1]:
         raise Fail("the raw constants leak into the returned record")
     g = jax.jvp(lambda tb: opr(xs, tb).outputs["Q"], (tabc,), (jnp.ones_like(tabc),))[1]
     close(g, jnp.sum(xs)[None], rtol=1e-5)
-    return f"captured {pc[0]['baked_floats']}, operand []; the operand's tangent reaches the tally"
+    return f"captured {pc[0]['closed_over_floats']}, operand []; the operand's tangent reaches the tally"
 
 
-@case("a located error keeps the original exception's attributes", ["lockstep"])
+@case("a located error keeps the original exception's attributes", ["xla"])
 def _(b):
     from tallymap._jaxpr import located
     eqn = jax.make_jaxpr(lambda x: x * 2.0)(F(1)).jaxpr.eqns[0]
@@ -1180,29 +1190,29 @@ def _qt_flat(t, gen, x, kind):          # no children: every thread lives in the
     return t.add("c", kind, jnp.int32(1)).add("s", kind, jnp.cos(x) + gen.astype(x.dtype))
 
 
-@case("spawn queue termination: every named item runs, launch after launch (cuda == lockstep, exact counts)",
+@case("spawn queue termination: every named item runs, launch after launch (cuda == xla, exact counts)",
       ["cuda"])
 def _(b):
     # dtrax tests_wavefront/test_qterm.py (b65e17a), the one-queue cells: a tree with children in flight while
     # roots are still being claimed, and roots only with N far above the resident grid.  An early exit loses
-    # items, and every item is one count in "c": the integer tallies must equal the lockstep ones exactly.
+    # items, and every item is one count in "c": the integer tallies must equal the xla ones exactly.
     out = {"c": tm.Sum((QT_NK,), jnp.int32), "s": tm.Sum((QT_NK,), F)}
     rng = np.random.default_rng(0)
     msg = []
     for fn, n, nm in ((_qt_tree, 20000, "tree"), (_qt_flat, 1 << 20, "roots only")):
         args = (jnp.zeros((n,), jnp.int32), jnp.asarray(rng.random(n), F),
                 jnp.asarray(rng.integers(0, QT_NK, n), jnp.int32))
-        ref = tm.vmap(fn, outputs=out, spawn=tm.Queue(1 << 20), backend="lockstep")(*args)
+        ref = tm.vmap(fn, outputs=out, spawn=tm.Queue(1 << 20), backend="xla")(*args)
         rc = np.asarray(ref.outputs["c"])
-        if int(ref.stats["dropped"]) != 0:
-            raise Fail(f"{nm}: the lockstep reference dropped {int(ref.stats['dropped'])}")
+        if int(ref.stats["children_dropped"]) != 0:
+            raise Fail(f"{nm}: the xla run dropped {int(ref.stats['children_dropped'])}")
         f = jax.jit(lambda *a, fn=fn: tm.vmap(fn, outputs=out, spawn=tm.Queue(1 << 20), backend=b)(*a))
         for rep in range(3):
             r = f(*args)
             c = np.asarray(r.outputs["c"])
-            if not np.array_equal(c, rc) or int(r.stats["dropped"]) != 0:
+            if not np.array_equal(c, rc) or int(r.stats["children_dropped"]) != 0:
                 raise Fail(f"{nm} launch {rep}: {int(c.sum())} items vs {int(rc.sum())}, dropped "
-                           f"{int(r.stats['dropped'])}")
+                           f"{int(r.stats['children_dropped'])}")
             if int(r.stats["spawned"]) != int(rc.sum()) - n:
                 raise Fail(f"{nm} launch {rep}: spawned {int(r.stats['spawned'])} != {int(rc.sum()) - n}")
             close(r.outputs["s"], ref.outputs["s"], rtol=1e-10 if F == jnp.float64 else 1e-3,   # (sum order)
@@ -1230,7 +1240,7 @@ def _(b):
         for rep in range(5):
             r = f(g0, x0)
             c = np.asarray(r.outputs["C"]).astype(np.int64)
-            sp, dr = int(r.stats["spawned"]), int(r.stats["dropped"])
+            sp, dr = int(r.stats["spawned"]), int(r.stats["children_dropped"])
             if c[0] != NR or c.sum() != NR + sp:
                 raise Fail(f"cap {cap} rep {rep}: processed {c.tolist()} != roots + spawned {NR} + {sp}")
             if sp + dr != F_OUT * int(c[:DEPTH].sum()):
@@ -1241,7 +1251,7 @@ def _(b):
             seen.add((cap, sp))
     full = tm.vmap(item, outputs=out, spawn=tm.Queue(1 << 20), backend=b)(g0, x0)
     want = [NR * F_OUT ** g for g in range(DEPTH + 1)]
-    if np.asarray(full.outputs["C"])[:DEPTH + 1].tolist() != want or int(full.stats["dropped"]):
+    if np.asarray(full.outputs["C"])[:DEPTH + 1].tolist() != want or int(full.stats["children_dropped"]):
         raise Fail(f"no-drop run: {np.asarray(full.outputs['C']).tolist()} != {want}")
     return f"{len(seen)} distinct (capacity, spawned) outcomes over 15 runs; full tree {sum(want) - NR} children"
 
@@ -1267,7 +1277,7 @@ def _(b):
     return f"naive key repeats at id + {period}; fold_in(fold_in(key, id), step) and the chunked key do not"
 
 
-@case("in-place dynamic_update_slice: aliasing hazards == lockstep == _cuda_inplace=False (bitwise)", ["cuda"])
+@case("in-place dynamic_update_slice: aliasing hazards == xla == _cuda_inplace=False (bitwise)", ["cuda"])
 def _(b):
     def item(t, x, key):
         buf0 = jnp.arange(8, dtype=jnp.int32) * x
@@ -1292,16 +1302,16 @@ def _(b):
     run = lambda bk, **o: tm.vmap(item, outputs=out, backend=bk, **o)
     g = lambda **o: (lambda a, k: run("cuda", **o)(a, k).per_item[0])
     assert_arms_differ(g(), g(_cuda_inplace=False), ii, keys)      # instrument: in-place updates did happen
-    rs = [run("cuda")(ii, keys), run("cuda", _cuda_inplace=False)(ii, keys), run("lockstep")(ii, keys)]
+    rs = [run("cuda")(ii, keys), run("cuda", _cuda_inplace=False)(ii, keys), run("xla")(ii, keys)]
     for r in rs[1:]:
         for a, c in zip(jax.tree_util.tree_leaves(rs[0]), jax.tree_util.tree_leaves(r)):
             if not np.array_equal(np.asarray(a), np.asarray(c)):
-                raise Fail("in-place cuda result differs from the copying cuda / lockstep result")
+                raise Fail("in-place cuda result differs from the copying cuda / xla result")
     return "bitwise equal; in-place and copying cubins differ"
 
 
 @case("buffer assignment (while init alias, cond destination, lazy write-back) == rule off == copying cuda == "
-      "lockstep", ["cuda"])
+      "xla", ["cuda"])
 def _(b):
     """the dead initial carry IS the carry storage, the cond output is written into its dead operand (one branch
     updates it in place, the other returns a lazy whole-array select over it: v5), and the lazy body result goes
@@ -1353,7 +1363,7 @@ def _(b):
         src = open(ks[-1]["source"]).read() if ks else ""
         return r, len(re.findall(r"\b(?:float|double) \w+\[32\];", src))
     (ra, na), (ro, no), (rc, nc), (rl, _) = run("cuda"), run("cuda", off=True), run("cuda", _cuda_inplace=False), \
-        run("lockstep")
+        run("xla")
     if not na < no:
         raise Fail(f"instrument: {na} 32-element arrays declared with buffer assignment, {no} with the rule off")
     for r_, what in ((ro, "rule-off"), (rc, "copying")):
@@ -1361,13 +1371,13 @@ def _(b):
             if not np.array_equal(np.asarray(a), np.asarray(c)):
                 raise Fail(f"buffer-assigned cuda result differs from the {what} cuda result")
     if not np.array_equal(np.asarray(ra.outputs["C"]), np.asarray(rl.outputs["C"])):
-        raise Fail("integer tally differs from lockstep")
-    close(ra.per_item, rl.per_item, 1e-6, 0.0, "per-item vs lockstep")
+        raise Fail("integer tally differs from xla")
+    close(ra.per_item, rl.per_item, 1e-6, 0.0, "per-item vs xla")
     return f"bitwise vs rule-off and copying cuda; 32-element arrays declared {na} / rule off {no} / copying {nc}"
 
 
 @case("$CXX: a missing or wrong host C++ compiler is a tallymap error naming the variable and the fix",
-      ["lockstep"])
+      ["xla"])
 def _(b):
     import shutil
 
@@ -1395,7 +1405,7 @@ def _(b):
 
 
 @case("op table: names are JAX primitives (or explained); supported_primitives() and docs/primitives.md current",
-      ["lockstep"])
+      ["xla"])
 def _(b):
     from jax.extend.core import Primitive
     from jax.extend.core import primitives as P
@@ -1424,13 +1434,13 @@ def _(b):
             "not ours")
 
 
-@case("exact=True on cuda without x64: equals the host fixed-point sum bitwise, order-independent", ["cuda"])
+@case("fixed_point=True on cuda without x64: equals the host fixed-point sum bitwise, order-independent", ["cuda"])
 def _(b):
     n, scale = 1 << 15, 2.0 ** 20
     v = jnp.asarray(np.random.default_rng(3).uniform(-3, 3, n), jnp.float32)
     i = jnp.arange(n, dtype=jnp.int32)
     f = tm.vmap(lambda t, x, j: t.add("Q", j % NB, x).add("Q", (j + 1) % NB, x * 3.0),
-                outputs={"Q": tm.Sum((NB,), jnp.float32, exact=True, scale=scale)}, backend="cuda")
+                outputs={"Q": tm.Sum((NB,), jnp.float32, fixed_point=True, scale=scale)}, backend="cuda")
     a1, a2 = np.asarray(f(v, i).outputs["Q"]), np.asarray(f(v[::-1], i[::-1]).outputs["Q"])
     acc = np.zeros(NB, np.int64)
     vv = np.asarray(v).astype(np.float64)
@@ -1438,7 +1448,7 @@ def _(b):
     np.add.at(acc, (np.arange(n) + 1) % NB, np.round(np.asarray(v * 3.0).astype(np.float64) * scale).astype(np.int64))
     want = (acc.astype(np.float64) * (1.0 / scale)).astype(np.float32)
     if not (np.array_equal(a1, a2) and np.array_equal(a1, want)):
-        raise Fail(f"exact sum: order-independent {np.array_equal(a1, a2)}, == host {np.array_equal(a1, want)}")
+        raise Fail(f"fixed-point sum: order-independent {np.array_equal(a1, a2)}, == host {np.array_equal(a1, want)}")
     return f"{NB}/{NB} bins bitwise equal to the host int64 sum (x64 off)"
 
 
@@ -1469,7 +1479,7 @@ def _(b):
     close(jax.jit(jax.hessian(sub(sm)))(q0), jax.jacfwd(jax.jacfwd(sub(rm)))(q0), what="hessian")
 
 
-@case("version policy: the tested versions, a warning only above the newest tested", ["lockstep"])
+@case("version policy: the tested versions, a warning only above the newest tested", ["xla"])
 def _(b):
     from tallymap._compat import _check_jax_version
     if tm.TESTED_JAX != ("0.5.3", "0.6.2", "0.7.2", "0.8.3", "0.9.2", "0.10.2", "0.11.2"):
@@ -1487,7 +1497,7 @@ def _(b):
     return f"jax {jax.__version__}: ok; {len(tm.TESTED_JAX)} tested; 0.12 dev warns, 0.4.38 does not"
 
 
-@case("eager calls: items that differ only in a host callback are different programs (cache key)", ["lockstep"])
+@case("eager calls: items that differ only in a host callback are different programs (cache key)", ["xla"])
 def _(b):
     def make(k):
         def cb(t, x):

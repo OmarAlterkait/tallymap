@@ -1,7 +1,7 @@
 """The ONE test entry point.
 
-    python tests/run_all.py            # CPU: lockstep backend
-    python tests/run_all.py --gpu      # GPU: lockstep AND cuda backends (tree adjoint and op parity on cuda)
+    python tests/run_all.py            # CPU: xla backend
+    python tests/run_all.py --gpu      # GPU: xla AND cuda backends (tree adjoint and op parity on cuda)
     python tests/run_all.py --x64      # with jax_enable_x64
     python tests/run_all.py --unfused  # the two-node jvp design (what runs if JAX drops the partial-eval registries)
     python tests/run_all.py --t3       # the single-loop adjoint forced wherever a program has its shape (TX_T3=1)
@@ -13,7 +13,7 @@ Suites: edge (edge cases), transforms (composability matrix), reverse (reverse m
 invariants (schedule invariance, cache-key soundness, run-or-raise, AD self-consistency, truncation),
 dice (DiCE gradients of discrete outcomes against closed forms, float score leaves through spawn),
 ops (cuda op table vs jit(vmap(op)) and the host-exact result; --gpu only), mulchain (a 64-bit multiply chain
-compiles fast and matches lockstep bitwise; --gpu only), examples (examples/*.py run as scripts).
+compiles fast and matches xla bitwise; --gpu only), examples (examples/*.py run as scripts).
 Each suite runs in its own process (fresh JAX state).  A suite passes iff its summary line was printed and every cell
 is PASS, an EXPECTED raise (RAISES-OK) or an expected failure (XFAIL: a known library defect pinned by the suite);
 anything else (FAIL, unexpected RAISE, XPASS -- an XFAIL cell that now passes, so its marker must go --, crash,
@@ -79,8 +79,8 @@ def main(argv):
                 None)
     suites = [s for s in SUITES if (only is None or s in only.split(",")) and (gpu or s not in GPU_ONLY)]
     env = dict(os.environ, PYTHONPATH=ROOT + os.pathsep + os.environ.get("PYTHONPATH", ""))
-    env["BACKENDS"] = "lockstep,cuda" if gpu else "lockstep"
-    env["TREE_BACKEND"] = "cuda" if gpu else "lockstep"
+    env["BACKENDS"] = "xla,cuda" if gpu else "xla"
+    env["TREE_BACKEND"] = "cuda" if gpu else "xla"
     # JAX preallocates 75% of the GPU; the forced-dense reverse cases launch a kernel whose per-thread local memory
     # (~17 GiB on an L40S) the CUDA driver reserves outside that pool, so they need it off.  A value you set wins.
     env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")

@@ -5,7 +5,7 @@ The arms (`run.py --arms` lists the ones each problem supports):
 | arm             | what it is                                                              | modes        |
 |-----------------|-------------------------------------------------------------------------|--------------|
 | `tm_cuda`       | tm.vmap, backend='cuda' (one persistent-thread kernel)                  | all          |
-| `tm_lockstep`   | tm.vmap, backend='lockstep' (the reference interpreter)                 | all          |
+| `tm_xla`        | tm.vmap, backend='xla' (the portable interpreter)                       | all          |
 | `jax_while`     | jax.vmap of the same item in a lax.while_loop, then one .at[].add       | forward only |
 | `jax_scan`      | jax.vmap of the same item as a masked lax.scan padded to the OBSERVED   | all          |
 |                 | maximum trip count (an oracle: a real program cannot know it)           |              |
@@ -28,7 +28,7 @@ import jax.numpy as jnp
 from jax import lax
 
 SCAN_ARMS = ("jax_scan", "jax_scan2x", "jax_ckpt", "jax_ckpt2x")
-TM_ARMS = ("tm_cuda", "tm_lockstep")
+TM_ARMS = ("tm_cuda", "tm_xla")
 ALL_ARMS = TM_ARMS + ("jax_while",) + SCAN_ARMS + ("diffrax",)
 GRAD_CAPABLE = TM_ARMS + SCAN_ARMS + ("diffrax",)
 
@@ -141,7 +141,7 @@ def jacfwd_k(theta):
 
 
 def cross_arm_check(sim_of, loss_of, theta, arms=("tm_cuda", "jax_while", "jax_scan", "jax_ckpt"),
-                    ref="tm_lockstep", grad_ref="jax_scan", grads=True):
+                    ref="tm_xla", grad_ref="jax_scan", grads=True):
     """Agreement of every arm against one reference arm, all in one process at a small size.
 
     `sim_of(arm) -> f(theta) -> tally` and `loss_of(arm) -> f(theta) -> scalar`.  Reported:

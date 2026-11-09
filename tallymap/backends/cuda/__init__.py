@@ -2,10 +2,10 @@
 
 Float semantics (cuda_math=): 'approx' (DEFAULT) = XLA:GPU's own f32 div/sqrt/rsqrt PTX (div.full / sqrt.approx /
 rsqrt.approx), everything else IEEE round-to-nearest without FMA contraction; 'ieee' = correctly rounded div/sqrt as
-well: the portable reference.
+well: portable.
 
 run(prog, pi, bc, cuda_math=, schedule=) -> [sum tallies] + [stats i32[5]] + [per-item results]
-Unsupported constructs raise tallymap.UnsupportedError (backend='auto' too; backend='lockstep' runs them).
+Unsupported constructs raise tallymap.UnsupportedError (backend='auto' too; backend='xla' runs them).
 """
 import hashlib
 import os
@@ -38,7 +38,7 @@ def _const_sig(c):
 def _key(p, opts):
     # the structural part is _jaxpr.digest (was str(p.cj.jaxpr): JAX's pretty-printer, 95 s per build on DTRAX)
     return (digest(p.cj.jaxpr), tuple(_const_sig(c) for c in p.cj.consts),
-            tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.exact, s.scale, s.kind) for s in p.tallies),
+            tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.fixed_point, s.scale, s.kind) for s in p.tallies),
             p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), tuple(sorted(opts.items())),
             codegen.FILL)                           # (the test-only fill byte changes the source)
 
@@ -62,7 +62,7 @@ class Kernel:
 
 
 def schedule_note(L):
-    """the schedule part of a frame-size or launch out-of-memory error: which schedule ran, and when the whole-item
+    """the schedule part of a frame-size or launch out-of-memory error: which schedule ran, and when the item
     schedule ran on a program the step schedule can split, that schedule='step' gives a smaller frame."""
     s = f"The kernel ran the {L.mode} schedule"
     if L.mode == "item" and L.splittable:
@@ -100,7 +100,7 @@ def run(p, pi, bc, cuda_math="approx", schedule="item", _cuda_inplace=True, **_)
     cuda_math: 'approx' (DEFAULT: div.full / sqrt.approx / rsqrt.approx, the PTX XLA:GPU itself emits for f32;
     measured 1.5x fwd / 1.65x jvp faster than ieee; validated by the pre-registered compare runs,
     docs/validation.md) |
-    'ieee' (correctly rounded f32 div/sqrt: the portable reference)."""
+    'ieee' (correctly rounded f32 div/sqrt: portable)."""
     math = cuda_math or "approx"
     extra = {} if _cuda_inplace else dict(inplace=False)        # (the default leaves the kernel key unchanged)
     # strict: the user's own item program (tag 'primal') must split under schedule='step'

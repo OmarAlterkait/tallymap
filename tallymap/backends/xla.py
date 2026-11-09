@@ -1,10 +1,10 @@
-"""lockstep backend: the reference and the fallback.  Plain JAX, any platform.
+"""xla backend: the portable backend.  Plain JAX (XLA runs it), any platform.
 
-A masked lockstep interpreter of the item jaxpr over P lanes: every value is (array, batched?), control flow
-runs while ANY active lane needs it, and emits / spawns / per-item writes are masked by the active lanes.
-Unlike jax.vmap, tallies are never per-lane: an emit is a masked scatter-add into ONE shared accumulator, so
-memory is O(P * state + outputs), not O(P * outputs).  Items are processed in blocks of P lanes; with spawn,
-children are queued in a ring buffer and run in later blocks (children first).
+A masked lockstep interpreter of the item jaxpr over a batch of P items: every value is (array, batched?), control
+flow runs while ANY active item of the batch needs it, and emits / spawns / per-item writes are masked by the
+active items.  Unlike jax.vmap, tallies are never per-item: an emit is a masked scatter-add into ONE shared
+accumulator, so memory is O(P * state + outputs), not O(P * outputs).  Items are processed in batches of P
+(xla_batch_size); with spawn, children are queued in a ring buffer and run in later batches (children first).
 """
 import jax
 import jax.numpy as jnp
@@ -27,7 +27,7 @@ class VT:
 
 
 class B:
-    """an interpreter value: array x (with a leading lane axis iff b)."""
+    """an interpreter value: array x (with a leading batch axis iff b)."""
     __slots__ = ("x", "b")
 
     def __init__(self, x, b):
@@ -43,8 +43,8 @@ class _St:
         self.p, self.P = p, P
         self.accs = accs                # slot -> array
         self.queue = queue              # None | dict(leaves, head, tail, spawned, dropped)
-        self.ovf = jnp.int32(0)         # exact-output overflow count
-        self.bad = {k: jnp.zeros(a.shape, bool) for k, a in accs.items() if p.tallies[k].exact}   # flagged bins
+        self.ovf = jnp.int32(0)         # fixed-point overflow count
+        self.bad = {k: jnp.zeros(a.shape, bool) for k, a in accs.items() if p.tallies[k].fixed_point}   # flagged bins
         self.drops = jnp.int32(0)       # out-of-range (dropped) emit indices
         self.mask = None
 
@@ -66,7 +66,7 @@ class _St:
 def _fixed(v, scale):
     """-> (int64 fixed-point values, representable mask); round-half-even like __double2ll_rn."""
     if not jax.config.jax_enable_x64:
-        raise NotImplementedError("tallymap: exact=True outputs need jax_enable_x64 on the lockstep backend")
+        raise NotImplementedError("tallymap: fixed_point=True outputs need jax_enable_x64 on the xla backend")
     x = v.astype(jnp.float64) * scale
     ok = jnp.abs(x) < 9.2e18
     return jnp.where(ok, jnp.round(x), 0).astype(jnp.int64), ok
@@ -88,7 +88,7 @@ def _emit(st, t, idx, val):
     nl = len(L)
     v = jnp.moveaxis(v, 0, nl).reshape(L + (-1,))      # [*L, P*I]
     a = st.accs[t.slot]
-    if spec.exact:
+    if spec.fixed_point:
         v, ok = _fixed(v, spec.scale)
         live = jnp.broadcast_to(f < S, ok.shape)
         st.ovf = st.ovf + jnp.sum((~ok & live).astype(jnp.int32), dtype=jnp.int32)
@@ -180,7 +180,7 @@ def _ev(st, jaxpr, consts, args):
 
 
 def _sel(m, new, old):
-    """per-lane select for batched values (VT passes through)."""
+    """per-item select for batched values (VT passes through)."""
     if isinstance(old, VT):
         return old
     mm = m.reshape(m.shape + (1,) * (new.ndim - 1))
@@ -314,7 +314,7 @@ def _scan(st, e, ins):
 
 
 # ------------------------------------------------------------------------------------------- driver
-def run(p, pi, bc, lockstep_block=None, **_):
+def run(p, pi, bc, xla_batch_size=None, **_):
     """-> [sum tally arrays] + [stats int32[5]] + [per-item results [N, ...]]"""
     N = int(pi[0].shape[0])
     nT = p.nT
@@ -322,12 +322,12 @@ def run(p, pi, bc, lockstep_block=None, **_):
     accs = {}
     for k, s in enumerate(p.tallies):
         if s.kind == "sum":
-            dt = jnp.int64 if s.exact else s.dtype
-            if s.exact:
+            dt = jnp.int64 if s.fixed_point else s.dtype
+            if s.fixed_point:
                 _fixed(jnp.zeros(()), 1.0)
             accs[k] = jnp.zeros(tuple(s.lead) + (s.S,), dt)
     ys0 = [jnp.zeros((N,) + tuple(a.shape), a.dtype) for a in ya]
-    P = int(min(max(N, 1), lockstep_block or BLOCK))
+    P = int(min(max(N, 1), xla_batch_size or BLOCK))
     cj = p.cj
     queue = None
     if p.spawn is not None:
@@ -409,7 +409,7 @@ def _finish(p, accs, sp, ys, st):
     for k, s in enumerate(p.tallies):
         if s.kind == "sum":
             a = accs[k]
-            if s.exact:                       # a bin that dropped an emit is NaN (as on cuda)
+            if s.fixed_point:                       # a bin that dropped an emit is NaN (as on cuda)
                 a = (a.astype(jnp.float64) / s.scale).astype(s.dtype)
                 if jnp.issubdtype(s.dtype, jnp.floating):
                     a = jnp.where(st.bad[k], jnp.asarray(np.nan, s.dtype), a)
