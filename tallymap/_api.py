@@ -53,9 +53,10 @@ def _call_site(fallback=None):
 @dataclasses.dataclass(frozen=True)
 class Sum:
     """A commutative (sum) output.  exact=True accumulates round(v * scale) in int64: bitwise order-independent
-    (needs jax_enable_x64 on the lockstep backend).  |v * scale| >= 9.2e18 cannot be represented: such emits are
-    DROPPED and counted in Result.stats['exact_overflow'] (check it!).  A jvp / vjp tangent tally of this output
-    uses the same scale."""
+    (needs jax_enable_x64 on the lockstep backend).  |v * scale| >= 9.2e18 cannot be represented: such an emit is
+    dropped and counted in Result.stats['exact_overflow'], and, like every other resource limit, every exact=True
+    float output of the call becomes NaN (the counter is per call, so it cannot say which exact output overflowed;
+    non-exact outputs are unaffected).  A jvp / vjp tangent tally of this output uses the same scale."""
     shape: Any
     dtype: Any = jnp.float32
     exact: bool = False
@@ -75,7 +76,8 @@ class Queue:
 
 class Result(NamedTuple):
     """What a tallymap.vmap function returns.  When a tallymap resource limit intervened (max_steps, the spawn
-    Queue capacity) every float output is NaN; the counters in `stats` say which limit it was."""
+    Queue capacity) every float output is NaN; when an exact=True emit overflowed, every exact float output is NaN.
+    The counters in `stats` say which limit it was."""
     outputs: dict        # name -> summed output (float: NaN when a resource limit intervened)
     per_item: Any        # pytree of [N, ...] per-item results (None if the item returns only its tally)
     truncated: Any       # bool[N]: the item hit max_steps in a top-level while loop
@@ -413,6 +415,9 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
             trunc = jnp.zeros((N,), bool)
         stats["n_truncated"] = jnp.sum(trunc.astype(jnp.int32))
         res_out = _poison(res_out, _limits(stats, st, spawn, max_steps))
+        ex = [n for n in names if outs_spec[n].exact]
+        if ex:        # an exact=True emit that could not be represented was dropped: the exact sums are not the sum
+            res_out.update(_poison({n: res_out[n] for n in ex}, stats["exact_overflow"] > 0))
         per_item = jax.tree_util.tree_unflatten(meta["ytree"], ys)
         return Result(res_out, per_item, trunc, stats)
     mapped.__wrapped__ = fn

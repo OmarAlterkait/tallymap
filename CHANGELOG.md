@@ -74,6 +74,11 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Changed
 
+- `Sum(exact=True)`: an emit too large for the int64 fixed point (`stats['exact_overflow'] > 0`) makes every
+  exact float output of the call NaN, tangents and cotangents included, like every other resource limit
+  (`max_steps`, the spawn Queue). It was dropped and only counted, so an overflowed sum came back finite and
+  wrong. The counter is per call, so all exact outputs are poisoned, not only the one that overflowed;
+  non-exact outputs are unchanged.
 - The cuda kernel cache and the eager-call cache key a program on a structural sha256 digest of its jaxpr
   (`_jaxpr.digest`) instead of its printed text. JAX's pretty-printer cost 95 s per build on a large engine item
   (4.2 s with the digest); the digest also separates literal values the printer rounds (`docs/design.md`

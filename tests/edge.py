@@ -656,7 +656,7 @@ def _(b):
     close(q[0], 2 * float(xs.sum()))
 
 
-@case("exact=True: order-independent, run-to-run bitwise; overflow counted")
+@case("exact=True: order-independent, run-to-run bitwise; overflow counted and poisons the exact sums")
 def _(b):
     if b == "lockstep" and not jax.config.jax_enable_x64:
         raises(NotImplementedError, lambda: tm.vmap(walk, outputs={"Q": tm.Sum((NB,), F, exact=True)}, in_axes=AX,
@@ -674,6 +674,24 @@ def _(b):
     big = tm.vmap(lambda t, x: t.add("Q", 0, x * 1e15), outputs=out, backend=b)(x2)
     if int(big.stats["exact_overflow"]) != n:
         raise Fail(f"overflow count {int(big.stats['exact_overflow'])} != {n}")
+    # an overflow is a resource limit: every exact float output is NaN (also its tangent); a non-exact one is not
+    mix = {"Q": tm.Sum((NB,), F, exact=True, scale=2.0 ** 20), "E": tm.Sum((2,), F, exact=True, scale=2.0 ** 20),
+           "P": tm.Sum((1,), F)}
+
+    def ovf(t, x, s):
+        return t.add("Q", 0, x * s).add("E", 1, x).add("P", 0, x)
+    g = tm.vmap(ovf, outputs=mix, in_axes=(0, None), backend=b)
+    r = g(x2, F(1e15))
+    if not (np.isnan(np.asarray(r.outputs["Q"])).all() and np.isnan(np.asarray(r.outputs["E"])).all()):
+        raise Fail(f"exact_overflow={int(r.stats['exact_overflow'])} did not poison the exact sums: "
+                   f"Q {np.asarray(r.outputs['Q'])[:2]} E {np.asarray(r.outputs['E'])}")
+    close(r.outputs["P"][0], float(x2.sum()))
+    tan = jax.jvp(lambda s: g(x2, s).outputs["Q"], (F(1e15),), (F(1),))[1]
+    if not np.isnan(np.asarray(tan)).all():
+        raise Fail("the tangent of an overflowed exact sum is not NaN")
+    ok = g(x2, F(1.0))
+    if int(ok.stats["exact_overflow"]) != 0 or not np.isfinite(np.asarray(ok.outputs["Q"])).all():
+        raise Fail("an exact call with no overflow was poisoned")
     fl = tm.vmap(walk, outputs={"Q": tm.Sum((NB,), F)}, in_axes=AX, backend=b)
     f1 = np.asarray(fl(x2, k2, tab, TH).outputs["Q"])
     f2 = np.asarray(fl(x2[::-1], k2[::-1], tab, TH).outputs["Q"])

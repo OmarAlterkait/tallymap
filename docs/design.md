@@ -127,7 +127,8 @@ derivatives with spawn give children tangents for every float per-item leaf. Rev
 - N, the number of items, is a runtime kernel argument: neither the compiled kernel nor the in-memory kernel cache
   key contains it. One call takes fewer than 2^31 items.
 - `Sum(exact=True)`: int64 fixed point, `round(v * scale)`, with one scale per output. Unrepresentable values,
-  meaning `|v * scale| >= 9.2e18`, are dropped AND counted (`stats['exact_overflow']`) on both backends. A fixed
+  meaning `|v * scale| >= 9.2e18`, are dropped AND counted (`stats['exact_overflow']`) on both backends, and an
+  overflow makes every exact float output of the call NaN (the resource-limit rule; the counter is per call). A fixed
   2^32 scale was tried first and wraps silently for tangents of order 1e11, so the scale is per output.  A
   tangent tally uses its primal output's scale; a separate `tangent_scale` was an unused knob and was removed.
 - Keys: tallymap invents no randomness. Typed and raw uint32 keys both work. Results do not depend on scheduling.

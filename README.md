@@ -303,7 +303,8 @@ reverse mode accumulate in different orders, so their derivatives agree only to 
 can be 1e-4 relative on a large tree and varies from run to run on a GPU. With `exact=True` the sum is
 accumulated in int64 fixed point: bitwise order-independent, identical across backends and schedules (the
 lockstep backend needs `jax_enable_x64` for it). Unrepresentable values are dropped and counted in
-`stats['exact_overflow']`. Use `exact=True` when derivatives of very large sums must agree tightly, or when you
+`stats['exact_overflow']`, and then every `exact=True` float output of the call is NaN, as for any other resource
+limit (the counter is per call, so it cannot say which exact output overflowed). Use `exact=True` when derivatives of very large sums must agree tightly, or when you
 need run-to-run reproducibility on a GPU.
 
 ### Sizing the spawn Queue
