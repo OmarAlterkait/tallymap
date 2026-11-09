@@ -274,6 +274,13 @@ error) turn every affected cell into a failure, which is how the matrix is known
   2080 Ti), 71,440 B in place (the private engine line: 70,160 B); `sEM1_lar_e` 557,248 B (over the 512 KiB
   limit) -> 156,496 B. Digests unchanged (`tab=85bce7a5ff627c27`, `97ceb69adae09286`). LUCiD's two kernels
   (fwd, jac6) are byte-identical with and without it (same `.cu` sha256; job 43897628).
+- **Local memory is reserved for the device, not the launch.** The CUDA driver reserves `local bytes per thread x
+  SMs x max resident threads per SM` at the first launch, whatever the grid: measured on a 2080 Ti (job
+  43897685) 2,382 MiB at 36,864 B and 750 MiB at 12,288 B for n_items = 1, 128, 8,192 and 69,632, spawning or not,
+  equal to that formula. The persistent grid is already `min(occupancy x SMs, ceil(n_items / block))` blocks for a
+  non-spawning program (a spawning one needs the whole grid for its children), but bounding the grid cannot shrink
+  the reservation: only a smaller frame does. (The private engine line's `TALLYMAP_GRID=1` shrank its grid-sized
+  global arena, not this reservation; dev has no arena.)
 - **Replay fingerprint.** Reverse mode uses a variant of the forward ItemProgram that carries a hidden per-item
   uint32 hash of the final carries of every top-level loop, computed with ordinary jaxpr operations (a
   forward-only call does not compute it: section 11). The adjoint receives the forward kernel's value as an
