@@ -188,7 +188,9 @@ def branch_fac(t, s, th, b=0.0, plant=""):
     t = t.add("S", idx, (lq - lax.stop_gradient(lq)) * hot)
     t = t.add("m", grp * jnp.int32(2) + jnp.arange(2, dtype=jnp.int32), jnp.stack([f, jnp.asarray(1.0, F)]))
     lp = jnp.log(p)
-    child_sv = jnp.zeros((D,), F) if plant == "noinherit" else sv + (lp - lax.stop_gradient(lp)) * hot
+    # noinherit: sv * 0, not a zeros constant -- a spawn whose payload floats are all constants does not build under
+    # jvp (tests/invariants.py [ad], pinned XFAIL)
+    child_sv = sv * jnp.asarray(0.0, F) if plant == "noinherit" else sv + (lp - lax.stop_gradient(lp)) * hot
     return t.spawn(dict(g=g + 1, grp=grp, key=jax.random.fold_in(s["key"], 1), sv=child_sv), when=split)
 
 

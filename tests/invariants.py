@@ -1175,6 +1175,31 @@ def _(b):
     return "accepted"
 
 
+_SPAWN_ZERO_XFAIL = ("found by tests/dice.py's 'noinherit' plant: under jax.jvp the spawned child must carry "
+                     "(primal leaves, tangents of its float leaves), and that layout is produced by spawn_p's jvp "
+                     "rule (_tally._spawn_jvp); JAX does not call a jvp rule whose tangents are ALL symbolic zeros "
+                     "(JVPTrace.process_primitive), so a spawn whose float leaves are all constants binds without "
+                     "tangent leaves and the queue carry no longer matches (TypeError: while_loop carry structure, "
+                     "lockstep and cuda). Fix: build the tangent payload layout in jvp_prog, not in the rule")
+
+
+@case("[ad] jvp through spawn: a child whose float payload is a constant (no tangent) builds and differentiates",
+      xfail={"lockstep": _SPAWN_ZERO_XFAIL, "cuda": _SPAWN_ZERO_XFAIL})
+def _(b):
+    def item(t, g, x):
+        t = t.add("Q", 0, x)
+        return t.spawn((g + 1, jnp.asarray(0.5, F)), when=g < 1)       # the child's float leaf is a constant
+    f = tm.vmap(item, outputs={"Q": tm.Sum((1,), F)}, spawn=tm.Queue(1 << 10), backend=b)
+    xs = jnp.linspace(0.5, 1.5, 16).astype(F)
+    g0 = jnp.zeros((16,), jnp.int32)
+    try:
+        d = jax.jvp(lambda s: f(g0, xs * s).outputs["Q"], (F(1),), (F(1),))[1]
+    except Exception as e:
+        raise Fail(f"{type(e).__name__}: {str(e).splitlines()[0][:160]}") from None
+    near(d, jnp.sum(xs).reshape(1), FT, "tangent (the constant children add 0)")
+    return "ok"
+
+
 # =================================================================================================== [trunc]
 CAP = 10
 
