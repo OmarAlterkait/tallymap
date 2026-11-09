@@ -11,7 +11,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.extend.core import Literal
 
-from .._foreign import ad_advice, advice
+from .._errors import ad_advice
 from .._jaxpr import bind, call_jaxpr, cond_branches, lit, located, scan_parts, while_parts
 
 BLOCK = 1 << 18
@@ -153,7 +153,7 @@ def _ev(st, jaxpr, consts, args):
             if e.effects:
                 raise located(NotImplementedError(
                     f"tallymap: primitive {name!r} has side effects {e.effects}; effects (debug.print, callbacks "
-                    f"with effects) are not supported inside tallymap.vmap.{advice(e)}"), e,
+                    "with effects) are not supported inside tallymap.vmap."), e,
                     f"item function {st.p.where}")
             if any(isinstance(a, VT) for a in ins):
                 raise located(TypeError(f"tallymap: {name} reads a tally"), e, f"item function {st.p.where}")

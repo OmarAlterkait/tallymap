@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.extend.core import ClosedJaxpr, Literal
 
-from ..._foreign import ad_advice, advice
+from ..._errors import ad_advice
 from ..._jaxpr import is_dropvar, located
 
 UNROLL = 32          # arrays with <= UNROLL elements are emitted as straight-line code
@@ -518,7 +518,7 @@ class Emitter:
 
     def const_val(self, x, aval=None):
         if isinstance(x, jax.core.Tracer):
-            from ..._foreign import CLOSED_TRACER
+            from ..._errors import CLOSED_TRACER
             raise CodegenError("a traced value is closed over inside a nested call; close over it at the top "
                                "level of the item function or pass it as an argument." + CLOSED_TRACER)
         a = np.asarray(x)
@@ -780,12 +780,12 @@ class Emitter:
         self.prims.add(name)
         if eqn.effects:
             raise CodegenError(f"primitive {name!r} has side effects {eqn.effects}; effects are not allowed "
-                                f"inside the item function on any backend.{advice(eqn)}")
+                                "inside the item function on any backend.")
         from . import op_table
         rule = self.hooks.get(name) or op_table.RULES.get(name)
         if name not in op_table.TALLY_AWARE and name not in self.hooks and any(isinstance(v, VTally) for v in ins):
             raise CodegenError(f"primitive {name!r} reads a tally")
         if rule is None:
             raise CodegenError(f"primitive {name!r} is not supported by the tallymap cuda backend "
-                                f"(params: {sorted(eqn.params)}).{advice(eqn)}")
+                                f"(params: {sorted(eqn.params)}).")
         return rule(self, eqn, ins, **eqn.params)

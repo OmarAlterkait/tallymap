@@ -117,8 +117,6 @@ JAX 0.11.2; each demo's README states where the margin shrinks or tallymap loses
 | `adaptive_quadrature` | quadax 0.3.0 `quadgk` | 3-18x forward, 12x gradient, 98-380x less memory |
 | `branching_epidemic` | a plain-JAX generation-frontier program | 4-14x forward, 5-8x `jacfwd`; reverse is a tie |
 
-diffrax itself now runs inside an item (`docs/equinox.md`, `examples/diffrax_ensemble.py`).
-
 **On CPU** there is only the lockstep backend, which is plain JAX. Measured at N = 65,536, its forward pass is
 within 0.7x to 1.3x of the best plain-JAX program on the natural problems. Its gradient is 3x to 7x SLOWER than a
 padded `lax.scan` given the oracle step cap (`docs/performance.md`, "cpu"). What it buys you there is a gradient
@@ -223,11 +221,6 @@ solver settings:
 |---|---|---|
 | tallymap item | 99 to 280x faster (step-count matched) | 19 to 125x faster, 2 to 67x less memory |
 | at 1M trajectories | | 2.8 s / 72 MB against 53 s / 4.8 GB |
-
-The user's literal `diffrax.diffeqsolve(...)` now runs inside an item too (`docs/equinox.md`). Measured on a
-stiff implicit ensemble against `jax.vmap(diffeqsolve)`: forward 14 to 136x faster, gradient 1.7 to 23x faster
-at 19 to 282x less memory. The margin is smaller than for the hand-written item because of diffrax's per-step
-overheads inside the item.
 
 Two costs to know:
 

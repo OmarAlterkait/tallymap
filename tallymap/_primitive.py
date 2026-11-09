@@ -49,7 +49,6 @@ from jax.extend.core import Primitive, jaxpr_as_fun
 from jax.interpreters import ad, mlir
 from jax.interpreters import partial_eval as _pe
 
-from . import _foreign
 from ._api import _WARNED, ItemProgram, UnsupportedError, _mk, _sds, jvp_prog
 from ._compat import NM, drop_var, register_batcher
 from ._reverse import vjp_prog
@@ -250,9 +249,9 @@ def _lowering(platform):
         except UnsupportedError:
             raise
         except Exception as e:
-            from . import _foreign
-            if _foreign.holds_tracer(node.prog.cj):
-                raise UnsupportedError(f"tallymap: cannot lower this item program.{_foreign.CLOSED_TRACER}\n"
+            from . import _errors
+            if _errors.holds_tracer(node.prog.cj):
+                raise UnsupportedError(f"tallymap: cannot lower this item program.{_errors.CLOSED_TRACER}\n"
                                        f"{type(e).__name__}: {str(e)[:300]}") from None
             raise
     return rule
@@ -595,8 +594,6 @@ def _dual_lanes(args, dims, node, fused):
             if T * m1 >= LANES_MAX_LOCAL:
                 return None
     q, lt, ly = dual_lanes_prog(p, T, bpi, bbc, shared)
-    if _foreign.lanes_unsafe(q.cj):     # a batched foreign primitive: one lane at a time (see lanes_unsafe)
-        return None
     if fused:
         ln = node.derived(q, "fused_jvp", base=(fwd, pp, pb, chain + ((T, bpi, bbc),)), pp=pp, pb=pb)
     else:

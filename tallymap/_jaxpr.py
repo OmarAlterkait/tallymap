@@ -24,13 +24,7 @@ CALL_PARAM = {"pjit": "jaxpr", "jit": "jaxpr", "closed_call": "call_jaxpr", "cor
 
 
 def closed(j):
-    """-> j as a ClosedJaxpr.  An open jaxpr's constvars become its leading invars: JAX's own control flow keeps
-    none, but a foreign primitive's static params can (lineax 0.0.8's linear_solve holds such an operator jaxpr)."""
-    if isinstance(j, ClosedJaxpr):
-        return j
-    if j.constvars:
-        j = j.replace(constvars=[], invars=list(j.constvars) + list(j.invars))
-    return ClosedJaxpr(j, [])
+    return j if isinstance(j, ClosedJaxpr) else ClosedJaxpr(j, [])
 
 
 def call_jaxpr(eqn):

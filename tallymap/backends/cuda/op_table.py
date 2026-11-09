@@ -1161,7 +1161,7 @@ def _scatter(em, eqn, ins, dimension_numbers, mode=None, **p):
       "custom_vjp_call_jaxpr", "checkpoint", "remat", "remat2", "custom_lin")
 def _primitive(em, eqn, ins, **params):
     if eqn.primitive.name == "custom_lin":
-        from ..._foreign import CUSTOM_VJP
+        from ..._errors import CUSTOM_VJP
         raise CodegenError(f"custom_lin (a linearized custom_vjp) cannot run inside a cuda kernel.{CUSTOM_VJP}")
     sub = call_jaxpr(eqn)
     if sub is None:

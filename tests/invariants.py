@@ -12,8 +12,7 @@ Sections (cell name prefixes):
            one fresh TALLYMAP_CUDA_CACHE).  NEGATIVE CONTROLS: the same pairs under a deliberately coarse key
            (jaxpr text only / the real keys' structural digest only / avals only) MUST be caught; the control cell
            PASSES when the stale reuse is detected.
-  [tdep]   tangent-dependent control flow: a while loop whose trip count follows the tangent-carrying primal;
-           lineax.CG under jacfwd (the _foreign.lanes_unsafe case; skipped without lineax).
+  [tdep]   tangent-dependent control flow: a while loop whose trip count follows the tangent-carrying primal.
   [size]   run-or-raise: per-item carries on a size ladder either run and match jax.vmap, or raise a tallymap
            error that names the size.
   [ad]     AD self-consistency without finite differences: <u, J v> by jvp == by vjp; jacfwd == jacrev; the
@@ -26,8 +25,8 @@ Sections (cell name prefixes):
 
 Each cell prints one line: PASS | RAISES-OK (an expected, clear error) | FAIL <why> | RAISE <exception> |
 XFAIL <reason> (a KNOWN library defect, pinned: the cell fails the way the reason says) | XPASS (an XFAIL cell that
-now passes: the defect is gone, remove the marker -- tests/run_all.py counts XPASS as a failure).  A cell whose
-optional dependency is missing prints SKIP and is not counted.
+now passes: the defect is gone, remove the marker -- tests/run_all.py counts XPASS as a failure).  A cell that
+has nothing to test on this JAX version prints SKIP and is not counted.
 Summary: TOTAL n PASS k RAISES-OK m XFAIL x (then FAIL / RAISE / XPASS counts).
 """
 import atexit
@@ -41,7 +40,6 @@ import traceback
 import warnings
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ.setdefault("EQX_ON_ERROR", "off")     # lineax's default error mode is a host callback (equinox_compat.py)
 # [key] one FRESH cubin cache for the whole suite: every kernel this process uses is compiled here, so a stale entry
 # from another process cannot hide (or fake) a key collision.  Set before tallymap reads it (cache_dir() reads the
 # environment at every compile).
@@ -59,7 +57,6 @@ from jax import lax  # noqa: E402
 
 import tallymap as tm  # noqa: E402
 from tallymap import _diagnostics as _D  # noqa: E402
-from tallymap import _foreign as _FO  # noqa: E402
 from tallymap import _primitive as _P  # noqa: E402
 from tallymap import reference  # noqa: E402
 
@@ -93,7 +90,7 @@ class Expected(Exception):
 
 
 class Skip(Exception):
-    """an optional dependency is missing: the cell is not counted"""
+    """the cell has nothing to test here: it is not counted"""
 
 
 def case(name, backends=None, xfail=None):
@@ -783,82 +780,6 @@ for T in (3, 17):
         m2 = lanes_same(b, J[1], S[1], "per-item jacfwd vs jvp columns")
         m3 = near(J, jax.jit(jax.jacfwd(gr))(th0), 1e-10 if X64 else 2e-5, "jacfwd vs reference jacfwd")
         return f"trip counts {k.min()}..{k.max()}; vs jvp: Q {m1}, per-item {m2}; vs reference {m3}"
-
-
-def _lineax():
-    try:
-        import lineax as lx
-    except ImportError as e:
-        raise Skip(f"lineax not installed: {e}") from None
-    return lx
-
-
-B0 = np.array([[2.0, 0.3, 0.1], [0.2, 1.8, 0.4], [0.1, 0.5, 2.2]])
-RHS3 = np.array([1.0, -0.5, 2.0])
-
-
-def cg_item(t, x, th):
-    import lineax as lx
-    m = jnp.asarray(B0, F) + jnp.diag(th[:3]) * x + th[3] * jnp.ones((3, 3), F) * 0.1
-    op = lx.MatrixLinearOperator(m @ m.T, lx.positive_semidefinite_tag)
-    y = lx.linear_solve(op, jnp.asarray(RHS3, F), solver=lx.CG(rtol=1e-6, atol=1e-9)).value
-    return t.add("Q", jnp.arange(3), y), y
-
-
-def cg_case(b):
-    _lineax()
-    th0 = jnp.asarray([0.5, 0.7, 0.9, 0.3], F)
-    xs = jnp.linspace(0.5, 1.5, 16).astype(F)
-    f = tm.vmap(cg_item, outputs={"Q": tm.Sum((NB,), F)}, in_axes=(0, None), backend=b)
-    g = lambda th: (f(xs, th).outputs["Q"], f(xs, th).per_item)
-    ref = jax.jit(jax.jacfwd(lambda th: jax.vmap(lambda x: cg_item(_Dense(), x, th)[1])(xs)))(th0)
-    jv = jax.jit(lambda th, v: jax.jvp(g, (th,), (v,))[1])
-    cols = [jv(th0, jnp.zeros((4,), F).at[j].set(1)) for j in range(4)]
-    S = jax.tree_util.tree_map(lambda *c: jnp.stack(c, -1), *cols)
-    jxp = str(jax.make_jaxpr(jax.jacfwd(g))(th0))
-    J = jax.jit(jax.jacfwd(g))(th0)
-    return J, S, ref, "dual_lanes" in jxp
-
-
-class _Dense:
-    """a stand-in Tally for the jax.vmap reference of cg_item (add is a no-op: only the per-item result is used)"""
-
-    def add(self, *a):
-        return self
-
-
-# CG tolerance rtol=1e-6: the tangent solve is a CG solve of its own, so implementations agree to ~1e-5 (f32)
-CG_TOL = 1e-6 if X64 else 2e-4
-
-
-@case("[tdep] lineax.CG under jacfwd, default path (lanes_unsafe: one lane at a time) == jvp columns == jax")
-def _(b):
-    J, S, ref, lanes = cg_case(b)
-    if lanes:
-        raise Fail("instrument: the default path built dual lanes for a batched vprim (lanes_unsafe did not fire)")
-    m1 = near(J, S, CG_TOL, "jacfwd vs jvp columns")
-    m2 = near(J[1], ref, CG_TOL, "per-item jacfwd vs jax.jacfwd(jax.vmap)")
-    return f"no dual lanes; vs jvp columns {m1}; vs jax {m2}"
-
-
-# Was XFAIL on cuda (plan section 4: NaN in lanes 2..T).  It does not reproduce: MEASURED 2026-11-04, bitwise equal to
-# the jvp columns on an L40S and a 2080 Ti, JAX 0.5.3 and 0.11.2.  So this cell now pins that forced lanes are right.
-@case("[tdep] lineax.CG under jacfwd, dual lanes FORCED (lanes_unsafe bypassed)")
-def _(b):
-    real = _FO.lanes_unsafe
-    _FO.lanes_unsafe = lambda cj: False
-    try:
-        J, S, ref, lanes = cg_case(b)
-    finally:
-        _FO.lanes_unsafe = real
-    if not lanes:
-        raise Fail("instrument: forcing did not build dual lanes")
-    bad = [j for j in range(4) if not np.all(np.isfinite(np.asarray(J[1])[..., j]))]
-    if bad:
-        raise Fail(f"non-finite Jacobian columns {bad} of 4 (lanes forced)")
-    m1 = near(J, S, CG_TOL, "jacfwd (forced lanes) vs jvp columns")
-    m2 = near(J[1], ref, CG_TOL, "per-item jacfwd (forced lanes) vs jax.jacfwd(jax.vmap)")
-    return f"dual lanes forced; vs jvp columns {m1}; vs jax {m2}"
 
 
 # =================================================================================================== [size]

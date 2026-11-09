@@ -242,14 +242,12 @@ def privatised(tallies, budget=PRIV_BYTES):
 
 
 def build_source(p, *, block=BLOCK, split=True, inplace=True):
-    """-> (CUDA source, Layout).  p: tallymap._api.ItemProgram.  Its jaxpr is first rewritten twice: the foreign
-    primitives a backend has to lower itself (_foreign.expand_late, e.g. lineax's linear_solve, which may only be
-    expanded now that every autodiff rule has been applied) and then the JAX sugar (canon.py)."""
+    """-> (CUDA source, Layout).  p: tallymap._api.ItemProgram.  Its jaxpr is first rewritten into the
+    canonical primitives (canon.py)."""
     import dataclasses
 
-    from ... import _foreign
     from .canon import canonical
-    p = dataclasses.replace(p, cj=canonical(_foreign.expand_late(p.cj)))
+    p = dataclasses.replace(p, cj=canonical(p.cj))
     em = Emitter()
     em.where = p.where
     em.inplace = inplace

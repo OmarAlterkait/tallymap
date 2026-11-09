@@ -27,6 +27,15 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Removed
 
+- Equinox-family support inside an item: the expansion of Equinox's own primitives (`unvmap_*`,
+  `select_if_vmap`, `maybe_set`, `nonbatchable`, `nontraceable`, `nondifferentiable_backward`) at the item trace,
+  the late expansion of Lineax's `linear_solve` and Equinox's `vprim`, the rule that ran a program holding a
+  batched `vprim` one tangent lane at a time, and the Equinox-specific advice in error messages.
+  `diffrax.diffeqsolve`, `optimistix`, `lineax` and `quadax` calls inside a `tm.vmap` item are no longer
+  supported: on cuda their primitives raise `tm.UnsupportedError` like any other primitive without a rule.
+  `docs/equinox.md`, `examples/diffrax_ensemble.py`, `tests/equinox_compat.py` and the `equinox` extra go with
+  it. The rewrite engine `_sugar.py` now lives in `backends/cuda/canon.py`, its only remaining user. diffrax and
+  quadax stay as the plain-JAX baselines of `benchmarks/vs_jax` and `examples/demos/`.
 - Linear algebra inside an item on cuda: the emission rules for `lu`, `lu_pivots_to_permutation`,
   `triangular_solve`, `cholesky`, `geqrf` and `ormqr` and their straight-line algorithms
   (`backends/cuda/dense.py`, with its size limits `MAXD` / `MAXB`). `jnp.linalg.solve`, `inv`, `det`,
@@ -38,8 +47,8 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   Passing it now raises, like any unknown option. Four independent measurements on a 2080 Ti found no benefit:
   the six `benchmarks/vs_jax` gradient cells (0.98-1.05 at S = 4 and 8), the toy walk at 1M items
   (6.32 / 6.36 / 6.45 / 6.43 ms at S = 0 / 4 / 8 / 16), a toy built to spill (168 registers, 1,328 bytes of
-  local memory per thread, grad/forward 8.1x: 32.4 / 31.2 / 32.1 ms at S = 0 / 2 / 4) and the diffrax ensemble
-  of `docs/equinox.md` (4,936 against 4,968 ms). `docs/design.md` section 6 already recorded that ptxas reports
+  local memory per thread, grad/forward 8.1x: 32.4 / 31.2 / 32.1 ms at S = 0 / 2 / 4) and a diffrax ensemble
+  inside an item (4,936 against 4,968 ms). `docs/design.md` section 6 already recorded that ptxas reports
   zero spill bytes for every public adjoint kernel, so no rule could have set S either. -96 lines.
 - Event scheduling (the private `_schedule='events'`, `kernel._cut`, `kernel._events_main`) and
   `benchmarks/events_bench.py`; `_schedule` takes `'step'` | `'item'`. It won only on the synthetic lopsided

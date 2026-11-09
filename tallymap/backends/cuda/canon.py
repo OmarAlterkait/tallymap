@@ -10,14 +10,16 @@ No numerics change: each canonical form performs the SAME IEEE operations, in th
 operands, as the rule it replaces (checked bitwise by tests/ops.py: square, clip, ipow3 and the rest keep their
 recorded numbers).  A program without sugar is returned unchanged (same object).
 
-The re-tracing engine is tallymap/_sugar.py (the foreign-primitive table in tallymap/_foreign.py uses the same
-one): the re-traced jaxpr keeps the original constants first, in order (the kernel's hoisted-constant inputs are
-indexed by position), and nested jaxprs (while / cond / scan / call bodies) are canonicalised recursively.
+The re-traced jaxpr keeps the original constants first, in order (the kernel's hoisted-constant inputs are indexed
+by position), and nested jaxprs (while / cond / scan / call bodies) are canonicalised recursively.  One pass is
+enough: no canonical form contains sugar.
 """
+import jax
 import numpy as np
 from jax import lax
+from jax.extend.core import ClosedJaxpr, Literal
 
-from ..._sugar import Sugar, rewrite
+from ..._jaxpr import bind, closed, contains, is_dropvar, lit, subjaxprs, with_source
 
 
 def _float_kind(dt):
@@ -131,9 +133,61 @@ def _expand(eqn, ins):
     return list(out) if isinstance(out, (list, tuple)) else [out]
 
 
-_TABLE = Sugar("cuda sugar", tuple(SUGAR), _applies, _expand)
+_NAMES = tuple(SUGAR)
+_CACHE = {}
+
+
+def _param(v):
+    if isinstance(v, ClosedJaxpr):
+        return canonical(v)
+    if type(v).__name__ == "Jaxpr":
+        c = canonical(closed(v))
+        if c.consts:                                     # pragma: no cover (canonical forms create no constants)
+            raise NotImplementedError("tallymap: canonicalising an open sub-jaxpr created constants")
+        return c.jaxpr
+    if isinstance(v, (tuple, list)) and any(isinstance(b, ClosedJaxpr) or type(b).__name__ == "Jaxpr" for b in v):
+        return type(v)(_param(b) for b in v)
+    return v
+
+
+def _eval(jaxpr, consts, args):
+    env = {}
+
+    def read(v):
+        return lit(v) if isinstance(v, Literal) else env[v]
+    for v, x in zip(jaxpr.constvars, consts):
+        env[v] = x
+    for v, x in zip(jaxpr.invars, args):
+        env[v] = x
+    for e in jaxpr.eqns:
+        ins = [read(v) for v in e.invars]
+        if _applies(e):
+            with with_source(e):
+                outs = _expand(e, ins)
+        else:
+            if any(contains(s.jaxpr, _NAMES) for s in subjaxprs(e)):
+                e = e.replace(params={k: _param(v) for k, v in e.params.items()})
+            outs = bind(e, ins)
+        for v, x in zip(e.outvars, outs):
+            if not is_dropvar(v):
+                env[v] = x
+    return [read(v) for v in jaxpr.outvars]
 
 
 def canonical(cj):
     """the canonical form of a ClosedJaxpr (the same object when it contains no sugar)."""
-    return rewrite(cj, _TABLE)
+    if not contains(cj.jaxpr, _NAMES):
+        return cj
+    k = id(cj)
+    hit = _CACHE.get(k)
+    if hit is not None and hit[0] is cj:
+        return hit[1]
+    nc = len(cj.consts)
+    sds = lambda v: jax.ShapeDtypeStruct(v.aval.shape, v.aval.dtype, weak_type=getattr(v.aval, "weak_type", False))
+    new = jax.make_jaxpr(lambda *a: _eval(cj.jaxpr, a[:nc], a[nc:]))(
+        *[sds(v) for v in list(cj.jaxpr.constvars) + list(cj.jaxpr.invars)])
+    j = new.jaxpr
+    j = j.replace(constvars=list(j.invars[:nc]) + list(j.constvars), invars=list(j.invars[nc:]))
+    out = ClosedJaxpr(j, list(cj.consts) + list(new.consts))
+    _CACHE[k] = (cj, out)
+    return out

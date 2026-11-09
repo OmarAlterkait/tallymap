@@ -12,9 +12,7 @@ Suites: edge (edge cases), transforms (composability matrix), reverse (reverse m
 invariants (schedule invariance, cache-key soundness, run-or-raise, AD self-consistency, truncation),
 dice (DiCE gradients of discrete outcomes against closed forms, float score leaves through spawn),
 ops (cuda op table vs jit(vmap(op)) and the host-exact result; --gpu only), mulchain (a 64-bit multiply chain
-compiles fast and matches lockstep bitwise; --gpu only), equinox_compat (diffrax / optimistix /
-lineax / quadax solvers inside an item; skipped when those are not installed), examples (examples/*.py run as
-scripts).
+compiles fast and matches lockstep bitwise; --gpu only), examples (examples/*.py run as scripts).
 Each suite runs in its own process (fresh JAX state).  A suite passes iff its summary line was printed and every cell
 is PASS, an EXPECTED raise (RAISES-OK) or an expected failure (XFAIL: a known library defect pinned by the suite);
 anything else (FAIL, unexpected RAISE, XPASS -- an XFAIL cell that now passes, so its marker must go --, crash,
@@ -30,17 +28,13 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-SUITES = ["edge", "transforms", "reverse", "reverse_spawn", "invariants", "dice", "ops", "mulchain",
-          "equinox_compat", "examples"]
+SUITES = ["edge", "transforms", "reverse", "reverse_spawn", "invariants", "dice", "ops", "mulchain", "examples"]
 GPU_ONLY = {"ops", "mulchain"}
-OPTIONAL = {"equinox_compat"}      # needs a package the library does not depend on; prints 'SUITE SKIP' without it
 EXAMPLES = ["quickstart", "photon_toy", "shower_toy", "ensemble_toy", "walk_on_spheres",
             "ode_ensemble", "gillespie", "interacting_particles", "particle_filter", "gradient_pitfall"]
 
 
 def verdict(name, out, rc):
-    if name in OPTIONAL and re.search(r"^SUITE SKIP", out, re.M):
-        return True, "skipped (optional dependency missing)"
     if name in ("reverse_spawn", "ops", "examples"):
         m = re.search(r"^ALL (PASS|FAIL) (\d+)/(\d+)", out, re.M)
         if not m:

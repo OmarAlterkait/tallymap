@@ -451,7 +451,7 @@ it with chunking by the local-memory budget is open (2026-11-04).
   (job 41231627); the toy walk at 1M items, S = 0 / 4 / 8 / 16, gave 6.32 / 6.36 / 6.45 / 6.43 ms
   (job 41231673); a toy built to spill -- a step holding 128 live nonlinear intermediates, 168 registers and
   1,328 bytes of local memory per thread, grad/forward 8.1x -- gave 32.4 / 31.2 / 32.1 ms at S = 0 / 2 / 4
-  (job 41232260); and the diffrax ensemble of `docs/equinox.md` gave 4,936 ms at S = 0 against 4,968 at S = 4.
+  (job 41232260); and a `diffrax.diffeqsolve` ensemble inside an item gave 4,936 ms at S = 0 against 4,968 at S = 4.
   A step that really spills may still exist (the two engines), but nothing public shows one, and an option
   cannot be kept on evidence nobody can rerun.
 - **Where the adjoint time goes**, decomposed on a transport workload whose adjoint kernel cost about 8 times its

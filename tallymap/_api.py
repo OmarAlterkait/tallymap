@@ -23,7 +23,7 @@ from jax import lax
 from jax.core import Tracer
 from jax.extend.core import ClosedJaxpr, jaxpr_as_fun
 
-from . import _foreign
+from . import _errors
 from ._rewrite import check_tallies, isfloat, retrace
 from ._tally import Tally
 
@@ -158,16 +158,13 @@ def _tally_aval(s):
 
 
 def _mk(fn, avals):
-    """trace fn to a ClosedJaxpr, with the Equinox ecosystem's own primitives expanded into JAX primitives
-    (_foreign.py; a no-op for a program that has none).  Every ItemProgram is built through here, so the
-    expansion happens once, before tallymap's jvp / reverse programs and before either backend - and so does
-    _foreign.ad_advice, which explains the one failure a foreign library makes likely (a custom_vjp in the item,
-    which JAX cannot forward-differentiate; diffrax's default adjoint is one)."""
+    """trace fn to a ClosedJaxpr.  Every ItemProgram is built through here, so a failure gets
+    _errors.ad_advice, which explains the failures an item makes likely (a custom_vjp, which JAX cannot
+    forward-differentiate; a leaked tracer)."""
     try:
-        cj = jax.make_jaxpr(fn)(*avals)
+        return jax.make_jaxpr(fn)(*avals)
     except Exception as e:
-        raise (_foreign.ad_advice(e, "item program") or e) from None
-    return _foreign.expand(cj)
+        raise (_errors.ad_advice(e, "item program") or e) from None
 
 
 # ------------------------------------------------------------------------------------------- transforms
