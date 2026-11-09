@@ -718,8 +718,13 @@ def _dce(cj):
     from jax.extend.core import ClosedJaxpr
 
     def closed(c):
-        nc = len(c.jaxpr.constvars)
-        return ClosedJaxpr(pe.convert_invars_to_constvars(deep(pe.convert_constvars_jaxpr(c.jaxpr)), nc), c.consts)
+        # consts -> leading invars (kept: instantiate=True), DCE, then the same leading invars back as constvars with
+        # the same consts.  Only convert_constvars_jaxpr / dce_jaxpr / replace / ClosedJaxpr(jaxpr, consts), which
+        # JAX 0.5.3 (separate ClosedJaxpr) and 0.11 (ClosedJaxpr = Jaxpr, consts attached) both have;
+        # convert_invars_to_constvars is gone in 0.11.
+        nc = len(c.consts)
+        jd = deep(pe.convert_constvars_jaxpr(c.jaxpr))
+        return ClosedJaxpr(jd.replace(constvars=list(jd.invars[:nc]), invars=list(jd.invars[nc:])), list(c.consts))
 
     def deep(jaxpr):
         eqns = []
