@@ -168,6 +168,12 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   `UnsupportedError` naming the size, as `cholesky` and `qr` already did; the late LU expansion had no size check
   and compiled silently (a 24x24 solve: a 16.8 KB local frame per thread on an L40S). The 16x16 solve (255
   registers, about 19x off the trend) is still pinned as an XFAIL in `tests/invariants.py`.
+- `jax.jvp` / `jacfwd` of a spawning program in which a `spawn` site's float child leaves are all constants (no
+  tangent reaches it): JAX binds that spawn without calling its jvp rule, so it carries only the primal leaves.
+  The lockstep backend raised a `while_loop` carry-structure TypeError; the cuda backend wrote nothing into the
+  child's tangent slots, so the child read whatever an earlier child had left in that ring slot (zero only until
+  the ring wraps). Both now write those tangents as zero. Found by the DiCE tests ported from the private engine
+  line.
 - `tm.diagnostics(f, ...)["stablehlo_sha256"]` (and `tests/ab_rule.py`, which compares it for the lockstep
   backend) is the same on every lowering of a program with a host callback. On JAX < 0.7 a callback lowers
   with the address of its Python callable, new every time, so the raw text never hashed the same twice; the

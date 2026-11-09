@@ -472,10 +472,11 @@ def _():
 def _():
     r = r2("branch", "noinherit")
     m, se = gradient(r)
-    z = (m - r["truth"][1]) / se
-    if abs(z) <= 3.5:
-        raise Fail(f"the plant did not fire: gradient {m:+.5g} vs {r['truth'][1]:+.5g}, z {z:+.2f}")
-    return f"fired: gradient {m:+.5g} vs {r['truth'][1]:+.5g}, z {z:+.1f}"
+    # fired = the estimate is more than 3.5 of its own standard errors from the truth; written without dividing by
+    # se, which is exactly 0 when the plant zeroes every group's gradient
+    if abs(m - r["truth"][1]) <= 3.5 * se:
+        raise Fail(f"the plant did not fire: gradient {m:+.5g} vs {r['truth'][1]:+.5g}, se {se:.3g}")
+    return f"fired: gradient {m:+.5g} (se {se:.3g}) vs {r['truth'][1]:+.5g}"
 
 
 print("\n================ SUMMARY", jax.__version__, "x64" if EX else "", jax.devices()[0].device_kind)

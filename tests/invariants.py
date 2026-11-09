@@ -1175,29 +1175,29 @@ def _(b):
     return "accepted"
 
 
-_SPAWN_ZERO_XFAIL = ("found by tests/dice.py's 'noinherit' plant: under jax.jvp the spawned child must carry "
-                     "(primal leaves, tangents of its float leaves), and that layout is produced by spawn_p's jvp "
-                     "rule (_tally._spawn_jvp); JAX does not call a jvp rule whose tangents are ALL symbolic zeros "
-                     "(JVPTrace.process_primitive), so a spawn whose float leaves are all constants binds without "
-                     "tangent leaves and the queue carry no longer matches (TypeError: while_loop carry structure, "
-                     "lockstep and cuda). Fix: build the tangent payload layout in jvp_prog, not in the rule")
-
-
-@case("[ad] jvp through spawn: a child whose float payload is a constant (no tangent) builds and differentiates",
-      xfail={"lockstep": _SPAWN_ZERO_XFAIL, "cuda": _SPAWN_ZERO_XFAIL})
+@case("[ad] jvp through spawn: a child whose float payload is a constant (no tangent) builds, and its tangent is 0 "
+      "in a reused queue slot")
 def _(b):
+    # JAX does not call spawn_p's jvp rule when every tangent reaching it is a symbolic zero, so that spawn carries
+    # only its primal leaves; the backends write the missing tangent leaves as zero.  Generations alternate a traced
+    # child (x * 0.5) and a CONSTANT child (0.25); 8 roots, depth 6 = 48 children through a 24-slot ring, so constant
+    # children land in slots that traced children wrote before (a stale tangent would show).  (Found by
+    # tests/dice.py's 'noinherit' plant: lockstep raised a while_loop carry-structure TypeError, cuda wrote nothing
+    # into the tangent slot.)
     def item(t, g, x):
         t = t.add("Q", 0, x)
-        return t.spawn((g + 1, jnp.asarray(0.5, F)), when=g < 1)       # the child's float leaf is a constant
-    f = tm.vmap(item, outputs={"Q": tm.Sum((1,), F)}, spawn=tm.Queue(1 << 10), backend=b)
-    xs = jnp.linspace(0.5, 1.5, 16).astype(F)
-    g0 = jnp.zeros((16,), jnp.int32)
-    try:
-        d = jax.jvp(lambda s: f(g0, xs * s).outputs["Q"], (F(1),), (F(1),))[1]
-    except Exception as e:
-        raise Fail(f"{type(e).__name__}: {str(e).splitlines()[0][:160]}") from None
-    near(d, jnp.sum(xs).reshape(1), FT, "tangent (the constant children add 0)")
-    return "ok"
+        t = t.spawn((g + 1, x * 0.5), when=(g < 6) & (g % 2 == 0))
+        return t.spawn((g + 1, jnp.asarray(0.25, F)), when=(g < 6) & (g % 2 == 1))
+    f = tm.vmap(item, outputs={"Q": tm.Sum((1,), F)}, spawn=tm.Queue(24), backend=b)
+    xs = jnp.linspace(0.5, 1.5, 8).astype(F)
+    g0 = jnp.zeros((8,), jnp.int32)
+    r = f(g0, xs)
+    _check(int(r.stats["spawned"]) == 48 and int(r.stats["dropped"]) == 0,
+           f"spawned {int(r.stats['spawned'])} dropped {int(r.stats['dropped'])}")
+    d = jax.jvp(lambda s: f(g0, xs * s).outputs["Q"], (F(1),), (F(1),))[1]
+    # d/ds: the roots (sum xs) and their traced children (sum xs / 2); every later generation descends from a
+    # constant child, so its tangent is exactly 0
+    return near(d, (1.5 * jnp.sum(xs)).reshape(1), FT, "tangent")
 
 
 # =================================================================================================== [trunc]

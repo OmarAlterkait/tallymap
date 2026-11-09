@@ -124,6 +124,15 @@ def _emit(st, t, idx, val):
     return t
 
 
+def _check_tail(qleaves, leaves):
+    """a spawn in a jvp program may carry only its PRIMAL leaves: JAX does not call spawn_p's jvp rule (which appends
+    the tangents of the float leaves) when every tangent reaching it is a symbolic zero.  The missing trailing leaves
+    are those tangents, i.e. zero, and must be written as zero (a queue slot is reused)."""
+    if len(leaves) > len(qleaves) or any(not jnp.issubdtype(ql.dtype, jnp.inexact) for ql in qleaves[len(leaves):]):
+        raise TypeError(f"tallymap: a spawn with {len(leaves)} child leaves in a program whose queue has "
+                        f"{len(qleaves)} (internal error)")
+
+
 def _spawn(st, t, when, leaves):
     q = st.queue
     P = st.P
@@ -132,7 +141,10 @@ def _spawn(st, t, when, leaves):
     pos = q["tail"] + jnp.cumsum(w.astype(jnp.int32), dtype=jnp.int32) - 1
     ok = w & (pos - q["head"] < Q)
     slot = jnp.where(ok, pos % Q, Q)
-    q["leaves"] = [ql.at[slot].set(_bc(x, P).astype(ql.dtype), mode="drop") for ql, x in zip(q["leaves"], leaves)]
+    _check_tail(q["leaves"], leaves)
+    q["leaves"] = [ql.at[slot].set(_bc(leaves[i], P).astype(ql.dtype) if i < len(leaves) else
+                                   jnp.zeros((P,) + ql.shape[1:], ql.dtype), mode="drop")
+                   for i, ql in enumerate(q["leaves"])]
     n_ok = jnp.sum(ok.astype(jnp.int32), dtype=jnp.int32)
     q["tail"] = q["tail"] + n_ok
     q["spawned"] = q["spawned"] + n_ok

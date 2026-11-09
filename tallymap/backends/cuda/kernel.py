@@ -637,10 +637,18 @@ def _spawn_rule(em, p, ins, pav):
     em.line(f"const u32 {tk} = atomicAdd(&SJ_QCTL[0], 1u);")
     em.line(f"const u32 {sl} = {tk} % {Q}u;")
     em.line(f"while (SJ_LDV(&SJ_SEQ[{sl}]) != {tk}) __nanosleep(32);")
-    for i, ((sh, dt, _), x) in enumerate(zip(pav, leaves)):
+    if len(leaves) > len(pav) or any(not np.issubdtype(np.dtype(dt), np.inexact) for _, dt, _ in pav[len(leaves):]):
+        raise CodegenError(f"a spawn with {len(leaves)} child leaves in a program whose queue has {len(pav)} "
+                           "(internal error)")
+    for i, (sh, dt, _) in enumerate(pav):
+        # (missing trailing leaves: the tangents of a spawn JAX bound without calling its jvp rule, i.e. zero;
+        # written as zero, since the queue slot is reused -- see lockstep._check_tail)
+        x = leaves[i] if i < len(leaves) else None
         n = _size(sh)
         qp = f"(({ctype(dt)}*)SJ_QBUF({i}))"
-        if sh == ():
+        if x is None:
+            em.line(f"for (i64 z_ = 0; z_ < {n}; ++z_) {qp}[(i64){sl} * {n} + z_] = ({ctype(dt)})0;")
+        elif sh == ():
             em.line(f"{qp}[{sl}] = {elem(x, [])};")
         else:
             em.each(sh, lambda idx, x=x, qp=qp, n=n, sh=sh: em.line(
