@@ -403,7 +403,6 @@ def build_source(p, *, block=BLOCK, split=True, inplace=True):
         advance = (f"sj_cond({', '.join(base_arg + cargs + ['sj_pr'])});\n"
                    f"      if (sj_pr) {{ sj_body({', '.join(base_arg + bargs + nargs)}); {' '.join(upd)} }}\n"
                    f"      else {{ sj_post({', '.join(base_arg + post_args + ys_names)}); done = true; }}")
-    em.flush_pools()
     L.consts = list(em.consts)
     base_const = nP + nB
     nin = base_const + len(L.consts)

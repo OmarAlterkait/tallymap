@@ -30,7 +30,8 @@ def _const_sig(c):
         a = np.asarray(c)
         return (a.shape, str(a.dtype), a.tobytes())
     a = np.asarray(c)
-    # the VALUE is part of the key: constant folding bakes closed-over arrays into the generated source
+    # the VALUE is part of the key: a launch passes the constants of the program its kernel was built from
+    # (Layout.cjs / Layout.consts), so two programs that differ only in a constant's value must not share it
     return (a.shape, str(a.dtype), hashlib.sha1(a.tobytes()).hexdigest())
 
 

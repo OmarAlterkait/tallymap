@@ -556,7 +556,7 @@ def make_pairs(b):
     P.append(Pair("table contents (broadcast operand)", lambda: ho(XK, ii, t1), lambda: ho(XK, ii, t2), ok_o(t1),
                   ok_o(t2), lambda ra, rb: not np.array_equal(_np(ra.per_item), _np(rb.per_item))))
 
-    # 8. table contents CLOSED OVER (a 256-entry constant table: the pooled-table / gather path, not a literal)
+    # 8. table contents CLOSED OVER (a 256-entry constant table: a kernel constant buffer, not a literal)
     big1 = (1.0 + jnp.sin(jnp.arange(256))).astype(F)
     big2 = big1.at[17].add(1.0)
     ij = jnp.asarray((np.arange(NK) * 7 + 17) % 256, jnp.int32)

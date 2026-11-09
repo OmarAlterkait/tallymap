@@ -388,6 +388,14 @@ cost-decomposition options (`_rev_phase`, `_tree_phase`), which produced wrong g
 test used -- the decompositions they produced are quoted in section 6. The fold rule is one comparison against
 the device's resident-thread count and no longer consults the kernel's privatisation rule at all (section 2).
 
+Constant folding in the cuda emitter is removed too: an array equation whose inputs were all known at compile time
+was evaluated on the host and its result (16 elements or more, `FOLD_MIN`) hoisted into a read-only table, one
+pooled buffer per dtype. With it off, lumen's value and jvp outputs were bitwise identical on SK, SBND and ANNIE
+(L40S); LUCiD's forward and 6-column Jacobian and every DTRAX table were bitwise identical too. The largest cost
+of removing it was 1.14x (lumen SK value on a 2080 Ti); LUCiD and DTRAX were within 1.02x. The pools alone were
+worth at most 1.02x anywhere. Scalar constants still fold into literals (`op_table._ew_rule`), and the lazy gather
+rule (`LAZY_GATHER`) stays: without it LUCiD and DTRAX fail to launch.
+
 Removed from the public surface before the first release (API decisions, so no measurement is involved):
 
 - `tm.compare`, with `criteria` and the square mode of the re-tracer that produced its floor run. Its frozen
@@ -422,8 +430,7 @@ it with chunking by the local-memory budget is open (2026-11-04).
   slightly worse), which is not reproducible here.
 - **Refuted levers**: contention on parameter-cotangent atomics; raising occupancy through launch bounds (the
   extra spills offset the occupancy); carrying one segment buffer instead of allocating a fresh one per segment
-  (slower); a flat K <= C sweep under a `lax.cond` (slower). One real bug was found while measuring these:
-  uniform-constant folding was allocating pools of tens of megabytes of zeros.
+  (slower); a flat K <= C sweep under a `lax.cond` (slower).
 - **Refuted: one kernel per phase, with a bounded global buffer.** Every adjoint program has exactly three
   top-level while loops (the replay, the checkpoint pass, the sweep), so the step split, which needs exactly one,
   never applies to an adjoint: it always runs whole-item and always gets one register allocation for all three
@@ -702,12 +709,6 @@ commit it came from; the measurements are on that private engine.
   element's C expression is longer than `codegen.MAT_MULTI_CHARS = 200` characters. Measured with that threshold:
   the GDML kernel's source 13.0 -> 7.5 MB. One-use values and short expressions stay lazy, so a large row gather
   read in two places with a short expression keeps loading only the elements it reads.
-- **Pooled constant buffers are concatenated once** (wavefront `3732513`). `Emitter.fold_table` re-concatenated
-  its whole per-dtype pool at every folded table, O(K x S) in the number and total size of the folded tables,
-  although the pool is read once, when the kernel's buffers are laid out; `Emitter.flush_pools` now builds it
-  there. Same bytes in the same order, so the source and the cubin are unchanged; worth about a second of a 29 s
-  emitter on DTRAX's mode-2 item, which folds into few pools; a program that folds hundreds of tables pays the
-  quadratic term.
 - **Buffer assignment at loop and cond boundaries** (wavefront "v3", base commit `82d6ee2`, and "v5", `fbf2c5b`, as
   ONE rule). v3: a `while` loop's initial carry array that is dead after the loop (the in-place liveness rule,
   `Emitter.can_mutate`) and that no other operand of the loop reads IS the carry storage, so the init copy

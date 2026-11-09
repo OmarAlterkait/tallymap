@@ -19,7 +19,6 @@ math library (libdevice).  Results agree with XLA only statistically (see docs/v
 """
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from jax.extend.core import ClosedJaxpr, Literal
 
@@ -316,29 +315,6 @@ def mul_chain(jaxpr, memo, cuts=None):
     return max([d.get(v, 0) for v in jaxpr.outvars if not isinstance(v, Literal)] or [0])
 
 
-# ----------------------------------------------------------------------------- constant folding
-FOLD_MIN = 16        # constant-folded results of at least this many elements become pooled constant tables
-_NOFOLD = ("custom_lin",)
-
-
-def _uniform(a):
-    """every element has the same bits (zeros, broadcast scalars)"""
-    b = np.ascontiguousarray(a).reshape(-1)
-    if b.size == 0:
-        return True
-    u = b.view(np.uint8).reshape(b.size, -1)
-    return bool(np.all(u == u[0]))
-
-
-def _with_cnp(v, a):
-    try:
-        if v.shape == tuple(np.shape(a)):
-            v.cnp = a
-    except Exception:
-        pass
-    return v
-
-
 # ----------------------------------------------------------------------------- emitter
 class Emitter:
     def __init__(self):
@@ -541,9 +517,7 @@ class Emitter:
         j = self._const_ids[key]
         ct = ctype(a.dtype)
         cast = "u8" if a.dtype == np.bool_ else ct
-        t = Table(f"((const {cast}*)SJ_CONST({j}))", a.shape, a.dtype)
-        t.cnp = a
-        return t
+        return Table(f"((const {cast}*)SJ_CONST({j}))", a.shape, a.dtype)
 
     # ------------------------------------------------------------ jaxpr evaluation
     def freeze(self, vals):
@@ -555,11 +529,11 @@ class Emitter:
 
     def can_mutate(self, var, val):
         """May the array `val` (bound to jaxpr var `var` of the CURRENT scope) be updated in place?  Only if it is
-        a mutable per-item Local (not a loop const / function parameter / compile-time-known value), `var` has no
+        a mutable per-item Local (not a loop const / function parameter), `var` has no
         remaining use in this scope, and no LIVE value of any active scope reads its storage (checked on the C
         text every live value would read: Views and Lazy expressions included)."""
         if not self.inplace or not self._scopes or not isinstance(val, Local) or val.shape == () or \
-                isinstance(var, Literal) or hasattr(val, "cnp"):
+                isinstance(var, Literal):
             return False
         if any(val.name in f for f in self._frozen):
             return False
@@ -619,13 +593,7 @@ class Emitter:
             if not isinstance(c, jax.core.Tracer) and np.ndim(c) == 0 and not is_key_dtype(v.aval.dtype):
                 consts.append(self.const_val(c, v.aval))
             else:
-                dc = self.dyn_const(fn, k, v.aval)
-                if not isinstance(c, jax.core.Tracer) and not is_key_dtype(v.aval.dtype):
-                    try:
-                        dc.cnp = np.asarray(c)          # known value: foldable downstream (and in the kernel key)
-                    except Exception:
-                        pass
-                consts.append(dc)
+                consts.append(self.dyn_const(fn, k, v.aval))
         try:
             return self.run_jaxpr(cj.jaxpr, consts, args)
         finally:
@@ -683,72 +651,9 @@ class Emitter:
         finally:
             self._scopes.pop()
 
-    # ------------------------------------------------------------ constant folding of arrays
-    def fold_table(self, a):
-        """Hoist a compile-time-known array into a per-dtype pooled read-only constant buffer (one kernel buffer
-        per dtype, however many folded arrays)."""
-        a = np.ascontiguousarray(a)
-        dt = a.dtype
-        if not hasattr(self, "_pools"):
-            self._pools = {}
-        pool = self._pools.get(dt)
-        if pool is None:
-            pool = self._pools[dt] = [len(self.consts), [], 0]
-            self.consts.append(("static", None, np.zeros((1,), dt)))
-        off = pool[2]
-        pool[1].append(a.ravel())
-        pool[2] += a.size
-        cast = "u8" if dt == np.bool_ else ctype(dt)
-        t = Table(f"((const {cast}*)SJ_CONST({pool[0]}))", a.shape, dt, off=off)
-        t.cnp = a
-        return t
-
-    def flush_pools(self):
-        """write each pooled constant buffer into self.consts, concatenated ONCE (re-concatenating at every
-        fold_table was quadratic in the pool).  kernel.build_source calls it before reading self.consts."""
-        for pool in getattr(self, "_pools", {}).values():
-            self.consts[pool[0]] = ("static", None, np.concatenate(pool[1]))
-
-    def _try_fold(self, eqn, ins):
-        """All inputs compile-time known -> evaluate the primitive eagerly ON THE DEFAULT DEVICE (XLA's own kernels,
-        so the bits are what XLA computes) and hoist results with >= FOLD_MIN elements as constant tables.
-        XLA folds/fuses these constant-only subgraphs; per item they would otherwise be recomputed every step
-        into per-thread local arrays (PROD: 15+ 255-element quantile grids per step).  -> list of Vals or None"""
-        if eqn.effects or eqn.primitive.name.startswith("random") or eqn.primitive.name in _NOFOLD:
-            return None
-        vals = []
-        for x in ins:
-            if getattr(x, "key_impl", None) is not None:
-                return None
-            if hasattr(x, "cnp"):
-                vals.append(x.cnp)
-            elif isinstance(x, Scalar) and x.cval is not None and np.dtype(x.dtype) != _FLOAT0:
-                vals.append(np.asarray(x.cval, x.dtype))
-            else:
-                return None
-        for v in eqn.outvars:
-            dt = getattr(v.aval, "dtype", None)
-            if dt is None or is_key_dtype(dt) or np.dtype(dt) == _FLOAT0 or not hasattr(v.aval, "shape"):
-                return None
-        try:
-            with jax.ensure_compile_time_eval():
-                outs = eqn.primitive.bind(*[jnp.asarray(v) for v in vals], **eqn.params)
-            outs = outs if eqn.primitive.multiple_results else [outs]
-            outs = [np.asarray(o) for o in outs]
-        except Exception:
-            return None
-        # UNIFORM arrays (zeros / broadcast scalars: tape buffers, zero cotangents) are never hoisted: the normal
-        # rule gives a literal (Lazy) value, while a pooled table turns every use into a global load (and every
-        # mutable copy of it into an O(size) load loop) and bloats the pool (measured: 33 MB and 80 MB adjoint
-        # pools of zeros on two engine workloads).  They stay known (cnp) for downstream folding.
-        fold = [o.size >= FOLD_MIN and not _uniform(o) for o in outs]
-        if not any(fold):
-            return outs      # small or uniform: emitted normally, but known (cnp) for downstream folding
-        return [self.fold_table(o) if f else o for o, f in zip(outs, fold)]
-
     def eqn(self, eqn, ins):
         try:
-            return self._eqn_folded(eqn, ins)
+            return self._eqn(eqn, ins)
         except CodegenError as e:
             raise located(e, eqn, f"item function {self.where}" if self.where else "") from None
         except Exception as e:
@@ -756,24 +661,6 @@ class Emitter:
             if better is None:
                 raise
             raise located(better, eqn, f"item function {self.where}") from None
-
-    def _eqn_folded(self, eqn, ins):
-        folded = self._try_fold(eqn, ins)
-        if folded is not None and any(isinstance(f, Val) for f in folded):
-            # mixed: small outputs still go through the rule (only multi-result primitives)
-            if eqn.primitive.multiple_results:
-                if not all(isinstance(f, Val) for f in folded):
-                    r = self._eqn(eqn, ins)
-                    folded = [f if isinstance(f, Val) else _with_cnp(rv, f) for f, rv in zip(folded, r)]
-                return folded
-            return folded[0]
-        r = self._eqn(eqn, ins)
-        if folded is not None and not isinstance(r, VTally):
-            if eqn.primitive.multiple_results:
-                r = [_with_cnp(rv, f) for rv, f in zip(r, folded)]
-            else:
-                r = _with_cnp(r, folded[0])
-        return r
 
     def _eqn(self, eqn, ins):
         name = eqn.primitive.name

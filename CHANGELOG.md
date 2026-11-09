@@ -54,6 +54,13 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Removed
 
+- Constant folding in the cuda emitter (`codegen.FOLD_MIN`, `Emitter._try_fold`, `fold_table`, `flush_pools`):
+  array equations whose inputs were all compile-time constants were evaluated on the host and hoisted into
+  read-only tables, pooled into one kernel buffer per dtype. With it off, lumen's value and jvp outputs were
+  bitwise identical on SK, SBND and ANNIE (L40S, job 43946370), as were LUCiD's forward and Jacobian and every
+  DTRAX table; the largest cost was 1.14x (lumen SK value, 2080 Ti) and the pools alone were worth at most 1.02x.
+  Such equations are now emitted like any other. Scalar constants still fold into literals, and the lazy gather
+  rule (`op_table.LAZY_GATHER`) stays, since without it LUCiD and DTRAX fail to launch.
 - Equinox-family support inside an item: the expansion of Equinox's own primitives (`unvmap_*`,
   `select_if_vmap`, `maybe_set`, `nonbatchable`, `nontraceable`, `nondifferentiable_backward`) at the item trace,
   the late expansion of Lineax's `linear_solve` and Equinox's `vprim`, the rule that ran a program holding a
