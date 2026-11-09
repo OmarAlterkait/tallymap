@@ -86,7 +86,7 @@ deliberate: it is what makes an upgrade a bounded job.
 | `stats['dropped'] > 0` and the float tallies are NaN | the spawn Queue is too small | size it (README, "Sizing the Queue") |
 | `stats['n_truncated'] > 0` and the float tallies are NaN | items hit `max_steps` | raise it, or put the budget in the loop condition if it is deliberate (README, `max_steps`) |
 | `stats['dropped_emits'] > 0` | an emit index was negative or at least the output size | an off-by-one in your binning; clip the index |
-| a NaN gradient | in this order: your own arithmetic, a resource limit, then a reverse-mode check | if `jvp` or `jacfwd` is NaN too it is your arithmetic (look for overflow); else check `stats` for truncation and dropped children; only then rerun with `rev_stats=True` and read `tm.diagnostics()['reverse']` |
+| a NaN gradient | in this order: your own arithmetic, a resource limit, then a reverse-mode check | if `jvp` or `jacfwd` is NaN too it is your arithmetic (look for overflow); else check `stats` for truncation and dropped children; through spawn, rerun with `rev_stats=True` and read `tm.diagnostics()['reverse']['tree']` |
 | a perf row is more than 1.5x slower | a lost `jax.jit` fast path (usually a host callback in the jitted program), a changed kernel, or a busy machine | rerun once; compare `tm.diagnostics(f, *args)['kernels']` against the baseline commit's; then profile |
 
 ## Tuning constants (and where they were measured)

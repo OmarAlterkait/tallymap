@@ -41,6 +41,9 @@ import tallymap as tm  # noqa: E402
 if os.environ.get("TX_UNFUSED") == "1":                 # run_all --unfused: the two-node jvp design
     from tallymap import _primitive as _P0
     _P0.FUSE_JVP = False
+if os.environ.get("TX_T3") == "1":                      # run_all --t3: the single-loop adjoint wherever it applies
+    from tallymap import _reverse as _R0
+    _R0.SINGLE = "force"
 GPU = jax.default_backend() == "gpu"
 BACKENDS = os.environ.get("BACKENDS", "lockstep,cuda" if GPU else "lockstep").split(",")
 B0 = "cuda" if "cuda" in BACKENDS else "lockstep"       # the backend under test; lockstep is R1's reference

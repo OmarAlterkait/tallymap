@@ -27,6 +27,8 @@ from tallymap import _reverse
 if os.environ.get("TX_UNFUSED") == "1":                 # run_all --unfused: the two-node jvp design
     from tallymap import _primitive as _P0
     _P0.FUSE_JVP = False
+if os.environ.get("TX_T3") == "1":                      # run_all --t3: the single-loop adjoint wherever it applies
+    _reverse.SINGLE = "force"
 from tallymap import reference
 
 jax.config.update("jax_default_matmul_precision", "highest")
@@ -72,13 +74,9 @@ def case(name, backends=None):
             if b not in BACKENDS or (ONLY and ONLY not in name):
                 continue
             t0 = time.perf_counter()
-            rp0 = tm.diagnostics()["reverse"]["replay"]["mismatch"]
             try:
                 r = fn(b)
                 msg = "PASS" + (f" ({r})" if isinstance(r, str) else "")
-                drp = tm.diagnostics()["reverse"]["replay"]["mismatch"] - rp0
-                if drp and "NEGATIVE" not in name:
-                    msg = f"FAIL replay_mismatch {drp} items ({msg})"
             except Fail as e:
                 msg = f"FAIL {e}"
             except Exception as e:
@@ -707,14 +705,7 @@ def _(b):
     return f"{nt} truncated; {msg}; n_active: {msg2}"
 
 
-@case("REPLAY CHECK: fingerprint matches (ieee/ieee); NEGATIVE CONTROL adjoint math=approx must mismatch -> NaN",
-      ["cuda"])
-def _(b):
-    if X64:     # the control flips f32 div / sqrt PTX; an f64 item does not use them (the control would be void)
-        return "skipped under x64 (the negative control needs f32 arithmetic)"
-    NB = 64
-    n = 4096
-
+def _replay_item(NB):
     def item(t, x):                       # trajectory decided by a sqrt/div-driven continuous state (ulp-sensitive)
         def body(c):
             k, y, w, t = c
@@ -722,96 +713,65 @@ def _(b):
             return k + 1, y2, w * 0.999, t.add("Q", (k * 7) % NB, w * y2)
         k, y, w, t = lax.while_loop(lambda c: (c[1] < 3.0) & (c[0] < 5000), body, (0, x * 0.5, x, t))
         return t, (k, y)
-    xs = jnp.linspace(0.11, 1.9, n).astype(F)
-    wq = jnp.cos(jnp.arange(NB)).astype(F)
-
-    def run(math, adj=None):
-        f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend="cuda", cuda_math=math, rev_stats=True,
-                     **(dict(_adj_math=adj) if adj else {}))
-        before = tm.diagnostics()["reverse"]["replay"]["mismatch"]
-        g = jax.jit(jax.grad(lambda x: jnp.sum(f(x).outputs["Q"] * wq)))(xs)
-        jax.block_until_ready(g)
-        return tm.diagnostics()["reverse"]["replay"]["mismatch"] - before, np.asarray(g)
-    # instrument: does approx vs ieee change trajectories at all?  (step counts per item)
-    ki = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend="cuda", cuda_math="ieee")(xs).per_item
-    ka = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend="cuda", cuda_math="approx")(xs).per_item
-    ndiff = int(np.sum((np.asarray(ki[0]) != np.asarray(ka[0])) | (np.asarray(ki[1]) != np.asarray(ka[1]))))
-    import warnings
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        m0, g0 = run("ieee")
-        m1, g1 = run("ieee", adj="approx")
-    if m0 != 0 or not np.isfinite(g0).all():
-        raise Fail(f"clean run reports {m0} replay mismatches (finite gradient: {np.isfinite(g0).all()})")
-    if m1 and not np.isnan(g1).all():
-        raise Fail("mismatching adjoint returned a non-NaN gradient")
-    if ndiff == 0:
-        raise Fail("instrument: approx vs ieee changes no final state here; the negative control would be void")
-    if m1 == 0:
-        raise Fail(f"NEGATIVE CONTROL not detected: {ndiff} items change step count under approx, 0 mismatches")
-    # the default (no rev_stats: no host callback): clean -> finite, mismatch -> NaN gradient
-    f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend="cuda", cuda_math="ieee", _adj_math="approx")
-    g2 = np.asarray(jax.jit(jax.grad(lambda x: jnp.sum(f(x).outputs["Q"] * wq)))(xs))
-    if not np.all(np.isnan(g2)):
-        raise Fail("default mode: the negative control did not poison the gradient")
-    return (f"clean 0 mismatches; approx-vs-ieee final states differ in {ndiff}/{n}; negative control flags {m1}/{n}, "
-            "gradient NaN (also without rev_stats)")
+    return item
 
 
-@case("REPLAY CHECK on demand: forward builds no fingerprint; grad(vmap) builds it (NEGATIVE CONTROL -> NaN)")
+@case("REPLAY GATE: per-item reverse == forward-mode derivative on an ulp-sensitive trajectory (nested and T3); "
+      "NEGATIVE CONTROL adjoint math=approx must fail it", ["cuda"])
 def _(b):
-    """the fingerprint is built only for reverse mode.  jax.grad of a direct call is linearized, so its program
-    carries it from the start; under jax.grad(jax.vmap(...)) the call is traced by vmap, so a forward-only program
-    (folded or mapped by the batching rule) reaches _vjp_call and must get it there (ItemProgram.with_fp, derived
-    through fold_prog): same gradient as per member, and on cuda the replay negative control must still poison it."""
-    from tallymap import _diagnostics as D
-    NB, n, B = 16, 1024, 2
+    """the adjoint differentiates the trajectory the forward kernel ran (what the removed runtime replay check
+    compared).  Here the step count of every item hangs on f32 sqrt / div bits, so an adjoint that replays a
+    different trajectory gets a different per-item derivative (one step more or fewer is ~1/150 of it), which the
+    forward-mode derivative (the fused jvp kernel, the forward's own trajectory) exposes item by item.  The negative
+    control compiles only the adjoint with approx div / sqrt: the gate must flag about the items whose step count
+    approx changes."""
+    if X64:     # the control flips f32 div / sqrt PTX; an f64 item does not use them (the control would be void)
+        return "skipped under x64 (the negative control needs f32 arithmetic)"
+    NB, n = 64, 4096
+    item = _replay_item(NB)
+    xs = jnp.linspace(0.11, 1.9, n).astype(F)
+    ki = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend="cuda", cuda_math="ieee")(xs).per_item[0]
+    ka = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend="cuda", cuda_math="approx")(xs).per_item[0]
+    ndiff = int(np.sum(np.asarray(ki) != np.asarray(ka)))
+    if ndiff == 0:
+        raise Fail("instrument: approx vs ieee changes no step count here; the negative control would be void")
+    s0, out = _reverse.SINGLE, {}
+    try:
+        for single in ("off", "force"):
+            for adj in (None, "approx"):
+                f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend="cuda", cuda_math="ieee",
+                            **(dict(_adj_math=adj) if adj else {}))
+                _reverse.SINGLE = single
+                gr = np.asarray(jax.jit(jax.grad(lambda x: jnp.sum(f(x).per_item[1])))(xs))
+                if _reverse.LAST_SINGLE.get("used") != (single == "force"):
+                    raise Fail(f"instrument: SINGLE={single} but {_reverse.LAST_SINGLE}")
+                gf = jax.jit(lambda x: jax.jvp(lambda x_: f(x_).per_item[1], (x,), (jnp.ones_like(x),))[1])(xs)
+                gf = np.asarray(gf)
+                out[single, adj] = int(np.sum(~(np.abs(gr - gf) <= 2e-4 * np.abs(gf) + 1e-6)))
+    finally:
+        _reverse.SINGLE = s0
+    for single in ("off", "force"):
+        if out[single, None]:
+            raise Fail(f"{single}: {out[single, None]}/{n} items' reverse derivative differs from forward mode")
+        if out[single, "approx"] < ndiff // 2:
+            raise Fail(f"NEGATIVE CONTROL ({single}): {out[single, 'approx']} items flagged, {ndiff} change step count")
+    return (f"clean 0/{n} (nested and T3); approx changes {ndiff} step counts; control flags nested "
+            f"{out['off', 'approx']}, T3 {out['force', 'approx']}")
 
-    def item(t, x):
-        def body(c):
-            k, y, w, t = c
-            y2 = y + 0.013 * jnp.sqrt(y + 0.1) / (x + 0.37) + 0.001 * jnp.sin(37.0 * y)
-            return k + 1, y2, w * 0.999, t.add("Q", (k * 7) % NB, w * y2)
-        k, y, w, t = lax.while_loop(lambda c: (c[1] < 3.0) & (c[0] < 5000), body, (0, x * 0.5, x, t))
-        return t, (k, y)
+
+@case("grad(vmap) of a call == per-member grads (the batching rule's folded / mapped adjoint)")
+def _(b):
+    NB, n, B = 16, 1024, 2
+    item = _replay_item(NB)
     xs = jnp.stack([jnp.linspace(0.11, 1.9, n), jnp.linspace(0.2, 1.7, n)]).astype(F)
     wq = jnp.cos(jnp.arange(B * NB)).astype(F).reshape(B, NB)
-    o = dict(cuda_math="ieee") if b == "cuda" else {}
-    progs, rec = [], D.record_program
-    D.record_program = lambda p: (progs.append(p), rec(p))[1]
-
-    def fps(fn, *a):
-        del progs[:]
-        jax.block_until_ready(fn(*a))
-        return [p.fp for p in progs]
-    try:
-        f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend=b, **o)
-        Lb = lambda x2: jnp.sum(jax.vmap(lambda x: f(x).outputs["Q"])(x2) * wq)
-        fwd_fp = fps(jax.jit(lambda x2: jax.vmap(lambda x: f(x).outputs["Q"])(x2)), xs)
-        gv = jax.jit(jax.grad(Lb))
-        gv_fp = fps(gv, xs)
-        g = np.asarray(gv(xs))
-        gm = [jax.jit(jax.grad(lambda x, m=m: jnp.sum(f(x).outputs["Q"] * wq[m]))) for m in range(B)]
-        gm_fp = fps(gm[0], xs[0])
-        ref = np.stack([np.asarray(gm[m](xs[m])) for m in range(B)])
-    finally:
-        D.record_program = rec
-    if not fwd_fp or not gv_fp or any(x is not None for x in fwd_fp + gv_fp):
-        raise Fail(f"a program traced outside linearization computes the fingerprint: fwd {fwd_fp}, grad(vmap) {gv_fp}")
-    if not gm_fp or any(x is None for x in gm_fp):
-        raise Fail(f"jax.grad's program was not built with the fingerprint up front: {gm_fp}")
+    f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend=b, **(dict(cuda_math="ieee") if b == "cuda" else {}))
+    g = np.asarray(jax.jit(jax.grad(lambda x2: jnp.sum(jax.vmap(lambda x: f(x).outputs["Q"])(x2) * wq)))(xs))
+    ref = np.stack([np.asarray(jax.jit(jax.grad(lambda x, m=m: jnp.sum(f(x).outputs["Q"] * wq[m])))(xs[m]))
+                    for m in range(B)])
     if not np.isfinite(g).all():
         raise Fail("grad(vmap) gradient not finite")
-    msg = close(dict(g=g), dict(g=ref), "grad(vmap) vs per-member grad")
-    if b == "cuda" and not X64:
-        fn = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend=b, cuda_math="ieee", _adj_math="approx")
-        Ln = lambda x2: jnp.sum(jax.vmap(lambda x: fn(x).outputs["Q"])(x2) * wq)
-        if not np.isnan(np.asarray(jax.jit(jax.grad(Ln))(xs))).all():
-            raise Fail("NEGATIVE CONTROL: the on-demand fingerprint did not poison the grad(vmap) gradient")
-        msg += "; NEGATIVE CONTROL NaN"
-    return "fwd / grad(vmap) programs without fingerprint, grad with; " + msg
-
-
+    return close(dict(g=g), dict(g=ref), "grad(vmap) vs per-member grad")
 
 
 @case("AUTO C: 16 for a small state, 64 for a ~300 B one, less beyond; bitwise == explicit C")
@@ -911,8 +871,7 @@ def _(b):
     try:
         for fb in (0x00, 0xFF):
             CG.FILL = fb
-            D.KERNELS.clear()         # (only the kernel history: diagnostics(reset=True) would also zero the replay
-            #                           counters this suite's case() compares before and after every cell)
+            D.KERNELS.clear()
             g, gr, info, (f, xs, keys, tab, th, wq, AX, item) = walk_case(b, 64, 100, rev_checkpoints=3)
             ks = tm.diagnostics()["kernels"]
             r = f(xs, keys, tab, th)
@@ -934,8 +893,88 @@ def _(b):
     return "per-item + cotangent x bitwise; " + close(g1, g0, "0xFF vs 0x00") + "; " + close(g0, gr, "vs padded")
 
 
+# ------------------------------------------------------------------------------------------- T3: single-loop adjoint
+def _with_single(mode, fn):
+    s0 = _reverse.SINGLE
+    _reverse.SINGLE = mode
+    try:
+        return fn()
+    finally:
+        _reverse.SINGLE = s0
+
+
+@case("T3 forced: per-item cotangents bitwise == the nested-loop adjoint (walk K<=C, K>C^2; nested); T3 used")
+def _(b):
+    out = []
+    for nm, mk, NB, ro in (("walk40", lambda: make_walk(64, 40), 64, {}), ("walk200C3", lambda: make_walk(64, 200), 64,
+                           dict(rev_checkpoints=3)), ("nested", lambda: make_nested(8), 8, {})):
+        item, padded = mk()
+        xs, keys, tab, th, wq = inputs(NB)
+        f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, in_axes=(0, 0, None, None), backend=b, **ro)
+        gs = []
+        for mode in ("off", "force"):
+            gs.append(_with_single(mode, lambda: grads(loss_of(f, wq), (xs, keys, tab, th))))
+            if _reverse.LAST_SINGLE.get("used") != (mode == "force"):
+                raise Fail(f"{nm}: SINGLE={mode} but {_reverse.LAST_SINGLE}")
+        nx = int((np.asarray(gs[0]["x"]) != np.asarray(gs[1]["x"])).sum())
+        if nx:
+            raise Fail(f"{nm}: {nx} per-item cotangents differ between T3 and the nested-loop adjoint")
+        out.append(f"{nm}: " + close(gs[1], gs[0], nm))
+    return "; ".join(out)
+
+
+@case("T3 auto: a small step keeps the nested-loop adjoint (T3_MIN_EQNS)")
+def _(b):
+    item, _ = make_walk(64, 10)
+    xs, keys, tab, th, wq = inputs(64)
+    f = tm.vmap(item, outputs={"Q": tm.Sum((64,), F)}, in_axes=(0, 0, None, None), backend=b)
+    _with_single("auto", lambda: grads(loss_of(f, wq), (xs, keys, tab, th)))
+    w = dict(_reverse.LAST_SINGLE)
+    if w.get("used") or "T3_MIN_EQNS" not in str(w.get("why")):
+        raise Fail(f"auto on a ~30-equation step: {w}")
+    return f"small step: {w['why']}"
+
+
+@case("max_steps under jax.grad: ONE launch (no forward); tally gradient NaN when truncated, per-item gradient exact "
+      "(nested and T3)")
+def _(b):
+    def item(t, x, th):
+        k, w, t = lax.while_loop(lambda c: c[0] < (x * 10).astype(jnp.int32),
+                                 lambda c: (c[0] + 1, c[1] * th, c[2].add("Q", 0, c[1] * c[1])), (0, x, t))
+        return t, w
+    xs = jnp.linspace(0.5, 1.5, 37).astype(F)
+    th = F(0.97)
+    res, msg = {}, []
+    for mode in ("off", "force"):
+        for cap in (64, 10):
+            f = tm.vmap(item, outputs={"Q": tm.Sum((4,), F)}, in_axes=(0, None), backend=b, max_steps=cap)
+            gq_f = jax.jit(jax.grad(lambda t_: jnp.sum(f(xs, t_).outputs["Q"])))
+            if b == "cuda":     # what runs: the custom calls left in the optimised program
+                hlo = _with_single(mode, lambda: gq_f.lower(th).compile().as_text())
+                nl = hlo.count('custom_call_target="tallymap_cuda_launch"')
+                if nl != 1:
+                    raise Fail(f"{mode}: jax.grad of a linear loss runs {nl} kernels, want 1 (the adjoint)")
+            gq = float(_with_single(mode, lambda: gq_f(th)))
+            if _reverse.LAST_SINGLE.get("used") != (mode == "force"):
+                raise Fail(f"SINGLE={mode} but {_reverse.LAST_SINGLE}")
+            gy = _with_single(mode, lambda: jax.jit(jax.grad(lambda t_: jnp.sum(f(xs, t_).per_item ** 2)))(th))
+            r = tm.reference(item, outputs={"Q": tm.Sum((4,), F)}, in_axes=(0, None), max_steps=cap)
+            close(dict(g=gy), dict(g=jax.jacfwd(lambda t_: jnp.sum(r(xs, t_).per_item ** 2))(th)), "per-item grad")
+            res[mode, cap] = gq
+        if not np.isfinite(res[mode, 64]) or not np.isnan(res[mode, 10]):
+            raise Fail(f"{mode}: tally gradient: no truncation {res[mode, 64]} (want finite), truncated "
+                       f"{res[mode, 10]} (want NaN)")
+        msg.append(f"{mode}: cap 64 finite {res[mode, 64]:.4g}, cap 10 NaN")
+    # forward mode: the tangent kernel poisons its own tangent sums (jvp and jacfwd, fused and lanes)
+    f = tm.vmap(item, outputs={"Q": tm.Sum((4,), F)}, in_axes=(0, None), backend=b, max_steps=10)
+    tq = np.asarray(jax.jvp(lambda t_: f(xs, t_).outputs["Q"], (th,), (F(1.0),))[1])
+    jq = np.asarray(jax.jacfwd(lambda t2: f(xs, t2[0] * t2[1]).outputs["Q"])(jnp.array([th, 1.0], F)))
+    if not (np.isnan(tq).all() and np.isnan(jq).all()):
+        raise Fail(f"truncated call: tangent sums not NaN (jvp {tq}, jacfwd {jq})")
+    return "; ".join(msg) + "; jvp / jacfwd tangents NaN when truncated"
+
+
 print("\n================ SUMMARY", jax.__version__, "x64" if X64 else "", jax.devices()[0].device_kind)
 for n, b, m in RES:
     print(f"{n:58s} {b:8s} {m[:200]}")
 print("TOTAL", len(RES), "PASS", sum(m.startswith("PASS") for _, _, m in RES))
-print("REPLAY", tm.diagnostics()["reverse"]["replay"])

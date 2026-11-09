@@ -6,9 +6,7 @@
                                            `truncated` output), or (rev=True) replace every while loop by a
                                            reverse-differentiable replay loop (_reverse.checkpointed_while)
 """
-import jax
 import jax.numpy as jnp
-import numpy as np
 from jax import lax
 from jax.extend.core import Literal
 
@@ -254,8 +252,7 @@ def emit_p_bind(t, i, v):
     return emit_p.bind(t, i, v)
 
 
-def retrace(cj, *, cap=None, rev=False, n_tally=0, emit=None, tables=None, report=None,
-            fingerprint=False, spawn=None, gate=None):
+def retrace(cj, *, cap=None, rev=False, n_tally=0, emit=None, tables=None, report=None, spawn=None, gate=None):
     """-> python function f(*invars) evaluating cj with (cap) every top-level while loop capped at `cap`
     iterations (f returns its outputs + [truncated:bool]), or (rev: True or _reverse.RevOpts) every while loop replaced
     by a reverse-differentiable loop (_reverse.checkpointed_while).  The first n_tally invars are tallies (rev: their
@@ -269,9 +266,7 @@ def retrace(cj, *, cap=None, rev=False, n_tally=0, emit=None, tables=None, repor
     tables (rev only): {invar index: token index}.  Reads (gather/dynamic_slice/slice) of these operands become
     _reverse.tread calls threading a cotangent token; f then takes the tokens as extra trailing arguments and returns
     them as extra trailing outputs.  report: a dict that receives 'dense' = token indices of tables that also have
-    other uses (they need the dense cotangent for those).
-    fingerprint: f also returns (last) a uint32 hash of the final carries of every top-level while loop (replay
-    consistency: the adjoint replays the same ops and compares, _reverse.vjp_prog)."""
+    other uses (they need the dense cotangent for those)."""
     tables = dict(tables or {})
     nt = len(tables)
 
@@ -279,33 +274,14 @@ def retrace(cj, *, cap=None, rev=False, n_tally=0, emit=None, tables=None, repor
         args = list(args)
         a, toks = (args[:len(args) - nt], args[len(args) - nt:]) if nt else (args, [])
         ctx = {"trunc": jnp.bool_(False), "emit": emit, "spawn": spawn, "gate": gate, "toks": list(toks),
-               "tread": nt > 0, "dense": set(), "fp": jnp.uint32(0x811C9DC5) if fingerprint else None}
+               "tread": nt > 0, "dense": set()}
         flags = [True] * n_tally + [False] * (len(a) - n_tally)
         tags = [tables.get(i) for i in range(len(a))]
         outs, _ = _interp(cj.jaxpr, cj.consts, a, flags, ctx, cap, rev, top=True, tags=tags)
         if report is not None:
             report["dense"] = set(ctx["dense"])
-        return (list(outs) + ([ctx["trunc"]] if cap is not None else []) + ([ctx["fp"]] if fingerprint else [])
-                + list(ctx["toks"]))
+        return list(outs) + ([ctx["trunc"]] if cap is not None else []) + list(ctx["toks"])
     return f
-
-
-def fp_mix(h, xs):
-    """fold the bit patterns of arrays xs into the uint32 hash h (order-dependent, wraps)."""
-    for x in xs:
-        x = jnp.asarray(x)
-        if jax.dtypes.issubdtype(x.dtype, jax.dtypes.prng_key):
-            x = jax.random.key_data(x)
-        if x.dtype == jnp.bool_ or x.dtype.itemsize < 4:
-            b = x.astype(jnp.int32).astype(jnp.uint32) if not jnp.issubdtype(x.dtype, jnp.floating) else \
-                lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
-        else:
-            b = lax.bitcast_convert_type(x, jnp.uint32)
-        b = jnp.ravel(b)
-        w = np.arange(1, 2 * b.size, 2, dtype=np.uint32)
-        sm = jnp.sum(b * w, dtype=jnp.uint32)
-        h = (h ^ sm) * jnp.uint32(0x9E3779B1) + jnp.uint32(0x7F4A7C15)
-    return h
 
 
 def _needs(jaxpr, rev, top, cap, ctx):
@@ -434,15 +410,15 @@ def _outflags(jaxpr, fin, any_branch=False):
 
 def _sub_fn(cj, nlead_flags, ctx, cap, rev, top, track_trunc=False, tags=None):
     """closed sub-jaxpr -> python function (re-traced recursively).  track_trunc: also return the branch's
-    (truncated flag, fingerprint) (cond branches at top level)."""
+    truncated flag (cond branches at top level)."""
     def f(*a):
         if track_trunc:
-            saved = ctx["trunc"], ctx.get("fp")
+            saved = ctx["trunc"]
             ctx["trunc"] = jnp.bool_(False)
         outs, fl = _interp(cj.jaxpr, cj.consts, list(a), nlead_flags, ctx, cap, rev, top, tags)
         if track_trunc:
-            t = (ctx["trunc"], ctx["fp"] if ctx.get("fp") is not None else jnp.uint32(0))
-            ctx["trunc"], ctx["fp"] = saved
+            t = ctx["trunc"]
+            ctx["trunc"] = saved
             return outs, t
         return outs
     return f
@@ -507,16 +483,13 @@ def _while(eqn, ins, fin, ctx, cap, rev, top, itags=None):
             return st[0] + 1, bfn(bc, st[1])
         k, out = lax.while_loop(c2, b2, (jnp.int32(0), list(init)))
         ctx["trunc"] = ctx["trunc"] | ((k >= M) & cfn(cc, out))
-        if ctx.get("fp") is not None:
-            ctx["fp"] = fp_mix(ctx["fp"], [x for x, t in zip(out, tflags) if not t])
         return list(out), tflags
     if not rev:
-        out = lax.while_loop(lambda c: cfn(cc, c), lambda c: bfn(bc, c), list(init))
-        if top and ctx.get("fp") is not None:
-            ctx["fp"] = fp_mix(ctx["fp"], [x for x, t in zip(out, tflags) if not t])
-        return out, tflags
-    from ._reverse import checkpointed_while
+        return lax.while_loop(lambda c: cfn(cc, c), lambda c: bfn(bc, c), list(init)), tflags
+    from ._reverse import checkpointed_while, checkpointed_while_single
     ropt = None if rev is True else rev
+    if top and getattr(ropt, "single", False):      # T3: the (fold_post) item's one top-level loop
+        checkpointed_while = checkpointed_while_single
     cfn = _notread(ctx, cfn)
     tids = _tids(ctx, btags, [w.body])
     bfl = list(fin[nc:nc + nb])
@@ -554,7 +527,7 @@ def _cond(eqn, ins, fin, ctx, cap, rev, top, itags=None):
     idx, ops = ins[0], ins[1:]
     brs = cond_branches(eqn)
     otags = (itags or [None] * len(ins))[1:]
-    track = cap is not None or (top and ctx.get("fp") is not None)
+    track = cap is not None
     fns = [_sub_fn(b, fin[1:], ctx, cap, rev, top, track_trunc=track, tags=otags) for b in brs]
     tids = _tids(ctx, otags, brs)
     nops = len(ops)
@@ -565,16 +538,14 @@ def _cond(eqn, ins, fin, ctx, cap, rev, top, itags=None):
             for t, v in zip(tids, o2[nops:]):
                 _set_tok(ctx, t, v)
             r = f(*o2[:nops])
-            outs, tr = r if track else (r, (jnp.bool_(False), jnp.uint32(0)))
+            outs, tr = r if track else (r, jnp.bool_(False))
             new = tuple(ctx["toks"][t] for t in tids)
             ctx["toks"] = saved
             return tuple(outs), tr, new
         return g
     outs, t, new = lax.switch(idx, [wrap(f) for f in fns], *ops, *[ctx["toks"][t] for t in tids])
     if track:                      # (only tracked when needed: a stale tracer must never leak across traces)
-        ctx["trunc"] = ctx["trunc"] | t[0]
-        if ctx.get("fp") is not None:
-            ctx["fp"] = t[1]
+        ctx["trunc"] = ctx["trunc"] | t
     for tt, v in zip(tids, new):
         _set_tok(ctx, tt, v)
     return list(outs), _outflags(brs[0].jaxpr, fin[1:])

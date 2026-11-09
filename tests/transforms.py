@@ -31,6 +31,9 @@ jax.config.update("jax_default_matmul_precision", "highest")
 if os.environ.get("TX_UNFUSED") == "1":
     from tallymap import _primitive as _C0
     _C0.FUSE_JVP = False
+if os.environ.get("TX_T3") == "1":                      # run_all --t3: the single-loop adjoint wherever it applies
+    from tallymap import _reverse as _R0
+    _R0.SINGLE = "force"
 NEG = os.environ.get("TEST_NEG", "")      # negative controls: the matrix MUST report FAIL in the affected cells
 if NEG:
     from tallymap import _primitive as _C

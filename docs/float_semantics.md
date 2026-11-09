@@ -18,7 +18,7 @@ math modes, schedules and JAX versions.
    lockstep backend it needs `jax_enable_x64`.  Unrepresentable values are dropped and counted
    (`stats['exact_overflow']`), and the bin each was emitted to is NaN (primal and tangent bins each by their own emits).
 5. **Forward, tangent and adjoint share one item program.**  The adjoint replays the same jaxpr with the same options
-   (same math), so a replay is bit-exact on the same backend; the replay fingerprint checks it on every reverse call.
+   (same math), so a replay is bit-exact on the same backend (gated in tests/reverse.py, "REPLAY GATE").
 
 ## Arithmetic per backend
 

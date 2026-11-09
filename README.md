@@ -401,13 +401,12 @@ common cause is first:
    iteration.
 2. **Otherwise look at `stats`.** A truncated item (`stats['n_truncated']`) or a dropped spawn child
    (`stats['dropped']`) poisons float tallies on purpose, and the forward pass is NaN too.
-3. **Only then suspect a reverse-mode check.** Reverse mode replays every item and verifies the replay with a
-   per-item fingerprint; the tree adjoint also checks that the recorded tree fits the Queue and that its two
-   recording passes agree. Any failed check makes that call's float cotangents NaN, so a gradient is never
-   silently wrong. Rerun with `rev_stats=True` and read the counters:
+3. **Only then suspect a reverse-mode check.** Reverse mode through spawn (the tree adjoint) checks that the
+   recorded tree fits the Queue and that its two recording passes agree; a failed check makes that call's float
+   cotangents NaN, so a gradient is never silently wrong. Rerun with `rev_stats=True` and read the counters:
 
    ```python
-   tm.diagnostics()["reverse"]    # {'replay': {'calls', 'mismatch', 'last'}, 'tree': {...} or None}
+   tm.diagnostics()["reverse"]    # {'single': {'used', 'why'}, 'tree': {...} or None}
    ```
 
 `tm.diagnostics()` is the one place to look when something is wrong, and what to paste into a bug report:
@@ -421,8 +420,8 @@ item jaxprs and generated kernels. `tm.diagnostics(f, *args)` reports what `jax.
 | `backend` | `'auto'` | `'auto'`: cuda on a GPU, where a program the cuda emitter cannot compile raises `tm.UnsupportedError` (pass `backend='lockstep'` to run it; it never falls back on its own, because lockstep is about 100x slower); lockstep elsewhere, with a one-time warning. `'cuda'`: cuda or raise. `'lockstep'`: always the plain-JAX interpreter, slow by design, the reference. |
 | `cuda_math` | `'approx'` | cuda f32 division, sqrt and rsqrt. `'approx'`: the PTX XLA:GPU itself emits, so it is the arithmetic a plain JAX program on the same GPU gets. `'ieee'`: correctly rounded, the portable reference, about 1.5x slower. |
 | `lockstep_block` | `2**18` | lockstep backend: lanes per block, which bounds its memory. |
-| `rev_checkpoints` | `'auto'` | reverse mode: checkpoint buffer size C. `'auto'`: 16 for a loop state (the carries the step reads) under 128 B, else the largest of 4 ... 64 whose 3C+1 states fit 64 KiB. A loop of K <= C steps is not replayed; O(K) work for K <= C^2; 3C+1 states of memory per item. |
-| `rev_stats` | `False` | reverse mode: report replay mismatches and tree-adjoint counts to the host. Off by default because a host callback takes `jax.jit` off its C++ fast path, which can cost an order of magnitude. |
+| `rev_checkpoints` | `'auto'` | reverse mode: checkpoint buffer size C. `'auto'`: 16 for a loop state (the carries the step reads) under 128 B, else the largest of 4 ... 64 whose 3C+1 states (single-loop adjoint: 2C+1) fit 64 KiB. A loop of K <= C steps is not replayed; O(K) work for K <= C^2. |
+| `rev_stats` | `False` | reverse through spawn: report the tree adjoint's counts to the host. Off by default because a host callback takes `jax.jit` off its C++ fast path, which can cost an order of magnitude. |
 
 Any other option name raises. Options starting with `_` are private measurement and negative-control switches
 (`tallymap/_api.py::_OPTS`). The only environment variable is `TALLYMAP_CUDA_CACHE`, the cubin cache directory,

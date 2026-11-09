@@ -6,6 +6,33 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ## Unreleased
 
+### Changed (revfit: reverse mode for lumen's acceptance)
+
+- Reverse mode: the single-loop adjoint (T3, from lumen/perf 6a70383 / b38db3f / 22e615d / e58e216, re-implemented
+  on dev) for an item whose one top-level loop has a step of >= 1000 equations (`_reverse.T3_MIN_EQNS`): ONE
+  while loop of micro-steps, so the cuda backend refills lanes at step granularity and the step is instantiated
+  once. lumen/perf measured grad / value 2.66 / 2.78 / 3.31x against 3.99 / 5.78 / 8.46x nested (SK / SBND /
+  ANNIE, L40S). Not taken from lumen/perf: the custom-rule guard (the single loop advances states with the
+  linearized step's primal, which is what `jax.grad` itself evaluates), the `_rev_single` option and the
+  `TALLYMAP_REV_SINGLE` env (tests set `_reverse.SINGLE`; `run_all.py --t3`), the fingerprint in the probe.
+- Reverse mode: the runtime replay check is REMOVED (the fingerprint, `ItemProgram.fp / with_fp`, the linearize
+  guess, `tm.diagnostics()['reverse']['replay']`). Replay is bitwise by construction; `tests/reverse.py` "REPLAY
+  GATE" gates it (reverse == forward-mode derivative per item on an ulp-sensitive trajectory; the `_adj_math`
+  negative control must fail it). `rev_stats` now concerns the tree adjoint only.
+- Truncation (`max_steps`) poisons the derived kernels themselves (lumen T6b, re-implemented): the primal outputs'
+  poison has an identity tangent, a tangent kernel emits NaN into its tangent sums for a truncated item, and the
+  adjoint poisons its cotangents from its own replay's flags. `jax.grad` of a loss linear in the outputs is ONE
+  launch (it was a forward launch + the adjoint).
+- Exact overflow poisons its own bins in every kernel (see Fixed).
+
+### Fixed
+
+- `Sum(exact=True)`: a TANGENT-only overflow was silently dropped on every unfused jvp path (FUSE_JVP off,
+  linearize, jacfwd with lanes refused), and the fused jvp's single counter made the correct PRIMAL exact outputs
+  NaN. Each kernel now flags the bins an unrepresentable emit was dropped from and writes them as NaN (cuda and
+  lockstep); the call-level exact poison is gone. A primal overflow no longer poisons other exact outputs or the
+  (correct) tangent.
+
 ### Added
 
 - `tm.diagnostics(...)["programs"][i]["baked_floats"]`: shape, dtype and size of every FLOAT constant the item

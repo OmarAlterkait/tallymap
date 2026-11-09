@@ -323,8 +323,7 @@ def dual_lanes_prog(p, T, bpi, bbc, shared=(0, 0)):
     vf = jax.vmap(lambda *a: list(f(*a)), in_axes=tuple(in_axes), out_axes=out_axes, axis_size=T)
     cj = _mk(vf, avals)
     tl = tuple(dataclasses.replace(s, lead=(T,) + tuple(s.lead)) if l else s for s, l in zip(p.tallies, lt))
-    mk = None if p.mkfp is None else (lambda: dual_lanes_prog(p.with_fp(), T, bpi, bbc, shared)[0])   # (RV)
-    return dataclasses.replace(p, cj=cj, tallies=tl, tag=p.tag + f"+dual_lanes{T}", mkfp=mk), lt, ly
+    return dataclasses.replace(p, cj=cj, tallies=tl, tag=p.tag + f"+dual_lanes{T}"), lt, ly
 
 
 # ------------------------------------------------------------------------------------------- jvp
@@ -413,13 +412,9 @@ def _float_slots(p):
     return ot, tf, yf
 
 
-def _val0(x):
-    return jnp.zeros(x.aval.shape, x.aval.dtype) if ad.is_undefined_primal(x) else x
-
-
 def _adj_opts(opts):
     """the adjoint kernel's options = the forward's (identical math / contraction policy).  Private _adj_math
-    overrides the adjoint's cuda_math -- NEGATIVE CONTROL of the replay check only."""
+    overrides the adjoint's cuda_math -- NEGATIVE CONTROL of tests/reverse.py's replay gate only."""
     m = dict(opts).get("_adj_math")
     return opts if not m else tuple(sorted(dict(opts, cuda_math=m).items()))
 
@@ -429,9 +424,6 @@ def _vjp_call(node, base, pi, bc, U_pi, U_bc, cts, N):
     if base.spawn is not None:          # reverse through spawn: the tree adjoint (one adjoint launch per generation)
         from ._reverse_spawn import tree_vjp
         return tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N)
-    # (RV) the replay check needs the fingerprint, which a forward-only program does not compute: take the variant
-    # that has it (the extra per-item result is the last and uint32, so `cts` and every index below still line up)
-    base = base.with_fp()
     ot, tf, yf = _float_slots(base)
     nt = len(ot)
     ya = base.y_avals()
@@ -441,19 +433,18 @@ def _vjp_call(node, base, pi, bc, U_pi, U_bc, cts, N):
         ct_t.append(_inst(cts[j], tuple(s.lead) + (s.S,), s.dtype))
     ct_y = [_inst(cts[nt + 1 + j], (N,) + tuple(ya[j].shape), ya[j].dtype) for j in yf]
     q = vjp_prog(base, tuple(U_pi), tuple(U_bc), dict(node.opts))   # (RV: rev_* options)
-    fp = []
-    if q.nP > base.nP + len(yf):
-        # (RV) replay consistency: the FORWARD kernel's per-item fingerprint (the same base program and options as
-        # the primal call, so XLA may CSE the two) is compared inside the adjoint with its own replay
-        fo = bind_call(*[_val0(x) for x in pi], *[_val0(x) for x in bc], node=node.derived(base, "primal"))
-        fp = [jax.lax.stop_gradient(fo[len(ot) + 1 + base.fp])]
     tn = node.derived(q, "adjoint", base=base, pp=tuple(U_pi), pb=tuple(U_bc),
-                      lin_pi=(False,) * base.nP + (True,) * len(yf) + (False,) * len(fp),
+                      lin_pi=(False,) * base.nP + (True,) * len(yf),
                       lin_bc=(False,) * base.nB + (True,) * len(tf), opts=_adj_opts(node.opts))
-    outs = bind_call(*pi, *ct_y, *fp, *bc, *ct_t, node=tn)
-    if fp:
-        from . import _reverse
-        outs = _reverse.check_replay(outs[-1], outs[:-1], bool(dict(node.opts).get("rev_stats")))
+    outs = bind_call(*pi, *ct_y, *bc, *ct_t, node=tn)
+    if q.trunc is not None:
+        tr = outs.pop()                 # the replay's own truncation flags (max_steps)
+        if any(not _is_zero(cts[j]) for j in tf):
+            # a truncated call's TALLIES are NaN, so a gradient through one is NaN; one through per-item results
+            # only stays exact.  The adjoint's own flags: no forward launch.  (A multiply: differentiated again,
+            # NaN * d stays NaN.)
+            f = jnp.where(jnp.any(tr), np.nan, 1.0)
+            outs = [o * f.astype(o.dtype) if isfloat(o.dtype) else o for o in outs]
     nib = sum(U_bc)
     g_bc_it, g_pi_it = iter(outs[:nib]), iter(outs[nib + 1:])
     g_pi = [next(g_pi_it) if u else None for u in U_pi]
@@ -518,7 +509,6 @@ def _transpose(cts, *args, node):
         g_ct = list(touts[:len(tf)])                      # -> cotangents of the adjoint node's tally-ct operands
         g_cy = list(touts[len(tf) + 1:])                  # -> cotangents of its per-item cy operands
         res_pi = [None] * nPb + [g if ad.is_undefined_primal(x) else None for g, x in zip(g_cy, pi[nPb:])]
-        res_pi += [None] * (len(pi) - len(res_pi))               # (RV) the forward fingerprint operand
         res_bc = [None] * nBb + [g if ad.is_undefined_primal(x) else None for g, x in zip(g_ct, bc[nBb:])]
         return res_pi + res_bc
     # any other linear node (lanes): the generic replay adjoint of its OWN item (linear in the undefined operands,
@@ -806,8 +796,7 @@ def fold_prog(p, B, bbc):
     bav = [jax.ShapeDtypeStruct((B,) + tuple(a.shape), a.dtype) if f else _sds(a) for a, f in zip(av[nT + nP:], bbc)]
     cj = _mk(item, tav + pav + [jax.ShapeDtypeStruct((), jnp.int32)] + bav)
     tl = tuple(dataclasses.replace(s, S=B * s.S) for s in p.tallies)
-    mk = None if p.mkfp is None else (lambda: fold_prog(p.with_fp(), B, bbc))     # (RV) derived the same way
-    return dataclasses.replace(p, cj=cj, tallies=tl, nP=nP + 1, tag=p.tag + f"+folded_batch{B}", mkfp=mk)
+    return dataclasses.replace(p, cj=cj, tallies=tl, nP=nP + 1, tag=p.tag + f"+folded_batch{B}")
 
 
 def _fold_batch(node, args, dims, bat, B):

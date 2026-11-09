@@ -7,8 +7,8 @@ Two questions, kept apart, and the one frozen statistical contract between imple
 - **A. Mechanics.** Is the derivative the exact derivative of the program as written?
   - Compare against the same transformation of the dense reference (`tm.reference`, which is `jax.vmap(item)`
     with real per-item tally arrays, summed) at small N.
-  - Use the same keys, use f64 or `Sum(exact=True)` wherever bitwise agreement is expected, and require
-    `replay_mismatch == 0`.
+  - Use the same keys, use f64 or `Sum(exact=True)` wherever bitwise agreement is expected, and compare reverse
+    mode against forward mode (`jacfwd`) on the same keys.
   - tallymap is responsible for A. `tests/` checks it: `tests/edge.py`, `tests/transforms.py`,
     `tests/reverse.py`, `tests/reverse_spawn.py`.
 - **B. Estimator.** Is the derivative of the program an unbiased estimate of d E[loss] / d theta?
@@ -90,7 +90,7 @@ they were run on. Nothing in this repository depends on them.
 | what | where |
 |---|---|
 | every transformation against the same transformation of the dense reference | `tests/transforms.py` |
-| reverse mode, including sparse table cotangents and the replay fingerprint | `tests/reverse.py` |
+| reverse mode, including sparse table cotangents, the single-loop adjoint and the replay gate | `tests/reverse.py` |
 | the spawn tree adjoint against `jax.grad` of a dense plain-JAX reference, with four negative controls | `tests/reverse_spawn.py` |
 | per-operation parity of the CUDA emitter against `jax.jit(jax.vmap(op))` and the host-exact result, with a bound per class and a per-GPU baseline | `tests/ops.py`, `tests/ops_baseline.json` |
 | edge cases and every documented failure mode | `tests/edge.py` |

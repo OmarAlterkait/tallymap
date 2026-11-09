@@ -23,6 +23,9 @@ from tallymap import reference
 if os.environ.get("TX_UNFUSED") == "1":                 # run_all --unfused: the two-node jvp design
     from tallymap import _primitive as _P0
     _P0.FUSE_JVP = False
+if os.environ.get("TX_T3") == "1":                      # run_all --t3: the single-loop adjoint wherever it applies
+    from tallymap import _reverse as _R0
+    _R0.SINGLE = "force"
 
 jax.config.update("jax_default_matmul_precision", "highest")
 GPU = jax.default_backend() == "gpu"
@@ -943,8 +946,8 @@ def _(b):
                    for r_ in res):
             raise Fail(f"no kernel resources after a run: {res}")
     r = tm.diagnostics()["reverse"]
-    if set(r) != {"replay", "tree"} or set(r["replay"]) != {"calls", "mismatch", "last"}:
-        raise Fail(f"reverse counters {r}")
+    if set(r) != {"single", "tree"}:
+        raise Fail(f"reverse record {r}")
     return f"{len(d['programs'])} program(s), {len(d['kernels'])} kernel(s); jax {d['versions']['jax']}"
 
 

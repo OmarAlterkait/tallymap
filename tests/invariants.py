@@ -19,9 +19,8 @@ Sections (cell name prefixes):
            gradient does not depend on rev_checkpoints.
   [trunc]  truncation (max_steps): flags, n_truncated, partial integer tallies, poisoned float tallies and per-item
            results agree between cuda, lockstep and the dense reference, with n_active and across cuda schedules.
-  (Replay guard negative control: already pinned by tests/reverse.py, cell "REPLAY CHECK: ... NEGATIVE CONTROL
-  adjoint math=approx must mismatch -> NaN" (private _adj_math; the gradient must come back NaN, also without
-  rev_stats).  Not duplicated here.)
+  (Replay: gated by tests/reverse.py, cell "REPLAY GATE" with its NEGATIVE CONTROL (private _adj_math).  Not
+  duplicated here.)
 
 Each cell prints one line: PASS | RAISES-OK (an expected, clear error) | FAIL <why> | RAISE <exception> |
 XFAIL <reason> (a KNOWN library defect, pinned: the cell fails the way the reason says) | XPASS (an XFAIL cell that
@@ -62,6 +61,9 @@ from tallymap import reference  # noqa: E402
 
 if os.environ.get("TX_UNFUSED") == "1":                 # run_all --unfused: the two-node jvp design
     _P.FUSE_JVP = False
+if os.environ.get("TX_T3") == "1":                      # run_all --t3: the single-loop adjoint wherever it applies
+    from tallymap import _reverse as _R0
+    _R0.SINGLE = "force"
 jax.config.update("jax_default_matmul_precision", "highest")
 X64 = bool(jax.config.jax_enable_x64)
 F = jnp.float64 if X64 else jnp.float32

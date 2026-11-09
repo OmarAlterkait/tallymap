@@ -50,7 +50,7 @@ Terms used in the code, the docs and the error messages.
 | **checkpointed loop** | the reverse-differentiable replacement of every `while_loop` in an adjoint: the forward stores the first C states (the head); the VJP replays from the initial carry with two-level checkpointing when the loop is longer than C. |
 | **checkpoint buffer** | C states per item (`rev_checkpoints`, default `'auto'` from the state size): O(K) work for loops of K <= C^2 steps, 3C+1 states of memory (head, checkpoints, tape). The checkpoint stride is C, so every buffer the sweep allocates is full. |
 | **sparse table cotangent** | the cotangent of a large read-only table (32 elements or more, read only by gathers): an atomic scatter of the read cotangents into ONE accumulator through a threaded cotangent token, never a dense per-item array. |
-| **replay fingerprint** | a per-item hash of the final carries of the top-level loops, computed by the forward kernel and again by the adjoint's replay.  A mismatch makes the call's cotangents NaN. |
+| **single-loop adjoint (T3)** | the adjoint of an item's one top-level loop as ONE while loop of micro-steps (count, checkpoint, advance, fill, sweep), so the cuda backend refills lanes at step granularity; used for steps of >= 1000 equations (`_reverse.T3_MIN_EQNS`). |
 | **tree adjoint** | reverse mode through spawn: the run is recorded generation by generation, then one adjoint launch per generation, deepest first. |
 | **drop risk** | the recorded spawn tree may exceed the Queue capacity, which means the forward may have dropped children: the tree adjoint's gradient is NaN. |
-| **rev_stats** | opt-in host reporting of replay mismatches and tree-adjoint counts (`tm.diagnostics()['reverse']`).  It costs `jax.jit`'s C++ fast path, so it is off by default. |
+| **rev_stats** | opt-in host reporting of the tree adjoint's counts (`tm.diagnostics()['reverse']`).  It costs `jax.jit`'s C++ fast path, so it is off by default. |

@@ -9,12 +9,11 @@ Keys:
   env        TALLYMAP_CUDA_CACHE, JAX_PLATFORMS, XLA_FLAGS, CUDA_VISIBLE_DEVICES (when set), machine
   platform   jax.default_backend(), devices; on a GPU: name, compute capability, driver
   cuda       compiler (NVRTC build or nvcc), cubin cache directory
-  reverse    host-side counters of the reverse-mode safety checks, filled only by tm.vmap(..., rev_stats=True)
-             calls (a host callback costs jax.jit's C++ fast path; a failed check makes the gradient NaN either way):
-               replay = {calls, mismatch, last}: adjoint calls whose replay did not reproduce the forward
-               trajectory, their mismatching items, the last such count;
-               tree   = stats of the last tree adjoint (reverse through spawn): generations, particles, launches,
-                        overflow, drop_risk, replay_mismatch, fwd_mismatch (any of the last four -> NaN gradient)
+  reverse    single = whether the last adjoint built is the single-loop one (T3), and if not why not;
+             tree   = stats of the last tree adjoint (reverse through spawn), filled only by tm.vmap(...,
+                      rev_stats=True) calls (a host callback costs jax.jit's C++ fast path): generations, particles,
+                      launches, overflow, drop_risk, replay_mismatch, fwd_mismatch (any of the last four -> NaN
+                      gradient)
   programs   the last item programs bound by tm.vmap: tag, item jaxpr (text), and baked_floats: [(shape, dtype,
              size)] of the FLOAT constants the item function closed over, the values a derivative cannot reach
              (a constant's tangent is zero, silently): anything you differentiate must be an argument
@@ -127,7 +126,7 @@ def _cuda():
 def _reverse():
     from . import _reverse as R
     from . import _reverse_spawn as RS
-    return dict(replay=R.replay_mismatch(), tree=RS.LAST[-1] if RS.LAST else None)
+    return dict(single=dict(R.LAST_SINGLE), tree=RS.LAST[-1] if RS.LAST else None)
 
 
 _CB_LINE = re.compile(r"^.*python_\w*callback.*$", re.M)
@@ -168,7 +167,7 @@ def diagnostics(fn=None, *args, reset=False, **kwargs):
     if reset:
         from . import _reverse as R
         from . import _reverse_spawn as RS
-        R.REPLAY.update(calls=0, mismatch=0, last=None)
+        R.LAST_SINGLE.clear()
         RS.LAST.clear()
         PROGRAMS.clear()
         KERNELS.clear()

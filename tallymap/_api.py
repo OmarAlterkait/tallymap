@@ -2,8 +2,7 @@
 
     user fn(tally, *args) -> tally | (tally, y)
       |  make_jaxpr + tally linearity check + hoist closed-over tracers as explicit operands
-      |  retrace: cap top-level while loops at max_steps (a per-item `truncated` output) [+ the replay fingerprint,
-      |  built only for reverse mode: ItemProgram.with_fp]
+      |  retrace: cap top-level while loops at max_steps (a per-item `truncated` output)
       v
     ItemProgram (item jaxpr + layout)  ->  bind_call(*per_item, *broadcast, node=Node(prog))      (_primitive.py)
 
@@ -113,28 +112,11 @@ class ItemProgram:
     trunc: Any = None      # index of the `truncated` flag among the per-item results
     spawn: Any = None      # Queue or None
     tag: str = "primal"
-    fp: Any = None         # (RV) index of the replay fingerprint (uint32) among the per-item results
     where: str = ""        # the user's item function ('qualname (file:line)'), for error messages
-    mkfp: Any = None       # (RV) () -> this program WITH the replay fingerprint (with_fp), or None
 
     @property
     def nT(self):
         return len(self.tallies)
-
-    def with_fp(self):
-        """(RV) this program with the per-item replay fingerprint (built once, on demand).  The fingerprint is a
-        hash of every leaf of every top-level loop carry, and its only consumer is reverse mode's replay check
-        (_primitive._vjp_call), so a forward-only call is built without it.  It is the LAST per-item result and
-        uint32, so every other output index is the same in both programs."""
-        if self.fp is not None or self.mkfp is None:
-            return self
-        q = self.__dict__.get("_with_fp")
-        if q is None:
-            q = self.mkfp()
-            if q.fp is None or (q.nT, q.nP, q.nB, q.nY) != (self.nT, self.nP, self.nB, self.nY + 1):
-                raise AssertionError("tallymap: the fingerprinted program does not match its base (internal error)")
-            object.__setattr__(self, "_with_fp", q)
-        return q
 
     @property
     def nY(self):
@@ -196,7 +178,10 @@ def jvp_prog(p, pert_pi, pert_bc):
                 bb[i] = v
             return f(*tt, *pp, *bb)
         out, dout = jax.jvp(g, ([t[i] for i in tf], [pi[i] for i in ip], [bc[i] for i in ib]), (td, pid, bcd))
-        return list(out[:nT]) + [dout[i] for i in tf] + list(out[nT:]) + [dout[nT + j] for j in yf]
+        dt = [dout[i] for i in tf]
+        if p.trunc is not None:      # (max_steps) a truncated item poisons the tangent sums itself: _poison_tally
+            dt = [_poison_tally(x, out[nT + p.trunc]) if p.tallies[i].kind == "sum" else x for i, x in zip(tf, dt)]
+        return list(out[:nT]) + dt + list(out[nT:]) + [dout[nT + j] for j in yf]
     av = p.in_avals()
     tav, pav, bav = av[:nT], av[nT:nT + nP], av[nT + nP:]
     avals = tav + [tav[i] for i in tf] + pav + [pav[i] for i in ip] + bav + [bav[i] for i in ib]
@@ -205,6 +190,18 @@ def jvp_prog(p, pert_pi, pert_bc):
         cj = _mk(J, [_sds(a) for a in avals])
     tl = list(p.tallies) + [dataclasses.replace(p.tallies[i], name=p.tallies[i].name + "'") for i in tf]
     return ItemProgram(cj, tuple(tl), nP + len(ip), nB + len(ib), p.trunc, p.spawn, p.tag + "+jvp", where=p.where)
+
+
+def _poison_tally(t, bad):
+    """the tally t with NaN emitted into every bin when the item's `bad` (its truncation flag) is set.  The primal
+    outputs of a truncated call are poisoned by _poison_primal, whose tangent is the identity (so that jax.grad needs
+    no forward launch); the tangent sums are poisoned here, inside the tangent / fused / dual-lane kernel, by the
+    items that were truncated (per item, so per batch member when a batch is folded).  An exact sum flags the NaN
+    emits as overflows (stats['exact_overflow'] then counts them too)."""
+    from ._rewrite import emit_p_bind
+    nan = jnp.full(t.shape[:-1], np.nan, t.dtype)
+    return lax.cond(bad, lambda t: lax.fori_loop(0, t.shape[-1], lambda i, t: emit_p_bind(t, i, nan), t),
+                    lambda t: t, t)
 
 
 # (the item VJP program, vjp_prog, lives with the reverse-mode internals in _reverse.py)
@@ -226,14 +223,14 @@ _OPTS = {
     "cuda_math": "cuda backend, f32 div/sqrt: 'approx' (default) | 'ieee'",
     "lockstep_block": "lockstep backend: lanes per block",
     "rev_checkpoints": "reverse mode: checkpoint buffer size C (default 'auto': from the loop state's size)",
-    "rev_stats": "reverse mode: report replay mismatches / tree stats to the host (costs jit's fast path)",
+    "rev_stats": "reverse through spawn: report the tree adjoint's stats to the host (costs jit's fast path)",
     # PRIVATE (measurements / tests / negative controls; not API)
     "_schedule": "cuda: 'step' | 'item' overrides the rule (step unless the program spawns)",
     "_cuda_inplace": "cuda: False never updates a per-item array in place (A/B control of the aliasing analysis)",
     "_lanes": "'off' never dual lanes | 'force' ignore the local-memory guard | int: chunks of at most this many lanes",
     "_fold": "False: never fold a batch into the item axis",
     "_rev_sparse_min": "smallest table (elements) that gets sparse emitted cotangents (default 32)",
-    "_adj_math": "NEGATIVE CONTROL: compile the adjoint with this cuda_math (replay check must fire)",
+    "_adj_math": "NEGATIVE CONTROL: compile the adjoint with this cuda_math (tests/reverse.py's replay gate)",
     "_rev_nodense": "NEGATIVE CONTROL: drop the dense detection of mixed-use tables",
     "_rev_gen_capacity": "tree adjoint: largest generation (default Queue capacity; memory lever)",
     "_tree_neg": "NEGATIVE CONTROL of the tree adjoint: 'detach' | 'replay'",
@@ -259,10 +256,10 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                lockstep_block     lockstep backend: lanes per block (default 2^18; bounds its memory).
                rev_checkpoints    reverse mode: states per checkpoint buffer C (default 'auto': 16 for a loop state
                                   -- the carries the step reads -- under 128 B, else the largest of 4, 8, ..., 64
-                                  whose 3C+1 states fit 64 KiB; _reverse.auto_checkpoints).  A loop of K <= C
-                                  steps needs no replay; O(K) work for K <= C^2; 3C+1 states of per-item (local)
-                                  memory.
-               rev_stats          reverse mode: report replay mismatches and tree-adjoint stats to the host
+                                  whose 3C+1 (single-loop adjoint: 2C+1) states fit 64 KiB;
+                                  _reverse.auto_checkpoints).  A loop of K <= C steps needs no replay; O(K) work for
+                                  K <= C^2.
+               rev_stats          reverse through spawn: report the tree adjoint's stats to the host
                                   (tallymap.diagnostics()['reverse']).  Off by default: a host callback takes jax.jit
                                   off its C++ fast path.  A failed check makes the gradient NaN either way.
                Underscored options are PRIVATE (measurements and negative controls; listed in _OPTS).  Any other
@@ -373,28 +370,18 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
         hoisted = [cj.consts[k] for k in hidx]
         nb0 = len(bc)
 
-        def build(fp):
-            """the item program; fp: with the (RV) per-item replay fingerprint as its last per-item result.  Only
-            reverse mode reads it (ItemProgram.with_fp), and a spawning program's reverse mode (the tree adjoint)
-            never does."""
-            def item2(*a):
-                consts = list(cj.consts)
-                for k, x in zip(hidx, a[nT + len(pi) + nb0:]):
-                    consts[k] = x
-                fr = retrace(ClosedJaxpr(cj.jaxpr, consts), cap=max_steps, n_tally=nT, fingerprint=fp)
-                return fr(*a[:nT + len(pi) + nb0])
-            cj2 = _mk(item2, tav + pav + bav + [_sds(h) for h in hoisted])
-            if spawn is not None:
-                _check_spawn(cj2, pav, where)
-            nY = len(cj2.jaxpr.outvars) - nT
-            return ItemProgram(cj2, tuple(tspecs), len(pi), len(bc) + len(hoisted),
-                               (nY - 1 - fp) if max_steps is not None else None, spawn, fp=nY - 1 if fp else None,
-                               where=where, mkfp=None if (fp or spawn is not None) else (lambda: build(True)))
+        def item2(*a):
+            consts = list(cj.consts)
+            for k, x in zip(hidx, a[nT + len(pi) + nb0:]):
+                consts[k] = x
+            return retrace(ClosedJaxpr(cj.jaxpr, consts), cap=max_steps, n_tally=nT)(*a[:nT + len(pi) + nb0])
+        cj2 = _mk(item2, tav + pav + bav + [_sds(h) for h in hoisted])
+        if spawn is not None:
+            _check_spawn(cj2, pav, where)
+        nY = len(cj2.jaxpr.outvars) - nT
+        prog = ItemProgram(cj2, tuple(tspecs), len(pi), len(bc) + len(hoisted),
+                           nY - 1 if max_steps is not None else None, spawn, where=where)
         bc_all = bc + hoisted
-        # built with the fingerprint up front only when this call is being LINEARIZED (jax.grad / vjp): the primal
-        # launch and the one _vjp_call adds for the fingerprint are then the same kernel and XLA merges them.  A
-        # wrong guess costs a launch, never a result.
-        prog = build(spawn is None and _linearizing(pi + bc_all))
         from ._diagnostics import record_program
         record_program(prog)
         from ._primitive import bind_call, make_node
@@ -405,33 +392,19 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
         stats = {"exact_overflow": st[3], "dropped_emits": st[4]}
         if spawn is not None:
             stats.update(spawned=st[0], dropped=st[1], children_truncated=st[2])
-        if prog.fp is not None:
-            ys = ys[:-1]                       # the replay fingerprint (ItemProgram.fp): internal
         if max_steps is not None:
             trunc = ys[-1]
             ys = ys[:-1]
         else:
             trunc = jnp.zeros((N,), bool)
         stats["n_truncated"] = jnp.sum(trunc.astype(jnp.int32))
-        res_out = _poison(res_out, _limits(stats, st, spawn, max_steps))
+        # (a truncated call: the derived kernels poison their own tangents / cotangents, so the primal's poison
+        # has an identity tangent; the tree adjoint (spawn) keeps the poison that differentiates)
+        res_out = (_poison if spawn is not None else _poison_primal)(res_out, _limits(stats, st, spawn, max_steps))
         per_item = jax.tree_util.tree_unflatten(meta["ytree"], ys)
         return Result(res_out, per_item, trunc, stats)
     mapped.__wrapped__ = fn
     return mapped
-
-
-def _linearizing(xs):
-    """is any of xs a tracer of JAX's linearization (what jax.grad / jax.vjp trace with)?  JAX >= 0.7 direct
-    linearize: a LinearizeTracer; before: a JVPTracer whose tangent is a partial-eval (unknown) tracer.  A plain
-    jvp / jacfwd has a concrete, staged or batched tangent instead."""
-    from jax.interpreters import ad
-    from jax.interpreters import partial_eval as pe
-    for x in xs:
-        if type(x).__name__ == "LinearizeTracer":
-            return True
-        if isinstance(x, ad.JVPTracer) and isinstance(getattr(x, "tangent", None), pe.JaxprTracer):
-            return True
-    return False
 
 
 def _limits(stats, st, spawn, max_steps):
@@ -461,6 +434,24 @@ def _poison(outs, bad):
         return outs
     poison = jnp.where(bad, jnp.float32(np.nan), jnp.float32(1.0))
     return {n: v * poison.astype(v.dtype) if isfloat(v.dtype) else v for n, v in outs.items()}
+
+
+@jax.custom_jvp
+def _pmul(x, f):
+    return x * f
+
+
+_pmul.defjvp(lambda pr, tg: (_pmul(*pr), tg[0]))
+
+
+def _poison_primal(outs, bad):
+    """_poison whose tangent is the identity: the tangent / adjoint kernels poison themselves (jvp_prog's
+    _poison_tally; _primitive._vjp_call with the adjoint's own truncation flags), so neither jax.jvp's tangent nor
+    jax.grad's cotangent reads this call's primal outputs, and a gradient is ONE launch (lumen T6b)."""
+    if bad is None:
+        return outs
+    poison = jnp.where(bad, jnp.float32(np.nan), jnp.float32(1.0))
+    return {n: _pmul(v, poison.astype(v.dtype)) if isfloat(v.dtype) else v for n, v in outs.items()}
 
 
 def _check_spawn(cj, pav, where=""):

@@ -307,16 +307,17 @@ error) turn every affected cell into a failure, which is how the matrix is known
   non-spawning program (a spawning one needs the whole grid for its children), but bounding the grid cannot shrink
   the reservation: only a smaller frame does. (The private engine line's `TALLYMAP_GRID=1` shrank its grid-sized
   global arena, not this reservation; dev has no arena.)
-- **Replay fingerprint.** Reverse mode uses a variant of the forward ItemProgram that carries a hidden per-item
-  uint32 hash of the final carries of every top-level loop, computed with ordinary jaxpr operations (a
-  forward-only call does not compute it: section 10). The adjoint receives the forward kernel's value as an
-  operand (the forward node is re-bound and XLA eliminates the common subexpression, which costs a few percent)
-  and compares it against its own replay. A mismatch makes every float cotangent of that call NaN. The
-  adjoint uses the forward node's options, so the arithmetic is identical and there is no contraction anywhere.
-  The negative control (a private option that runs the adjoint in `approx` math against an `ieee` forward) flags
-  every item whose final state changes, 832 of 4096 on the toy walk. In every test and full-program run the
-  count is 0.
-- **Host reporting is opt-in** (`rev_stats=True`, read through `tm.diagnostics()['reverse']`). Any
+- **Replay is bitwise by construction, and a test gate, not a runtime check.** The adjoint uses the forward node's
+  options, so the arithmetic is identical (`-fmad=false`, explicit `_rn` intrinsics, no contraction anywhere) and
+  items are pure. The runtime fingerprint check that used to compare the forward kernel with the adjoint's count
+  pass was removed (revfit): it compared the wrong pair (not the replays that feed the step VJPs), never fired
+  outside its negative control, and cost a forward launch per gradient (~1x the value call on lumen). Its failure
+  class is gated in `tests/reverse.py` ("REPLAY GATE"): on an item whose step count hangs on f32 div / sqrt bits,
+  every item's reverse derivative must equal its forward-mode derivative (the fused jvp kernel runs the forward's
+  own trajectory), for the nested and the single-loop adjoint; the negative control (a private option that runs
+  only the adjoint in `approx` math against an `ieee` forward) must fail the gate on the items whose step count
+  changes. Applications validate gradients against `jacfwd` / finite differences (lumen does, on 6 detectors).
+- **Host reporting is opt-in** (`rev_stats=True`, the tree adjoint's counters in `tm.diagnostics()['reverse']`). Any
   `jax.debug.callback` in a jitted program takes `jax.jit` off its C++ dispatch path: the toy-walk gradient takes
   42 ms instead of 2.3 ms, and it does so even when the callback sits inside a `lax.cond` that is never taken
   (41.5 ms). So a failed check poisons the gradient with NaN, which is never silently wrong and needs no host
@@ -670,7 +671,8 @@ commit it came from; the measurements are on that private engine.
   linearized (its operands are tracers of `jax.grad` / `jax.vjp`) is built with the fingerprint up front, so its
   primal launch is the one the replay check re-binds and XLA merges the two; elsewhere reverse mode pays one extra
   forward launch. A spawning program never builds it (its reverse mode, the tree adjoint, has its own check).
-  `tests/reverse.py`'s replay negative control (`_adj_math`) still makes the gradient NaN.
+  `tests/reverse.py`'s replay negative control (`_adj_math`) still makes the gradient NaN.  (Superseded: the runtime check and its fingerprint were removed in revfit; see section 4, "Replay is bitwise by
+  construction".)
 - **A serial chain of 64-bit multiplies is cut every 8 links** (wavefront `41140a0`, `8337bb7`, merged in `58db0f2`).
   NVVM is exponential in the depth of a dependency chain of 64-bit integer multiplies inside one function: on the
   identical arithmetic (`cicc` alone) 0.2 s at depth 8, 0.7 s at 12, 127.3 s at 16, > 300 s at 20, while the same

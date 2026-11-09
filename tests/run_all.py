@@ -4,6 +4,7 @@
     python tests/run_all.py --gpu      # GPU: lockstep AND cuda backends (tree adjoint and op parity on cuda)
     python tests/run_all.py --x64      # with jax_enable_x64
     python tests/run_all.py --unfused  # the two-node jvp design (what runs if JAX drops the partial-eval registries)
+    python tests/run_all.py --t3       # the single-loop adjoint forced wherever a program has its shape (TX_T3=1)
     python tests/run_all.py --canary   # DeprecationWarning / FutureWarning are errors (the JAX-upgrade canary)
     python tests/run_all.py --only reverse,reverse_spawn
     env RUN_ALL="--gpu --x64" (same flags), TEST_LOG=<prefix> (full output of a failing suite -> <prefix>.<suite>.log)
@@ -73,6 +74,7 @@ def examples(env, timeout):
 def main(argv):
     argv = list(argv) + os.environ.get("RUN_ALL", "").split()        # (batch jobs pass flags through the env)
     gpu, x64, unfused, canary = "--gpu" in argv, "--x64" in argv, "--unfused" in argv, "--canary" in argv
+    t3 = "--t3" in argv
     only = next((a.split("=", 1)[1] if "=" in a else argv[argv.index(a) + 1] for a in argv if a.startswith("--only")),
                 None)
     suites = [s for s in SUITES if (only is None or s in only.split(",")) and (gpu or s not in GPU_ONLY)]
@@ -86,6 +88,8 @@ def main(argv):
         env["TEST_X64"] = "1"
     if unfused:
         env["TX_UNFUSED"] = "1"
+    if t3:
+        env["TX_T3"] = "1"
     if canary:      # every suite process: a deprecation in the APIs tallymap (or the tests) use fails the run
         env["PYTHONWARNINGS"] = "error::DeprecationWarning,error::FutureWarning"
     timeout = int(os.environ.get("TEST_TIMEOUT", 3600))
@@ -106,7 +110,7 @@ def main(argv):
             open(f"{os.environ['TEST_LOG']}.{s}.log", "w").write(out)
     import jax
     print(f"ALL {'PASS' if all(r[1] for r in res) else 'FAIL'}  jax {jax.__version__} ({jax.__file__})"
-          f"  {'gpu' if gpu else 'cpu'}{' x64' if x64 else ''}{' unfused' if unfused else ''}"
+          f"  {'gpu' if gpu else 'cpu'}{' x64' if x64 else ''}{' unfused' if unfused else ''}{' t3' if t3 else ''}"
           f"{' canary' if canary else ''}", flush=True)
     return 0 if all(r[1] for r in res) else 1
 
