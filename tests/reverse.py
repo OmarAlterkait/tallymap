@@ -812,6 +812,128 @@ def _(b):
     return "fwd / grad(vmap) programs without fingerprint, grad with; " + msg
 
 
+
+
+@case("AUTO C: 16 for a small state, 64 for a ~300 B one, less beyond; bitwise == explicit C")
+def _(b):
+    """T5: rev_checkpoints unset picks C from the stored state's bytes (_reverse.auto_checkpoints); the recorded loop
+    says so; per-item cotangents are bitwise those of the same explicit C (C changes work, never values)."""
+    R = _reverse
+    want = {}
+    for sb in (12, 300, 400, 4096):
+        c = R.AUTO_C_SMALL if sb < R.AUTO_BIG_STATE else R.AUTO_C_MAX
+        while c > R.AUTO_C_MIN and (3 * c + 1) * sb > R.AUTO_CKPT_BYTES:
+            c //= 2
+        want[sb] = c
+    got = {sb: R.auto_checkpoints(sb) for sb in want}
+    if got != want or got[12] != R.AUTO_C_SMALL or got[300] != R.AUTO_C_MAX or not got[300] >= got[400] >= got[4096]:
+        raise Fail(f"auto_checkpoints rule: {got} (want {want}: C_SMALL for a small state, C_MAX for a 300 B one)")
+    g, gr, info, _ = walk_case(b, 64, 40)
+    lp = info["loops"][0]
+    if not lp.get("auto") or lp["checkpoints"] != R.auto_checkpoints(lp["state_bytes"]):
+        raise Fail(f"instrument: loop record {lp}")
+    gc, _, infoc, _ = walk_case(b, 64, 40, rev_checkpoints=lp["checkpoints"])
+    if infoc["loops"][0].get("auto"):
+        raise Fail("instrument: explicit rev_checkpoints recorded as auto")
+    nx = int((np.asarray(g["x"]) != np.asarray(gc["x"])).sum())
+    if nx:
+        raise Fail(f"auto vs explicit C={lp['checkpoints']}: {nx} per-item cotangents differ")
+    return (f"C={lp['checkpoints']} (state {lp['state_bytes']} B, ckpt {lp['ckpt_bytes']} B); "
+            + close(g, gr, "auto C vs padded"))
+
+
+@case("walk K in [3, 9]: head path (K <= C) and head + replay (K > C) mixed in one call, == grad(padded)")
+def _(b):
+    """lanes of one call on both sides of K = C (and K = C exactly): the head sweep and the refilled tapes"""
+    g, gr, _, _ = walk_case(b, 64, 6, rev_checkpoints=8)          # K in [3, 9]: spans C = 8
+    g2, _, _, _ = walk_case(b, 64, 6, rev_checkpoints=2)          # K > C^2 for most items
+    nx = int((np.asarray(g["x"]) != np.asarray(g2["x"])).sum())
+    if b == "cuda" and nx:
+        raise Fail(f"cuda: C=8 vs C=2 moved {nx} per-item cotangents")
+    return f"C=8 vs C=2 per-item differ {nx}; " + close(g, gr, "C=8") + "; " + close(g2, gr, "C=2")
+
+
+@case("live state: a carry the step never reads is not stored; grad == padded")
+def _(b):
+    """_rewrite._live_carries: a per-step diagnostic the body overwrites without reading, and a pass-through
+    constant, are not in the checkpoint state (restored as their initial values, which nothing reads)."""
+    NB = 16
+
+    def step(c, key, tab, th):
+        k, w, y, last, cst = c
+        i = (kb(key, k) % jnp.uint32(NB)).astype(jnp.int32)
+        v = w * tab[i] * th[0] * cst
+        return (k + 1, w * (0.99 + 0.01 * jnp.cos(y * th[2])), y + 0.05 * jnp.sin(3 * y + th[1]), v, cst), i, v
+
+    def item(t, x, key, tab, th):
+        L = (5 + kb(key, 7) % jnp.uint32(20)).astype(jnp.int32)
+
+        def body(c):
+            s, t = c
+            s2, i, v = step(s, key, tab, th)
+            return s2, t.add("Q", i, v)
+        (k, w, y, last, cst), t = lax.while_loop(lambda c: c[0][0] < L, body, ((0, x, 0.5 * x, x * 0, x * 2), t))
+        return t, (w, y + last)
+
+    def padded(t, x, key, tab, th):
+        L = (5 + kb(key, 7) % jnp.uint32(20)).astype(jnp.int32)
+
+        def body(c, _):
+            s, t = c
+            act = s[0] < L
+            s2, i, v = step(s, key, tab, th)
+            return (mask_tree(act, s2, s), t.add("Q", jnp.where(act, i, -1), v)), None
+        ((k, w, y, last, cst), t), _ = lax.scan(body, ((0, x, 0.5 * x, x * 0, x * 2), t), None, length=25)
+        return t, (w, y + last)
+    xs, keys, tab, th, wq = inputs(NB)
+    AX = (0, 0, None, None)
+    f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, in_axes=AX, backend=b)
+    r = reference(padded, outputs={"Q": tm.Sum((NB,), F)}, in_axes=AX)
+    g = grads(loss_of(f, wq), (xs, keys, tab, th))
+    lp = _reverse.LAST["loops"][0]
+    gr = grads(loss_of(r, wq), (xs, keys, tab, th))
+    if not lp["n_live"] < lp["n_state"]:
+        raise Fail(f"instrument: every state carry stored ({lp})")
+    return f"stored {lp['n_live']}/{lp['n_state']} state carries; " + close(g, gr, "live")
+
+
+@case("FILL PATTERN: every uninitialised per-thread declaration 0x00 vs 0xFF -> bitwise-equal forward and per-item "
+      "cotangents", ["cuda"])
+def _(b):
+    # The reverse program's checkpoint buffers are tallymap_uninit (declared with no fill) and copies of them are
+    # elided (codegen.Emitter.assign).  Correct only if no slot is read before it is written: filling EVERY
+    # uninitialised per-thread declaration with two different bytes must not move a single bit of what the program
+    # computes (per-item results and per-item cotangents; the tally sums and broadcast-operand cotangents are
+    # atomics, whose float order is the hardware's, so those are compared within tolerance).
+    from tallymap import _diagnostics as D
+    from tallymap.backends.cuda import codegen as CG
+    out = {}
+    try:
+        for fb in (0x00, 0xFF):
+            CG.FILL = fb
+            D.KERNELS.clear()         # (only the kernel history: diagnostics(reset=True) would also zero the replay
+            #                           counters this suite's case() compares before and after every cell)
+            g, gr, info, (f, xs, keys, tab, th, wq, AX, item) = walk_case(b, 64, 100, rev_checkpoints=3)
+            ks = tm.diagnostics()["kernels"]
+            r = f(xs, keys, tab, th)
+            srcs = [open(k["source"]).read() for k in ks]
+            if not any("tallymap_uninit" in k["prims"] for k in ks):
+                raise Fail(f"instrument: no kernel uses tallymap_uninit ({[k['prims'] for k in ks]})")
+            if not all(f"sj_f[sj_e] = {fb};" in sc for sc in srcs):
+                raise Fail(f"instrument: fill {fb:#x} is not in every kernel source")
+            out[fb] = (g, r, gr)
+    finally:
+        CG.FILL = None
+    (g0, r0, gr), (g1, r1, _) = out[0x00], out[0xFF]
+    for nm, a, c in (("per-item w", r0.per_item[0], r1.per_item[0]), ("per-item y", r0.per_item[1], r1.per_item[1]),
+                     ("cotangent x", g0["x"], g1["x"])):
+        a, c = np.asarray(a), np.asarray(c)
+        if not np.array_equal(a, c):
+            raise Fail(f"{nm}: {int((a != c).sum())}/{a.size} differ between fills 0x00 and 0xFF")
+    close(dict(Q=r1.outputs["Q"]), dict(Q=r0.outputs["Q"]), "Q 0xFF vs 0x00")
+    return "per-item + cotangent x bitwise; " + close(g1, g0, "0xFF vs 0x00") + "; " + close(g0, gr, "vs padded")
+
+
 print("\n================ SUMMARY", jax.__version__, "x64" if X64 else "", jax.devices()[0].device_kind)
 for n, b, m in RES:
     print(f"{n:58s} {b:8s} {m[:200]}")

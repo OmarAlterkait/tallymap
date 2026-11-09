@@ -329,7 +329,28 @@ def dual_lanes_prog(p, T, bpi, bbc, shared=(0, 0)):
 
 
 # ------------------------------------------------------------------------------------------- jvp
+def _lean(node):
+    """an ADJOINT node about to be differentiated again (second order: hvp, grad-of-grad) -> the same adjoint built
+    with C = _reverse.LEAN_C (unless the call set rev_checkpoints).  Its outputs are the same function (C changes the
+    work, not the values), but every loop of the first-order adjoint whose state holds a checkpoint buffer becomes a
+    loop the second-order adjoint checkpoints in turn, so its memory is ~C1 x C2 states: measured (lumen/perf
+    762da14), the toy's rev-over-rev cuda kernel needed 290 KB of local memory per thread at C1 = 64 (59 GiB of
+    driver reservation on an L40S: launch OOM)."""
+    if node.kind != "adjoint" or node.base is None or dict(node.opts).get("rev_checkpoints") is not None:
+        return node
+    k = node.__dict__.get("_lean")
+    if k is None:
+        from . import _reverse
+        o = dict(node.opts, rev_checkpoints=_reverse.LEAN_C)
+        q = vjp_prog(node.base, node.pp, node.pb, o)
+        k = node.derived(q, "adjoint", base=node.base, pp=node.pp, pb=node.pb, lin_pi=node.lin_pi,
+                         lin_bc=node.lin_bc, opts=tuple(sorted(o.items())))
+        object.__setattr__(node, "_lean", k)
+    return k
+
+
 def _jvp(primals, tangents, *, node):
+    node = _lean(node)
     p = node.prog
     pi, bc = _split(node, primals)
     dpi, dbc = _split(node, tangents)

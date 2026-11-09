@@ -79,6 +79,19 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   (`max_steps`, the spawn Queue). It was dropped and only counted, so an overflowed sum came back finite and
   wrong. The counter is per call, so all exact outputs are poisoned, not only the one that overflowed;
   non-exact outputs are unchanged.
+- Reverse mode (from lumen/perf 8c92ee8, 762da14, 830c071): the forward pass of a checkpointed loop stores the
+  states before steps 0..C-1 in a head buffer, so an item of K <= C steps is never replayed; the first segment
+  tape reads the head. Only the carries the step or predicate reads are stored (liveness read off the loop's
+  jaxprs, no re-trace). `rev_checkpoints` defaults to `'auto'`: 16 for a state under 128 B, else the largest of
+  4 ... 64 whose 3C+1 states fit 64 KiB (logical bytes); an adjoint differentiated again is rebuilt at C = 16.
+  Per-item memory is 3C+1 states (was 2C). The replay check stays on. lumen's grad / value ratio was 10.1 / 18.0 /
+  19.5x on SK / SBND / ANNIE with the old scheme (L40S); see `docs/design.md` section 3.
+- Reverse-mode checkpoint buffers are uninitialised on cuda (`tallymap_uninit`): zero-filling them cost the
+  cheap-step `vs_jax` gradients up to 5x. Tested by filling every uninitialised declaration with 0x00 and 0xFF
+  (bitwise-equal results required).
+- cuda step split: an array loop carry of >= 64 elements is updated in place instead of being rebuilt and
+  copied back every step.
+
 - The cuda kernel cache and the eager-call cache key a program on a structural sha256 digest of its jaxpr
   (`_jaxpr.digest`) instead of its printed text. JAX's pretty-printer cost 95 s per build on a large engine item
   (4.2 s with the digest); the digest also separates literal values the printer rounds (`docs/design.md`

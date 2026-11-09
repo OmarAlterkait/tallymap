@@ -9,7 +9,7 @@ N (the item count) is a kernel ARGUMENT: one cubin serves every N.
 """
 import numpy as np
 
-from .codegen import CodegenError, Emitter, Local, Scalar, Table, VTally, _size, ctype, elem, unravel
+from .codegen import CodegenError, Emitter, Local, Scalar, Table, VTally, _size, ctype, elem, fill_decl, unravel
 from .op_table import phys
 
 # Every kernel takes ONE by-value struct of buffer pointers.  Up to SJ_SMALL = 504 (4,032 + 8 bytes with n_items)
@@ -224,6 +224,7 @@ def _split(cj):
 
 
 BLOCK = 128          # threads per block (measured: 64 / 128 / 256 within 1%)
+STEP_INPLACE_MIN = 64    # step split: array loop carries of at least this many elements are updated in place
 PRIV_BYTES = 4096    # shared-memory budget for privatised sum tallies per block
 
 
@@ -290,16 +291,22 @@ def build_source(p, *, block=BLOCK, split=True, inplace=True):
     L.cjs = {}
     fdefs = []
 
-    def function(name, cj, ins, out_names=None):
+    def function(name, cj, ins, out_names=None, inplace_out=None):
         """emit `cj` as a device function taking the base params + (decl, Val) inputs; non-tally results are
-        written to reference params o<j> (or the given names).  -> (results, out (shape, dtype, impl) or None)"""
+        written to reference params o<j> (or the given names).  inplace_out {j: name}: result j may be the mutable
+        reference parameter `name` itself, updated in place (then it has no o<j>, and its spec is "inplace").
+        -> (results, out (shape, dtype, impl) | None | "inplace")"""
         L.cjs[name] = cj
         em.lines, em.ind = [], 1
-        res = em.run_top(cj, [v for _, v in ins], name)
+        inplace_out = dict(inplace_out or {})
+        res = em.run_top(cj, [v for _, v in ins], name, mutable=set(inplace_out.values()))
         odecl, ospec = [], []
         for j, (v, r) in enumerate(zip(cj.jaxpr.outvars, res)):
             if isinstance(r, VTally):
                 ospec.append(None)
+                continue
+            if j in inplace_out and isinstance(r, Local) and r.name == inplace_out[j]:
+                ospec.append("inplace")
                 continue
             sh, dt, impl = phys(v.aval)
             odecl.append(_decl(f"o{j}", sh, dt, const=False))
@@ -311,7 +318,7 @@ def build_source(p, *, block=BLOCK, split=True, inplace=True):
 
     def svar(prefix, j, spec):
         sh, dt, impl = spec
-        return f"  {ctype(dt)} {prefix}{j}{'' if sh == () else f'[{max(1, _size(sh))}]'};\n"
+        return f"  {ctype(dt)} {prefix}{j}{'' if sh == () else f'[{max(1, _size(sh))}]'};{fill_decl(f'{prefix}{j}')}\n"
 
     sp = _split(p.cj) if split else None
     L.mode = "step" if sp is not None else "item"
@@ -368,11 +375,20 @@ def build_source(p, *, block=BLOCK, split=True, inplace=True):
         function("cond", sp["cond"], [(d, x) for d, x, _ in pc + pk])
         decls += "  bool sj_pr;\n"
         cargs = [a for _, _, a in pc + pk if a is not None]
-        bargs = [a for _, _, a in pb + pk if a is not None]
-        bres, bspec = function("body", sp["body"], [(d, x) for d, x, _ in pb + pk])
+        # A LARGE array carry (>= STEP_INPLACE_MIN elements: a checkpoint buffer, a state history) is passed to the
+        # body as a mutable reference and updated in place, instead of being rebuilt into n<j> and copied back to
+        # k<j> every step (two full copies per step: for the single-loop adjoint's checkpoint buffer, 2C+1 loop
+        # states, more traffic than the step itself).  Small carries keep the copy (their code is unchanged).
+        ipc = {j for j, x in enumerate(kvals) if inplace and isinstance(x, Local) and x.shape != ()
+               and _size(x.shape) >= STEP_INPLACE_MIN}
+        pkb = [(_decl(f"w{j}", tuple(x.shape), x.dtype, const=False), _val(f"w{j}", tuple(x.shape), x.dtype,
+                x.key_impl), f"k{j}") if j in ipc else q for j, (x, q) in enumerate(zip(kvals, pk))]
+        bargs = [a for _, _, a in pb + pkb if a is not None]
+        bres, bspec = function("body", sp["body"], [(d, x) for d, x, _ in pb + pkb],
+                               inplace_out={j: f"w{j}" for j in ipc})
         nargs, upd = [], []
         for j, spc in enumerate(bspec):
-            if spc is None:
+            if spc is None or spc == "inplace":
                 continue
             decls += svar("n", j, spc)
             nargs.append(f"n{j}")

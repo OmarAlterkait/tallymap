@@ -48,7 +48,11 @@ because a lane whose item has finished otherwise idles until the longest item in
 exactly ONE top-level while loop is split into pre / cond / body / post
 (`backends/cuda/kernel.py::_split`); anything else runs whole-item. With spawn the order reverses and whole-item
 is the faster of the two, by about half again, so the rule is: step refill unless the program spawns. (A warp is
-the group of 32 GPU threads that execute together on NVIDIA hardware.)
+the group of 32 GPU threads that execute together on NVIDIA hardware.) Under the split, a loop carry is normally rebuilt by
+`sj_body` into a temporary and copied back once per step; an ARRAY carry of at least `STEP_INPLACE_MIN` (64)
+elements (a checkpoint buffer, a state history) is instead passed to `sj_body` by mutable reference and, when the
+body's result is that parameter updated in place, it has no temporary and no copy. Smaller carries keep the copy, so
+kernels without a large carry are unchanged.
 
 That rule was re-measured on every `benchmarks/vs_jax` problem (private `_schedule`, forward and gradient, `div`
 high), as the ratio of step-refill time to whole-item time (below 1: step refill is faster):
@@ -237,10 +241,22 @@ error) turn every affected cell into a failure, which is how the matrix is known
 ## 3. Reverse mode (`_reverse.py`)
 
 - **Checkpointed loops.** `retrace(rev=...)` replaces every while loop by `checkpointed_while`. The forward pass
-  stores nothing and only counts the steps K; the backward pass replays the loop once storing every m-th state,
-  then walks the segments newest first, refilling a buffer of at most C = `rev_checkpoints` (default 16) states
-  from each segment's checkpoint. That is O(K) work for K <= C^2 and 2C states of memory per item, with no bound
-  on K required anywhere. Toy walk at 65k items, the ratio of grad to forward: 3.0x at K=100. The scheme this
+  counts the steps K and stores the states before steps 0..C-1 in a HEAD buffer; an item of K <= C steps is swept
+  straight off the head, with no replay. Otherwise the backward pass replays the loop once storing every m-th
+  state, then walks the segments newest first, refilling a tape of at most C = `rev_checkpoints` states from each
+  segment's checkpoint (the first C states come from the head). That is O(K) work for K <= C^2 and 3C+1 states of
+  memory per item, with no bound on K required anywhere. Only the carries the step or predicate reads are stored
+  (`_rewrite._live_carries`, read off the loop's jaxprs). A counting pass that stored nothing made every K <= C
+  item replay its whole loop once more: 1.7x slower on lumen SK's gradient and 1.4x on SBND (lumen/perf
+  8c92ee8 / 762da14). The head is a read-only residual, not the segment tape: reusing it as the tape (a carry of
+  the segment loops) made the emitter copy it, a 28 KB against a 12 KB frame on lumen SK, 17% slower.
+- **C is chosen from the state size** (`rev_checkpoints='auto'`, `_reverse.auto_checkpoints`): 16 below 128 B of
+  stored state, else the largest of 4 ... 64 whose 3C+1 states fit 64 KiB of LOGICAL bytes. lumen (306-318 B
+  states, warp-maximum trip counts 16 to 60) is 1.3-1.6x faster at C = 64 than at 16; the `vs_jax` problems
+  (8-25 B) are 1.5-3x slower at 64. The 64 KiB budget ignores the device (the driver reserves the compiled
+  frame for every resident thread): sizing C from the compiled frame against free memory is still to do. An
+  adjoint that is differentiated again (hvp, grad-of-grad) is rebuilt at C = 16 (`_primitive._lean`): its
+  memory goes as C1 x C2, and at C1 = 64 the toy's rev-over-rev kernel needed 290 KB per thread (launch OOM). Toy walk at 65k items, the ratio of grad to forward: 3.0x at K=100. The scheme this
   replaced, replaying from the start for every step, was 13x at K=100 and over 100x at K=1000. A single fused
   reverse loop (one VJP instance for the whole loop) was also tried and was 2 to 5 times slower, because it
   defeats in-place updates; it was reverted.
@@ -253,6 +269,15 @@ error) turn every affected cell into a failure, which is how the matrix is known
   gradient of transport from 15.6 to 7.4 ms, walk-on-spheres from 9.9 to 5.0 ms, and the toy walk at K=100 from
   1.70 to 1.47 ms, with no problem slower. It is also why `rev_checkpoints` used to look so sharply
   non-monotone: at C = 32 the same transport gradient cost 44.9 ms before and 10.7 ms after.
+- **Checkpoint buffers are uninitialised.** The head, the checkpoint buffer and the segment tape are
+  `tallymap_uninit` buffers (`_reverse.uninit_p`): every slot is written before it is read, by construction. The cuda
+  backend declares them with no fill, and a copy of one that has not been written yet emits nothing (a copy of an
+  undefined value is undefined; the step split and loop-carry adoption would otherwise load and keep a second copy
+  of garbage). Every other backend gets zeros. Zero-filling 3C+1 states per item at C = 64 made the cheap-step
+  `benchmarks/vs_jax` gradients up to 5x slower at 2^19 items (random_walk 0.80 -> 3.98 ms; lumen/perf d6cb9fc). The
+  contract is tested, not assumed: `backends/cuda/codegen.FILL` (test-only module constant) fills every
+  uninitialised per-thread declaration with a byte, and tests/reverse.py requires bitwise-equal per-item results
+  and per-item cotangents for 0x00 and 0xFF.
 - **Activity.** Only float loop carries that can depend on a perturbed constant, carry or table token are
   differentiated in a step VJP. The set is a fixpoint probed with symbolic zeros. On a production
   photon-transport workload it removed half of the float carries and about a quarter of the reverse-mode time.

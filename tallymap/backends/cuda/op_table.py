@@ -667,6 +667,7 @@ def _dus(em, eqn, ins, **p):
         em.line(f"{out.name}[{ravel([ia(s, i) for s, i in zip(st, idx)], src.shape)}] = {elem(upd, idx)};")
     em.each(upd.shape, body)
     out.key_impl = src.key_impl
+    out.undef = False                  # (written: no longer an undefined value, codegen.Emitter.assign)
     return out
 
 
@@ -740,6 +741,17 @@ def _iota(em, eqn, ins, dtype, shape, dimension, **p):
     dt = np.dtype(dtype)
     t = ctype(dt)
     return Lazy(tuple(shape), dt, lambda idx: f"(({t})({idx[dimension]}))")
+
+
+@rule("tallymap_uninit")
+def _uninit(em, eqn, ins, **p):
+    """tallymap's own uninitialised per-item buffer (_reverse.uninit_p: reverse-mode checkpoint buffers, every slot
+    written before it is read): a declaration with no fill."""
+    shape, dt, impl = phys(_aval(eqn))
+    v = em.declare(shape, dt, "u")
+    v.key_impl = impl
+    v.undef = True                     # copies of it are free (Emitter.assign) until it is written
+    return v
 
 
 @rule("empty", "empty2")
@@ -1247,6 +1259,7 @@ def _carry_vars(em, inits, pass_through, dest=None):
             if X is not v:
                 em.assign(X, v)
                 X.key_impl = v.key_impl
+            X.undef = False                     # (the loop update writes it: inside the body it is defined)
             cars.append(X)
             continue
         if v.shape == ():

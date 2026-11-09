@@ -1618,6 +1618,33 @@ def _(b):
             + ("within 1e-5 (GPU scatter order)" if GPU else "all BITWISE"))
 
 
+
+@case("step split: a large array loop carry is updated in place (no per-step copy), same result", ["cuda"])
+def _(b):
+    from tallymap.backends.cuda.kernel import STEP_INPLACE_MIN
+    H = 2 * STEP_INPLACE_MIN
+
+    def item(t, x, key, th):
+        def body(c):
+            k, w, h = c
+            i = k % H                     # (a dynamic_update_slice: the in-place write the step split keeps in
+            h = lax.dynamic_update_index_in_dim(h, h[i] + w * th, i, 0)   # place; scatter always copies)
+            return k + 1, w * F(0.9), h
+        k, w, h = lax.while_loop(lambda c: (bits(key, c[0]) % 7 != 0) | (c[0] < 3), body,
+                                 (0, x, jnp.zeros((H,), F)))
+        return t.add("Q", (k % NB).astype(jnp.int32), jnp.sum(h * jnp.arange(H, dtype=F)))
+    f = V(item, b, in_axes=(0, 0, None))
+    d = tm.diagnostics(lambda x, k, th: f(x, k, th).outputs["Q"], xs, keys, TH)
+    k0 = d["kernels"][-1]
+    src = open(k0["source"]).read()
+    if k0.get("mode") != "step":
+        raise Fail(f"no step split (mode {k0.get('mode')}): the cell does not test the in-place carry")
+    if re.search(rf"e < {H}; \+\+e\) k\d+\[e\] = n\d+\[e\]", src):
+        raise Fail(f"the {H}-element carry is still copied back every step")
+    close(f(xs, keys, TH), R(item, in_axes=(0, 0, None))(xs, keys, TH))
+    return f"{H}-element carry: no per-step copy"
+
+
 print("\n================ SUMMARY", jax.__version__, "x64" if jax.config.jax_enable_x64 else "",
       jax.devices()[0].device_kind)
 for n, b, m in RES:
