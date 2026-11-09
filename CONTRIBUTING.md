@@ -126,8 +126,9 @@ Settings are in `pyproject.toml`: rule sets E, F, W and I, a line length of 120,
 better in index arithmetic and in small closures. Ruff runs in CI on every pull request and must be clean.
 
 Beyond ruff: keep the public surface small (a new public name is a decision, not a convenience), keep every
-JAX-version difference inside `_compat.py` or `_jaxpr.py` so that a JAX upgrade stays a bounded job, and make new
-options private (a leading underscore) unless a user has a reason to reach for them.
+JAX-version difference inside `_compat.py` or `_jaxpr.py` so that a JAX upgrade stays a bounded job, and do not add
+private options: a measurement switch or a negative control is a test-only module constant (like `codegen.FILL`)
+that the tests set with `tests/ab_rule.patched`.
 
 Prose, in comments and in docs: plain and direct, one claim per sentence, with the measurement next to the claim
 that rests on it.

@@ -40,17 +40,17 @@ def _key(p, opts):
     return (digest(p.cj.jaxpr), tuple(_const_sig(c) for c in p.cj.consts),
             tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.fixed_point, s.scale, s.kind) for s in p.tallies),
             p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), tuple(sorted(opts.items())),
-            codegen.FILL)                           # (the test-only fill byte changes the source)
+            codegen.FILL, codegen.INPLACE)          # (the test-only fill byte / in-place switch change the source)
 
 
 MATH_OPTS = {"ieee": [], "approx": ["-DTALLYMAP_APPROX_DIVSQRT", "--prec-div=false", "--prec-sqrt=false"]}
 
 
 class Kernel:
-    def __init__(self, p, schedule="item", strict=False, math="approx", inplace=True):
+    def __init__(self, p, schedule="item", strict=False, math="approx"):
         self.block = BLOCK
         try:
-            self.src, self.L = build_source(p, schedule=schedule, strict=strict, inplace=bool(inplace))
+            self.src, self.L = build_source(p, schedule=schedule, strict=strict)
         except CodegenError as e:
             raise UnsupportedError(str(e)) from None
         if math not in MATH_OPTS:
@@ -88,23 +88,19 @@ def _phys_in(x):
     return jax.random.key_data(x) if is_key_dtype(x.dtype) else x
 
 
-def run(p, pi, bc, cuda_math="approx", schedule="item", _cuda_inplace=True, **_):
+def run(p, pi, bc, cuda_math="approx", schedule="item", **_):
     """schedule: 'item' (DEFAULT: a thread runs one whole item at a time) | 'step' (a thread is refilled with a new
     item at loop-STEP granularity: the item program must have exactly one top-level while loop, else
     UnsupportedError; a program derived from it (jvp, lanes, a folded batch, an adjoint) uses the step schedule
     where it splits and the item schedule otherwise; tm.diagnostics()['kernels'][i]['schedule'] is what ran).
     Measurements: docs/design.md section 1b.
-    Private _cuda_inplace=False: never update a
-    per-item array in place (every dynamic_update_slice and scatter copies; the A/B control of the emitter's
-    aliasing analysis).
     cuda_math: 'approx' (DEFAULT: div.full / sqrt.approx / rsqrt.approx, the PTX XLA:GPU itself emits for f32;
     measured 1.5x fwd / 1.65x jvp faster than ieee; validated by the pre-registered compare runs,
     docs/validation.md) |
     'ieee' (correctly rounded f32 div/sqrt: portable)."""
     math = cuda_math or "approx"
-    extra = {} if _cuda_inplace else dict(inplace=False)        # (the default leaves the kernel key unchanged)
     # strict: the user's own item program (tag 'primal') must split under schedule='step'
-    kern = kernel(p, schedule=schedule, strict=schedule == "step" and p.tag == "primal", math=math, **extra)
+    kern = kernel(p, schedule=schedule, strict=schedule == "step" and p.tag == "primal", math=math)
     L = kern.L
     N = int(pi[0].shape[0])
     consts = []

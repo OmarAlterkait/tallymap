@@ -19,6 +19,7 @@ if os.environ.get("TEST_X64"):
 import jax
 import jax.numpy as jnp
 import numpy as np
+from ab_rule import patched
 from jax import lax
 
 import tallymap as tm
@@ -189,7 +190,8 @@ for K in KS:
     if K <= 100:
         @case(f"walk K~{K} NB=4096: rev(dense path forced for the big table) == grad(padded)")
         def _(b, K=K):
-            g, gr, info, _ = walk_case(b, 4096, K, _rev_sparse_min=10 ** 9)
+            with patched(_reverse, SPARSE_MIN=10 ** 9):
+                g, gr, info, _ = walk_case(b, 4096, K)
             if info["sparse"]:
                 raise Fail(f"instrument: expected the dense path, got {info}")
             return close(g, gr, "dense")
@@ -429,7 +431,8 @@ def _(b):
 @case("NEGATIVE CONTROL: mixed use with dense detection disabled MUST differ", ["xla"])
 def _(b):
     g, gr, _ = branchy_case(b, 256, mixed=True)
-    gb, _, info = branchy_case(b, 256, mixed=True, _rev_nodense=True)
+    with patched(_reverse, NODENSE=True):
+        gb, _, info = branchy_case(b, 256, mixed=True)
     if any(s == 256 for _, s in info["dense"]):
         raise Fail(f"instrument: the defect was not applied {info}")
     e = relerr(gb["tab"], gr["tab"])

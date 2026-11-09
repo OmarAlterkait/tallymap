@@ -426,8 +426,8 @@ item jaxprs and generated kernels. `tm.diagnostics(f, *args)` reports what `jax.
 | `rev_checkpoints` | `'auto'` | reverse mode: checkpoint buffer size C. `'auto'`: 16 for a loop step of fewer than 1000 equations, else the largest of 4 ... 64 whose 3C+1 states (single-loop adjoint: 2C+1) fit 64 KiB. A loop of K <= C steps is not replayed; O(K) work for K <= C^2. |
 | `rev_stats` | `False` | reverse through spawn: report the tree adjoint's counts to the host. Off by default because a host callback takes `jax.jit` off its C++ fast path, which can cost an order of magnitude. |
 
-Any other option name raises. Options starting with `_` are private measurement and negative-control switches
-(`tallymap/_api.py::_OPTS`). The only environment variable is `TALLYMAP_CUDA_CACHE`, the cubin cache directory,
+Any other option name raises, and there are no private options: the measurement switches and negative controls
+are test-only module constants. The only environment variable is `TALLYMAP_CUDA_CACHE`, the cubin cache directory,
 which defaults to `~/.cache/tallymap`.
 
 ### Which derivative to use

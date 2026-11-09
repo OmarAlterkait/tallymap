@@ -22,6 +22,7 @@ if os.environ.get("TEST_X64"):
 import jax
 import jax.numpy as jnp
 import numpy as np
+from ab_rule import patched
 from jax import lax
 
 import tallymap as tm
@@ -372,7 +373,7 @@ def _(b):
     return close(J, Jr, what="jac") + f"; {n} tallymap eqns"
 
 
-@case("chunked dual lanes (_lanes=3, T=7 -> 3+3+1 padded): jacfwd with primal, jacrev(jacfwd)")
+@case("chunked dual lanes (_primitive.LANES=3, T=7 -> 3+3+1 padded): jacfwd with primal, jacrev(jacfwd)")
 def _(b):
     P7 = jnp.concatenate([tab[:5], TH])
 
@@ -381,14 +382,16 @@ def _(b):
             y = big_vec(fn, p[5:], x=xs) + jnp.sum(fn(xs, keys, tab.at[:5].set(p[:5]), p[5:]).outputs["Q"] * WQ)
             return y, y
         return h
-    J, y = jax.jit(jax.jacfwd(g(S(b, _lanes=3)), has_aux=True))(P7)
+    from tallymap import _primitive as _P
+    with patched(_P, LANES=3):
+        J, y = jax.jit(jax.jacfwd(g(S(b)), has_aux=True))(P7)
+        js = str(jax.make_jaxpr(jax.jacfwd(g(S(b)), has_aux=True))(P7))
+        H = jax.jit(jax.jacrev(lambda p: jax.jacfwd(lambda q: g(S(b))(q)[0][-1])(p)))(P7)
     Jr, yr = jax.jacfwd(g(R()), has_aux=True)(P7)
     close(y, yr, what="primal")
     m = close(J, Jr, what="jacfwd")
-    js = str(jax.make_jaxpr(jax.jacfwd(g(S(b, _lanes=3)), has_aux=True))(P7))
     if "+dual_lanes3" not in js:
         raise Fail("instrument: no 3-lane chunk program was built")
-    H = jax.jit(jax.jacrev(lambda p: jax.jacfwd(lambda q: g(S(b, _lanes=3))(q)[0][-1])(p)))(P7)
     Hr = jax.jacfwd(jax.jacfwd(lambda q: g(R())(q)[0][-1]))(P7)
     return m + "; " + close(H, Hr, what="jacrev(jacfwd)")
 

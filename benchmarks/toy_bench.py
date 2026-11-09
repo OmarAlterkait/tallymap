@@ -12,6 +12,7 @@ import jax.numpy as jnp
 from jax import lax
 
 import tallymap as tm
+from tallymap import _primitive as _P
 
 BK = os.environ.get("BK", "cuda")
 N = int(os.environ.get("N", 1 << 20))
@@ -44,14 +45,14 @@ TH = jnp.array([0.9, 0.3], jnp.float32)
 WQ = jnp.linspace(0.5, 2.0, NB, dtype=jnp.float32)
 
 
-LANES = os.environ.get("LANES")        # private _lanes for every call: off | auto | force | <int chunk>
+LANES = os.environ.get("LANES")        # _primitive.LANES for every call: off | auto | force | <int chunk>
+if LANES:
+    _P.LANES = int(LANES) if LANES.isdigit() else LANES
 OPTS = {k: (int(v) if v.lstrip("-").isdigit() else {"False": False, "True": True}.get(v, v)) for k, v in
         (kv.split("=") for kv in os.environ.get("OPTS", "").split(",") if kv)}   # extra tm.vmap options: k=v,k=v
 
 
 def mk(**o):
-    if LANES:
-        o = dict(o, _lanes=int(LANES) if LANES.isdigit() else LANES)
     o = dict(OPTS, **o)
     return tm.vmap(walk, outputs={"Q": tm.Sum((NB,))}, in_axes=(0, 0, None, None), backend=BK,
                    cuda_math=os.environ.get("MATH", "approx"), **o)
@@ -117,9 +118,11 @@ if "vmap" in MODES:
     bench(f"vmap over theta B={BV}", jax.vmap(lambda th: fF(xs, keys, tab, th).outputs["Q"]), ths)
     xb = jnp.stack([xs * (1 + 0.05 * i) for i in range(BV)])
     bench(f"vmap over events B={BV}", jax.vmap(lambda x: fF(x, keys, tab, TH).outputs["Q"]), xb)
-    fM = mk(_fold=False)
+    fM = mk()
+    _P.FOLD = False                    # (read when the vmap is traced, inside bench)
     bench(f"vmap theta B={BV} (lax.map)", jax.vmap(lambda th: fM(xs, keys, tab, th).outputs["Q"]), ths)
     bench(f"vmap events B={BV} (lax.map)", jax.vmap(lambda x: fM(x, keys, tab, TH).outputs["Q"]), xb)
+    _P.FOLD = True
 if "host" in MODES:      # host overhead of one eager call / one retrace (small N so the kernel is negligible)
     n = 1024
     f = fF

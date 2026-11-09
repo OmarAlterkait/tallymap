@@ -551,7 +551,7 @@ def _dual_lanes(args, dims, node, fused):
         lin_pi, lin_bc = node.lin_pi, node.lin_bc
     bat = [d is not NM for d in dims]
     lin = list(lin_pi) + list(lin_bc)
-    mode = dict(node.opts).get("_lanes", "auto")
+    mode = LANES
     if not any(lin) or any(b and not l for b, l in zip(bat, lin)) or mode == "off":
         return None
     size = next(a.shape[d] for a, d in zip(args, dims) if d is not NM)
@@ -633,6 +633,9 @@ LANES_MAX_LOCAL = 512
 # kernel per chunk of 4 / 8 / 16 / 32 / 64 lanes 229 / 191 / 175 / 176 / 325 ms, all 256 at once 4.3 s, fold 533 ms;
 # hessian 8x8 (8 lanes) 83 ms vs fold 102 ms.  A photon-transport jacfwd of 10 parameters stays one kernel.
 MAX_LANES = 16
+# TEST-ONLY (tests patch it, like FUSE_JVP): 'auto' (MAX_LANES and the LANES_MAX_LOCAL guard on a GPU, every lane in
+# one kernel elsewhere) | 'off' (never dual lanes) | 'force' (ignore the guard) | int (chunks of at most this many)
+LANES = "auto"
 
 
 def _balanced(size, cap):
@@ -721,11 +724,12 @@ def _largest_loop_array(jaxpr, in_loop=False):
 
 # ------------------------------------------------------------------------------------------- fold a batch into items
 FOLD_MAX_BC = 4096      # largest batched broadcast operand (elements per batch member) indexed per item when folding
+FOLD = True             # TEST-ONLY (like FUSE_JVP): False never folds a batch into the item axis
 
 
 def _can_fold(node, args, dims, bat, size):
     p = node.prog
-    if dict(node.opts).get("_fold", True) is False or p.spawn is not None:
+    if not FOLD or p.spawn is not None:
         return False            # spawn: one shared queue per launch would change capacity semantics
     if any(s.fixed_point for s in p.tallies if s.kind == "sum"):
         return False            # stats['fixed_point_overflow'] is per launch, not per batch member

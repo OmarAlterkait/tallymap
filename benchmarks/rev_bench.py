@@ -28,6 +28,7 @@ KS = [int(k) for k in os.environ.get("RB_KS", "10,30,100,300,1000").split(",")]
 PS = os.environ.get("RB_PS", "1,10,tab").split(",")
 BACKENDS = os.environ.get("RB_BACKENDS", "cuda,xla" if GPU else "xla").split(",")
 MATHS = os.environ.get("RB_MATH", "ieee,approx").split(",")
+SPARSE_MIN0 = _reverse.SPARSE_MIN
 MODES = os.environ.get("RB_MODES", "fwd,jvp,jacfwd,ckpt,dense").split(",")
 REPS = int(os.environ.get("RB_REPS", 5))
 SLOTS = [int(c) for c in os.environ.get("RB_SLOTS", "16").split(",")]
@@ -123,9 +124,8 @@ def run_arm(backend, math, K, P, mode):
     opts = dict(backend=backend)
     if backend == "cuda":
         opts["cuda_math"] = math
-    if mode.startswith(("ckpt", "dense")):
-        if mode == "dense":
-            opts["_rev_sparse_min"] = 10 ** 9
+    _reverse.SPARSE_MIN = 10 ** 9 if mode == "dense" else SPARSE_MIN0     # 'dense': every table on the dense path
+    if mode.startswith("ckpt"):
         if mode.startswith("ckpt_s"):
             opts["rev_checkpoints"] = int(mode[6:])
     f = tm.vmap(item, outputs={"Q": tm.Sum((NB,))}, in_axes=(0, 0, None, None), **opts)

@@ -400,9 +400,14 @@ emitted value AT THE SPAWN STEP, inside the parent's ordinary replay adjoint. No
 
 ## 5. Fewer knobs
 
-Unknown option names raise. The public options are the six in the README; every measurement and
-negative-control switch is a private option whose name starts with an underscore (they are listed in
-`_api._OPTS`), part of the node and of every cache key, never global state.
+Unknown option names raise. The public options are the six in the README, and there are no private options.
+Every measurement switch and negative control is a TEST-ONLY module constant that the library never sets, patched
+by the tests (`tests/ab_rule.patched`): `codegen.FILL` and `codegen.INPLACE` (both in the cuda kernel key),
+`_primitive.FUSE_JVP`, `LANES` and `FOLD`, `_reverse.SINGLE`, `REPLAY_SHIFT`, `SPARSE_MIN` and `NODENSE`, and
+`_reverse_spawn.GEN_CAPACITY` and `TREE_NEG`. They were private options (`_cuda_inplace`, `_lanes`, `_fold`,
+`_rev_sparse_min`, `_rev_nodense`, `_rev_gen_capacity`, `_tree_neg`) carried in every node and cache key; as
+constants they are read when a program is traced or lowered, and the eager-call cache does not see them (the
+test helper clears it).
 
 Removed, with their measurements: 20 environment switches; the replay-from-start reverse scheme (3.4 to 13 times
 slower wherever it was measured); turning activity analysis off; the CUDA block size, shared-memory budget and

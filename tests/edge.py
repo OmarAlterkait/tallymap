@@ -14,7 +14,7 @@ if os.environ.get("TEST_X64"):
 import jax
 import jax.numpy as jnp
 import numpy as np
-from ab_rule import assert_arms_differ
+from ab_rule import assert_arms_differ, patched
 from jax import lax
 
 import tallymap as tm
@@ -188,7 +188,9 @@ def _(b):
     for kw in (dict(math="ieee"), dict(min_blocks=4), dict(block=8), dict(rev_slots=4), dict(rev_remat=2),
                dict(ad="forward"), dict(bogus=1), dict(_occ_cap=2), dict(_replay_check=False),
                dict(cuda_min_blocks=2), dict(_rev_phase="skip"), dict(_tree_phase="fwd"),
-               dict(rev_step_segments=8), dict(lockstep_block=8), dict(_schedule="step")):
+               dict(rev_step_segments=8), dict(lockstep_block=8), dict(_schedule="step"), dict(_cuda_inplace=False),
+               dict(_lanes="off"), dict(_fold=False), dict(_rev_sparse_min=1), dict(_rev_nodense=True),
+               dict(_rev_gen_capacity=8), dict(_tree_neg="detach")):
         raises(ValueError, lambda: V(f, b, **kw), "unknown option")
     for bk in ("lockstep", "jax"):                                     # 'lockstep' is the old name of 'xla'
         raises(ValueError, lambda: tm.vmap(f, outputs={"Q": tm.Sum((NB,), F)}, backend=bk), "unknown backend")
@@ -674,7 +676,7 @@ def _(b):
     accumulates into a second array in place.  The loop is NESTED (a single top-level while is split into step
     functions whose parameters are never mutated, and nothing would be updated in place).  Copies are exact:
     per-item results must equal jax.vmap bitwise.  Instrument (cuda): strictly fewer 12-element arrays are
-    declared than with _cuda_inplace=False, i.e. the in-place rule fired."""
+    declared than with codegen.INPLACE = False, i.e. the in-place rule fired."""
     import re
     S = 12
 
@@ -715,7 +717,9 @@ def _(b):
     n_in = run()
     if b != "cuda":
         return ""
-    n_cp = run(_cuda_inplace=False)
+    from tallymap.backends.cuda import codegen as CG
+    with patched(CG, INPLACE=False):
+        n_cp = run()
     if not n_in < n_cp:
         raise Fail(f"instrument: {n_in} 12-element arrays declared in place, {n_cp} copying: the rule did not fire")
     return f"12-element arrays: {n_in} in place, {n_cp} copying"
@@ -759,8 +763,8 @@ def _tangent_overflow(b, x2):
             check(f"jvp {tag}", p, t[None])
             p, t = jax.vmap(lambda d: jax.jvp(f, (s0,), (d,)))(eye)          # jacfwd's mechanism, with the primal
             check(f"jacfwd lanes {tag}", p, t)
-            fo = mk(_lanes="off")                                              # lanes refused (DTRAX's regime)
-            p, t = jax.vmap(lambda d: jax.jvp(fo, (s0,), (d,)))(eye)
+            with patched(P_, LANES="off"):                                    # lanes refused (DTRAX's regime)
+                p, t = jax.vmap(lambda d: jax.jvp(f, (s0,), (d,)))(eye)
             check(f"jacfwd lanes-refused {tag}", p, t)
             check(f"jacfwd() {tag}", ref, jax.jacfwd(f)(s0).T)
             p, lin = jax.linearize(f, s0)
@@ -1277,7 +1281,7 @@ def _(b):
     return f"naive key repeats at id + {period}; fold_in(fold_in(key, id), step) and the chunked key do not"
 
 
-@case("in-place dynamic_update_slice: aliasing hazards == xla == _cuda_inplace=False (bitwise)", ["cuda"])
+@case("in-place dynamic_update_slice: aliasing hazards == xla == codegen.INPLACE off (bitwise)", ["cuda"])
 def _(b):
     def item(t, x, key):
         buf0 = jnp.arange(8, dtype=jnp.int32) * x
@@ -1299,10 +1303,14 @@ def _(b):
         return t, (buf, acc)
     out = {"C": tm.Sum((8,), jnp.int32)}
     ii = jnp.arange(N, dtype=jnp.int32) % 5 + 1
-    run = lambda bk, **o: tm.vmap(item, outputs=out, backend=bk, **o)
-    g = lambda **o: (lambda a, k: run("cuda", **o)(a, k).per_item[0])
-    assert_arms_differ(g(), g(_cuda_inplace=False), ii, keys)      # instrument: in-place updates did happen
-    rs = [run("cuda")(ii, keys), run("cuda", _cuda_inplace=False)(ii, keys), run("xla")(ii, keys)]
+    from tallymap.backends.cuda import codegen as CG
+    run = lambda bk: tm.vmap(item, outputs=out, backend=bk)
+    g = lambda a, k: run("cuda")(a, k).per_item[0]
+    assert_arms_differ(g, g, ii, keys, patch_b=(CG, dict(INPLACE=False)))    # instrument: in-place updates happened
+    rs = [run("cuda")(ii, keys)]
+    with patched(CG, INPLACE=False):
+        rs.append(run("cuda")(ii, keys))
+    rs.append(run("xla")(ii, keys))
     for r in rs[1:]:
         for a, c in zip(jax.tree_util.tree_leaves(rs[0]), jax.tree_util.tree_leaves(r)):
             if not np.array_equal(np.asarray(a), np.asarray(c)):
@@ -1317,7 +1325,8 @@ def _(b):
     updates it in place, the other returns a lazy whole-array select over it: v5), and the lazy body result goes
     straight back into the carry.  The loop is NESTED: a single top-level while is split into step functions whose
     parameters are never mutated, where the rule (rightly) never fires.  Arms: the rule patched off (the control:
-    strictly more arrays must be declared without it), and _cuda_inplace=False (every liveness-based reuse off)."""
+    strictly more arrays must be declared without it), and codegen.INPLACE = False (every liveness-based reuse
+    off)."""
     import re
 
     from tallymap import _primitive as _P
@@ -1344,25 +1353,27 @@ def _(b):
     out = {"C": tm.Sum((NB,), jnp.int32)}
     xs = (jnp.arange(N) % 7 * 0.125).astype(F)
 
-    def run(bk, off=False, **o):
+    def run(bk, off=False, inplace=True):
         saved = (OT._cond_dest, OT._init_alias, CG.Emitter.elementwise_self)
         CB._KERNELS.clear()
         _P._EAGER.clear()
+        CG.INPLACE = inplace
         if off:
             OT._cond_dest = lambda em, eqn, ops, bodies: [None] * len(eqn.outvars)
             OT._init_alias = lambda em, inits, ivars, pt, others: [None] * len(inits)
             CG.Emitter.elementwise_self = lambda self, dst, x: False
         try:
             tm.diagnostics(reset=True)
-            r = tm.vmap(item, outputs=out, backend=bk, **o)(xs, keys)
+            r = tm.vmap(item, outputs=out, backend=bk)(xs, keys)
             ks = tm.diagnostics()["kernels"]
         finally:
             OT._cond_dest, OT._init_alias, CG.Emitter.elementwise_self = saved
+            CG.INPLACE = True
             CB._KERNELS.clear()
             _P._EAGER.clear()
         src = open(ks[-1]["source"]).read() if ks else ""
         return r, len(re.findall(r"\b(?:float|double) \w+\[32\];", src))
-    (ra, na), (ro, no), (rc, nc), (rl, _) = run("cuda"), run("cuda", off=True), run("cuda", _cuda_inplace=False), \
+    (ra, na), (ro, no), (rc, nc), (rl, _) = run("cuda"), run("cuda", off=True), run("cuda", inplace=False), \
         run("xla")
     if not na < no:
         raise Fail(f"instrument: {na} 32-element arrays declared with buffer assignment, {no} with the rule off")

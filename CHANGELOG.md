@@ -30,6 +30,15 @@ Error messages name the call the user wrote (`t.add(...)`, `t.spawn`) instead of
 for a tangent (or cotangent) direction of a dual-lanes kernel, "reference" only for `tm.reference`, one name pair
 for the schedules ("item schedule" / "step schedule"), and the spelling "materialise".
 
+### Removed (private options)
+
+- Every private option: `_cuda_inplace`, `_lanes`, `_fold`, `_rev_sparse_min` and `_rev_nodense` (and, above,
+  `_schedule`, `_rev_gen_capacity`, `_tree_neg`). They were A/B and negative-control switches for the tests and
+  benchmarks. They are now TEST-ONLY module constants that the library never sets: `codegen.INPLACE`,
+  `_primitive.LANES`, `_primitive.FOLD`, `_reverse.SPARSE_MIN`, `_reverse.NODENSE` (the tests set them with
+  `tests/ab_rule.patched`, which also clears the eager-call cache). `tm.vmap` takes the six public options only;
+  any other name raises.
+
 ### Changed (tree adjoint)
 
 - Its private options `_rev_gen_capacity` and `_tree_neg` are now the test-only module constants

@@ -3,10 +3,11 @@ env: BACKENDS=xla,cuda  TEST_X64=1  ONLY=substr
 
 docs: the consolidation plan's section 9 ("fundamental tests") -- the suite that makes removing internal paths safe.
 Sections (cell name prefixes):
-  [sched]  schedule invariance: schedule step/item (also through spawn), _fold, _lanes chunking under jacfwd
-           (T = 1/16/17/33, MAX_LANES = 16), _cuda_inplace, xla vs cuda, item order.  BITWISE wherever the
-           arithmetic is the same program (fixed-point and integer tallies, per-item results); a float tally is a sum
-           whose ORDER the schedule decides, so it is held to the stated reassociation tolerance FT.
+  [sched]  schedule invariance: schedule step/item (also through spawn), _primitive.FOLD, _primitive.LANES
+           chunking under jacfwd (T = 1/16/17/33, MAX_LANES = 16), codegen.INPLACE, xla vs cuda, item order.
+           BITWISE wherever the arithmetic is the same program (fixed-point and integer tallies, per-item results);
+           a float tally is a sum whose ORDER the schedule decides, so it is held to the stated reassociation
+           tolerance FT.
   [key]    cache-key soundness: programs that differ only in a closed-over array's values, a closed-over Python
            scalar, dtype, shape, an option, max_steps or table contents never share a compiled program (one process,
            one fresh TALLYMAP_CUDA_CACHE).  NEGATIVE CONTROLS: the same pairs under a deliberately coarse key
@@ -51,13 +52,14 @@ if os.environ.get("TEST_X64"):
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
-from ab_rule import assert_arms_differ  # noqa: E402
+from ab_rule import assert_arms_differ, patched  # noqa: E402
 from jax import lax  # noqa: E402
 
 import tallymap as tm  # noqa: E402
 from tallymap import _diagnostics as _D  # noqa: E402
 from tallymap import _primitive as _P  # noqa: E402
 from tallymap import reference  # noqa: E402
+from tallymap.backends.cuda import codegen as _CG  # noqa: E402
 
 if os.environ.get("TX_UNFUSED") == "1":                 # run_all --unfused: the two-node jvp design
     _P.FUSE_JVP = False
@@ -226,7 +228,7 @@ def kernel_hashes():
 # =================================================================================================== [sched]
 # A divergent walk: the trip count is decided by the item's RNG bits (integer-exact, so every backend takes the same
 # path), a table read per step, emits into a float tally Q, an integer tally C and (where supported) a fixed-point tally
-# E, a per-item array h updated in place every step (the _cuda_inplace path), and per-item results (w, k, h).  The
+# E, a per-item array h updated in place every step (the codegen.INPLACE path), and per-item results (w, k, h).  The
 # emitted weights use only IEEE +, * (no div / sqrt / transcendental), so cuda_math does not enter and the fixed-point
 # tally can be compared bitwise across compilers.
 N1 = 37
@@ -248,7 +250,7 @@ def mk_walk(fixed_point):
             if fixed_point:
                 t = t.add("E", i, v)
             # two dynamic_update_slices: the first copies the loop carry (a carry is never mutated), the second
-            # updates that fresh copy IN PLACE -- the path _cuda_inplace=False switches off
+            # updates that fresh copy IN PLACE -- the path codegen.INPLACE = False switches off
             j = i % 4
             h = lax.dynamic_update_index_in_dim(h, h[j] + v, j, 0)
             h = lax.dynamic_update_index_in_dim(h, h[(j + 1) % 4] * 0.5, (j + 1) % 4, 0)
@@ -351,12 +353,16 @@ def _(b):
     return agree(res["step"], res["item"], "step vs item through spawn") + f"; schedules {ran}"
 
 
-@case("[sched] _cuda_inplace on == off (cuda)", ["cuda"])
+@case("[sched] codegen.INPLACE on == off (cuda)", ["cuda"])
 def _(b):
-    fa, fb = walk_fn(b), walk_fn(b, _cuda_inplace=False)
+    f = walk_fn(b)
     th = th_of(3)
-    assert_arms_differ(lambda t: fa(XS, KEYS, TAB, t).per_item[2], lambda t: fb(XS, KEYS, TAB, t).per_item[2], th)
-    return agree(fa(XS, KEYS, TAB, th), fb(XS, KEYS, TAB, th), "inplace on vs off")
+    g = lambda t: f(XS, KEYS, TAB, t).per_item[2]
+    assert_arms_differ(g, g, th, patch_b=(_CG, dict(INPLACE=False)))
+    A = f(XS, KEYS, TAB, th)
+    with patched(_CG, INPLACE=False):
+        B = f(XS, KEYS, TAB, th)
+    return agree(A, B, "inplace on vs off")
 
 
 @case("[sched] xla == cuda (fixed-point/int bitwise, float to tol)", ["cuda"])
@@ -383,18 +389,19 @@ def _(b):
     return m + ("; fixed-point E bitwise" if "E" in A.outputs else "; (no fixed-point tally: xla without x64)")
 
 
-@case("[sched] _fold on == off under jax.vmap of tm.vmap")
+@case("[sched] _primitive.FOLD on == off under jax.vmap of tm.vmap")
 def _(b):
     # fixed-point outputs are never folded (_can_fold: stats['fixed_point_overflow'] is per launch): this program has
     # none
     ths = jnp.stack([th_of(3) * s for s in (1.0, 1.1, 0.95)])
-    fo, fn = walk_fn(b, fixed_point=False), walk_fn(b, fixed_point=False, _fold=False)
-    g = lambda f: jax.jit(jax.vmap(lambda th: f(XS, KEYS, TAB, th)))
-    jo, jn = str(jax.make_jaxpr(jax.vmap(lambda th: fo(XS, KEYS, TAB, th)))(ths)), \
-        str(jax.make_jaxpr(jax.vmap(lambda th: fn(XS, KEYS, TAB, th)))(ths))
+    fo = walk_fn(b, fixed_point=False)
+    g = lambda: jax.jit(jax.vmap(lambda th: fo(XS, KEYS, TAB, th)))
+    jx = lambda: str(jax.make_jaxpr(jax.vmap(lambda th: fo(XS, KEYS, TAB, th)))(ths))
+    jo, A = jx(), g()(ths)
+    with patched(_P, FOLD=False):
+        jn, B = jx(), g()(ths)
     if "folded_batch" not in jo or "folded_batch" in jn:
-        raise Fail(f"instrument: folded in default {'folded_batch' in jo}, in _fold=False {'folded_batch' in jn}")
-    A, B = g(fo)(ths), g(fn)(ths)
+        raise Fail(f"instrument: folded in default {'folded_batch' in jo}, with FOLD=False {'folded_batch' in jn}")
     m = agree(A, B, "fold vs no fold")
     for j in range(ths.shape[0]):                       # and the meaning: member j == the unbatched call at ths[j]
         Cj = fo(XS, KEYS, TAB, ths[j])
@@ -402,13 +409,11 @@ def _(b):
     return m + "; every member == its unbatched call"
 
 
-LANE_VARIANTS = [("auto", {}), ("off", dict(_lanes="off")), ("chunk4", dict(_lanes=4)), ("chunk16", dict(_lanes=16)),
-                 ("force", dict(_lanes="force"))]
+LANE_VARIANTS = [("auto", "auto"), ("off", "off"), ("chunk4", 4), ("chunk16", 16), ("force", "force")]   # LANES
 
 
-def _chunk(b, T, opts):
-    """the dual-lane width _primitive._dual_lanes picks (None: no lanes)"""
-    mode = opts.get("_lanes", "auto")
+def _chunk(b, T, mode):
+    """the dual-lane width _primitive._dual_lanes picks under _primitive.LANES = mode (None: no lanes)"""
     if mode == "off":
         return None
     if isinstance(mode, int):
@@ -424,17 +429,18 @@ for T in (1, 16, 17, 33):
         th0 = th_of(T)
         ref = None
         msgs = []
-        for name, opts in LANE_VARIANTS:
-            f = walk_fn(b, **opts)
+        f = walk_fn(b)
 
-            def g(th, f=f):
-                r = f(XS, KEYS, TAB, th)
-                return {k: v for k, v in r.outputs.items() if k != "C"}, (r.per_item[0], r.per_item[2])
-            want = _chunk(b, T, opts)
-            got = set(int(x) for x in re.findall(r"dual_lanes(\d+)", str(jax.make_jaxpr(jax.jacfwd(g))(th0))))
+        def g(th):
+            r = f(XS, KEYS, TAB, th)
+            return {k: v for k, v in r.outputs.items() if k != "C"}, (r.per_item[0], r.per_item[2])
+        for name, mode in LANE_VARIANTS:
+            want = _chunk(b, T, mode)
+            with patched(_P, LANES=mode):
+                got = set(int(x) for x in re.findall(r"dual_lanes(\d+)", str(jax.make_jaxpr(jax.jacfwd(g))(th0))))
+                J = jax.jit(jax.jacfwd(g))(th0)
             if got != ({want} if want else set()):
                 raise Fail(f"instrument: {name} built dual lanes {sorted(got)}, expected {want}")
-            J = jax.jit(jax.jacfwd(g))(th0)
             if ref is None:      # the meaning: column j of the Jacobian is jax.jvp along e_j (one launch each)
                 jv = jax.jit(lambda th, v, g=g: jax.jvp(g, (th,), (v,))[1])
                 cols = [jv(th0, jnp.zeros((T,), F).at[j].set(1)) for j in range(T)]

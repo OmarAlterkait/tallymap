@@ -25,7 +25,7 @@ Only ACTIVE float carries are differentiated in a step VJP: a carry is active if
 operand of the loop (a fixpoint over the body, probed with JAX's own symbolic zeros).  Tally carries get a
 pass-through cotangent (emit is additive), so no dense per-item cotangent of an output is ever formed.
 
-Sparse table cotangents: a perturbed broadcast operand with >= sparse_min elements that is read only by
+Sparse table cotangents: a perturbed broadcast operand with >= SPARSE_MIN elements that is read only by
 gather / dynamic_slice / slice (through pjit, loops, cond and scan) never gets a dense per-item cotangent.  Each
 read is rewritten into a custom_vjp `tread` that threads a cotangent token (a virtual tally) linearly through
 the item: the transpose of a read is an emit of the read's cotangent at the flat indices it read, i.e. an
@@ -52,26 +52,26 @@ from ._tally import emit_p
 
 FLOAT0 = jax.dtypes.float0
 LAST = {}          # what the last vjp_prog / checkpointed_while built (instrument checks in tests and benchmarks)
+SPARSE_MIN = 32    # tables of >= this many elements get sparse (emitted) cotangents (tests patch it, like codegen.FILL)
+NODENSE = False    # TEST-ONLY NEGATIVE CONTROL: drop the dense detection of mixed-use tables (a wrong gradient)
 
 
 @dataclasses.dataclass(frozen=True)
 class RevOpts:
     checkpoints: int = 0       # C: states per checkpoint buffer (public option rev_checkpoints); 0 = auto_checkpoints
-    sparse_min: int = 32       # tables with >= this many elements get sparse (emitted) cotangents (private)
     single: bool = False       # T3: the top-level loop's adjoint is ONE while loop (checkpointed_while_single); set
                                # by vjp_prog only for a program it folded (fold_post)
     probe: tuple = None        # T3: (probe carry, truncation carry) of the folded loop (fold_post)
 
 
 def rev_opts(opts=None):
-    """RevOpts from the tallymap.vmap option rev_checkpoints (public: an int >= 1, or 'auto' / None) and
-    _rev_sparse_min (private)."""
+    """RevOpts from the tallymap.vmap option rev_checkpoints (an int >= 1, or 'auto' / None)."""
     if isinstance(opts, RevOpts):
         return opts
     opts = dict(opts or {})
     c = opts.get("rev_checkpoints")
     auto = c is None or (isinstance(c, str) and c == "auto")
-    r = RevOpts(checkpoints=0 if auto else int(c), sparse_min=int(opts.get("_rev_sparse_min", 32)))
+    r = RevOpts(checkpoints=0 if auto else int(c))
     if not auto and r.checkpoints < 1:
         raise ValueError("tallymap: rev_checkpoints must be >= 1 (or 'auto' / None)")
     return r
@@ -891,7 +891,7 @@ def vjp_prog(p, pert_pi, pert_bc, opts=None):
     tav, pav, bav = av[:nT], av[nT:nT + nP], av[nT + nP:]
     size = lambda i: int(np.prod(bav[i].shape, dtype=np.int64))
     flat_aval = lambda i: jax.ShapeDtypeStruct((size(i),), bav[i].dtype)
-    big = [i for i in ib if size(i) >= o.sparse_min]
+    big = [i for i in ib if size(i) >= SPARSE_MIN]
     tables = {nT + nP + sh + i: k for k, i in enumerate(big)}
     dense = set()
     if big:                                   # trace-time pass: which tables have non-read (dense) uses
@@ -899,7 +899,7 @@ def vjp_prog(p, pert_pi, pert_bc, opts=None):
         jax.make_jaxpr(retrace(pc_.cj, rev=o, n_tally=nT, tables=tables, report=rep))(
             *[_sds(a) for a in pc_.in_avals()], *[flat_aval(i) for i in big])
         dense = {big[k] for k in rep["dense"]}
-        if dict(opts or {}).get("_rev_nodense"):               # NEGATIVE CONTROL ONLY: drop the dense uses
+        if NODENSE:                                            # NEGATIVE CONTROL ONLY: drop the dense uses
             dense = set()
     big = [i for i in big if i not in dense]  # a table with any other use is differentiated densely for ALL uses
     tables = {nT + nP + sh + i: k for k, i in enumerate(big)}

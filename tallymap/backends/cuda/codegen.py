@@ -31,6 +31,9 @@ MAX_LOCAL = 1 << 14  # largest per-thread local array we agree to materialise
 # declaration (Emitter.declare, kernel.build_source's carry / state / result variables) is filled with.  A program
 # that never reads an uninitialised value gives bitwise-equal results for FILL = 0x00 and 0xFF (tests/reverse.py).
 FILL = None
+# TEST-ONLY A/B control of the aliasing analysis: False never updates a per-item array in place (every
+# dynamic_update_slice and scatter copies; the step schedule copies every loop carry).  Part of the kernel key.
+INPLACE = True
 
 
 def fill_decl(n):
@@ -329,7 +332,7 @@ class Emitter:
         self._scopes = []         # active run_jaxpr scopes: (env, remaining uses) -- liveness for in-place updates
         self._frozen = [set()]    # names of Local arrays that must never be mutated (loop consts, function params)
         self.where = ""           # the item function (error messages)
-        self.inplace = True       # False (private _cuda_inplace=False): never update an array in place
+        self.inplace = INPLACE    # False (test-only codegen.INPLACE): never update an array in place
         self._mulmemo = {}        # mul_chain: id(jaxpr) -> (jaxpr, output chain depth)
         self.n_brk = 0            # chain cuts emitted (sj_brk)
 

@@ -250,7 +250,7 @@ def privatised(tallies, budget=PRIV_BYTES):
     return out
 
 
-def build_source(p, *, block=BLOCK, schedule="item", strict=False, inplace=True):
+def build_source(p, *, block=BLOCK, schedule="item", strict=False):
     """-> (CUDA source, Layout).  p: tallymap._api.ItemProgram.  Its jaxpr is first rewritten into the
     canonical primitives (canon.py).  schedule: 'item' (one whole item per thread at a time) | 'step' (the step
     schedule wherever the program splits, else 'item'; strict: raise when it does not split).  Layout.mode is the
@@ -261,7 +261,6 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False, inplace=True)
     p = dataclasses.replace(p, cj=canonical(p.cj))
     em = Emitter()
     em.where = p.where
-    em.inplace = inplace
     L = Layout()
     jx = p.cj.jaxpr
     nT, nP, nB = p.nT, p.nP, p.nB
@@ -392,7 +391,7 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False, inplace=True)
         # body as a mutable reference and updated in place, instead of being rebuilt into n<j> and copied back to
         # k<j> every step (two full copies per step: for the single-loop adjoint's checkpoint buffer, 2C+1 loop
         # states, more traffic than the step itself).  Small carries keep the copy (their code is unchanged).
-        ipc = {j for j, x in enumerate(kvals) if inplace and isinstance(x, Local) and x.shape != ()
+        ipc = {j for j, x in enumerate(kvals) if em.inplace and isinstance(x, Local) and x.shape != ()
                and _size(x.shape) >= STEP_INPLACE_MIN}
         pkb = [(_decl(f"w{j}", tuple(x.shape), x.dtype, const=False), _val(f"w{j}", tuple(x.shape), x.dtype,
                 x.key_impl), f"k{j}") if j in ipc else q for j, (x, q) in enumerate(zip(kvals, pk))]

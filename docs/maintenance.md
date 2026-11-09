@@ -102,7 +102,7 @@ deliberate: it is what makes an upgrade a bounded job.
 | `UNROLL` / `MAX_LOCAL` | 32 / 16384 elements | `backends/cuda/codegen.py` | L40S and 2080 Ti: compile time against local memory |
 | `LAZY_GATHER` | 16 elements | `backends/cuda/op_table.py` | L40S and 2080 Ti: at 0 (every gather materialised) LUCiD's forward needs 108,160 B of local memory per thread instead of 68,048 and DTRAX's 255,840 B, and both fail to launch (out of memory) |
 | `rev_checkpoints` default (`T3_MIN_EQNS`, `AUTO_C_SMALL`, `AUTO_CKPT_BYTES`, `LEAN_C`) | 'auto': 16 for a step under 1000 equations, else up to 64 within 64 KiB; 16 at second order | `_reverse.py` | L40S: lumen SK / SBND / ANNIE (306-318 B states) 1.3-1.6x faster at 64; `vs_jax` (8-25 B) 1.5-3x slower at 64 |
-| `sparse_min` | 32 elements | `_reverse.py` | L40S, toy walk |
+| `SPARSE_MIN` | 32 elements | `_reverse.py` | L40S, toy walk |
 | `MIN_BUCKET` (tree adjoint) | 256 | `_reverse_spawn.py` | L40S |
 | xla `BLOCK` (`xla_batch_size` default) | 2^18 items | `backends/xla.py` | CPU and L40S, memory bound |
 | `EAGER_CACHE` | 64 programs | `_primitive.py` | the eager-call jit cache size |

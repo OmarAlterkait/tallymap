@@ -220,19 +220,12 @@ def _out_tallies(p):
 
 
 # ------------------------------------------------------------------------------------------- vmap
-_OPTS = {
-    # public
+_OPTS = {                  # the public options; measurement switches and negative controls are module constants
     "cuda_math": "cuda backend, f32 div/sqrt: 'approx' (default) | 'ieee'",
     "schedule": "cuda backend: 'item' (default: a thread runs whole items) | 'step' (refill at loop-step granularity)",
     "xla_batch_size": "xla backend: items per batch",
     "rev_checkpoints": "reverse mode: checkpoint buffer size C (default 'auto': from the loop state's size)",
     "rev_stats": "reverse through spawn: report the tree adjoint's stats to the host (costs jit's fast path)",
-    # PRIVATE (measurements / tests / negative controls; not API)
-    "_cuda_inplace": "cuda: False never updates a per-item array in place (A/B control of the aliasing analysis)",
-    "_lanes": "'off' never dual lanes | 'force' ignore the local-memory guard | int: chunks of at most this many lanes",
-    "_fold": "False: never fold a batch into the item axis",
-    "_rev_sparse_min": "smallest table (elements) that gets sparse emitted cotangents (default 32)",
-    "_rev_nodense": "NEGATIVE CONTROL: drop the dense detection of mixed-use tables",
 }
 BACKENDS = ("auto", "cuda", "xla")
 
@@ -266,8 +259,8 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                rev_stats          reverse through spawn: report the tree adjoint's stats to the host
                                   (tallymap.diagnostics()['reverse']).  Off by default: a host callback takes jax.jit
                                   off its C++ fast path.  A failed check makes the gradient NaN either way.
-               Underscored options are PRIVATE (measurements and negative controls; listed in _OPTS).  Any other
-               name raises.
+               Any other name raises (there are no private options: measurement switches and negative
+               controls are test-only module constants, e.g. codegen.FILL, _primitive.LANES).
     The returned function takes the mapped/broadcast args, plus optionally n_active=<traced int>: only items
     i < n_active run (fixed capacity N, varying active count: no retrace / recompile).  Items i >= n_active do
     nothing, so they never count as truncated.
@@ -294,7 +287,7 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
     bad = sorted(set(opts) - set(_OPTS))
     if bad:
         raise ValueError(f"tallymap: unknown option(s) {bad}; options are "
-                         + ", ".join(k for k in _OPTS if not k.startswith("_")))
+                         + ", ".join(_OPTS))
     if opts.get("schedule", "item") not in ("item", "step"):
         raise ValueError(f"tallymap: schedule must be 'item' or 'step', got {opts['schedule']!r}")
     if backend not in BACKENDS:
