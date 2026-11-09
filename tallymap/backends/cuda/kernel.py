@@ -450,10 +450,18 @@ def build_source(p, *, block=BLOCK, split=True, inplace=True):
         if s.exact:
             gp = f"((u64*)P.p[{L.r_scr[k]}])"
             sc = float(s.scale)
+            # an emit that cannot be represented is dropped, counted, and flags its bin (u32 flags after the
+            # accumulators): post makes a flagged bin NaN, so each output (primal or tangent, any node) is poisoned
+            # by its own overflows only
+            fl = f"((u32*)P.p[{L.r_scr[k]}] + {2 * tot})"
             src.append(f"__device__ __forceinline__ void sj_emit{k}(const SjParams& P, u64* a, i64 i, {ot} v) {{ "
                        f"const double x = (double)v * {sc!r}; if (!(fabs(x) < 9.2e18)) {{ atomicAdd(&SJ_STATS[3], 1); "
-                       f"return; }} atomicAdd((unsigned long long*)&a[i], (unsigned long long)__double2ll_rn(x)); }}")
-            post.append(f"for (i64 i = g; i < {tot}; i += s) {dst}[i] = ({ot})(((double)(i64){gp}[i]) * {1.0 / sc!r});")
+                       f"{fl}[i] = 1u; return; }} "
+                       f"atomicAdd((unsigned long long*)&a[i], (unsigned long long)__double2ll_rn(x)); }}")
+            val = f"((double)(i64){gp}[i]) * {1.0 / sc!r}"
+            if ot in ("float", "double"):
+                val = f"{fl}[i] ? __longlong_as_double(0x7ff8000000000000LL) : {val}"
+            post.append(f"for (i64 i = g; i < {tot}; i += s) {dst}[i] = ({ot})({val});")
             op = lambda a, i, v: f"atomicAdd((unsigned long long*)&{a}[{i}], (unsigned long long){v});"
         elif ot in ("i64", "u64"):
             gp = f"((u64*)P.p[{L.r_out[k]}])"

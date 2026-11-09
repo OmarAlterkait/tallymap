@@ -8,6 +8,7 @@ children are queued in a ring buffer and run in later blocks (children first).
 """
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.extend.core import Literal
 
@@ -43,19 +44,21 @@ class _St:
         self.accs = accs                # slot -> array
         self.queue = queue              # None | dict(leaves, head, tail, spawned, dropped)
         self.ovf = jnp.int32(0)         # exact-output overflow count
+        self.bad = {k: jnp.zeros(a.shape, bool) for k, a in accs.items() if p.tallies[k].exact}   # flagged bins
         self.drops = jnp.int32(0)       # out-of-range (dropped) emit indices
         self.mask = None
 
     # ------------------------------------------------------------- state threaded through lax control flow
     def pack(self):
         q = self.queue
-        return (tuple(self.accs[k] for k in sorted(self.accs)), self.ovf,
+        return (tuple(self.accs[k] for k in sorted(self.accs)), tuple(self.bad[k] for k in sorted(self.bad)), self.ovf,
                 None if q is None else (tuple(q["leaves"]), q["head"], q["tail"], q["spawned"], q["dropped"]),
                 self.drops)
 
     def unpack(self, s):
-        a, self.ovf, q, self.drops = s
+        a, bad, self.ovf, q, self.drops = s
         self.accs = dict(zip(sorted(self.accs), a))
+        self.bad = dict(zip(sorted(self.bad), bad))
         if q is not None:
             self.queue = dict(leaves=list(q[0]), head=q[1], tail=q[2], spawned=q[3], dropped=q[4])
 
@@ -89,6 +92,7 @@ def _emit(st, t, idx, val):
         v, ok = _fixed(v, spec.scale)
         live = jnp.broadcast_to(f < S, ok.shape)
         st.ovf = st.ovf + jnp.sum((~ok & live).astype(jnp.int32), dtype=jnp.int32)
+        st.bad[t.slot] = st.bad[t.slot].at[..., f].max(~ok, mode="drop")        # a bin that dropped an emit
     else:
         v = v.astype(a.dtype)
     st.accs[t.slot] = a.at[..., f].add(v, mode="drop")
@@ -347,7 +351,7 @@ def run(p, pi, bc, lockstep_block=None, **_):
         return ys, ctr
 
     if N == 0 and queue is None:
-        return _finish(p, accs, None, ys0, st.ovf, st.drops)
+        return _finish(p, accs, None, ys0, st)
     if queue is None:
         nblk = -(-N // P)
 
@@ -364,12 +368,12 @@ def run(p, pi, bc, lockstep_block=None, **_):
         else:
             packed, ys = lax.fori_loop(0, nblk, body, (st.pack(), ys0))
         st.unpack(packed)
-        return _finish(p, st.accs, None, ys, st.ovf, st.drops)
+        return _finish(p, st.accs, None, ys, st)
 
     # spawn: children (queued) first, then primaries
     def cond_s(s):
         nxt, packed, ys, ctr = s
-        return (nxt < N) | (packed[2][2] > packed[2][1])
+        return (nxt < N) | (packed[3][2] > packed[3][1])
 
     def body_s(s):
         nxt, packed, ys, ctr = s
@@ -393,18 +397,22 @@ def run(p, pi, bc, lockstep_block=None, **_):
     _, packed, ys, ctr = lax.while_loop(cond_s, body_s, (jnp.int32(0), st.pack(), ys0, jnp.int32(0)))
     st.unpack(packed)
     q = st.queue
-    return _finish(p, st.accs, (q["spawned"], q["dropped"], ctr), ys, st.ovf, st.drops)
+    return _finish(p, st.accs, (q["spawned"], q["dropped"], ctr), ys, st)
 
 
 def _lm(m, x):
     return m.reshape(m.shape + (1,) * (x.ndim - 1))
 
 
-def _finish(p, accs, sp, ys, ovf, drops):
+def _finish(p, accs, sp, ys, st):
     out = []
     for k, s in enumerate(p.tallies):
         if s.kind == "sum":
             a = accs[k]
-            out.append((a.astype(jnp.float64) / s.scale).astype(s.dtype) if s.exact else a)
+            if s.exact:                       # a bin that dropped an emit is NaN (as on cuda)
+                a = (a.astype(jnp.float64) / s.scale).astype(s.dtype)
+                if jnp.issubdtype(s.dtype, jnp.floating):
+                    a = jnp.where(st.bad[k], jnp.asarray(np.nan, s.dtype), a)
+            out.append(a)
     sp = sp if sp is not None else (jnp.int32(0),) * 3
-    return out + [jnp.stack([jnp.asarray(x, jnp.int32) for x in (*sp, ovf, drops)])] + list(ys)
+    return out + [jnp.stack([jnp.asarray(x, jnp.int32) for x in (*sp, st.ovf, st.drops)])] + list(ys)

@@ -711,7 +711,7 @@ def _(b):
     return f"12-element arrays: {n_in} in place, {n_cp} copying"
 
 
-@case("exact=True: order-independent, run-to-run bitwise; overflow counted and poisons the exact sums")
+@case("exact=True: order-independent, run-to-run bitwise; overflow counted, poisons its own bin (primal and tangent)")
 def _(b):
     if b == "lockstep" and not jax.config.jax_enable_x64:
         raises(NotImplementedError, lambda: tm.vmap(walk, outputs={"Q": tm.Sum((NB,), F, exact=True)}, in_axes=AX,
@@ -729,24 +729,77 @@ def _(b):
     big = tm.vmap(lambda t, x: t.add("Q", 0, x * 1e15), outputs=out, backend=b)(x2)
     if int(big.stats["exact_overflow"]) != n:
         raise Fail(f"overflow count {int(big.stats['exact_overflow'])} != {n}")
-    # an overflow is a resource limit: every exact float output is NaN (also its tangent); a non-exact one is not
+    # an overflow poisons the BIN it was emitted to, nothing else: other bins, other exact outputs and non-exact
+    # outputs stay as they are
     mix = {"Q": tm.Sum((NB,), F, exact=True, scale=2.0 ** 20), "E": tm.Sum((2,), F, exact=True, scale=2.0 ** 20),
            "P": tm.Sum((1,), F)}
 
     def ovf(t, x, s):
-        return t.add("Q", 0, x * s).add("E", 1, x).add("P", 0, x)
+        return t.add("Q", 0, x * s).add("Q", 1, x).add("E", 1, x).add("P", 0, x)
     g = tm.vmap(ovf, outputs=mix, in_axes=(0, None), backend=b)
     r = g(x2, F(1e15))
-    if not (np.isnan(np.asarray(r.outputs["Q"])).all() and np.isnan(np.asarray(r.outputs["E"])).all()):
-        raise Fail(f"exact_overflow={int(r.stats['exact_overflow'])} did not poison the exact sums: "
-                   f"Q {np.asarray(r.outputs['Q'])[:2]} E {np.asarray(r.outputs['E'])}")
+    q = np.asarray(r.outputs["Q"])
+    if not (np.isnan(q[0]) and np.isfinite(q[1:]).all() and np.isfinite(np.asarray(r.outputs["E"])).all()):
+        raise Fail(f"exact_overflow={int(r.stats['exact_overflow'])}: want only Q[0] NaN, got Q {q[:3]} "
+                   f"E {np.asarray(r.outputs['E'])}")
     close(r.outputs["P"][0], float(x2.sum()))
-    tan = jax.jvp(lambda s: g(x2, s).outputs["Q"], (F(1e15),), (F(1),))[1]
-    if not np.isnan(np.asarray(tan)).all():
-        raise Fail("the tangent of an overflowed exact sum is not NaN")
     ok = g(x2, F(1.0))
     if int(ok.stats["exact_overflow"]) != 0 or not np.isfinite(np.asarray(ok.outputs["Q"])).all():
         raise Fail("an exact call with no overflow was poisoned")
+    return _tangent_overflow(b, x2) + "; " + _f32_bins(b, x2, k2)
+
+
+def _tangent_overflow(b, x2):
+    """(G7) only the TANGENT overflows: emit x*(s0-1)*1e15 + x*s1 at s = (1, 1) -> primal x (finite), tangent
+    column 0 x*1e15 (unrepresentable), column 1 x.  On every jvp path the column-0 tangent bin is NaN, the column-1
+    bin and every primal bin are finite, and the primal is bitwise the plain call's."""
+    from tallymap import _primitive as P_
+    out = {"Q": tm.Sum((NB,), F, exact=True, scale=2.0 ** 20)}
+    s0 = jnp.ones((2,), F)
+    eye = jnp.eye(2, dtype=F)
+
+    def mk(**o):
+        g = tm.vmap(lambda t, x, s: t.add("Q", 0, x * (s[0] - 1) * 1e15 + x * s[1]), outputs=out,
+                    in_axes=(0, None), backend=b, **o)
+        return lambda s: g(x2, s).outputs["Q"]
+    ref = np.asarray(mk()(s0))
+    if not np.isfinite(ref).all():
+        raise Fail(f"the primal overflowed: {ref[:2]}")
+
+    def check(nm, prim, tans):
+        prim, tans = np.asarray(prim), np.asarray(tans)
+        if not np.array_equal(prim, np.broadcast_to(ref, prim.shape)):
+            raise Fail(f"{nm}: primal not bitwise the plain call (finite {np.isfinite(prim).all()})")
+        t0, t1 = tans[0], tans[1] if tans.shape[0] > 1 else None
+        if not (np.isnan(t0[0]) and np.isfinite(t0[1:]).all()):
+            raise Fail(f"{nm}: tangent-only overflow not poisoned in its bin: {t0[:2]}")
+        if t1 is not None:
+            close(t1, ref, what=f"{nm}: column 1")
+    paths = []
+    fused0 = P_.FUSE_JVP
+    try:
+        for fused in (True, False):
+            P_.FUSE_JVP = fused
+            tag = "fused" if fused else "unfused"
+            f = mk()
+            p, t = jax.jvp(f, (s0,), (eye[0],))
+            check(f"jvp {tag}", p, t[None])
+            p, t = jax.vmap(lambda d: jax.jvp(f, (s0,), (d,)))(eye)          # jacfwd's mechanism, with the primal
+            check(f"jacfwd lanes {tag}", p, t)
+            fo = mk(_lanes="off")                                              # lanes refused (DTRAX's regime)
+            p, t = jax.vmap(lambda d: jax.jvp(fo, (s0,), (d,)))(eye)
+            check(f"jacfwd lanes-refused {tag}", p, t)
+            check(f"jacfwd() {tag}", ref, jax.jacfwd(f)(s0).T)
+            p, lin = jax.linearize(f, s0)
+            check(f"linearize {tag}", p, lin(eye[0])[None])
+            paths.append(tag)
+    finally:
+        P_.FUSE_JVP = fused0
+    return "tangent-only overflow poisons its bin, primal bitwise: jvp/jacfwd(lanes, refused)/linearize x " + \
+        "/".join(paths)
+
+
+def _f32_bins(b, x2, k2):
     fl = tm.vmap(walk, outputs={"Q": tm.Sum((NB,), F)}, in_axes=AX, backend=b)
     f1 = np.asarray(fl(x2, k2, tab, TH).outputs["Q"])
     f2 = np.asarray(fl(x2[::-1], k2[::-1], tab, TH).outputs["Q"])

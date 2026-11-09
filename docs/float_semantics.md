@@ -16,7 +16,7 @@ math modes, schedules and JAX versions.
 4. **`Sum(exact=True)` is order-independent and exact.**  Each value is rounded to int64 fixed point
    (`round(v * scale)`) before an integer add: bitwise results across schedules, `vmap`, and the two backends.  On the
    lockstep backend it needs `jax_enable_x64`.  Unrepresentable values are dropped and counted
-   (`stats['exact_overflow']`), and the exact outputs of that call are NaN (a resource limit, like `max_steps`).
+   (`stats['exact_overflow']`), and the bin each was emitted to is NaN (primal and tangent bins each by their own emits).
 5. **Forward, tangent and adjoint share one item program.**  The adjoint replays the same jaxpr with the same options
    (same math), so a replay is bit-exact on the same backend; the replay fingerprint checks it on every reverse call.
 

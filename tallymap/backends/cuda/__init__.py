@@ -111,7 +111,7 @@ def run(p, pi, bc, cuda_math="approx", _schedule=None, _cuda_inplace=True, **_):
     for k in outs:
         if k in L.r_scr:
             s = p.tallies[k]
-            rs.append(jax.ShapeDtypeStruct((2 * int(np.prod(s.lead, dtype=np.int64)) * s.S,), jnp.uint32))  # u64
+            rs.append(jax.ShapeDtypeStruct((3 * int(np.prod(s.lead, dtype=np.int64)) * s.S,), jnp.uint32))  # u64 + flag
     rs.append(jax.ShapeDtypeStruct((2,), jnp.uint32))          # claim counter (u64)
     rs.append(jax.ShapeDtypeStruct((5,), jnp.int32))           # stats
     if p.spawn is not None:
