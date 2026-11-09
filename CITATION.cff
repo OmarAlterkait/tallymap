@@ -6,7 +6,7 @@ authors:
   - given-names: Omar
     family-names: Alterkait
     email: omar.alterkait@tufts.edu
-version: 0.5.0
+version: 0.6.0rc1
 license: Apache-2.0
 repository-code: "https://github.com/OmarAlterkait/tallymap"
 url: "https://github.com/OmarAlterkait/tallymap"
@@ -14,9 +14,8 @@ abstract: >-
   tallymap maps a function over many independent Monte Carlo items, each running its own data-dependent loop,
   and sums their results into commutative tallies. It is one JAX primitive, so jit, vmap, grad, jvp, jacfwd,
   jacrev, hessian and shard_map all compose with it, and a call means exactly jax.vmap of the item followed by a
-  sum. On an NVIDIA GPU the item compiles to a single CUDA kernel in which a lane takes a new item as soon as its
-  current one finishes; on every other platform it runs a masked plain-JAX interpreter that is also the reference
-  implementation. Reverse mode replays each item from its inputs, so gradient memory does not grow with the trip
+  sum. On an NVIDIA GPU the item compiles to a single CUDA kernel in which each thread runs one item at that item's
+  own trip count and then claims the next; on every other platform it runs a masked plain-JAX interpreter. Reverse mode replays each item from its inputs, so gradient memory does not grow with the trip
   count, which is something plain JAX cannot do for a while loop at all.
 keywords:
   - JAX

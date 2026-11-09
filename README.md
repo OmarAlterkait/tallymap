@@ -130,6 +130,10 @@ pip install tallymap                 # CPU: the xla backend, plain JAX
 pip install 'tallymap[cuda]'         # + JAX's CUDA 12 plugin and NVRTC (quote it: zsh treats [] as a glob)
 ```
 
+Pin the minor release in a project that depends on tallymap: `tallymap>=0.6.0rc1,<0.7` (with the `cuda` extra:
+`tallymap[cuda]>=0.6.0rc1,<0.7`). Until 1.0 a minor release may change the API (`CHANGELOG.md`). A specifier
+that names a pre-release, as this one does, lets pip install the release candidate.
+
 A **C++17 compiler is needed once**, the first time you use the GPU backend, to build the `jax.ffi` launch shim.
 It is about 200 lines and the result is cached per toolchain and jaxlib version. If `$CXX` is set it is used.
 
