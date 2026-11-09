@@ -38,10 +38,10 @@ total), so a larger tree poisons the gradient (NaN) and is reported (stats 'drop
 mismatches poison too.  Never silently wrong.
 
 Capacities are derived from the Queue capacity Q (the user sets nothing): the tree holds up to Q children
-(non-root items: exactly the bound under which the forward provably dropped nothing), a generation up to Q (private
-option _rev_gen_capacity lowers it to save memory; a larger generation then poisons: stats 'generation_overflow'),
-depth up to Q.  Generation launches use capacity buckets Cg, Cg/2, Cg/4, ... (>= 256) so a small generation does
-not pay for Cg idle items.  Private _tree_neg ('detach' | 'replay') are the negative controls.
+(non-root items: exactly the bound under which the forward provably dropped nothing), a generation up to Q (a
+larger generation poisons: stats 'generation_overflow'), depth up to Q.  Generation launches use capacity buckets
+Cg, Cg/2, Cg/4, ... (>= 256) so a small generation does not pay for Cg idle items.  The test-only module constants
+GEN_CAPACITY and TREE_NEG (below) lower the generation capacity and select the negative controls.
 Stats of the last tree adjoint (host side, via jax.debug.callback, OPT-IN: rev_stats=True -- a host callback takes
 jax.jit off its C++ dispatch path): tallymap.diagnostics()['reverse']['tree'] (= _reverse_spawn.LAST[-1]).
 Second order through this adjoint raises (the recorded payloads are bit-cast, they carry no tangent).
@@ -60,6 +60,10 @@ U32 = jnp.uint32
 FNV = 16777619
 LAST = []            # host-side stats of executed tree adjoints (appended by a debug callback)
 MIN_BUCKET = 256
+# TEST-ONLY (tests/reverse_spawn.py patches them, like codegen.FILL; never set by the library):
+GEN_CAPACITY = None  # largest generation the tree records (None: the Queue capacity); smaller -> generation_overflow
+TREE_NEG = ""        # NEGATIVE CONTROLS: 'detach' (children's cotangents not injected) | 'replay' (the adjoint
+                     # replays a 1-ulp perturbed item, which the replay fingerprint must catch)
 
 
 # ------------------------------------------------------------------------------------------- words / hash
@@ -116,7 +120,7 @@ def _wsum(x):
 @dataclasses.dataclass(frozen=True, eq=False)
 class Rec:
     cj: object           # rec item jaxpr (forward kernels: count / write)
-    cj_adj: object       # the same, for the adjoint (differs only under the negative control _tree_neg='replay')
+    cj_adj: object       # the same, for the adjoint (differs only under the negative control TREE_NEG='replay')
     us: tuple            # user tally slots of the base prog
     fl: tuple            # float per-item leaves
     ls: tuple            # elements per leaf
@@ -145,7 +149,7 @@ def build_rec(p, Cg, neg=""):
     ls = tuple(_size(a.shape) for a in pav)
     nw = tuple(_nwords(a) for a in pav)
     if Cg * max(ls + nw) >= 2 ** 31:
-        raise ValueError(f"tallymap tree adjoint: rev_gen_capacity {Cg} x leaf size overflows int32 slot indices")
+        raise ValueError(f"tallymap tree adjoint: generation capacity {Cg} x leaf size overflows int32 slot indices")
     nU, nF = len(us), len(fl)
 
     def make(neg_replay):
@@ -232,10 +236,10 @@ def _progs(p, Cg, U_bc, o):
     """(Rec, count ItemProgram, write ItemProgram, adjoint-base ItemProgram, T ItemProgram) for base p; cached on p."""
     from ._reverse import check_slots, vjp_prog
     cache = p.__dict__.setdefault("_tree_cache", {})
-    key = (Cg, tuple(U_bc), tuple(sorted(o.items())))
+    key = (Cg, tuple(U_bc), tuple(sorted(o.items())), TREE_NEG)
     if key in cache:
         return cache[key]
-    R = build_rec(p, Cg, o.get("_tree_neg", ""))
+    R = build_rec(p, Cg, TREE_NEG)
     us_kinds = [p.tallies[k].kind for k in R.us]
     if any(k not in ("sum", "discard") for k in us_kinds):
         raise NotImplementedError("tallymap tree adjoint: unsupported tally kinds " + str(us_kinds))
@@ -293,10 +297,9 @@ def tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N):
     from ._primitive import _float_slots, _inst, bind_call
     o = dict(node.opts)
     Q = int(base.spawn.capacity)
-    Cg = min(int(o.get("_rev_gen_capacity", Q)), Q)
+    Cg = min(int(GEN_CAPACITY or Q), Q)
     TOT = Q                     # all children (non-root items): more than Q -> the forward may have dropped (drop_risk)
     GMAX = Q + 1                # depth <= children + 1: never the binding limit
-    neg = o.get("_tree_neg", "")
     R, count, write, adj, T, pert_pi, pert_bc = _progs(base, Cg, U_bc, o)
     nP, nB = base.nP, base.nB
     av = base.in_avals()
@@ -385,7 +388,7 @@ def tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N):
     def adj_gen(X, cnt, H, b, nact, Gc, cy):
         iid = jnp.arange(b, dtype=jnp.int32)
         cnt = jnp.where(iid < nact, cnt, 0)
-        if neg == "detach":          # NEGATIVE CONTROL ONLY: children's cotangents are not injected
+        if TREE_NEG == "detach":     # NEGATIVE CONTROL ONLY: children's cotangents are not injected
             Gc = [jnp.zeros_like(g_) for g_ in Gc]
         ct = ct_user + [g_.reshape(-1) for g_ in Gc] + [jnp.ones((1,), jnp.float32)]
         outs = call(t_node, list(X) + [_excl_cumsum(cnt), iid, cnt, H, jnp.zeros((b,), jnp.float32)] + list(cy),

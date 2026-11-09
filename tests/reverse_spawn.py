@@ -30,6 +30,7 @@ import jax.numpy as jnp
 from jax import lax
 
 import tallymap as tm
+from tallymap import _reverse_spawn as RS
 
 if os.environ.get("TX_UNFUSED") == "1":                 # run_all --unfused: the two-node jvp design
     from tallymap import _primitive as _P0
@@ -162,9 +163,12 @@ def reference(th, X0, depth=DEPTH + 1, cap=CG):
 
 
 # ------------------------------------------------------------------------------------------- tallymap
-def tallymap_fn(cap_q=QCAP, cg=CG, backend=BK, **neg):
+RS.GEN_CAPACITY = CG          # the test-only generation capacity (TREE_CG); the overflow cell lowers it
+
+
+def tallymap_fn(cap_q=QCAP, backend=BK):
     return tm.vmap(ITEM_TALLYMAP, outputs={"h": tm.Sum((NB,), FT), "soft": tm.Sum((1,), FT)}, in_axes=(0, None),
-                    spawn=tm.Queue(cap_q), backend=backend, _rev_gen_capacity=cg, rev_stats=True, **neg)
+                    spawn=tm.Queue(cap_q), backend=backend, rev_stats=True)
 
 
 rng = np.random.default_rng(0)
@@ -268,14 +272,18 @@ c = cmp(a, b)
 report("reverse(tree) == jacfwd/jvp through spawn", c["max_rel"] < (1e-10 if X64 else 1e-4), **c)
 
 # 4. the tree matters: detached children (cotangents of children not injected) must differ -- NEGATIVE CONTROL
-_, g_d = grad_tallymap(TH, X0, tallymap_fn(_tree_neg="detach"))
+RS.TREE_NEG = "detach"
+_, g_d = grad_tallymap(TH, X0, tallymap_fn())
+RS.TREE_NEG = ""
 c = cmp(g_d, g_r)
 report("NEG detach: detached-children gradient differs from the reference", c["max_rel"] > 1e-3, **c)
 
 # 5. replay fingerprint: the adjoint replays a 1-ulp perturbed item -> mismatches counted, gradient NaN
 #    (NEGATIVE CONTROL)
 tm.diagnostics(reset=True)
-_, g_p = grad_tallymap(TH, X0, tallymap_fn(_tree_neg="replay"))
+RS.TREE_NEG = "replay"
+_, g_p = grad_tallymap(TH, X0, tallymap_fn())
+RS.TREE_NEG = ""
 jax.block_until_ready(g_p)
 st = tm.diagnostics()["reverse"]["tree"]
 report("NEG replay: fingerprint detects a replay that differs from the forward", int(st["replay_mismatch"]) > 0
@@ -283,10 +291,12 @@ report("NEG replay: fingerprint detects a replay that differs from the forward",
 
 # 6. overflow: generation capacity too small -> NaN + overflow flag (never silently wrong)
 tm.diagnostics(reset=True)
-_, g_o = grad_tallymap(TH, X0, tallymap_fn(cg=max(8, max(sizes) // 2)))
+RS.GEN_CAPACITY = max(8, max(sizes) // 2)
+_, g_o = grad_tallymap(TH, X0, tallymap_fn())
+RS.GEN_CAPACITY = CG
 jax.block_until_ready(g_o)
 st = tm.diagnostics()["reverse"]["tree"]
-report("overflow (_rev_gen_capacity < largest generation) -> NaN",
+report("overflow (GEN_CAPACITY < largest generation) -> NaN",
        bool(st["generation_overflow"]) and np.isnan(flat(g_o)).all(),
        generation_overflow=bool(st["generation_overflow"]))
 

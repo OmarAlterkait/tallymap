@@ -447,7 +447,10 @@ deepest first.
 
 Reverse mode costs roughly 3.5 to 10 times the forward pass independent of P, while forward dual lanes cost about
 forward x (1 + alpha P). So the break-even in P is the ratio of those, typically in the tens, and it is worth
-measuring once for your own program. Do not run forward and reverse on one call: `jax.value_and_grad` computes
+measuring once for your own program. Through spawn (the tree adjoint, measured on four spawning programs, L40S)
+the rule depends on whether `jacfwd` gets dual lanes: with lanes it wins up to about 64 parameters; when lanes are
+refused (a large per-lane loop state; `tm.diagnostics()['kernels']` then shows no `dual_lanes` tag) `jacfwd` is
+one launch per parameter and the tree adjoint wins from about 4 parameters (4-24x at 16-64). Do not run forward and reverse on one call: `jax.value_and_grad` computes
 the value once.
 
 Measured `jax.jit` wall time per call on the toy walk of `benchmarks/` (1M items, a 256-bin table, L40S, JAX

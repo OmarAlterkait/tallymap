@@ -61,7 +61,7 @@ below.
 
 Forward mode and `jacfwd` need a `tm.Queue` that holds the pending frontier.  The tree adjoint needs one that
 covers **every** child of the call, which is about 15.5 per index case here.  An undersized Queue does not give
-a wrong answer: the gradient is NaN and `tm.diagnostics()['reverse']['tree']` reports `overflow=1`.  `--quick`
+a wrong answer: the gradient is NaN and `tm.diagnostics()['reverse']['tree']` reports `generation_overflow=1`.  `--quick`
 runs that negative control deliberately and checks both.  The capacities used in the tables are in
 `results/branching_epidemic.json` under `meta.fwd_cap` and `meta.grad_caps`.
 

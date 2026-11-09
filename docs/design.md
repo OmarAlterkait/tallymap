@@ -378,11 +378,25 @@ emitted value AT THE SPAWN STEP, inside the parent's ordinary replay adjoint. No
   `jvp` at the same keys, relative 2.5e-14 in 64-bit. The negative controls (detached children, an adjoint replay
   perturbed by one unit in the last place, a generation bucket smaller than the largest generation, a Queue
   smaller than the tree) all fail as they must.
-- **Cost.** The tree adjoint is expensive: on the shower workload it cost on the order of 70 to 100 times the
-  forward pass, and the break-even against `jacfwd(P)` was at P in the high tens on an L40S and far lower on a
-  2080 Ti. The cost is the adjoint KERNEL, not the tree bookkeeping: that step VJP compiled to the full 255
-  registers with a 13 KB stack frame and several kilobytes of spill stores, where the forward step used about a
-  hundred registers and 56 bytes of stack.
+- **Cost, and when it beats `jacfwd`.** Measured on four spawning programs (`shower`, `toy`, `rs` and `epi` in
+  the records of job 43935229; L40S, JAX 0.5.3, 9 interleaved rounds, an A-vs-A tree arm within 0.7%), the tree
+  adjoint costs a flat 2.4-4.1 times the forward pass, whatever P. Which mode wins depends on whether `jacfwd`
+  gets dual lanes:
+  - **with lanes** (the lane state fits the `LANES_MAX_LOCAL` guard), `jacfwd(P)` runs P lanes in one kernel and
+    wins up to about P = 64: jacfwd / tree = 0.14-0.35 at P = 16 and 0.56-1.43 at P = 64;
+  - **with lanes refused** (a large lane state, as in DTRAX: about 1,400-5,000 f64 per lane), `jacfwd(P)` is one
+    full launch per direction and the tree adjoint wins from about P = 4: jacfwd / tree = 1.24-1.85 at P = 4,
+    4.1-6.0 at P = 16 and 16-24 at P = 64.
+  An earlier engine measurement (70 to 100 times the forward pass on a shower step VJP with 255 registers and a
+  13 KB frame) was the adjoint kernel of that engine, not the tree bookkeeping.
+- **Replay fingerprint: kept.** The per-item replay check was removed from production because `tests/reverse.py`
+  "REPLAY GATE" gates per-item replay deterministically. The tree adjoint's own check (`fwd_mismatch`: the count
+  and write passes agree on each item's child count and hash; `replay_mismatch`: the adjoint's replay of a
+  generation agrees with the write pass) is not covered by that gate: the gate exercises `vjp_prog` on items that
+  do not spawn, while the tree adjoint also depends on two different forward kernels agreeing and on child states
+  decoded from recorded payloads, and `tests/reverse_spawn.py`'s gradient comparisons (2,000 ulp in f32) cannot see
+  a replay that differs by one ulp. Until a gate of the same kind covers the tree, the check stays. It adds no
+  launch (the hash rides on the count, write and adjoint passes); its arithmetic cost was not measured.
 
 ## 5. Fewer knobs
 

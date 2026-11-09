@@ -233,8 +233,6 @@ _OPTS = {
     "_fold": "False: never fold a batch into the item axis",
     "_rev_sparse_min": "smallest table (elements) that gets sparse emitted cotangents (default 32)",
     "_rev_nodense": "NEGATIVE CONTROL: drop the dense detection of mixed-use tables",
-    "_rev_gen_capacity": "tree adjoint: largest generation (default Queue capacity; memory lever)",
-    "_tree_neg": "NEGATIVE CONTROL of the tree adjoint: 'detach' | 'replay'",
 }
 BACKENDS = ("auto", "cuda", "xla")
 

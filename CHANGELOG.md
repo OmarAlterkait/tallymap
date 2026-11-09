@@ -30,6 +30,17 @@ Error messages name the call the user wrote (`t.add(...)`, `t.spawn`) instead of
 for a tangent (or cotangent) direction of a dual-lanes kernel, "reference" only for `tm.reference`, one name pair
 for the schedules ("item schedule" / "step schedule"), and the spelling "materialise".
 
+### Changed (tree adjoint)
+
+- Its private options `_rev_gen_capacity` and `_tree_neg` are now the test-only module constants
+  `_reverse_spawn.GEN_CAPACITY` and `_reverse_spawn.TREE_NEG` (like `codegen.FILL`); passing either option raises.
+- Its replay fingerprint (`fwd_mismatch`, `replay_mismatch`) is kept: unlike the per-item replay check, no
+  deterministic gate covers it yet (`docs/design.md` section 4).
+- The docs give the measured rule for reverse versus forward mode through spawn (L40S, job 43935229): with dual
+  lanes `jacfwd` wins up to about 64 parameters; when lanes are refused the tree adjoint wins from about 4
+  parameters (4-24x at 16-64). The tree adjoint costs 2.4-4.1 times the forward pass on the four programs
+  measured.
+
 ### Changed (schedule)
 
 - The cuda schedule is a public option, `schedule='item' | 'step'`, and the default is `'item'` (a thread runs
