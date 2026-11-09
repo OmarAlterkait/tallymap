@@ -53,6 +53,7 @@ class Kernel:
         if math not in MATH_OPTS:
             raise ValueError("tallymap: cuda_math must be 'ieee' or 'approx'")
         cubin, self.info = C.compile_cubin(self.src, C.device_arch(), MATH_OPTS[math])
+        C.check_frame(cubin, p.where)            # run-or-raise: over CUDA's per-thread local limit never launches
         self.kid = C.register_kernel(cubin)
 
 

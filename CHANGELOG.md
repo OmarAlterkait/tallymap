@@ -161,6 +161,10 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Fixed
 
+- cuda: a kernel whose per-thread local memory (the item's frame: per-item arrays and register spills) is over
+  CUDA's 512 KiB per-thread limit raises `UnsupportedError` before its first launch, naming the bytes, the limit
+  and the item function. The frame is read from the cubin's own `.nv.info` records, so no launch is needed. It
+  failed in the launch with `CUDA driver error 1: invalid argument` (DTRAX `sEM1_lar_e`, 557,248 B per thread).
 - An error re-raised with the item function and source line appended (tally misuse, unsupported operations)
   keeps every attribute of the original exception; it kept only the message. No library exception carries one
   today; the private engine line lost `CodegenError.nbytes` this way (8fe2295).

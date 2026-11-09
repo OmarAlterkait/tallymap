@@ -121,7 +121,9 @@ derivatives with spawn give children tangents for every float per-item leaf. Rev
   the advice to pass `backend='lockstep'`, because a silent change to the reference interpreter is a silent
   factor-of-100 slowdown. On every other platform it is lockstep with a one-time warning. `backend='cuda'` raises
   the same way. Compile errors from NVRTC (NVIDIA's runtime CUDA compiler) are
-  bugs and raise. Effects, such as `jax.debug.print` or an input/output callback, raise on both backends.
+  bugs and raise. A compiled kernel whose per-thread local memory is over CUDA's 512 KiB per-thread limit raises
+  `UnsupportedError` with the bytes and the limit before it is launched (`compile.check_frame`, read from the
+  cubin's `.nv.info` records); the driver would refuse it with `invalid argument`. Effects, such as `jax.debug.print` or an input/output callback, raise on both backends.
 - N, the number of items, is a runtime kernel argument: neither the compiled kernel nor the in-memory kernel cache
   key contains it. One call takes fewer than 2^31 items.
 - `Sum(exact=True)`: int64 fixed point, `round(v * scale)`, with one scale per output. Unrepresentable values,

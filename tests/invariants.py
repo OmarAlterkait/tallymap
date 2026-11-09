@@ -1045,6 +1045,43 @@ for S in (8, 64, 512, 2048):
         return f"{m}; {_res_str(res)}" if b == "cuda" else m
 
 
+FRAME_K, FRAME_S = 12, 16384      # 12 live per-item arrays of 16,384 floats: >= 768 KiB of local memory per thread
+
+
+def frame_item(t, x, key):
+    """FRAME_K per-item arrays, each updated at a data-dependent index every step and read back at another: all
+    of them live in per-thread local memory at once, over CUDA's 512 KiB per-thread limit"""
+    L = 3 + (bits(key, 0) % 4).astype(jnp.int32)
+
+    def body(c):
+        k, hs, t = c
+        hs = tuple(h.at[(k * (j + 3) + 1) % FRAME_S].set(h[(k * (j + 5)) % FRAME_S] * 0.5 + x)
+                   for j, h in enumerate(hs))
+        return k + 1, hs, t.add("Q", 0, sum(h[(k * 7 + j) % FRAME_S] for j, h in enumerate(hs)))
+    hs0 = tuple(jnp.full((FRAME_S,), x + j, F) for j in range(FRAME_K))
+    _, _, t = lax.while_loop(lambda c: c[0] < L, body, (0, hs0, t))
+    return t
+
+
+@case("[size] a per-item frame over CUDA's 512 KiB per-thread local limit raises before launch, naming both", ["cuda"])
+def _(b):
+    from tallymap.backends.cuda.compile import LOCAL_LIMIT
+    keys = jax.random.split(jax.random.PRNGKey(3), NS)
+    xs = jnp.linspace(0.5, 1.5, NS).astype(F)
+    f = tm.vmap(frame_item, outputs={"Q": tm.Sum((1,), F)}, backend=b)
+    try:
+        jax.block_until_ready(f(xs, keys))
+    except tm.UnsupportedError as e:
+        s = str(e)
+        if f"{LOCAL_LIMIT:,}" not in s or "bytes of local memory per thread" not in s or "frame_item" not in s:
+            raise Fail(f"the refusal does not name the frame, the limit and the item: {s[:300]}") from None
+        need = int(s.split(" needs ")[1].split(" bytes")[0].replace(",", ""))
+        if need <= LOCAL_LIMIT:
+            raise Fail(f"refused a frame of {need} B, which is under the limit {LOCAL_LIMIT}") from None
+        raise Expected(f"{need:,} B > {LOCAL_LIMIT:,} B: {s.splitlines()[0][:140]}") from None
+    raise Fail("a kernel over the per-thread local limit was launched instead of refused")
+
+
 # =================================================================================================== [ad]
 NA = 24
 NBA = 16

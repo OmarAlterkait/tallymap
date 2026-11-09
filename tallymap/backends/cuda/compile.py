@@ -245,6 +245,69 @@ def kernel_info(kid):
                 resident_threads=occ * block * sms, local_reserved_gib=round(local * per_sm * sms / 2 ** 30, 3))
 
 
+# CUDA's per-thread local memory limit: 512 KiB on every compute capability (CUDA C++ Programming Guide, "Technical
+# Specifications per Compute Capability": maximum amount of local memory per thread).  A kernel over it compiles, and
+# its launch fails with `CUDA driver error 1: invalid argument` (DTRAX sEM1_lar_e at 557,248 B, 2080 Ti and L40S).
+LOCAL_LIMIT = 512 * 1024
+
+
+def frame_bytes(cubin):
+    """-> {kernel name: per-thread local memory bytes} read from the cubin itself (no device, no module load): each
+    function's EIATTR_MIN_STACK_SIZE (0x12, its frame plus what its callees need) in the ELF .nv.info section, else
+    its EIATTR_FRAME_SIZE (0x11).  These equal cuFuncGetAttribute(CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES) (checked on
+    DTRAX's kernels: 70,160 / 178,160 / 557,248 B).  {} when the cubin carries no such record."""
+    import struct
+    b = bytes(cubin)
+    if b[:4] != b"\x7fELF" or b[4] != 2:
+        return {}
+    shoff, = struct.unpack_from("<Q", b, 0x28)
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", b, 0x3A)
+    sh = [struct.unpack_from("<IIQQQQIIQQ", b, shoff + i * shentsize) for i in range(shnum)]
+
+    def cstr(off):
+        return b[off:b.index(b"\0", off)].decode(errors="replace")
+    names = [cstr(sh[shstrndx][4] + s[0]) for s in sh]
+    sec = {n: b[s[4]:s[4] + s[5]] for n, s in zip(names, sh)}
+    syms = []
+    if ".symtab" in sec and ".strtab" in names:
+        st, so = sec[".symtab"], sh[names.index(".strtab")][4]
+        syms = [cstr(so + struct.unpack_from("<I", st, o)[0]) for o in range(0, len(st) - 23, 24)]
+    got = {}
+    d, i = sec.get(".nv.info", b""), 0
+    while i + 2 <= len(d):
+        fmt, attr = d[i], d[i + 1]
+        i += 2
+        if fmt == 4:                                     # EIFMT_SVAL: u16 size + payload
+            n, = struct.unpack_from("<H", d, i)
+            if attr in (0x11, 0x12) and n == 8:
+                sym, val = struct.unpack_from("<II", d, i + 2)
+                name = syms[sym] if sym < len(syms) else f"symbol {sym}"
+                if attr == 0x12 or name not in got:
+                    got[name] = val
+            i += 2 + n
+        elif fmt == 3:                                   # EIFMT_HVAL: u16
+            i += 2
+        elif fmt == 2:                                   # EIFMT_BVAL: u8
+            i += 1
+        elif fmt != 1:                                   # unknown format: stop (the reading is best effort)
+            break
+    return got
+
+
+def check_frame(cubin, where=""):
+    """run-or-raise: a kernel whose per-thread local memory is over LOCAL_LIMIT cannot launch on any GPU; raise
+    UnsupportedError naming the bytes and the limit BEFORE the launch, instead of the driver's `invalid argument`."""
+    over = {k: v for k, v in frame_bytes(cubin).items() if v > LOCAL_LIMIT}
+    if over:
+        from ..._api import UnsupportedError
+        k, v = max(over.items(), key=lambda kv: kv[1])
+        raise UnsupportedError(
+            f"tallymap: the cuda kernel{' for ' + where if where else ''} needs {v:,} bytes of local memory per "
+            f"thread ({k}: the item's per-thread frame, its local arrays and register spills), over CUDA's limit "
+            f"of {LOCAL_LIMIT:,} bytes (512 KiB) per thread, so it cannot launch on any GPU.  Make the per-item "
+            f"state smaller (fewer or smaller per-item arrays live at once), or run it with backend='lockstep'.")
+
+
 def register_kernel(cubin):
     kid = int.from_bytes(hashlib.sha256(cubin).digest()[:8], "little", signed=True)
     shim().tallymap_register(ctypes.c_int64(kid), cubin, len(cubin))
