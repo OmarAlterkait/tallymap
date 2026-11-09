@@ -4,7 +4,7 @@ Float semantics (cuda_math=): 'approx' (DEFAULT) = XLA:GPU's own f32 div/sqrt/rs
 rsqrt.approx), everything else IEEE round-to-nearest without FMA contraction; 'ieee' = correctly rounded div/sqrt as
 well: the portable reference.
 
-run(prog, pi, bc, cuda_math=None) -> [sum tallies] + [stats i32[5]] + [per-item results]
+run(prog, pi, bc, cuda_math=, schedule=) -> [sum tallies] + [stats i32[5]] + [per-item results]
 Unsupported constructs raise tallymap.UnsupportedError (backend='auto' too; backend='lockstep' runs them).
 """
 import hashlib
@@ -47,17 +47,28 @@ MATH_OPTS = {"ieee": [], "approx": ["-DTALLYMAP_APPROX_DIVSQRT", "--prec-div=fal
 
 
 class Kernel:
-    def __init__(self, p, split=True, math="approx", inplace=True):
+    def __init__(self, p, schedule="item", strict=False, math="approx", inplace=True):
         self.block = BLOCK
         try:
-            self.src, self.L = build_source(p, split=bool(split), inplace=bool(inplace))
+            self.src, self.L = build_source(p, schedule=schedule, strict=strict, inplace=bool(inplace))
         except CodegenError as e:
             raise UnsupportedError(str(e)) from None
         if math not in MATH_OPTS:
             raise ValueError("tallymap: cuda_math must be 'ieee' or 'approx'")
         cubin, self.info = C.compile_cubin(self.src, C.device_arch(), MATH_OPTS[math])
-        C.check_frame(cubin, p.where)            # run-or-raise: over CUDA's per-thread local limit never launches
-        self.kid = C.register_kernel(cubin)
+        note = schedule_note(self.L)
+        C.check_frame(cubin, p.where, note)      # run-or-raise: over CUDA's per-thread local limit never launches
+        self.kid = C.register_kernel(cubin, note)
+
+
+def schedule_note(L):
+    """the schedule part of a frame-size or launch out-of-memory error: which schedule ran, and when the whole-item
+    schedule ran on a program the step schedule can split, that schedule='step' gives a smaller frame."""
+    s = f"The kernel ran the {L.mode} schedule"
+    if L.mode == "item" and L.splittable:
+        s += (" on an item with one top-level while loop: schedule='step' gives a smaller frame (only the loop "
+              "state stays live from step to step)")
+    return s + "."
 
 
 def kernel(p, **opts):
@@ -66,7 +77,7 @@ def kernel(p, **opts):
         _KERNELS[k] = Kernel(p, **opts)
     kern = _KERNELS[k]
     from ..._diagnostics import record_kernel
-    record_kernel(dict(tag=p.tag, mode=kern.L.mode, hash=kern.info["hash"], cached=kern.info["cached"],
+    record_kernel(dict(tag=p.tag, schedule=kern.L.mode, hash=kern.info["hash"], cached=kern.info["cached"],
                        kid=kern.kid, compile_s=round(kern.info["seconds"], 1),
                        source=os.path.join(C.cache_dir(), kern.info["hash"] + ".cu"), prims=list(kern.L.prims),
                        options=dict(opts)))
@@ -77,10 +88,12 @@ def _phys_in(x):
     return jax.random.key_data(x) if is_key_dtype(x.dtype) else x
 
 
-def run(p, pi, bc, cuda_math="approx", _schedule=None, _cuda_inplace=True, **_):
-    """Scheduling: a lane is refilled with a new item at STEP granularity (needs one top-level while loop) unless
-    the program spawns (whole items); the measurements behind the rule are in docs/design.md section 1b.  Private
-    _schedule 'step' | 'item' overrides it (measurements and A/B checks only).
+def run(p, pi, bc, cuda_math="approx", schedule="item", _cuda_inplace=True, **_):
+    """schedule: 'item' (DEFAULT: a thread runs one whole item at a time) | 'step' (a thread is refilled with a new
+    item at loop-STEP granularity: the item program must have exactly one top-level while loop, else
+    UnsupportedError; a program derived from it (jvp, lanes, a folded batch, an adjoint) uses the step schedule
+    where it splits and the item schedule otherwise; tm.diagnostics()['kernels'][i]['schedule'] is what ran).
+    Measurements: docs/design.md section 1b.
     Private _cuda_inplace=False: never update a
     per-item array in place (every dynamic_update_slice and scatter copies; the A/B control of the emitter's
     aliasing analysis).
@@ -89,11 +102,9 @@ def run(p, pi, bc, cuda_math="approx", _schedule=None, _cuda_inplace=True, **_):
     docs/validation.md) |
     'ieee' (correctly rounded f32 div/sqrt: the portable reference)."""
     math = cuda_math or "approx"
-    if _schedule not in (None, "step", "item"):
-        raise ValueError("tallymap: _schedule must be 'step' or 'item'")
-    split = _schedule == "step" or (_schedule is None and p.spawn is None)
     extra = {} if _cuda_inplace else dict(inplace=False)        # (the default leaves the kernel key unchanged)
-    kern = kernel(p, split=split, math=math, **extra)
+    # strict: the user's own item program (tag 'primal') must split under schedule='step'
+    kern = kernel(p, schedule=schedule, strict=schedule == "step" and p.tag == "primal", math=math, **extra)
     L = kern.L
     N = int(pi[0].shape[0])
     consts = []

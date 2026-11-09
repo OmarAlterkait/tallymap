@@ -6,6 +6,21 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ## Unreleased
 
+### Changed (schedule)
+
+- The cuda schedule is a public option, `schedule='item' | 'step'`, and the default is `'item'` (a thread runs
+  one whole item at a time). It replaces the private `_schedule` and the rule "step unless the program spawns".
+  LUCiD's forward is 3.0x slower under the step schedule (L40S, job 43935228) while lumen's value, jvp and
+  jacfwd are 1.01-1.39x faster under it (job 43935227), so the step schedule is an explicit request.
+  `schedule='step'` on an item that cannot be split raises `tm.UnsupportedError` saying why (the number of
+  top-level while loops, or the loop constant that cannot cross the split); it used to fall back to the item
+  schedule silently. Kernels derived from the item (jvp, lanes, an adjoint) use the step schedule wherever they
+  split. Spawn works under both schedules. `_schedule` now raises like any unknown option.
+- `tm.diagnostics()['kernels'][i]['schedule']` (was `'mode'`) is the schedule the kernel ran.
+- A kernel frame over CUDA's per-thread limit, and a launch that fails for lack of local memory, now name the
+  schedule that ran; when the item schedule ran on an item the step schedule can split, the error says that
+  `schedule='step'` gives a smaller frame. Nothing switches schedule on its own.
+
 ### Changed (revfit: reverse mode for lumen's acceptance)
 
 - Reverse mode: the single-loop adjoint (T3, from lumen/perf 6a70383 / b38db3f / 22e615d / e58e216, re-implemented

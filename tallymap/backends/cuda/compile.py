@@ -199,7 +199,7 @@ def shim():
                                    f"{r.stderr}")
             os.replace(tmp, so)
         lib = ctypes.CDLL(so)
-        lib.tallymap_register.argtypes = [ctypes.c_int64, ctypes.c_char_p, ctypes.c_size_t]
+        lib.tallymap_register.argtypes = [ctypes.c_int64, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p]
         jax.ffi.register_ffi_target(TARGET, jax.ffi.pycapsule(lib.TallymapLaunch), platform="CUDA")
         _SHIM.append(lib)
         return lib
@@ -270,23 +270,28 @@ def frame_bytes(cubin):
     return got
 
 
-def check_frame(cubin, where=""):
+def check_frame(cubin, where="", note=""):
     """run-or-raise: a kernel whose per-thread local memory is over LOCAL_LIMIT cannot launch on any GPU; raise
-    UnsupportedError naming the bytes and the limit BEFORE the launch, instead of the driver's `invalid argument`."""
+    UnsupportedError naming the bytes and the limit BEFORE the launch, instead of the driver's `invalid argument`.
+    note: the schedule that ran (cuda.schedule_note), appended to the error."""
     over = {k: v for k, v in frame_bytes(cubin).items() if v > LOCAL_LIMIT}
     if over:
         from ..._api import UnsupportedError
         k, v = max(over.items(), key=lambda kv: kv[1])
+        note = note + "  " if note else ""
         raise UnsupportedError(
             f"tallymap: the cuda kernel{' for ' + where if where else ''} needs {v:,} bytes of local memory per "
             f"thread ({k}: the item's per-thread frame, its local arrays and register spills), over CUDA's limit "
-            f"of {LOCAL_LIMIT:,} bytes (512 KiB) per thread, so it cannot launch on any GPU.  Make the per-item "
-            f"state smaller (fewer or smaller per-item arrays live at once), or run it with backend='lockstep'.")
+            f"of {LOCAL_LIMIT:,} bytes (512 KiB) per thread, so it cannot launch on any GPU.  {note}"
+            f"Make the per-item state smaller (fewer or smaller per-item arrays live at once), or run it with "
+            f"backend='lockstep'.")
 
 
-def register_kernel(cubin):
+def register_kernel(cubin, note=""):
+    """register a cubin with the launch shim under its content id; `note` (cuda.schedule_note) is appended to the
+    shim's out-of-memory launch error."""
     kid = int.from_bytes(hashlib.sha256(cubin).digest()[:8], "little", signed=True)
-    shim().tallymap_register(ctypes.c_int64(kid), cubin, len(cubin))
+    shim().tallymap_register(ctypes.c_int64(kid), cubin, len(cubin), note.encode())
     return kid
 
 

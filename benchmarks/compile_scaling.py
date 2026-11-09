@@ -60,6 +60,6 @@ for M in MS:
         wall = time.perf_counter() - t0
         for k in tm.diagnostics()["kernels"]:
             r = k.get("resources") or {}
-            print("CS " + json.dumps(dict(stages=M, which=which, wall_s=round(wall, 1), mode=k["mode"],
+            print("CS " + json.dumps(dict(stages=M, which=which, wall_s=round(wall, 1), schedule=k["schedule"],
                                           src_bytes=os.path.getsize(k["source"]), compile_s=k["compile_s"],
                                           regs=r.get("regs"), local_bytes=r.get("local_bytes"))), flush=True)

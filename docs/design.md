@@ -41,21 +41,35 @@ The only item-level primitives are `tallymap_emit` and `tallymap_spawn` (`_tally
 
 ### 1b. No init / step / done for the user
 
-The CUDA kernel builder finds the outer loop itself. Two scheduling strategies were measured against each other:
-running a whole item on a persistent thread (the item's loops become C loops), and refilling a lane with a new
-item at loop-STEP granularity. Step refill won on a production photon-transport workload, by about a third,
-because a lane whose item has finished otherwise idles until the longest item in its warp ends. So an item with
-exactly ONE top-level while loop is split into pre / cond / body / post
-(`backends/cuda/kernel.py::_split`); anything else runs whole-item. With spawn the order reverses and whole-item
-is the faster of the two, by about half again, so the rule is: step refill unless the program spawns. (A warp is
-the group of 32 GPU threads that execute together on NVIDIA hardware.) Under the split, a loop carry is normally rebuilt by
+The CUDA kernel builder finds the outer loop itself. There are two schedules, chosen with the public option
+`schedule=`. The **item schedule** (the default) runs one whole item on a persistent thread (the item's loops
+become C loops), then the thread claims the next item. The **step schedule** (`schedule='step'`) refills a thread
+with a new item at loop-STEP granularity, so a thread whose item has finished does not idle until the longest
+item in its warp ends (GPU path tracing calls this path regeneration). It splits an item with exactly ONE
+top-level while loop into pre / cond / body / post (`backends/cuda/kernel.py::_split`); `schedule='step'` on an
+item it cannot split raises `UnsupportedError` and says why (`kernel.split_blocker`: the number of top-level while
+loops, or the loop constant that cannot cross the split). Kernels derived from the item (jvp, dual lanes, a folded
+batch, an adjoint) use the step schedule wherever they split and the item schedule otherwise; every kernel record
+in `tm.diagnostics()['kernels']` names the schedule that ran. Spawn works under both. (A warp is the group of 32
+GPU threads that execute together on NVIDIA hardware.)
+
+Why the item schedule is the default: the old rule, step refill unless the program spawns, came from a
+production photon-transport workload where step refill won by about a third. Re-measured on the applications:
+LUCiD's forward is 3.0x SLOWER under the step schedule and its 6-column Jacobian 2.85x slower, with bitwise equal
+outputs (L40S, job 43935228), while lumen's value, jvp and jacfwd are 1.01-1.39x FASTER under it (job 43935227).
+Neither schedule wins everywhere, so the default is the one that never splits the item and the step schedule is
+an explicit request. When a kernel's frame is too large to launch, the error names the schedule that ran and, if
+the item schedule ran on an item the step schedule can split, says that `schedule='step'` gives a smaller frame:
+lumen measured item frames 1.4-3x its step frames.
+
+Under the step schedule, a loop carry is normally rebuilt by
 `sj_body` into a temporary and copied back once per step; an ARRAY carry of at least `STEP_INPLACE_MIN` (64)
 elements (a checkpoint buffer, a state history) is instead passed to `sj_body` by mutable reference and, when the
 body's result is that parameter updated in place, it has no temporary and no copy. Smaller carries keep the copy, so
 kernels without a large carry are unchanged.
 
-That rule was re-measured on every `benchmarks/vs_jax` problem (private `_schedule`, forward and gradient, `div`
-high), as the ratio of step-refill time to whole-item time (below 1: step refill is faster):
+The two schedules were measured on every `benchmarks/vs_jax` problem (forward and gradient, `div` high), as the
+ratio of step-schedule time to item-schedule time (below 1: the step schedule is faster):
 
 | | 2080 Ti, 262k items | 2080 Ti, 4M items | L40S, 262k items |
 |---|---|---|---|
@@ -70,13 +84,12 @@ high), as the ratio of step-refill time to whole-item time (below 1: step refill
 | interacting md | 1.28 / 1.04 | 1.56 / 1.15 | 1.13 / 1.06 |
 | shower (spawns) | 1.30 / 1.02 | 1.19 / - | 0.91 / 1.00 |
 
-(forward / gradient; identical kernels rerun differ by up to about 10%.)  Step refill wins by up to 1.7x where
-trip counts diverge and each resident thread runs several items (the 2080 Ti holds about 70k resident threads);
-it loses by up to 1.6x on uniform or interaction-bound items, and by 1-13% on the L40S at 262k items, where its
-218k resident threads leave about one item each and there is nothing to refill.  No structural rule picks the
-faster mode on both GPUs, and a rule on items per resident thread would need a fitted threshold (occupancy and
-divergence both move it), so the rule stays: step refill unless the program spawns, which is right on the
-divergent workloads the library is for.
+(forward / gradient; identical kernels rerun differ by up to about 10%.)  The step schedule wins by up to 1.7x
+where trip counts diverge and each resident thread runs several items (the 2080 Ti holds about 70k resident
+threads); it loses by up to 1.6x on uniform or interaction-bound items, and by 1-13% on the L40S at 262k items,
+where its 218k resident threads leave about one item each and there is nothing to refill.  No structural rule
+picks the faster schedule on both GPUs, and a rule on items per resident thread would need a fitted threshold
+(occupancy and divergence both move it): the schedule is the user's choice, measured on their workload.
 
 Event scheduling of the step loop was implemented and is removed. It cut the step body at its most expensive
 top-level `cond` and let each warp run ONE branch per round, chosen online by a ski-rental rule. It won only on
@@ -373,14 +386,14 @@ emitted value AT THE SPAWN STEP, inside the parent's ordinary replay adjoint. No
 
 ## 5. Fewer knobs
 
-Unknown option names raise. The public options are the five in the README; every measurement and
+Unknown option names raise. The public options are the six in the README; every measurement and
 negative-control switch is a private option whose name starts with an underscore (they are listed in
 `_api._OPTS`), part of the node and of every cache key, never global state.
 
 Removed, with their measurements: 20 environment switches; the replay-from-start reverse scheme (3.4 to 13 times
 slower wherever it was measured); turning activity analysis off; the CUDA block size, shared-memory budget and
-schedule options (fixed rules instead: a block of 128 threads is within 1% of 64 and 256, and step refill unless
-the program spawns); the replay-check raise mode; the tree adjoint's own capacity, depth and on-mismatch
+earlier schedule options (a block of 128 threads is within 1% of 64 and 256; the schedule is now the one public
+`schedule` option, section 1b); the replay-check raise mode; the tree adjoint's own capacity, depth and on-mismatch
 options; `cuda_min_blocks` (at most 1.08x on any cell measured) and `rev_step_segments` (nothing on four
 independent workloads), both covered below; `Sum(tangent_scale=)`, which nothing ever set; event scheduling
 (section 1b); and the two reverse-mode

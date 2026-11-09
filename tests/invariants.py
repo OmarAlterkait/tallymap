@@ -3,10 +3,10 @@ env: BACKENDS=lockstep,cuda  TEST_X64=1  ONLY=substr
 
 docs: the consolidation plan's section 9 ("fundamental tests") -- the suite that makes removing internal paths safe.
 Sections (cell name prefixes):
-  [sched]  schedule invariance: _schedule step/item, _fold, _lanes chunking under jacfwd (T = 1/16/17/33, MAX_LANES =
-           16), _cuda_inplace, lockstep vs cuda, item order.  BITWISE wherever the arithmetic is the same program
-           (exact and integer tallies, per-item results); a float tally is a sum whose ORDER the schedule decides,
-           so it is held to the stated reassociation tolerance FT.
+  [sched]  schedule invariance: schedule step/item (also through spawn), _fold, _lanes chunking under jacfwd
+           (T = 1/16/17/33, MAX_LANES = 16), _cuda_inplace, lockstep vs cuda, item order.  BITWISE wherever the
+           arithmetic is the same program (exact and integer tallies, per-item results); a float tally is a sum
+           whose ORDER the schedule decides, so it is held to the stated reassociation tolerance FT.
   [key]    cache-key soundness: programs that differ only in a closed-over array's values, a closed-over Python
            scalar, dtype, shape, an option, max_steps or table contents never share a compiled program (one process,
            one fresh TALLYMAP_CUDA_CACHE).  NEGATIVE CONTROLS: the same pairs under a deliberately coarse key
@@ -284,14 +284,71 @@ def _(b):
     return f"trip counts {k.min()}..{k.max()} ({len(set(k.tolist()))} distinct); exact tally {'E' in r.outputs}"
 
 
-@case("[sched] _schedule step == item (cuda)", ["cuda"])
+@case("[sched] schedule step == item (cuda)", ["cuda"])
 def _(b):
-    fs, fi = walk_fn(b, _schedule="step"), walk_fn(b, _schedule="item")
+    fs, fi = walk_fn(b, schedule="step"), walk_fn(b, schedule="item")
     th = th_of(3)
     assert_arms_differ(lambda t: fs(XS, KEYS, TAB, t).outputs["Q"], lambda t: fi(XS, KEYS, TAB, t).outputs["Q"],
                           th)
     # the same per-item arithmetic in both kernels: per-item results bitwise; Q's atomics order differs: FT
     return agree(fs(XS, KEYS, TAB, th), fi(XS, KEYS, TAB, th), "step vs item")
+
+
+def two_loops(t, x, key, tab, th):
+    """an item with TWO top-level while loops: the step schedule cannot split it"""
+    k, t = lax.while_loop(lambda c: c[0] < 3, lambda c: (c[0] + 1, c[1].add("Q", c[0] % NB, x)), (jnp.int32(0), t))
+    k, t = lax.while_loop(lambda c: c[0] < 5, lambda c: (c[0] + 1, c[1].add("C", c[0] % NB, 1)), (k, t))
+    return t, k
+
+
+@case("[sched] schedule='step' on an item it cannot split raises, naming why; a bad value raises")
+def _(b):
+    try:
+        tm.vmap(mk_walk(False), outputs=outs1(b, False), in_axes=AX1, backend=b, schedule="steps")
+    except ValueError as e:
+        if "'item' or 'step'" not in str(e):
+            raise Fail(f"bad schedule value: {e}") from None
+    else:
+        raise Fail("schedule='steps' was accepted")
+    f = tm.vmap(two_loops, outputs=outs1(b, False), in_axes=AX1, backend=b, schedule="step")
+    if b != "cuda":
+        jax.block_until_ready(f(XS, KEYS, TAB, th_of(3)))                      # lockstep has no schedules
+        return "lockstep ignores schedule"
+    try:
+        jax.block_until_ready(f(XS, KEYS, TAB, th_of(3)))
+    except tm.UnsupportedError as e:
+        if "2 top-level while loops" not in str(e) or "exactly one" not in str(e):
+            raise Fail(f"the refusal does not say why: {e}") from None
+        jax.block_until_ready(tm.vmap(two_loops, outputs=outs1(b, False), in_axes=AX1, backend=b)(
+            XS, KEYS, TAB, th_of(3)))                                          # the default (item) runs it
+        raise Expected(str(e)[:160]) from None
+    raise Fail("schedule='step' ran an item with two top-level while loops")
+
+
+def spawn_walk(t, g, x):
+    """a divergent walk with one top-level while loop that spawns a child (generation g + 1) while g < 3"""
+    def body(c):
+        k, w, t = c
+        return k + 1, w * 0.75, t.add("Q", k % NB, w).add("C", k % NB, 1)
+    n = 2 + g + (x > 1.0).astype(jnp.int32)
+    k, w, t = lax.while_loop(lambda c: c[0] < n, body, (jnp.int32(0), x, t))
+    return t.spawn((g + 1, w), when=g < 3), k
+
+
+@case("[sched] schedule step == item through spawn; kernels record the schedule that ran (cuda)", ["cuda"])
+def _(b):
+    o = {"Q": tm.Sum((NB,), F), "C": tm.Sum((NB,), jnp.int32)}
+    G = jnp.zeros((N1,), jnp.int32)
+    res, ran = {}, {}
+    for s in ("step", "item"):
+        _D.KERNELS.clear()
+        res[s] = tm.vmap(spawn_walk, outputs=o, spawn=tm.Queue(1024), backend=b, schedule=s)(G, XS)
+        ran[s] = {k["schedule"] for k in _D.KERNELS}
+    if ran != {"step": {"step"}, "item": {"item"}}:
+        raise Fail(f"instrument: the schedules that ran {ran}")
+    if int(res["step"].stats["spawned"]) != 3 * N1:
+        raise Fail(f"spawned {int(res['step'].stats['spawned'])}, want {3 * N1}")
+    return agree(res["step"], res["item"], "step vs item through spawn") + f"; schedules {ran}"
 
 
 @case("[sched] _cuda_inplace on == off (cuda)", ["cuda"])
@@ -881,6 +938,8 @@ def _(b):
         s = str(e)
         if f"{LOCAL_LIMIT:,}" not in s or "bytes of local memory per thread" not in s or "frame_item" not in s:
             raise Fail(f"the refusal does not name the frame, the limit and the item: {s[:300]}") from None
+        if "ran the item schedule" not in s or "schedule='step' gives a smaller frame" not in s:
+            raise Fail(f"the refusal does not name the schedule that ran and the step hint: {s[:600]}") from None
         need = int(s.split(" needs ")[1].split(" bytes")[0].replace(",", ""))
         if need <= LOCAL_LIMIT:
             raise Fail(f"refused a frame of {need} B, which is under the limit {LOCAL_LIMIT}") from None
@@ -1105,9 +1164,9 @@ def _(b):
     return agree(A, B, "cuda vs lockstep", per_item="tol", pi_tol=1e-12 if X64 else 1e-6)
 
 
-@case("[trunc] max_steps: _schedule step == item (cuda)", ["cuda"])
+@case("[trunc] max_steps: schedule step == item (cuda)", ["cuda"])
 def _(b):
-    A, B = trunc_fn(b, _schedule="step")(XS, KEYS), trunc_fn(b, _schedule="item")(XS, KEYS)
+    A, B = trunc_fn(b, schedule="step")(XS, KEYS), trunc_fn(b, schedule="item")(XS, KEYS)
     trunc_check(A, "step")
     trunc_check(B, "item")
     return agree(A, B, "step vs item")

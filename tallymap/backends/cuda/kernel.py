@@ -163,20 +163,29 @@ def _val(name, shape, dt, impl):
     return v
 
 
+def split_blocker(jx):
+    """why the step schedule cannot split the item jaxpr `jx` (None: it can).  The split needs exactly one
+    top-level while loop."""
+    n = sum(e.primitive.name == "while" for e in jx.eqns)
+    if n == 1:
+        return None
+    return (f"the item has {n} top-level while loops; the step schedule needs exactly one (a "
+            "while loop inside a cond, a scan or a call does not count, and n_active puts the item inside a cond)")
+
+
 def _split(cj):
-    """If the item has exactly ONE top-level while loop, split it into pre / (cond, body) / post so the kernel can
-    refill a lane with a new item at STEP granularity (a lane whose item finished does not idle until the whole
-    warp's items finish; measurements: docs/design.md section 1b).  -> None (whole-item mode) or dict of closed
-    jaxprs + wiring."""
+    """The step schedule: split an item with exactly ONE top-level while loop into pre / (cond, body) / post, so the
+    kernel refills a thread with a new item at STEP granularity (a thread whose item finished does not idle until
+    the whole warp's items finish; measurements: docs/design.md section 1b).  -> None (split_blocker says why) or a
+    dict of closed jaxprs + wiring."""
     import jax
     from jax.extend.core import Literal
 
     from ..._jaxpr import bind, is_dropvar, lit, while_parts
     jx = cj.jaxpr
-    ws = [i for i, e in enumerate(jx.eqns) if e.primitive.name == "while"]
-    if len(ws) != 1:
+    if split_blocker(jx) is not None:
         return None
-    w = ws[0]
+    w = next(i for i, e in enumerate(jx.eqns) if e.primitive.name == "while")
     we = jx.eqns[w]
     pre_e, post_e = jx.eqns[:w], jx.eqns[w + 1:]
     base = set(jx.invars) | set(jx.constvars)
@@ -241,9 +250,11 @@ def privatised(tallies, budget=PRIV_BYTES):
     return out
 
 
-def build_source(p, *, block=BLOCK, split=True, inplace=True):
+def build_source(p, *, block=BLOCK, schedule="item", strict=False, inplace=True):
     """-> (CUDA source, Layout).  p: tallymap._api.ItemProgram.  Its jaxpr is first rewritten into the
-    canonical primitives (canon.py)."""
+    canonical primitives (canon.py).  schedule: 'item' (one whole item per thread at a time) | 'step' (the step
+    schedule wherever the program splits, else 'item'; strict: raise when it does not split).  Layout.mode is the
+    schedule that ran; Layout.splittable says whether the program splits (error hints)."""
     import dataclasses
 
     from .canon import canonical
@@ -318,7 +329,10 @@ def build_source(p, *, block=BLOCK, split=True, inplace=True):
         sh, dt, impl = spec
         return f"  {ctype(dt)} {prefix}{j}{'' if sh == () else f'[{max(1, _size(sh))}]'};{fill_decl(f'{prefix}{j}')}\n"
 
-    sp = _split(p.cj) if split else None
+    L.splittable = split_blocker(p.cj.jaxpr) is None
+    sp = _split(p.cj) if schedule == "step" else None
+    if sp is None and schedule == "step" and strict:
+        raise CodegenError(f"schedule='step': {split_blocker(p.cj.jaxpr)}.  Pass schedule='item' (the default).")
     L.mode = "step" if sp is not None else "item"
     decls = ""
     if sp is None:
@@ -363,7 +377,8 @@ def build_source(p, *, block=BLOCK, split=True, inplace=True):
             if isinstance(x, (VTally, Table)) or (isinstance(x, Scalar) and x.cval is not None) or \
                     not isinstance(x, (Scalar, Local)):
                 if not isinstance(x, (VTally, Table, Scalar, Local)):
-                    raise CodegenError(f"loop constant of kind {type(x).__name__} cannot cross the step split")
+                    raise CodegenError(f"schedule='step': a loop constant of kind {type(x).__name__} cannot cross "
+                                       "the step schedule's split.  Pass schedule='item' (the default).")
                 return None, x, None
             sh, dt = tuple(x.shape), x.dtype
             return _decl(name, sh, dt), _val(name, sh, dt, x.key_impl), (x.name if isinstance(x, Local) else x.text)

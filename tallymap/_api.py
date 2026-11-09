@@ -221,11 +221,11 @@ def _out_tallies(p):
 _OPTS = {
     # public
     "cuda_math": "cuda backend, f32 div/sqrt: 'approx' (default) | 'ieee'",
+    "schedule": "cuda backend: 'item' (default: a thread runs whole items) | 'step' (refill at loop-step granularity)",
     "lockstep_block": "lockstep backend: lanes per block",
     "rev_checkpoints": "reverse mode: checkpoint buffer size C (default 'auto': from the loop state's size)",
     "rev_stats": "reverse through spawn: report the tree adjoint's stats to the host (costs jit's fast path)",
     # PRIVATE (measurements / tests / negative controls; not API)
-    "_schedule": "cuda: 'step' | 'item' overrides the rule (step unless the program spawns)",
     "_cuda_inplace": "cuda: False never updates a per-item array in place (A/B control of the aliasing analysis)",
     "_lanes": "'off' never dual lanes | 'force' ignore the local-memory guard | int: chunks of at most this many lanes",
     "_fold": "False: never fold a batch into the item axis",
@@ -252,6 +252,12 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                it), the lockstep backend elsewhere (with a one-time warning) | 'cuda' | 'lockstep'
     opts:      cuda_math          cuda f32 div/sqrt: 'approx' (default; XLA:GPU's own PTX) | 'ieee' (correctly
                                   rounded: the portable reference).
+               schedule           cuda: 'item' (default: a thread runs one whole item, then claims the next) |
+                                  'step' (the step schedule: a thread is refilled with a new item at loop-STEP
+                                  granularity, so a thread whose item ended does not idle until its warp's longest
+                                  item ends).  'step' needs an item with exactly one top-level while loop and
+                                  raises UnsupportedError otherwise; derived kernels (jvp, lanes, an adjoint) use it
+                                  wherever they split.  Which is faster depends on the workload: measure.
                lockstep_block     lockstep backend: lanes per block (default 2^18; bounds its memory).
                rev_checkpoints    reverse mode: states per checkpoint buffer C (default 'auto': 16 for a loop step
                                   of fewer than 1000 equations, else the largest of 4, 8, ..., 64 whose 3C+1
@@ -288,6 +294,8 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
     if bad:
         raise ValueError(f"tallymap: unknown option(s) {bad}; options are "
                          + ", ".join(k for k in _OPTS if not k.startswith("_")))
+    if opts.get("schedule", "item") not in ("item", "step"):
+        raise ValueError(f"tallymap: schedule must be 'item' or 'step', got {opts['schedule']!r}")
     if backend not in BACKENDS:
         raise ValueError(f"tallymap: unknown backend {backend!r}; backends are {', '.join(BACKENDS)}")
     if spawn is not None and not isinstance(spawn, Queue):

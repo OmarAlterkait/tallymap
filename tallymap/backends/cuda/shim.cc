@@ -98,7 +98,7 @@ struct Loaded {
 // preallocates 75% of the GPU by default, so a kernel can fail there that runs with the pool turned off.
 // MEASURED on L40S: the forced-dense reverse kernel of tests/reverse.py (82 KB/thread, ~17 GiB at full residency)
 // fails under the default preallocation and passes with XLA_PYTHON_CLIENT_PREALLOCATE=false or MEM_FRACTION=.5.
-std::string launch_err(const char* what, CUresult r, CUfunction f, int sms) {
+std::string launch_err(const char* what, CUresult r, CUfunction f, int sms, const std::string& note) {
   std::string s = std::string(what) + ": " + cuerr(r);
   if (r != 2 /*CUDA_ERROR_OUT_OF_MEMORY*/) return s;
   int local = -1, per_sm = 0;
@@ -112,6 +112,7 @@ std::string launch_err(const char* what, CUresult r, CUfunction f, int sms) {
                   "every resident thread (%.1f GiB on this GPU)", local, (double)local * per_sm * sms / (1 << 30));
     s += buf;
   }
+  if (!note.empty()) s += ". " + note.substr(0, note.size() - (note.back() == '.' ? 1 : 0));
   s += ". JAX preallocates 75% of GPU memory by default: set XLA_PYTHON_CLIENT_PREALLOCATE=false, or a lower "
        "XLA_PYTHON_CLIENT_MEM_FRACTION, before JAX starts; or make the per-item state smaller (large per-item "
        "arrays live in local memory)";
@@ -120,6 +121,7 @@ std::string launch_err(const char* what, CUresult r, CUfunction f, int sms) {
 
 struct Entry {
   std::string image;
+  std::string note;   // appended to an out-of-memory launch error (the schedule that ran: cuda.schedule_note)
   std::unordered_map<CUcontext, Loaded> loaded;
 };
 
@@ -128,10 +130,13 @@ std::unordered_map<int64_t, Entry> g_reg;
 
 }  // namespace
 
-extern "C" int tallymap_register(int64_t id, const char* data, size_t n) {
+extern "C" int tallymap_register(int64_t id, const char* data, size_t n, const char* note) {
   std::lock_guard<std::mutex> lk(g_mu);
   Entry& e = g_reg[id];
-  if (e.image.empty()) e.image.assign(data, n);
+  if (e.image.empty()) {
+    e.image.assign(data, n);
+    e.note = note ? note : "";
+  }
   return 0;
 }
 
@@ -157,6 +162,7 @@ static ffi::Error SjLaunchImpl(cudaStream_t stream, ffi::RemainingArgs args, ffi
   CUresult r = d.CtxGetCurrent(&ctx);
   if (r) return ffi::Error(ffi::ErrorCode::kInternal, cuerr(r));
   Loaded L;
+  std::string note;
   {
     std::lock_guard<std::mutex> lk(g_mu);
     auto it = g_reg.find(kernel_id);
@@ -188,6 +194,7 @@ static ffi::Error SjLaunchImpl(cudaStream_t stream, ffi::RemainingArgs args, ffi
       lt = e.loaded.emplace(ctx, n).first;
     }
     L = lt->second;
+    note = e.note;
   }
   SjParams P;
   std::memset(&P, 0, sizeof(P));
@@ -215,17 +222,17 @@ static ffi::Error SjLaunchImpl(cudaStream_t stream, ffi::RemainingArgs args, ffi
   const int aux_grid = L.sms * 4;
   if (flags & 1) {
     r = d.LaunchKernel(L.prep, aux_grid, 1, 1, 256, 1, 1, 0, stream, kp, nullptr);
-    if (r) return ffi::Error(ffi::ErrorCode::kInternal, launch_err("sj_prep", r, L.prep, L.sms));
+    if (r) return ffi::Error(ffi::ErrorCode::kInternal, launch_err("sj_prep", r, L.prep, L.sms, note));
   }
   long long g = grid > 0 ? grid : (long long)L.sms * (grid < 0 && -grid < L.occ ? -grid : L.occ);   // grid < 0: cap blocks/SM (instrument)
   long long need = (n_items + block - 1) / block;
   if (g > need && !(flags & 4)) g = need;
   if (g < 1) g = 1;
   r = d.LaunchKernel(L.main, (unsigned)g, 1, 1, block, 1, 1, 0, stream, kp, nullptr);
-  if (r) return ffi::Error(ffi::ErrorCode::kInternal, launch_err("sj_main", r, L.main, L.sms));
+  if (r) return ffi::Error(ffi::ErrorCode::kInternal, launch_err("sj_main", r, L.main, L.sms, note));
   if (flags & 2) {
     r = d.LaunchKernel(L.post, aux_grid, 1, 1, 256, 1, 1, 0, stream, kp, nullptr);
-    if (r) return ffi::Error(ffi::ErrorCode::kInternal, launch_err("sj_post", r, L.post, L.sms));
+    if (r) return ffi::Error(ffi::ErrorCode::kInternal, launch_err("sj_post", r, L.post, L.sms, note));
   }
   return ffi::Error::Success();
 }
