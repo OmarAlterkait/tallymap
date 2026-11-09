@@ -77,9 +77,9 @@ def rev_opts(opts=None):
     return r
 
 
-# The automatic C (rev_checkpoints unset).  A state of fewer than AUTO_BIG_STATE bytes (the carries the step reads)
-# keeps C = AUTO_C_SMALL; a larger one gets the largest power of two in [AUTO_C_MIN, AUTO_C_MAX] whose 3C+1 states
-# (head C+1, checkpoints C, segment tape C) fit AUTO_CKPT_BYTES.
+# The automatic C (rev_checkpoints unset).  A loop whose step has fewer than T3_MIN_EQNS equations (recursive) keeps
+# C = AUTO_C_SMALL; a larger step gets AUTO_C_MAX; either way the largest power of two in [AUTO_C_MIN, that] whose
+# 3C+1 states (head C+1, checkpoints C, segment tape C; T3: 2C+1) fit AUTO_CKPT_BYTES.
 #   MEASURED on an L40S (lumen/perf 762da14, 830c071).  lumen's photon transport (states of 306-318 B; per-photon
 #   trip counts K: SK mean 7.1 / warp(32)-max over mean 2.29, SBND 15.0 / 2.35, ANNIE 12.4 / 3.83, longest 1263):
 #   the adjoint runs whole items per warp, a warp pays its LONGEST item, and an item of K <= C steps needs no
@@ -88,12 +88,17 @@ def rev_opts(opts=None):
 #   3x SLOWER than 16 at 2^19 items (random_walk 2.53 against 0.92 ms, transport 3.86 against 1.81).  The emitter
 #   writes arrays of <= 32 elements (codegen.UNROLL) as straight-line code that ptxas can keep in registers: a
 #   scalar's C = 16 buffers can, C >= 32 cannot, while a 28-carry state lives in local memory at any C.
-#   AUTO_BIG_STATE = 128 B lies in the measured gap (25 .. 306 B): nothing in between was measured.
+#   The split was first made on the stored state's BYTES (< 128 B: C = 16).  That proxy depends on JAX's own carry
+#   layout: JAX >= 0.7's lax.while_loop moves a carry the body forwards unchanged to a body const, so lumen SK's
+#   stored state is 35 carries / 324 B on JAX 0.5.3 and 23 / 123 B on 0.11.2 for the same program, which dropped
+#   C to 16 there (MEASURED, L40S, revfit 389b6be: grad / value 4.71 / 4.62 / 5.12 on 0.11.2 against 2.59 / 2.95 /
+#   3.39 on 0.5.3; dev's nested adjoint 10.2 against 4.94 on SK).  The step's equation count separates the same
+#   measured cases (lumen 16.5k-26k, vs_jax 35-190) and does not depend on where JAX keeps a loop invariant; it is
+#   the T3 threshold too, so ONE "large step" rule decides the adjoint's shape and its C.
 #   KNOWN LIMIT: AUTO_CKPT_BYTES counts LOGICAL state bytes and ignores the device.  Per-item memory is local
 #   memory, which the CUDA driver reserves for EVERY resident thread outside JAX's pool (bytes/thread x max
 #   threads/SM x SMs); the right rule sizes C from the compiled frame (tm.diagnostics()["kernels"][i]["resources"])
 #   against free device memory.  Not done yet.
-AUTO_BIG_STATE = 128
 AUTO_C_SMALL = 16
 AUTO_C_MIN, AUTO_C_MAX = 4, 64
 AUTO_CKPT_BYTES = 65536          # of LOGICAL state bytes: lumen (306 B per state) gets C = 64
@@ -105,11 +110,11 @@ def state_bytes(xs):
     return int(sum(int(np.prod(jnp.shape(_phys(x)), dtype=np.int64)) * np.dtype(_dt(_phys(x))).itemsize for x in xs))
 
 
-def auto_checkpoints(sb, slots=3):
-    """C for a loop state of sb bytes (see AUTO_BIG_STATE): AUTO_C_SMALL below AUTO_BIG_STATE bytes, else the largest
-    C <= AUTO_C_MAX whose slots*C+1 states fit AUTO_CKPT_BYTES (checkpointed_while keeps 3C+1, the single-loop
-    adjoint 2C+1), at least AUTO_C_MIN."""
-    C = AUTO_C_SMALL if sb < AUTO_BIG_STATE else AUTO_C_MAX
+def auto_checkpoints(sb, big, slots=3):
+    """C for a loop state of sb bytes whose step is `big` (>= T3_MIN_EQNS equations): AUTO_C_MAX if big else
+    AUTO_C_SMALL, halved while slots*C+1 states exceed AUTO_CKPT_BYTES (checkpointed_while keeps 3C+1, the
+    single-loop adjoint 2C+1), at least AUTO_C_MIN."""
+    C = AUTO_C_MAX if big else AUTO_C_SMALL
     while C > AUTO_C_MIN and (slots * C + 1) * sb > AUTO_CKPT_BYTES:
         C //= 2
     return C
@@ -225,14 +230,26 @@ def _active(bfn, bc, init, pb, pc, cand, w_idx):
         act |= nz
 
 
+# TEST-ONLY negative control of tests/reverse.py's REPLAY GATE (patched like codegen.FILL; never set by the library):
+# the adjoint replays and sweeps K - REPLAY_SHIFT steps of a K-step loop (at least 1), i.e. it differentiates a
+# trajectory the forward did not run, for every item of K >= 2.  Read when the adjoint program is traced, so the
+# perturbed adjoint is a different program (and kernel); the forward is untouched.
+REPLAY_SHIFT = 0
+
+
+def _shifted(K):
+    return jnp.maximum(K - REPLAY_SHIFT, jnp.minimum(K, 1)) if REPLAY_SHIFT else K
+
+
 # ------------------------------------------------------------------------------------------- checkpointed_while
-def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None, live=None):
+def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None, live=None, big=False):
     """cfn(cc, carry) -> bool, bfn(bc, carry) -> carry (lists).
     kinds[j]: None/False = state, True/'o' = output Tally (pass-through cotangent), 'w' = table cotangent token
     (its cotangent is threaded through the backward sweep).  bflags[i]: body const i is a tally (never
     differentiated: a closed-over tally is a discarded one).  live[j]: does the body or the predicate READ carry j
     (_rewrite._live_carries; None: all do)?  Only read state carries are stored: one that is never read is restored
-    as its initial value, which no replayed step and no step VJP can tell apart."""
+    as its initial value, which no replayed step and no step VJP can tell apart.  big: the step has >= T3_MIN_EQNS
+    equations (auto_checkpoints)."""
     o = rev_opts(opts)
     btal = list(bflags) if bflags is not None else [False] * len(bc)
     kinds = ["o" if k is True else (k or None) for k in kinds]
@@ -248,7 +265,7 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None, li
 
     l_idx = [j for j in s_idx if live is None or live[j]]       # the stored state: the carries the step reads
     sb = state_bytes([init[j] for j in l_idx])
-    C = int(o.checkpoints) if o.checkpoints else auto_checkpoints(sb)
+    C = int(o.checkpoints) if o.checkpoints else auto_checkpoints(sb, big)
 
     def fwd(cc, bc, init):
         pb = tuple(bool(x.perturbed) and not t for x, t in zip(bc, btal))
@@ -269,6 +286,7 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None, li
 
     def bwd(res, ct):
         cc, bc, init, K, head, st = res
+        K = _shifted(K)
         pb, pc, act = st.v
         act = list(act)
         fb = [i for i, x in enumerate(bc) if pb[i] and isfloat(_dt(x))]
@@ -553,7 +571,7 @@ def fold_post(p):
     return dataclasses.replace(p, cj=cj2, nP=p.nP + 1, tag=p.tag + "+fold"), meta
 
 
-def checkpointed_while_single(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None, live=None):
+def checkpointed_while_single(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None, live=None, big=True):
     """checkpointed_while whose adjoint is ONE while loop (T3, see the section comment).  Its forward returns the
     INITIAL carry in place of the loop's outputs: only for the top-level loop of a fold_post program inside vjp_prog,
     whose primal outputs nothing reads."""
@@ -571,7 +589,7 @@ def checkpointed_while_single(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=N
         raise ValueError("tallymap: the single-loop adjoint cannot see the truncation carry (internal error)")
     tpos = l_idx.index(tr_c) if tr_c >= 0 else None
     sb = state_bytes([init[j] for j in l_idx])
-    C = int(o.checkpoints) if o.checkpoints else auto_checkpoints(sb, slots=2)
+    C = int(o.checkpoints) if o.checkpoints else auto_checkpoints(sb, big, slots=2)
 
     @jax.custom_vjp
     def loop(cc, bc, init):
@@ -658,7 +676,7 @@ def checkpointed_while_single(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=N
             cnt_end = (ph == COUNT) & jnp.logical_not(go)
             if tpos is not None:                 # the probe: the truncation flag COUNT computed
                 fin = jnp.where(cnt_end, jnp.reshape(y[tpos].astype(jnp.float32), (1,)), fin)
-            K2 = sel(cnt_end, k1, K)
+            K2 = sel(cnt_end, _shifted(k1), K)
             short = K2 <= C
             m2 = sel(cnt_end, jnp.maximum(C, cdiv(K2, C)), m)
             ns2 = sel(cnt_end, cdiv(K2, m2), ns)

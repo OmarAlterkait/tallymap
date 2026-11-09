@@ -251,8 +251,11 @@ error) turn every affected cell into a failure, which is how the matrix is known
   item replay its whole loop once more: 1.7x slower on lumen SK's gradient and 1.4x on SBND (lumen/perf
   8c92ee8 / 762da14). The head is a read-only residual, not the segment tape: reusing it as the tape (a carry of
   the segment loops) made the emitter copy it, a 28 KB against a 12 KB frame on lumen SK, 17% slower.
-- **C is chosen from the state size** (`rev_checkpoints='auto'`, `_reverse.auto_checkpoints`): 16 below 128 B of
-  stored state, else the largest of 4 ... 64 whose 3C+1 states fit 64 KiB of LOGICAL bytes. lumen (306-318 B
+- **C is chosen from the step size** (`rev_checkpoints='auto'`, `_reverse.auto_checkpoints`): 16 for a step of
+  fewer than 1000 equations (`T3_MIN_EQNS`, the same rule that picks the single-loop adjoint), else the largest of
+  4 ... 64 whose 3C+1 (T3: 2C+1) states fit 64 KiB of LOGICAL bytes. (It was 16 below 128 B of stored state, a
+  proxy that JAX >= 0.7 moved: its while_loop hoists forwarded carries, so lumen SK's state is 324 B on 0.5.3 and
+  123 B on 0.11.2, which gave C = 16 and 1.6-1.8x slower gradients there.) lumen (306-318 B
   states, warp-maximum trip counts 16 to 60) is 1.3-1.6x faster at C = 64 than at 16; the `vs_jax` problems
   (8-25 B) are 1.5-3x slower at 64. The 64 KiB budget ignores the device (the driver reserves the compiled
   frame for every resident thread): sizing C from the compiled frame against free memory is still to do. An
@@ -314,9 +317,11 @@ error) turn every affected cell into a failure, which is how the matrix is known
   outside its negative control, and cost a forward launch per gradient (~1x the value call on lumen). Its failure
   class is gated in `tests/reverse.py` ("REPLAY GATE"): on an item whose step count hangs on f32 div / sqrt bits,
   every item's reverse derivative must equal its forward-mode derivative (the fused jvp kernel runs the forward's
-  own trajectory), for the nested and the single-loop adjoint; the negative control (a private option that runs
-  only the adjoint in `approx` math against an `ieee` forward) must fail the gate on the items whose step count
-  changes. Applications validate gradients against `jacfwd` / finite differences (lumen does, on 6 detectors).
+  own trajectory), for the nested and the single-loop adjoint; the negative control (test-only
+  `_reverse.REPLAY_SHIFT = 1`: the adjoint replays and sweeps K-1 steps) must fail the gate on exactly the items of
+  K >= 2, with a different adjoint kernel. (An earlier control, the adjoint in `approx` math against an `ieee`
+  forward, changed no step count on two attempts and was replaced: a negative control must perturb by
+  construction.) Applications validate gradients against `jacfwd` / finite differences (lumen does, on 6 detectors).
 - **Host reporting is opt-in** (`rev_stats=True`, the tree adjoint's counters in `tm.diagnostics()['reverse']`). Any
   `jax.debug.callback` in a jitted program takes `jax.jit` off its C++ dispatch path: the toy-walk gradient takes
   42 ms instead of 2.3 ms, and it does so even when the callback sits inside a `lax.cond` that is never taken
@@ -671,7 +676,7 @@ commit it came from; the measurements are on that private engine.
   linearized (its operands are tracers of `jax.grad` / `jax.vjp`) is built with the fingerprint up front, so its
   primal launch is the one the replay check re-binds and XLA merges the two; elsewhere reverse mode pays one extra
   forward launch. A spawning program never builds it (its reverse mode, the tree adjoint, has its own check).
-  `tests/reverse.py`'s replay negative control (`_adj_math`) still makes the gradient NaN.  (Superseded: the runtime check and its fingerprint were removed in revfit; see section 4, "Replay is bitwise by
+  `tests/reverse.py`'s replay negative control still makes the gradient NaN.  (Superseded: the runtime check and its fingerprint were removed in revfit; see section 4, "Replay is bitwise by
   construction".)
 - **A serial chain of 64-bit multiplies is cut every 8 links** (wavefront `41140a0`, `8337bb7`, merged in `58db0f2`).
   NVVM is exponential in the depth of a dependency chain of 64-bit integer multiplies inside one function: on the

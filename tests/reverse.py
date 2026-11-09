@@ -723,54 +723,45 @@ def _replay_item(NB):
     return item
 
 
-@case("REPLAY GATE: per-item reverse == forward-mode derivative on an ulp-sensitive trajectory (nested and T3); "
-      "NEGATIVE CONTROL adjoint math=approx must fail it", ["cuda"])
+@case("REPLAY GATE: per-item reverse == forward-mode derivative (nested and T3); NEGATIVE CONTROL: a replay of "
+      "K-1 steps must fail it on every item of K >= 2", ["cuda"])
 def _(b):
     """the adjoint differentiates the trajectory the forward kernel ran (what the removed runtime replay check
-    compared).  The step count of every item hangs on f32 div / sqrt bits (_replay_item), so an adjoint that replays
-    a different trajectory gets a different per-item derivative, which the forward-mode derivative (the fused jvp
-    kernel, the forward's own trajectory) exposes item by item.  The negative control compiles only the adjoint
-    with approx div / sqrt (instrument: a different adjoint cubin, and approx changes the step count of many
-    items): the gate must flag at least half of the items whose step count approx changes."""
+    compared): every item's reverse derivative must equal its forward-mode derivative (the jvp kernel runs the
+    forward's own trajectory), item by item.  NEGATIVE CONTROL, deterministic: _reverse.REPLAY_SHIFT = 1 makes the
+    adjoint replay and sweep K-1 steps of each K-step loop (test-only, like codegen.FILL), which must be flagged on
+    EXACTLY the items of K >= 2; the control's adjoint kernel must differ from the clean one (cuda)."""
     from tallymap import _diagnostics as D
-    if X64:     # the control flips f32 div / sqrt PTX; an f64 item does not use them (the control would be void)
-        return "skipped under x64 (the negative control needs f32 arithmetic)"
     NB, n = 64, 4096
     item = _replay_item(NB)
     xs = jnp.linspace(0.11, 1.9, n).astype(F)
-    ki = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend="cuda", cuda_math="ieee")(xs).per_item[0]
-    ka = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend="cuda", cuda_math="approx")(xs).per_item[0]
-    ndiff = int(np.sum(np.asarray(ki) != np.asarray(ka)))
-    if ndiff < n // 8:
-        raise Fail(f"instrument: approx vs ieee changes the step count of only {ndiff}/{n} items here; the negative "
-                   "control would be void")
-    s0, out, hashes = _reverse.SINGLE, {}, {}
+    f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend=b)
+    want = np.asarray(f(xs).per_item[0]) >= 2                       # the items the control must flag
+    gf = jax.jit(lambda x: jax.jvp(lambda x_: f(x_).per_item[1], (x,), (jnp.ones_like(x),))[1])(xs)
+    gf = np.asarray(gf)
+    s0, r0, bad, hashes = _reverse.SINGLE, _reverse.REPLAY_SHIFT, {}, {}
     try:
         for single in ("off", "force"):
-            for adj in (None, "approx"):
-                f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend="cuda", cuda_math="ieee",
-                            **(dict(_adj_math=adj) if adj else {}))
-                _reverse.SINGLE = single
+            for shift in (0, 1):
+                _reverse.SINGLE, _reverse.REPLAY_SHIFT = single, shift
                 D.KERNELS.clear()
                 gr = np.asarray(jax.jit(jax.grad(lambda x: jnp.sum(f(x).per_item[1])))(xs))
-                hashes[single, adj] = {k["hash"] for k in D.KERNELS if "vjp" in k["tag"]}
+                hashes[single, shift] = {k["hash"] for k in D.KERNELS if "vjp" in k["tag"]}
                 if _reverse.LAST_SINGLE.get("used") != (single == "force"):
-                    raise Fail(f"instrument: SINGLE={single} but {_reverse.LAST_SINGLE}")
-                gf = jax.jit(lambda x: jax.jvp(lambda x_: f(x_).per_item[1], (x,), (jnp.ones_like(x),))[1])(xs)
-                gf = np.asarray(gf)
-                out[single, adj] = int(np.sum(~(np.abs(gr - gf) <= 2e-4 * np.abs(gf) + 1e-6)))
+                    raise Fail(f"instrument: SINGLE={single}: {_reverse.LAST_SINGLE}")
+                bad[single, shift] = ~(np.abs(gr - gf) <= 2e-4 * np.abs(gf) + 1e-6)
     finally:
-        _reverse.SINGLE = s0
+        _reverse.SINGLE, _reverse.REPLAY_SHIFT = s0, r0
+    counts = {k: int(v.sum()) for k, v in bad.items()}
+    print(f"    REPLAY GATE counts {b}: K>=2 {int(want.sum())}/{n}; flagged {counts}", flush=True)
     for single in ("off", "force"):
-        h0, h1 = hashes[single, None], hashes[single, "approx"]
-        if not h0 or not h1 or h0 & h1:
-            raise Fail(f"instrument ({single}): the control did not change the adjoint cubin: {h0} vs {h1}")
-        if out[single, None]:
-            raise Fail(f"{single}: {out[single, None]}/{n} items' reverse derivative differs from forward mode")
-        if out[single, "approx"] < ndiff // 2:
-            raise Fail(f"NEGATIVE CONTROL ({single}): {out[single, 'approx']} items flagged, {ndiff} change step count")
-    return (f"clean 0/{n} (nested and T3); approx changes {ndiff} step counts; adjoint cubins differ; control "
-            f"flags nested {out['off', 'approx']}, T3 {out['force', 'approx']}")
+        if b == "cuda" and (not hashes[single, 0] or hashes[single, 0] & hashes[single, 1]):
+            raise Fail(f"{single}: control kernel == clean kernel")
+        if counts[single, 0]:
+            raise Fail(f"{single}: clean flags {counts[single, 0]}/{n}")
+        if not np.array_equal(bad[single, 1], want):
+            raise Fail(f"{single}: control flags {counts[single, 1]}, want the {int(want.sum())} of K>=2")
+    return f"clean 0/{n}; control flags exactly the K>=2 items ({int(want.sum())}), nested and T3"
 
 
 @case("grad(vmap) of a call == per-member grads (the batching rule's folded / mapped adjoint)")
@@ -788,23 +779,27 @@ def _(b):
     return close(dict(g=g), dict(g=ref), "grad(vmap) vs per-member grad")
 
 
-@case("AUTO C: 16 for a small state, 64 for a ~300 B one, less beyond; bitwise == explicit C")
+@case("AUTO C: 16 for a small step, 64 for a large one (T3_MIN_EQNS), less when the states exceed 64 KiB; "
+      "bitwise == explicit C")
 def _(b):
-    """T5: rev_checkpoints unset picks C from the stored state's bytes (_reverse.auto_checkpoints); the recorded loop
-    says so; per-item cotangents are bitwise those of the same explicit C (C changes work, never values)."""
+    """T5: rev_checkpoints unset picks C from the step's size and the stored state's bytes
+    (_reverse.auto_checkpoints); the recorded loop says so; per-item cotangents are bitwise those of the same
+    explicit C (C changes work, never values)."""
     R = _reverse
     want = {}
     for sb in (12, 300, 400, 4096):
-        c = R.AUTO_C_SMALL if sb < R.AUTO_BIG_STATE else R.AUTO_C_MAX
-        while c > R.AUTO_C_MIN and (3 * c + 1) * sb > R.AUTO_CKPT_BYTES:
-            c //= 2
-        want[sb] = c
-    got = {sb: R.auto_checkpoints(sb) for sb in want}
-    if got != want or got[12] != R.AUTO_C_SMALL or got[300] != R.AUTO_C_MAX or not got[300] >= got[400] >= got[4096]:
-        raise Fail(f"auto_checkpoints rule: {got} (want {want}: C_SMALL for a small state, C_MAX for a 300 B one)")
+        for big in (False, True):
+            c = R.AUTO_C_MAX if big else R.AUTO_C_SMALL
+            while c > R.AUTO_C_MIN and (3 * c + 1) * sb > R.AUTO_CKPT_BYTES:
+                c //= 2
+            want[sb, big] = c
+    got = {k: R.auto_checkpoints(*k) for k in want}
+    if (got != want or got[12, False] != R.AUTO_C_SMALL or got[300, False] != R.AUTO_C_SMALL
+            or got[300, True] != R.AUTO_C_MAX or not got[300, True] >= got[400, True] >= got[4096, True]):
+        raise Fail(f"auto_checkpoints rule: {got} (want {want})")
     g, gr, info, _ = walk_case(b, 64, 40)
     lp = info["loops"][0]
-    if not lp.get("auto") or lp["checkpoints"] != R.auto_checkpoints(lp["state_bytes"]):
+    if not lp.get("auto") or lp["checkpoints"] != R.auto_checkpoints(lp["state_bytes"], False):
         raise Fail(f"instrument: loop record {lp}")
     gc, _, infoc, _ = walk_case(b, 64, 40, rev_checkpoints=lp["checkpoints"])
     if infoc["loops"][0].get("auto"):

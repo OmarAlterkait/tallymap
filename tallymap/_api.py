@@ -230,7 +230,6 @@ _OPTS = {
     "_lanes": "'off' never dual lanes | 'force' ignore the local-memory guard | int: chunks of at most this many lanes",
     "_fold": "False: never fold a batch into the item axis",
     "_rev_sparse_min": "smallest table (elements) that gets sparse emitted cotangents (default 32)",
-    "_adj_math": "NEGATIVE CONTROL: compile the adjoint with this cuda_math (tests/reverse.py's replay gate)",
     "_rev_nodense": "NEGATIVE CONTROL: drop the dense detection of mixed-use tables",
     "_rev_gen_capacity": "tree adjoint: largest generation (default Queue capacity; memory lever)",
     "_tree_neg": "NEGATIVE CONTROL of the tree adjoint: 'detach' | 'replay'",
@@ -254,11 +253,10 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
     opts:      cuda_math          cuda f32 div/sqrt: 'approx' (default; XLA:GPU's own PTX) | 'ieee' (correctly
                                   rounded: the portable reference).
                lockstep_block     lockstep backend: lanes per block (default 2^18; bounds its memory).
-               rev_checkpoints    reverse mode: states per checkpoint buffer C (default 'auto': 16 for a loop state
-                                  -- the carries the step reads -- under 128 B, else the largest of 4, 8, ..., 64
-                                  whose 3C+1 (single-loop adjoint: 2C+1) states fit 64 KiB;
-                                  _reverse.auto_checkpoints).  A loop of K <= C steps needs no replay; O(K) work for
-                                  K <= C^2.
+               rev_checkpoints    reverse mode: states per checkpoint buffer C (default 'auto': 16 for a loop step
+                                  of fewer than 1000 equations, else the largest of 4, 8, ..., 64 whose 3C+1
+                                  (single-loop adjoint: 2C+1) states fit 64 KiB; _reverse.auto_checkpoints).  A loop
+                                  of K <= C steps needs no replay; O(K) work for K <= C^2.
                rev_stats          reverse through spawn: report the tree adjoint's stats to the host
                                   (tallymap.diagnostics()['reverse']).  Off by default: a host callback takes jax.jit
                                   off its C++ fast path.  A failed check makes the gradient NaN either way.

@@ -494,12 +494,15 @@ def _while(eqn, ins, fin, ctx, cap, rev, top, itags=None):
     tids = _tids(ctx, btags, [w.body])
     bfl = list(fin[nc:nc + nb])
     live = _live_carries(w, nc, nb, len(init))
+    from ._reverse import T3_MIN_EQNS, _n_eqns
+    big = _n_eqns(w.body.jaxpr) >= T3_MIN_EQNS            # (auto_checkpoints)
     if not tids:
-        return checkpointed_while(cfn, bfn, list(cc), list(bc), list(init), tflags, ropt, bfl, live=live), tflags
+        return checkpointed_while(cfn, bfn, list(cc), list(bc), list(init), tflags, ropt, bfl, live=live,
+                                  big=big), tflags
     n = len(init)
     out = checkpointed_while(lambda cc_, c2: cfn(cc_, c2[:n]), _with_toks(ctx, tids, bfn, n), list(cc), list(bc),
                     list(init) + [ctx["toks"][t] for t in tids], list(tflags) + ["w"] * len(tids),
-                    ropt, bfl, live=live + [False] * len(tids))
+                    ropt, bfl, live=live + [False] * len(tids), big=big)
     for t, v in zip(tids, out[n:]):
         _set_tok(ctx, t, v)
     return list(out[:n]), tflags

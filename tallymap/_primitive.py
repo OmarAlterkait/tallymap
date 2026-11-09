@@ -412,13 +412,6 @@ def _float_slots(p):
     return ot, tf, yf
 
 
-def _adj_opts(opts):
-    """the adjoint kernel's options = the forward's (identical math / contraction policy).  Private _adj_math
-    overrides the adjoint's cuda_math -- NEGATIVE CONTROL of tests/reverse.py's replay gate only."""
-    m = dict(opts).get("_adj_math")
-    return opts if not m else tuple(sorted(dict(opts, cuda_math=m).items()))
-
-
 def _vjp_call(node, base, pi, bc, U_pi, U_bc, cts, N):
     """cotangents of base's operands flagged U_pi / U_bc, given cotangents `cts` of ALL base outputs."""
     if base.spawn is not None:          # reverse through spawn: the tree adjoint (one adjoint launch per generation)
@@ -435,7 +428,7 @@ def _vjp_call(node, base, pi, bc, U_pi, U_bc, cts, N):
     q = vjp_prog(base, tuple(U_pi), tuple(U_bc), dict(node.opts))   # (RV: rev_* options)
     tn = node.derived(q, "adjoint", base=base, pp=tuple(U_pi), pb=tuple(U_bc),
                       lin_pi=(False,) * base.nP + (True,) * len(yf),
-                      lin_bc=(False,) * base.nB + (True,) * len(tf), opts=_adj_opts(node.opts))
+                      lin_bc=(False,) * base.nB + (True,) * len(tf))
     outs = bind_call(*pi, *ct_y, *bc, *ct_t, node=tn)
     if q.trunc is not None:
         tr = outs.pop()                 # the replay's own truncation flags (max_steps)

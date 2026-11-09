@@ -420,7 +420,7 @@ item jaxprs and generated kernels. `tm.diagnostics(f, *args)` reports what `jax.
 | `backend` | `'auto'` | `'auto'`: cuda on a GPU, where a program the cuda emitter cannot compile raises `tm.UnsupportedError` (pass `backend='lockstep'` to run it; it never falls back on its own, because lockstep is about 100x slower); lockstep elsewhere, with a one-time warning. `'cuda'`: cuda or raise. `'lockstep'`: always the plain-JAX interpreter, slow by design, the reference. |
 | `cuda_math` | `'approx'` | cuda f32 division, sqrt and rsqrt. `'approx'`: the PTX XLA:GPU itself emits, so it is the arithmetic a plain JAX program on the same GPU gets. `'ieee'`: correctly rounded, the portable reference, about 1.5x slower. |
 | `lockstep_block` | `2**18` | lockstep backend: lanes per block, which bounds its memory. |
-| `rev_checkpoints` | `'auto'` | reverse mode: checkpoint buffer size C. `'auto'`: 16 for a loop state (the carries the step reads) under 128 B, else the largest of 4 ... 64 whose 3C+1 states (single-loop adjoint: 2C+1) fit 64 KiB. A loop of K <= C steps is not replayed; O(K) work for K <= C^2. |
+| `rev_checkpoints` | `'auto'` | reverse mode: checkpoint buffer size C. `'auto'`: 16 for a loop step of fewer than 1000 equations, else the largest of 4 ... 64 whose 3C+1 states (single-loop adjoint: 2C+1) fit 64 KiB. A loop of K <= C steps is not replayed; O(K) work for K <= C^2. |
 | `rev_stats` | `False` | reverse through spawn: report the tree adjoint's counts to the host. Off by default because a host callback takes `jax.jit` off its C++ fast path, which can cost an order of magnitude. |
 
 Any other option name raises. Options starting with `_` are private measurement and negative-control switches
