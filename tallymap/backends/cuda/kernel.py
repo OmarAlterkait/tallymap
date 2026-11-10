@@ -193,8 +193,12 @@ def _val(name, shape, dt, impl):
 def split_blocker(jx):
     """why the step schedule cannot split the item jaxpr `jx` (None: it can).  The split needs exactly one
     top-level while loop."""
-    n = sum(e.primitive.name == "while" for e in jx.eqns)
+    ws = [e for e in jx.eqns if e.primitive.name == "while"]
+    n = len(ws)
     if n == 1:
+        from ..._jaxpr import while_parts
+        if while_parts(ws[0]).cond.jaxpr.outvars[0].aval.shape != ():
+            return "the item's top-level while loop has a batched (per-lane) predicate"
         return None
     return (f"the item has {n} top-level while loops; the step schedule needs exactly one (a "
             "while loop inside a cond, a scan or a call does not count)")
@@ -682,6 +686,14 @@ def _emit_rule(em, p, ins):
     nl = int(np.prod(s.lead, dtype=np.int64))
     lead = tuple(s.lead)
     I = tuple(idx.shape)
+    for _, B in em.lane_masks:          # (inside a while loop with a batched predicate: op_table._batched_body)
+        if lead[:len(B)] != B:
+            raise CodegenError(f"an emit into a tally with lead dims {lead} inside a while loop whose predicate has "
+                               f"shape {B} (internal error: JAX batches every carry of such a loop)")
+
+    def live(li):                        # the emit of lane index li runs only where every enclosing predicate holds
+        c = " && ".join(elem(pm, list(li[:len(B)])) for pm, B in em.lane_masks)
+        return f"if ({c}) " if c else ""
 
     def body(ii):
         fi = em.fresh("ei")
@@ -693,11 +705,13 @@ def _emit_rule(em, p, ins):
         if nl <= 32:
             for l in range(nl):
                 li = unravel(l, lead) if lead else []
-                em.line(f"sj_emit{t.slot}(P, sj_acc{t.slot}, {l * S} + {fi}, {elem(val, list(li) + list(ii))});")
+                em.line(f"{live(li)}sj_emit{t.slot}(P, sj_acc{t.slot}, {l * S} + {fi}, "
+                        f"{elem(val, list(li) + list(ii))});")
         else:
             lv = em.fresh("l")
             em.open(f"for (int {lv} = 0; {lv} < {nl}; ++{lv})")
-            em.line(f"sj_emit{t.slot}(P, sj_acc{t.slot}, (i64){lv} * {S} + {fi}, {elem(val, unravel(lv, lead) + list(ii))});")
+            li = unravel(lv, lead)
+            em.line(f"{live(li)}sj_emit{t.slot}(P, sj_acc{t.slot}, (i64){lv} * {S} + {fi}, {elem(val, li + list(ii))});")
             em.close()
         em.close()
     em.each(I, body)
@@ -706,6 +720,8 @@ def _emit_rule(em, p, ins):
 
 def _spawn_rule(em, p, ins, pav):
     q, when, leaves = ins[0], ins[1], ins[2:]
+    if em.lane_masks:
+        raise CodegenError("a spawn inside a while loop with a batched predicate is not supported")
     Q = int(p.spawn.capacity)
     old, tk, sl = em.fresh("qo"), em.fresh("qt"), em.fresh("qs")
     em.open(f"if ({elem(when, [])})")

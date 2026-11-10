@@ -13,7 +13,8 @@ Sections (cell name prefixes):
            one fresh TALLYMAP_CUDA_CACHE).  NEGATIVE CONTROLS: the same pairs under a deliberately coarse key
            (jaxpr text only / the real keys' structural digest only / avals only) MUST be caught; the control cell
            PASSES when the stale reuse is detected.
-  [tdep]   tangent-dependent control flow: a while loop whose trip count follows the tangent-carrying primal.
+  [tdep]   tangent-dependent control flow: a while loop whose trip count follows the tangent-carrying primal, and
+           one whose predicate reads the tangent itself (a per-lane predicate under dual lanes).
   [size]   run-or-raise: per-item carries on a size ladder either run and match jax.vmap, or raise a tallymap
            error that names the size.
   [ad]     AD self-consistency without finite differences: <u, J v> by jvp == by vjp; jacfwd == jacrev; the
@@ -846,6 +847,95 @@ for T in (3, 17):
         m2 = lanes_same(b, J[1], S[1], "per-item jacfwd vs jvp columns")
         m3 = near(J, jax.jit(jax.jacfwd(gr))(th0), 1e-10 if X64 else 2e-5, "jacfwd vs reference jacfwd")
         return f"trip counts {k.min()}..{k.max()}; vs jvp: Q {m1}, per-item {m2}; vs reference {m3}"
+
+
+# A loop whose PREDICATE reads the tangent: a hand-written conjugate-gradient solve inside a custom_jvp whose tangent
+# rule is a second CG on the tangent residual (round2/unproven item 3).  Under jacfwd with dual lanes the tangent
+# CG's predicate is per lane (bool[T]): JAX's while contract is "run while ANY lane's predicate holds, select each
+# lane's carries by its own predicate".  The RHS columns are chosen so the tangent solves of different columns take
+# different numbers of iterations (checked: the per-lane trip counts must differ).
+CG_N, CG_T, CG_RTOL, CG_ATOL, CG_MAXIT = 12, 10, 1e-5, 1e-7, 400
+
+
+def _cg_setup():
+    rng = np.random.default_rng(0)
+    Qm, _ = np.linalg.qr(rng.standard_normal((CG_N, CG_N)))
+    Bm = np.zeros((CG_N, CG_T))
+    Bm[:, 0], Bm[:, 1], Bm[:, 2] = Qm[:, 0], Qm[:, 6], Qm[:, 0] + Qm[:, 11]
+    Bm[:, 3], Bm[:, 4] = Qm[:, :3].sum(1), Qm[:, 2] - Qm[:, 9]
+    Bm[:, 5:] = rng.standard_normal((CG_N, CG_T - 5))
+    return jnp.asarray(Qm, F), jnp.asarray(np.logspace(0, 3, CG_N), F), jnp.asarray(Bm, F)
+
+
+CG_Q, CG_L, CG_B = _cg_setup()
+
+
+def cg_A(x):
+    return (CG_Q * (CG_L * (1.0 + 0.3 * x * jnp.linspace(0.0, 1.0, CG_N)))) @ CG_Q.T
+
+
+def cg_while(A, b):
+    bb = b @ b
+
+    def body(c):
+        k, x, r, p, rr = c
+        Ap = A @ p
+        a = rr / (p @ Ap)
+        x, r = x + a * p, r - a * Ap
+        rr2 = r @ r
+        return k + 1, x, r, r + (rr2 / rr) * p, rr2
+    k, x, _, _, _ = lax.while_loop(lambda c: (c[4] > (CG_RTOL * CG_RTOL) * bb + CG_ATOL * CG_ATOL) & (c[0] < CG_MAXIT),
+                                   body, (jnp.int32(0), jnp.zeros_like(b), b, b, bb))
+    return x, k
+
+
+@jax.custom_jvp
+def cg_solve(A, b):
+    return cg_while(A, b)[0]
+
+
+@cg_solve.defjvp
+def _cg_solve_jvp(pr, tg):
+    A, b = pr
+    dA, db = tg
+    x = cg_solve(A, b)
+    return x, cg_while(A, db - dA @ x)[0]      # the tangent solve: its while predicate reads the tangent residual
+
+
+def cg_item(t, x, th):
+    y = cg_solve(cg_A(x), CG_B @ th)
+    return t.add("Q", jnp.arange(CG_N), y), y
+
+
+class _NoTally:
+    def add(self, *a):
+        return self
+
+
+@case("[tdep] while whose PREDICATE reads the tangent (hand-written CG): jacfwd with dual lanes == jax.jacfwd of "
+      "plain JAX == stacked jvp")
+def _(b):
+    xs = jnp.linspace(0.5, 1.5, 64).astype(F)
+    th0 = jnp.asarray(0.5 + 0.1 * np.arange(CG_T), F)
+    tk = np.asarray(jax.jit(jax.vmap(lambda x: jnp.stack([cg_while(cg_A(x), CG_B[:, k])[1]
+                                                          for k in range(CG_T)])))(xs))
+    if len(set(tk[0].tolist())) < 3:
+        raise Fail(f"instrument: per-lane trip counts of item 0 {sorted(set(tk[0].tolist()))} are not divergent")
+    f = tm.vmap(cg_item, outputs={"Q": tm.Sum((CG_N,), F)}, in_axes=(0, None), backend=b)
+    g = lambda th: (f(xs, th).outputs["Q"], f(xs, th).per_item)
+    jx = str(jax.make_jaxpr(jax.jacfwd(g))(th0))
+    if "dual_lanes" not in jx:
+        raise Fail("instrument: jacfwd did not build a dual-lanes program")
+    J = jax.jit(jax.jacfwd(g))(th0)
+    ref_y = jax.jit(jax.jacfwd(lambda th: jax.vmap(lambda x: cg_item(_NoTally(), x, th)[1])(xs)))(th0)
+    m1 = near(J[1], ref_y, 1e-10 if X64 else 2e-4, "per-item jacfwd vs jax.jacfwd of plain JAX")
+    m2 = near(J[0], jnp.sum(ref_y, axis=0), 1e-10 if X64 else 2e-4, "Q jacfwd vs jax.jacfwd of plain JAX")
+    jv = jax.jit(lambda th, v: jax.jvp(g, (th,), (v,))[1])
+    cols = [jv(th0, jnp.zeros((CG_T,), F).at[j].set(1)) for j in range(CG_T)]
+    S = jax.tree_util.tree_map(lambda *c: jnp.stack(c, -1), *cols)
+    m3 = near(J, S, 1e-12 if X64 else 1e-5, "jacfwd (lanes) vs stacked jvp columns")
+    return (f"lane trip counts item 0 {sorted(set(tk[0].tolist()))}; vs plain JAX: per-item {m1}, Q {m2}; "
+            f"vs stacked jvp {m3}")
 
 
 # =================================================================================================== [size]

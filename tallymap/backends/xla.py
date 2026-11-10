@@ -47,6 +47,7 @@ class _St:
         self.bad = {k: jnp.zeros(a.shape, bool) for k, a in accs.items() if p.tallies[k].fixed_point}   # flagged bins
         self.drops = jnp.int32(0)       # out-of-range (dropped) emit indices
         self.mask = None
+        self.lanes = []                 # enclosing while loops with a batched predicate: their [P, *B] masks
 
     # ------------------------------------------------------------- state threaded through lax control flow
     def pack(self):
@@ -81,6 +82,12 @@ def _emit(st, t, idx, val):
     L = tuple(spec.lead)
     i = _bc(idx, P)                                   # [P, *I]
     v = _bc(val, P)                                   # [P, *L, *I]
+    for lm in st.lanes:     # inside a loop with a batched predicate (_while): a lane whose predicate is false
+        nb = lm.ndim - 1    # emits nothing (adding zero), the "select" of a tally carry
+        if tuple(L[:nb]) != tuple(lm.shape[1:]):
+            raise NotImplementedError(f"tallymap: an emit into a tally with lead dims {L} inside a while loop whose "
+                                      f"predicate has shape {lm.shape[1:]} (internal error)")
+        v = jnp.where(lm.reshape(lm.shape + (1,) * (v.ndim - lm.ndim)), v, jnp.zeros((), v.dtype))
     m = jnp.broadcast_to(st.mask.reshape((P,) + (1,) * (i.ndim - 1)), i.shape)
     live = m & (i >= 0) & (i < S)
     st.drops = st.drops + jnp.sum((m & ~live).astype(jnp.int32), dtype=jnp.int32)   # out of range: dropped
@@ -109,6 +116,8 @@ def _check_tail(qleaves, leaves):
 
 
 def _spawn(st, t, when, leaves):
+    if st.lanes:
+        raise NotImplementedError("tallymap: a spawn inside a while loop with a batched predicate is not supported")
     q = st.queue
     P = st.P
     Q = st.p.spawn.capacity
@@ -183,11 +192,14 @@ def _sel(m, new, old):
     """per-item select for batched values (VT passes through)."""
     if isinstance(old, VT):
         return old
-    mm = m.reshape(m.shape + (1,) * (new.ndim - 1))
+    mm = m.reshape(m.shape + (1,) * (new.ndim - m.ndim))
     return jnp.where(mm, new, old)
 
 
 def _while(st, e, ins):
+    """A predicate of shape B (batched: jax.vmap of a loop whose condition reads a batched value) follows JAX's while
+    contract: the loop runs while ANY entry holds; an entry whose predicate is false keeps its carries and emits
+    nothing.  The predicate is then [P, *B] and selects every carry ([P, *B, ...]) per entry."""
     w = while_parts(e)
     nc, nb = w.nc, w.nb
     cc, bc, init = ins[:nc], ins[nc:nc + nb], ins[nc + nb:]
@@ -201,8 +213,8 @@ def _while(st, e, ins):
         return [a if v else B(next(it), True) for a, v in zip(init, isvt)]
 
     def pred(arr):
-        r = _ev(st, w.cond.jaxpr, w.cond.consts, cc + carries(arr))[0]
-        return _bc(r, P) & outer
+        r = _bc(_ev(st, w.cond.jaxpr, w.cond.consts, cc + carries(arr))[0], P)
+        return r & outer.reshape(outer.shape + (1,) * (r.ndim - 1))
 
     def cond_f(s):
         return jnp.any(s[1])
@@ -211,8 +223,12 @@ def _while(st, e, ins):
         arr, m, packed = s
         st.unpack(packed)
         saved = st.mask
-        st.mask = m
+        st.mask = m if m.ndim == 1 else jnp.any(m.reshape(P, -1), axis=1)
+        if m.ndim > 1:
+            st.lanes.append(m)
         out = _ev(st, w.body.jaxpr, w.body.consts, bc + carries(arr))
+        if m.ndim > 1:
+            st.lanes.pop()
         st.mask = saved
         new = [_sel(m, _bc(o, P), a) for o, a in zip([o for o, v in zip(out, isvt) if not v], arr)]
         return new, pred(new), st.pack()

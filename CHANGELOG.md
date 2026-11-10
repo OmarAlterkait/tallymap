@@ -52,6 +52,14 @@ for the schedules ("item schedule" / "step schedule"), and the spelling "materia
   replacing the two-tier 504 / 2048 rule. The limits are the driver's own: up to 511 buffers within the classic
   4 KB parameter block, up to 4,094 (32,764 bytes) with CUDA 12.1+ large kernel parameters; more raises naming
   the limit. Every kernel's source (and cubin) changes once.
+- Both backends implement JAX's while contract for a batched (per-lane) predicate: the loop runs while ANY entry of
+  the predicate holds, each entry keeps its carries once its own predicate is false (per-entry select), and its
+  emits inside the body are dropped. `jax.vmap` produces such a loop for a condition that reads a batched value;
+  under `jacfwd` with dual lanes that is any loop whose condition reads the TANGENT (a hand-written CG inside a
+  `custom_jvp` whose tangent rule iterates on the tangent residual). It used to fail to build: a `bool[T]`
+  predicate where the cuda rule wrote a scalar test, a shape error on the xla backend. A loop with a batched
+  predicate is never split by the step schedule (it runs the item schedule). Test: invariants `[tdep]` hand CG,
+  `jacfwd` with lanes against `jax.jacfwd` of plain JAX and against stacked jvp columns, both backends.
 
 ### Changed (tree adjoint)
 

@@ -1334,13 +1334,52 @@ def _while(em, eqn, ins, **p):
     em.freeze(vals)                                                 # the predicate must not consume a carry
     pred = em.run_closed(w.cond, cc + vals)[0]
     em.unfreeze()
-    em.line(f"if (!({elem(pred, [])})) break;")
-    outs = em.run_closed(w.body, bc + vals)
+    if pred.shape == ():
+        em.line(f"if (!({elem(pred, [])})) break;")
+        outs = em.run_closed(w.body, bc + vals)
+    else:
+        outs = _batched_body(em, w, pred, bc, cars, vals, pt)
     _update_carries(em, cars, outs, pt)
     em.cf_depth -= 1
     em.close()
     em.unfreeze()
     return vals
+
+
+def _batched_body(em, w, pred, bc, cars, vals, pt):
+    """JAX's while contract for a BATCHED predicate (jax.vmap of a loop whose condition reads a batched value, e.g.
+    dual lanes of a loop whose condition reads the tangent): the predicate has shape B, a prefix of every carry's
+    shape; the loop runs while ANY of its B entries holds, and an entry whose predicate is false keeps its carries
+    (per-entry select of the body's results) and its emits are dropped (every emit inside the body is masked by
+    it: a tally carry is "selected" by not emitting).  -> the selected body results."""
+    B = tuple(pred.shape)
+    pm = em.declare(B, np.bool_, "pm")                  # the predicate of THIS iteration (the body reads carries)
+    em.assign(pm, pred)
+    anyv = em.fresh("pa")
+    em.line(f"bool {anyv} = false;")
+    em.each(B, lambda idx: em.line(f"{anyv} |= {elem(pm, idx)};"))
+    em.line(f"if (!{anyv}) break;")
+    for c, p_ in zip(cars, pt):
+        if not p_ and not isinstance(c, VTally) and tuple(c.shape[:len(B)]) != B:
+            raise CodegenError(f"a while loop with a predicate of shape {B} has a carry of shape {tuple(c.shape)} "
+                               "(internal error: JAX batches every carry of such a loop)")
+    em.freeze(vals)                                     # the select reads the OLD carries: never updated in place
+    em.lane_masks.append((pm, B))
+    try:
+        outs = em.run_closed(w.body, bc + vals)
+    finally:
+        em.lane_masks.pop()
+        em.unfreeze()
+    res = []
+    for o, c, p_ in zip(outs, vals, pt):
+        if p_ or isinstance(c, VTally):
+            res.append(o)
+            continue
+        fn = (lambda idx, o=o, c=c: f"({elem(pm, list(idx[:len(B)]))} ? ({elem(o, idx)}) : ({elem(c, idx)}))")
+        sel = Lazy(c.shape, c.dtype, fn, cost=lazy_cost(o) + 1)
+        sel.key_impl = c.key_impl
+        res.append(sel)
+    return res
 
 
 def _branch(em, br, ops):

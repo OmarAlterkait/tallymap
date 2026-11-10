@@ -335,6 +335,7 @@ class Emitter:
         self.inplace = INPLACE    # False (test-only codegen.INPLACE): never update an array in place
         self._mulmemo = {}        # mul_chain: id(jaxpr) -> (jaxpr, output chain depth)
         self.n_brk = 0            # chain cuts emitted (sj_brk)
+        self.lane_masks = []      # enclosing while loops with a per-lane predicate: (mask Local, predicate shape)
 
     # ------------------------------------------------------------ text helpers
     def fresh(self, p="v"):
