@@ -928,7 +928,9 @@ def _(b):
     jv = jax.jit(lambda th, v: jax.jvp(g, (th,), (v,))[1])
     cols = [jv(th0, jnp.zeros((CG_T,), F).at[j].set(1)) for j in range(CG_T)]
     S = jax.tree_util.tree_map(lambda *c: jnp.stack(c, -1), *cols)
-    m3 = near(J, S, 1e-12 if X64 else 1e-5, "jacfwd (lanes) vs stacked jvp columns")
+    # f32: plain JAX's own jacfwd and stacked jvp differ by 1.51e-5 here (CPU, JAX 0.6.2; cond(A) ~ 1e3),
+    # so the bound sits above that floor rather than at f32 epsilon.
+    m3 = near(J, S, 1e-12 if X64 else 1e-4, "jacfwd (lanes) vs stacked jvp columns")
     return (f"lane trip counts item 0 {sorted(set(tk[0].tolist()))}; vs plain JAX: per-item {m1}, Q {m2}; "
             f"vs stacked jvp {m3}")
 
