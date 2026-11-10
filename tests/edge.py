@@ -1666,6 +1666,28 @@ def _(b):
             close(jr, jf, what=f"jacrev vs jacfwd, max_steps={cap}")
     return "max_steps 64: jacrev == jacfwd; 10 (truncating): both NaN"
 
+
+@case("typed PRNG key (jax.random.key) as a mapped input of a spawning call: value and grad == raw uint32 key")
+def _(b):
+    def particle(t, p, th):
+        def body(c):
+            s, n, t = c
+            k = jax.random.fold_in(s["key"], n)
+            u = jax.random.uniform(k)
+            t = t.add("Q", (u * NB).astype(jnp.int32), s["E"] * th)
+            t = t.spawn(dict(E=s["E"] * 0.5, key=jax.random.fold_in(k, 1), g=s["g"] + 1), when=(u < 0.3) & (s["g"] < 3))
+            return dict(E=s["E"] * 0.8, key=s["key"], g=s["g"]), n + 1, t
+        return lax.while_loop(lambda c: c[1] < 5, body, (p, jnp.int32(0), t))[2]
+    raw = jax.random.split(jax.random.PRNGKey(1), N)
+    got = {}
+    for kind, k in (("typed", jax.random.wrap_key_data(raw)), ("raw", raw)):
+        p0 = dict(E=xs, key=k, g=jnp.zeros((N,), jnp.int32))
+        g = V(particle, b, in_axes=(0, None), spawn=tm.Queue(1 << 12))
+        got[kind] = (jax.jit(lambda th: g(p0, th).outputs["Q"])(TH),
+                     jax.jit(jax.grad(lambda th: g(p0, th).outputs["Q"].sum()))(TH))
+    close(got["typed"], got["raw"], what="typed vs raw key")
+    return "typed key == raw key, value and grad"
+
 print("\n================ SUMMARY", jax.__version__, "x64" if jax.config.jax_enable_x64 else "",
       jax.devices()[0].device_kind)
 for n, b, m in RES:

@@ -351,7 +351,7 @@ def run(p, pi, bc, xla_batch_size=None, **_):
     if p.spawn is not None:
         Q = int(p.spawn.capacity)
         pav = [v.aval for v in cj.jaxpr.invars[nT:nT + p.nP]]
-        queue = dict(leaves=[jnp.zeros((Q,) + tuple(a.shape), a.dtype) for a in pav], head=jnp.int32(0),
+        queue = dict(leaves=[lax.full((Q,) + tuple(a.shape), 0, a.dtype) for a in pav], head=jnp.int32(0),
                      tail=jnp.int32(0), spawned=jnp.int32(0), dropped=jnp.int32(0))
     st = _St(p, P, accs, queue)
     lanes = jnp.arange(P, dtype=jnp.int32)

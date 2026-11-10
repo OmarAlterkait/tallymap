@@ -454,12 +454,12 @@ def _poison_primal(outs, bad):
 
 def _check_spawn(cj, pav, where=""):
     from ._jaxpr import located, subjaxprs
-    want = [(tuple(a.shape), np.dtype(a.dtype)) for a in pav]
+    want = [(tuple(a.shape), a.dtype) for a in pav]     # not np.dtype: a typed PRNG key
 
     def walk(j):
         for e in j.eqns:
             if e.primitive.name == "tallymap_spawn":
-                got = [(tuple(v.aval.shape), np.dtype(v.aval.dtype)) for v in e.invars[2:]]
+                got = [(tuple(v.aval.shape), v.aval.dtype) for v in e.invars[2:]]
                 if got != want:
                     raise located(TypeError(f"tallymap: spawned child leaves {got} do not match the mapped inputs "
                                             f"{want}"), e, f"item function {where}")
