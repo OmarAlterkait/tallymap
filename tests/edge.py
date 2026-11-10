@@ -1643,6 +1643,29 @@ def _(b):
     return f"{H}-element carry: no per-step copy"
 
 
+
+@case("jacrev with max_steps set (a laned adjoint's per-lane truncation flags) == jacfwd")
+def _(b):
+    def item(t, x, key, th):
+        L = 2 + (bits(key, 7) % 19).astype(jnp.int32)
+
+        def body(c):
+            k, w, t = c
+            i = (bits(key, k) % NB).astype(jnp.int32)
+            return k + 1, w * th[i % 4] + 0.125, t.add("Q", i, w)
+        return lax.while_loop(lambda c: c[0] < L, body, (jnp.int32(0), x, t))[2]
+    th = jnp.linspace(0.5, 0.9, 4).astype(F)
+    for cap, trunc in ((64, False), (10, True)):
+        f = V(item, b, in_axes=(0, 0, None), max_steps=cap)
+        Q = lambda th: f(xs, keys, th).outputs["Q"]
+        jr, jf = jax.jit(jax.jacrev(Q))(th), jax.jit(jax.jacfwd(Q))(th)
+        if trunc:
+            if not (np.all(np.isnan(np.asarray(jr))) and np.all(np.isnan(np.asarray(jf)))):
+                raise Fail(f"max_steps={cap} truncates: jacrev / jacfwd should be NaN")
+        else:
+            close(jr, jf, what=f"jacrev vs jacfwd, max_steps={cap}")
+    return "max_steps 64: jacrev == jacfwd; 10 (truncating): both NaN"
+
 print("\n================ SUMMARY", jax.__version__, "x64" if jax.config.jax_enable_x64 else "",
       jax.devices()[0].device_kind)
 for n, b, m in RES:

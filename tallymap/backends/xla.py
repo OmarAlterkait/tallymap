@@ -365,7 +365,8 @@ def run(p, pi, bc, xla_batch_size=None, **_):
         ys = [y.at[wid].set(v.astype(y.dtype), mode="drop") for y, v in zip(ys, yv)]
         ctr = jnp.int32(0)
         if p.trunc is not None:
-            ctr = jnp.sum((yv[p.trunc].astype(bool) & mask & ~primary).astype(jnp.int32), dtype=jnp.int32)
+            tr = yv[p.trunc].astype(bool).reshape(P, -1).any(axis=1)     # a laned program (jacrev) flags per lane
+            ctr = jnp.sum((tr & mask & ~primary).astype(jnp.int32), dtype=jnp.int32)
         return ys, ctr
 
     if N == 0 and queue is None:
