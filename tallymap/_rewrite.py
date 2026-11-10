@@ -258,7 +258,7 @@ def retrace(cj, *, cap=None, rev=False, n_tally=0, emit=None, tables=None, repor
     iterations (f returns its outputs + [truncated:bool]), or (rev: True or _reverse.RevOpts) every while loop replaced
     by a reverse-differentiable loop (_reverse.checkpointed_while).  The first n_tally invars are tallies (rev: their
     carries get a pass-through cotangent instead of a dense one).  emit: f(tally, idx, val) -> tally' replaces every
-    emit (e.g. offset indices when a batch is folded into items).
+    emit (the tree adjoint records its emits through it).
     spawn: f(token, when, *child) -> token' replaces every spawn (the tree adjoint, _reverse_spawn.py).  With hooks a
     tally value may be a python TUPLE (e.g. (array, hash)): equations it flows into are interpreted (never bound),
     and lax control flow carries it as a pytree.  Only for rev=False (the hooked program is re-traced to a flat jaxpr).

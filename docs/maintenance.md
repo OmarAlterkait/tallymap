@@ -21,8 +21,8 @@ The floor is **JAX 0.5.3 and Python 3.10**, with **no upper bound**, as equinox,
 found to be broken gets a `!=` exclusion in `pyproject.toml` and a patch release; there are none so far.
 
 **Every minor release from the floor to the newest is tested**, not only the two ends, because the parts of JAX
-this library leans on (the legacy transformation registries, the jaxpr equation parameter names, the shard_map
-varying-axes type) change between minors and not between patches. Each minor is tested at its latest patch, on
+this library leans on (the legacy transformation registries, the jaxpr equation parameter names) change between
+minors and not between patches. Each minor is tested at its latest patch, on
 CPU, with the full suite:
 
 | JAX | 0.5.3 | 0.6.2 | 0.7.2 | 0.8.3 | 0.9.2 | 0.10.2 | 0.11.2 |
@@ -59,10 +59,9 @@ warning.
 
 | tier | what tallymap uses | where |
 |---|---|---|
-| public (3-month deprecation policy) | `make_jaxpr`, `jvp` / `vjp` / `vmap`, `custom_jvp` / `custom_vjp` (with symbolic zeros), `checkpoint`, `typeof`, `tree_util`, `debug.callback`, `lax` control flow, `lax.pcast` / `pvary`, `jax.random.{key_data, wrap_key_data, key_impl}`, `jax.ffi.*`, `jax.export.DisabledSafetyCheck`, `jax.test_util.check_grads` (tests only) | everywhere |
+| public (3-month deprecation policy) | `make_jaxpr`, `jvp` / `vjp` / `vmap`, `custom_jvp` / `custom_vjp` (with symbolic zeros), `checkpoint`, `typeof`, `tree_util`, `debug.callback`, `lax` control flow, `jax.random.{key_data, wrap_key_data, key_impl}`, `jax.ffi.*`, `jax.export.DisabledSafetyCheck`, `jax.test_util.check_grads` (tests only) | everywhere |
 | `jax.extend` | `core.{Primitive, ClosedJaxpr, Literal, jaxpr_as_fun, DropVar, primitives}`, `random.{threefry,rbg,unsafe_rbg}_prng_impl`, `source_info_util.{summarize, user_context, register_exclusion}` | `_api`, `_jaxpr`, `_compat` |
 | legacy modules: where a JAX upgrade would break us | `jax.core.{ShapedArray, Tracer}`; `jax.interpreters.ad.{primitive_jvps, primitive_transposes, Zero, instantiate_zeros, is_undefined_primal}`; `batching.fancy_primitive_batchers`; `mlir.{register_lowering, lower_fun}`; `partial_eval.{custom_partial_eval_rules, partial_eval_jaxpr_custom_rules}` (the fused JVP only, feature-detected) | `_tally`, `_primitive`, `_reverse`, `_compat` |
-| experimental | the shard_map varying-axes type (`aval.vma` on 0.7-0.10, `aval.manual_axis_type.varying` on 0.11) | `_primitive` (feature-detected) |
 | private | `aval.dtype._impl` of a typed pseudo-random key (with a name lookup as the fallback); the jaxpr equation parameters read by `_jaxpr.py` | `_compat`, `_jaxpr` |
 | jaxlib / XLA | the foreign-function-interface C++ headers (api_version 4), hashed into the shim's cache key | `backends/cuda/shim.cc`, `compile.py` |
 
@@ -80,7 +79,6 @@ deliberate: it is what makes an upgrade a bounded job.
 | `run_all.py --canary` fails with a DeprecationWarning from tallymap's own code | JAX deprecated an API the library uses | move to the replacement in `_compat.py`; if it is one of the legacy transformation registries, start the hijax port |
 | every JVP suddenly runs two kernels (`tallymap._primitive.FUSE_JVP` is False), while the numbers stay correct | the partial-evaluation registries are gone | nothing is wrong: that is the fallback design, and `run_all.py --unfused` already tests it. Regaining one kernel needs the hijax port |
 | batching rules not found, or a wrong batcher signature | the batching registry changed | adapt `_compat.register_batcher`, which is one wrapper |
-| the shard_map or pmap cells fail on a new JAX | the varying-axes type moved again | adapt `_varying` / `_with_varying` / `_plain` in `_primitive.py`; meanwhile users can pass `shard_map(..., check_vma=False)` |
 | typed-key randomness fails on cuda (`random_bits`, `split`, `fold_in`) | the pseudo-random implementation object or `dtype._impl` changed | adapt `_compat.key_impl` and the `random_*` shims; the RNG rows of `tests/ops.py` check it bitwise; meanwhile users can pass raw uint32 keys |
 | the shim does not build or does not load | a new jaxlib FFI header, or a different host compiler | `shim.cc` is about 200 lines and its cache key contains the headers, so a stale shared object is never reused; check `$CXX` first |
 | `tests/ops.py` reports CHANGED rows | the CUDA emitter, NVRTC or the CUDA math library changed the numbers | if the change was intended: rerun the `compare` protocol (`docs/validation.md`), then re-record `tests/ops_baseline.json` in a commit of its own |
@@ -96,7 +94,6 @@ deliberate: it is what makes an upgrade a bounded job.
 |---|---|---|---|
 | `MAX_LANES` | 16 | `_primitive.py` | L40S: `jacrev` of 256 outputs in chunks of 4 / 8 / 16 / 32 / 64 lanes: 229 / 191 / 175 / 176 / 325 ms |
 | `LANES_MAX_LOCAL` | 512 elements | `_primitive.py` | L40S: `jacfwd` lane counts; the toy `jacfwd(grad)` went from 95 ms to 2.3 ms once a 6 KB stack frame was split |
-| `FOLD_MAX_BC` | 4096 elements | `_primitive.py` | L40S: a folded batch against `lax.map`, 1.2 to 3.4x (the fold rule itself is the device's resident-thread count, not a constant: `docs/design.md` section 2) |
 | `BLOCK` (cuda) | 128 threads | `backends/cuda/kernel.py` | L40S: 64, 128 and 256 within 1% |
 | `PRIV_BYTES` | 4096 bytes per block | `backends/cuda/kernel.py` | 2080 Ti: random walk 7.9 ms against 36.4 and barrier 14.4 against 56.6 (forward, 4M items) with privatisation off |
 | `UNROLL` / `MAX_LOCAL` | 32 / 16384 elements | `backends/cuda/codegen.py` | L40S and 2080 Ti: compile time against local memory |
@@ -126,8 +123,9 @@ constant.
   (`DisabledSafetyCheck.custom_call("tallymap_cuda_launch")` exports it anyway) and the cubin registry is per
   process, so a deserialised CUDA program only runs in a process that built the same kernels. Programs on the xla backend
   export normally.
-- **shard_map**: the primitive follows shard_map's varying-axes typing. If a JAX release changes that type before
-  the adapter does, `shard_map(..., check_vma=False)` (`check_rep=False` on 0.5.3) is the escape hatch.
+- **shard_map is not supported** (removed before 0.6.0rc1, with the varying-axes adapter it needed). Shard the
+  items outside the call: `jax.pmap` over devices works (tests/transforms.py), and `shard_map(...,
+  check_vma=False)` skips the typing the primitive does not follow (untested).
 
 ## Profiling
 

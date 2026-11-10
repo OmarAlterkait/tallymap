@@ -12,8 +12,6 @@ they recurse to any order.  Node kinds:
   tangent       pi, dpi | bc, dbc           tangent part of jax.jvp(base item)              dpi, dbc (trailing operands)
   adjoint       pi, cy  | bc, ct            jax.vjp(base item) (replay adjoint)             cy, ct   (trailing operands)
   dual_lanes    pi, bc (some with T lanes)  jax.vmap of a linear node's item over T dual lanes (batched linear operands)
-  folded_batch  pi, b | bc (some [B, ...])  a batch folded into the item axis: B*N items, member b's emits go to
-                                            [b*S, (b+1)*S)
   fused_jvp     pi, dpi | bc, dbc           jax.jvp(item): primal + tangent in one kernel (primitive tallymap_jvp;
                                             split into primal + tangent wherever JAX partially evaluates it)
 
@@ -25,9 +23,8 @@ they recurse to any order.  Node kinds:
   batching     only linear operands batched (jacfwd, jacrev, vmap of jvp/vjp tangents; for a fused_jvp node: only its
                tangents) -> `dual_lanes`: T dual lanes per item, the primal computed once; on cuda in chunks of at
                most MAX_LANES (16) lanes whose lane-dependent loop arrays stay < LANES_MAX_LOCAL (512) elements, one
-               launch per chunk.  Otherwise, when no spawn / fixed-point outputs, every batched broadcast operand is
-               small (<= FOLD_MAX_BC elements per member) and (cuda) one member's N items cannot fill the device
-               -> `folded_batch`: ONE launch over B*N items; anything else -> lax.map (one launch per member).
+               launch per chunk.  Anything else (a batched non-linear operand: jax.vmap of a call) -> lax.map (one
+               launch per member).
   lowering     per PLATFORM: on 'cuda' the cuda backend (backend='auto'|'cuda'), elsewhere the xla backend.
   impl         eager calls go through a jax.jit cached on the node's structure.
 
@@ -52,7 +49,7 @@ from jax.interpreters import partial_eval as _pe
 from ._api import _WARNED, ItemProgram, UnsupportedError, _mk, _sds, jvp_prog
 from ._compat import NM, drop_var, register_batcher
 from ._reverse import vjp_prog
-from ._rewrite import emit_p_bind, isfloat, retrace
+from ._rewrite import isfloat
 
 tallymap_call_p = Primitive("tallymap_call")
 tallymap_call_p.multiple_results = True
@@ -68,7 +65,7 @@ class Node:
     prog: ItemProgram
     backend: str
     opts: tuple                 # sorted (name, value) backend options
-    kind: str = "primal"        # 'primal' | 'tangent' | 'adjoint' | 'dual_lanes' | 'folded_batch' | 'fused_jvp'
+    kind: str = "primal"        # 'primal' | 'tangent' | 'adjoint' | 'dual_lanes' | 'fused_jvp'
     base: Any = None            # tangent / adjoint: the ItemProgram they were derived from
     pp: tuple = ()              # tangent / adjoint: which per-item operands of `base` carry tangents / get cotangents
     pb: tuple = ()              # tangent / adjoint: same for the broadcast operands
@@ -106,24 +103,11 @@ class Node:
 
 
 def bind_call(*args, node):
-    """bind tallymap_call_p.  Inside shard_map (jax >= 0.7, vma checking on) operands that are invariant over a manual
-    axis some other operand varies over are first cast to varying (lax.pvary / lax.pcast), exactly as JAX does for its
-    own n-ary primitives; the cast's transpose (psum) then sums the per-device cotangents of those operands."""
-    vs = [_varying(_aval(a)) for a in args]
-    if any(vs):
-        u = frozenset().union(*vs)
-        args = [_cast_varying(a, tuple(sorted(u - v, key=str))) if u - v else a for a, v in zip(args, vs)]
     return _prim_of(node).bind(*args, node=node)
 
 
 def _prim_of(node):
     return tallymap_jvp_p if node.kind == "fused_jvp" else tallymap_call_p
-
-
-def _cast_varying(x, axes):
-    if hasattr(lax, "pcast"):                 # jax >= 0.9
-        return lax.pcast(x, axes, to="varying")
-    return lax.pvary(x, axes)                 # jax 0.7 - 0.8
 
 
 def make_node(prog, backend, opts, site=None):
@@ -159,11 +143,6 @@ def _abstract(*args, node):
     outs = [ShapedArray(tuple(p.tallies[k].lead) + (p.tallies[k].S,), p.tallies[k].dtype) for k in _out_specs(p)]
     outs.append(ShapedArray((5,), jnp.int32))
     outs += [ShapedArray((N,) + tuple(a.shape), a.dtype) for a in p.y_avals()]
-    vs = [_varying(a) for a in args]
-    if any(vs):                  # inside shard_map (jax >= 0.7): the result varies over every axis an operand does
-        vset = frozenset().union(*vs)
-        src = args[[len(v) for v in vs].index(max(len(v) for v in vs))]
-        outs = [_with_varying(o, vset, src) for o in outs]
     return outs
 
 
@@ -211,40 +190,12 @@ def _warn_once(msg, site=None):
         warnings.warn_explicit(msg, UserWarning, site[0], site[1])
 
 
-# shard_map's "varying manual axes" type (jax >= 0.7: aval.vma; >= 0.11: aval.manual_axis_type.varying).  The
-# result of an tallymap call varies over every manual axis any operand varies over; the backends' internal ops are not
-# vma-aware, so the lowering traces them with plain avals (the lowered program does not depend on the type).
-def _varying(a):
-    v = getattr(a, "vma", None)
-    if v is None:
-        v = getattr(getattr(a, "manual_axis_type", None), "varying", None)
-    return frozenset(v or ())
-
-
-def _with_varying(o, vset, src):
-    if hasattr(src, "manual_axis_type"):                         # jax >= 0.11
-        from jax.sharding import NamedSharding, PartitionSpec
-        sh = NamedSharding(src.sharding.mesh, PartitionSpec(*([None] * len(o.shape))))
-        return ShapedArray(o.shape, o.dtype, sharding=sh, manual_axis_type=type(src.manual_axis_type)(varying=vset))
-    return o.update(vma=vset)                                    # jax 0.7 - 0.10
-
-
-def _plain(a):
-    if not _varying(a):
-        return a
-    if hasattr(a, "manual_axis_type"):
-        return a.update(sharding=None, manual_axis_type=type(a.manual_axis_type)())
-    return a.update(vma=frozenset())
-
-
 def _lowering(platform):
     def f(*args, node):
         return _run(node, args, platform)
     low = mlir.lower_fun(f, multiple_results=True)
 
     def rule(ctx, *args, node):
-        if any(_varying(a) for a in list(ctx.avals_in) + list(ctx.avals_out)):
-            ctx = ctx.replace(avals_in=[_plain(a) for a in ctx.avals_in], avals_out=[_plain(a) for a in ctx.avals_out])
         try:
             return low(ctx, *args, node=node)
         except UnsupportedError:
@@ -522,10 +473,8 @@ def _batch(args, dims, *, node):
     if r is not None:
         return r
     bat = [d is not NM for d in dims]
-    size = next(a.shape[d] for a, d in zip(args, dims) if d is not NM)
-    if _can_fold(node, args, dims, bat, size):
-        return _fold_batch(node, args, dims, bat, size)
-    # general batching: one launch per batch member (full SIMT divergence per member, no per-lane tally selects)
+    # general batching (jax.vmap of a call): one launch per batch member (full SIMT divergence per member, no
+    # per-lane tally selects)
     idx = [k for k, b in enumerate(bat) if b]
     xs = [jnp.moveaxis(args[k], dims[k], 0) for k in idx]
 
@@ -627,12 +576,13 @@ register_batcher(tallymap_call_p, _batch)
 # per lane (L40S): T lanes in one kernel cost 1.34 / 1.99 / 2.27 / 2.57 x fwd for T = 1..4 but 14 / 23 / 32 x for
 # T = 6 / 8 / 10
 # (one launch per column: 2.2 + 1.2 (T-1) x).  On cuda the lane-dependent loop state is kept below LANES_MAX_LOCAL
-# elements by splitting the lanes into chunks (one launch each); a single lane over the limit -> fold / lax.map.
+# elements by splitting the lanes into chunks (one launch each); a single lane over the limit -> lax.map.
 LANES_MAX_LOCAL = 512
 # ... and at most MAX_LANES lanes per kernel (the guard sees the largest lane array, not the sum of many small lane
 # values).  Measured (L40S, toy walk 1M items, jacrev of 256 outputs = 256 cotangent lanes of the adjoint): one
-# kernel per chunk of 4 / 8 / 16 / 32 / 64 lanes 229 / 191 / 175 / 176 / 325 ms, all 256 at once 4.3 s, fold 533 ms;
-# hessian 8x8 (8 lanes) 83 ms vs fold 102 ms.  A photon-transport jacfwd of 10 parameters stays one kernel.
+# kernel per chunk of 4 / 8 / 16 / 32 / 64 lanes 229 / 191 / 175 / 176 / 325 ms, all 256 at once 4.3 s, a folded
+# batch (since removed) 533 ms; hessian 8x8 (8 lanes) 83 ms vs 102 ms folded.  A photon-transport jacfwd of 10
+# parameters stays one kernel.
 MAX_LANES = 16
 # TEST-ONLY (tests patch it, like FUSE_JVP): 'auto' (MAX_LANES and the LANES_MAX_LOCAL guard on a GPU, every lane in
 # one kernel elsewhere) | 'off' (never dual lanes) | 'force' (ignore the guard) | int (chunks of at most this many)
@@ -721,111 +671,6 @@ def _largest_loop_array(jaxpr, in_loop=False):
         for sj in subs:
             m = max(m, _largest_loop_array(sj.jaxpr, loop))
     return m
-
-
-# ------------------------------------------------------------------------------------------- fold a batch into items
-FOLD_MAX_BC = 4096      # largest batched broadcast operand (elements per batch member) indexed per item when folding
-FOLD = True             # TEST-ONLY (like FUSE_JVP): False never folds a batch into the item axis
-
-
-def _can_fold(node, args, dims, bat, size):
-    p = node.prog
-    if not FOLD or p.spawn is not None or p.nact is not None:
-        return False            # spawn: one shared queue per launch would change capacity semantics; n_active is
-                                # one member's item count
-    if any(s.fixed_point for s in p.tallies if s.kind == "sum"):
-        return False            # stats['fixed_point_overflow'] is per launch, not per batch member
-    for k in range(p.nP, len(args)):
-        if bat[k] and int(np.prod(args[k].shape, dtype=np.int64)) // max(size, 1) > FOLD_MAX_BC:
-            return False        # a large batched table would be indexed per item (xla backend: gathered per item)
-    if _gpu(node):
-        # Folding costs B copies of every per-item operand and runs ONE launch of B*N items, so it pays only while
-        # one member's launch of N items cannot fill the device by itself.  MEASURED (2080 Ti, 68 SMs = 69,632
-        # resident threads, B = 8, toy walk, 64 / 256 / 1024 / 4096 bins, docs/design.md section 2): folding is
-        # 1.3x to 2.5x faster at N = 65,536, 1.0x to 1.4x at N = 262,144, 2.5x SLOWER at 1M and 5.8 to 6.9x
-        # slower at 4M.  The rule is therefore the device, not the tally size: the earlier rule (fold only while
-        # shared-memory privatisation is preserved) refused the 2.2x at 65k items and 1024 bins and allowed the
-        # 6.9x loss at 4M items, because a tally privatised at every B, or at none, passed it at every N.
-        rt = _resident_threads()
-        if rt and _item_count(args, dims, bat, p.nP) >= rt:
-            return False
-    return True
-
-
-def _resident_threads():
-    """A lower bound on the GPU's resident threads: multiprocessors x 1024, where 1024 is the SMALLEST
-    maximum-threads-per-multiprocessor of any architecture this library is tested on (compute capability 7.5 has
-    1024, 8.9 has 1536, 8.0 has 2048), so the bound never overestimates.  0 when the count is unavailable."""
-    try:
-        return int(getattr(jax.devices()[0], "core_count", 0) or 0) * 1024
-    except Exception:          # pragma: no cover (no device)
-        return 0
-
-
-def _item_count(args, dims, bat, nP):
-    """N, the item count of ONE batch member, read off the first per-item operand: vmap inserted the batch axis
-    at dims[0], so the item axis is still axis 0 unless the batch axis went in front of it."""
-    if not nP:                                 # (unreachable: tallymap.vmap needs a mapped argument)
-        return 0
-    sh = args[0].shape
-    return int(sh[1] if (bat[0] and dims[0] == 0) else sh[0])
-
-
-def fold_prog(p, B, bbc):
-    """the batch folded into the item axis: per-item operands + member index b; batched broadcast operands keep
-    their [B, ...] axis and are indexed with b inside the item; tallies are B times longer and every emit of member b
-    lands in [b*S, (b+1)*S) (out-of-range indices stay dropped)."""
-    nT, nP = p.nT, p.nP
-
-    def em(t, idx, val):
-        S = t.shape[-1] // B
-        b = em.b
-        i = jnp.asarray(idx).astype(jnp.int32)
-        return emit_p_bind(t, jnp.where((i >= 0) & (i < S), i + b * S, -1), val)
-
-    def item(*a):
-        t, pi, b, bc = a[:nT], a[nT:nT + nP], a[nT + nP], list(a[nT + nP + 1:])
-        bc = [lax.dynamic_index_in_dim(x, b, 0, keepdims=False) if f else x for x, f in zip(bc, bbc)]
-        em.b = b
-        return retrace(p.cj, n_tally=nT, emit=em)(*t, *pi, *bc)
-    av = p.in_avals()
-    tav = [jax.ShapeDtypeStruct(tuple(s.lead) + (B * s.S,), a.dtype) if s.kind != "spawn" else _sds(a)
-           for s, a in zip(p.tallies, av[:nT])]
-    pav = [_sds(a) for a in av[nT:nT + nP]]
-    bav = [jax.ShapeDtypeStruct((B,) + tuple(a.shape), a.dtype) if f else _sds(a) for a, f in zip(av[nT + nP:], bbc)]
-    cj = _mk(item, tav + pav + [jax.ShapeDtypeStruct((), jnp.int32)] + bav)
-    tl = tuple(dataclasses.replace(s, S=B * s.S) for s in p.tallies)
-    return dataclasses.replace(p, cj=cj, tallies=tl, nP=nP + 1, tag=p.tag + f"+folded_batch{B}")
-
-
-def _fold_batch(node, args, dims, bat, B):
-    p = node.prog
-    nP = p.nP
-    a0 = jnp.moveaxis(args[0], dims[0], 0) if bat[0] else args[0][None]
-    N = a0.shape[1]
-    pi2 = []
-    for k in range(nP):
-        x = jnp.moveaxis(args[k], dims[k], 0) if bat[k] else jnp.broadcast_to(args[k], (B,) + args[k].shape)
-        pi2.append(x.reshape((B * N,) + x.shape[2:]))
-    bid = jnp.repeat(jnp.arange(B, dtype=jnp.int32), N, total_repeat_length=B * N)
-    bc2 = [jnp.moveaxis(args[k], dims[k], 0) if bat[k] else args[k] for k in range(nP, len(args))]
-    q = fold_prog(p, B, tuple(bat[nP:]))
-    fn = node.derived(q, "folded_batch", lin_pi=(node.lin_pi + (False,)) if node.linear else (),
-                      lin_bc=node.lin_bc if node.linear else ())
-    outs = bind_call(*pi2, bid, *bc2, node=fn)
-    ot = _out_specs(p)
-    nt = len(ot)
-    res, od = [], []
-    for j, k in enumerate(ot):
-        o = outs[j]
-        res.append(o.reshape(o.shape[:-1] + (B, p.tallies[k].S)))
-        od.append(len(p.tallies[k].lead))
-    res.append(outs[nt])
-    od.append(NM)
-    for o in outs[nt + 1:]:
-        res.append(o.reshape((B, N) + o.shape[1:]))
-        od.append(0)
-    return res, od
 
 
 # ------------------------------------------------------------------------------------------- fused jvp

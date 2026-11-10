@@ -202,7 +202,7 @@ def _poison_tally(t, bad):
     """the tally t with NaN emitted into every bin when the item's `bad` (its truncation flag) is set.  The primal
     outputs of a truncated call are poisoned by _poison_primal, whose tangent is the identity (so that jax.grad needs
     no forward launch); the tangent sums are poisoned here, inside the tangent / fused / dual-lane kernel, by the
-    items that were truncated (per item, so per batch member when a batch is folded).  A fixed-point sum flags the
+    items that were truncated (per item).  A fixed-point sum flags the
     NaN emits as overflows (stats['fixed_point_overflow'] then counts them too)."""
     from ._rewrite import emit_p_bind
     nan = jnp.full(t.shape[:-1], np.nan, t.dtype)

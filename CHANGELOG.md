@@ -60,6 +60,14 @@ for the schedules ("item schedule" / "step schedule"), and the spelling "materia
   predicate where the cuda rule wrote a scalar test, a shape error on the xla backend. A loop with a batched
   predicate is never split by the step schedule (it runs the item schedule). Test: invariants `[tdep]` hand CG,
   `jacfwd` with lanes against `jax.jacfwd` of plain JAX and against stacked jvp columns, both backends.
+- REMOVED: the batch fold (`folded_batch` node, `fold_prog`, `_can_fold`, `FOLD_MAX_BC`, the test-only
+  `_primitive.FOLD`, the device-occupancy rule). `jax.vmap` of a call over a non-linear operand is `lax.map`, one
+  launch per member, as it already was whenever the fold did not apply; vmap over tangent / cotangent operands
+  stays dual lanes. No application path reached the fold (round2/simplicity), and it paid only while one member's
+  launch could not fill the device. `tests/transforms.py` loses its `TEST_NEG=fold` control.
+- REMOVED: shard_map support (casting operands to their varying axes at every bind, the varying-axes abstract
+  evaluation and lowering adapter: `_varying`, `_with_varying`, `_plain`, `_cast_varying`). shard_map's typing is
+  experimental and moved on every JAX minor from 0.7 to 0.11. `jax.pmap` over devices still works.
 
 ### Changed (tree adjoint)
 

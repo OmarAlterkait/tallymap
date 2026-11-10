@@ -41,7 +41,6 @@ Terms used in the code, the docs and the error messages.
 | node kind **adjoint** | the replay vector-Jacobian product of the item (`vjp_prog`). |
 | **lane** | one tangent (or cotangent) direction of a dual-lanes kernel, and nothing else: a GPU worker is a thread, an element of an xla batch is an item. |
 | node kind **dual_lanes** | T tangent or cotangent lanes of a linear node in ONE kernel (`jacfwd`, `jacrev`, vmap of a jvp). |
-| node kind **folded_batch** | a `jax.vmap` batch of B members folded into the item axis: B*N items in one launch. |
 | node kind **fused_jvp** | primal and tangent in one kernel (`jax.jvp` of a call); split back into primal plus tangent wherever JAX partially evaluates it.  A separate primitive, `tallymap_jvp`. |
 | **activity** | which loop carries can depend on perturbed inputs.  Only active float carries are differentiated in a step VJP. |
 

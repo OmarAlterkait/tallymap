@@ -115,14 +115,9 @@ if "grad" in MODES:
     bench("value_and_grad", jax.value_and_grad(lambda th: loss(fR, th)), TH)
 if "vmap" in MODES:
     ths = jnp.stack([TH * (1 + 0.05 * i) for i in range(BV)])
-    bench(f"vmap over theta B={BV}", jax.vmap(lambda th: fF(xs, keys, tab, th).outputs["Q"]), ths)
+    bench(f"vmap over theta B={BV} (lax.map)", jax.vmap(lambda th: fF(xs, keys, tab, th).outputs["Q"]), ths)
     xb = jnp.stack([xs * (1 + 0.05 * i) for i in range(BV)])
-    bench(f"vmap over events B={BV}", jax.vmap(lambda x: fF(x, keys, tab, TH).outputs["Q"]), xb)
-    fM = mk()
-    _P.FOLD = False                    # (read when the vmap is traced, inside bench)
-    bench(f"vmap theta B={BV} (lax.map)", jax.vmap(lambda th: fM(xs, keys, tab, th).outputs["Q"]), ths)
-    bench(f"vmap events B={BV} (lax.map)", jax.vmap(lambda x: fM(x, keys, tab, TH).outputs["Q"]), xb)
-    _P.FOLD = True
+    bench(f"vmap over events B={BV} (lax.map)", jax.vmap(lambda x: fF(x, keys, tab, TH).outputs["Q"]), xb)
 if "host" in MODES:      # host overhead of one eager call / one retrace (small N so the kernel is negligible)
     n = 1024
     f = fF

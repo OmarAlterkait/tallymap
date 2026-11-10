@@ -3,7 +3,7 @@ env: BACKENDS=xla,cuda  TEST_X64=1  ONLY=substr
 
 docs: the consolidation plan's section 9 ("fundamental tests") -- the suite that makes removing internal paths safe.
 Sections (cell name prefixes):
-  [sched]  schedule invariance: schedule step/item (also through spawn), _primitive.FOLD, _primitive.LANES
+  [sched]  schedule invariance: schedule step/item (also through spawn), jax.vmap (lax.map), _primitive.LANES
            chunking under jacfwd (T = 1/16/17/33, MAX_LANES = 16), codegen.INPLACE, xla vs cuda, item order.
            BITWISE wherever the arithmetic is the same program (fixed-point and integer tallies, per-item results);
            a float tally is a sum whose ORDER the schedule decides, so it is held to the stated reassociation
@@ -390,24 +390,19 @@ def _(b):
     return m + ("; fixed-point E bitwise" if "E" in A.outputs else "; (no fixed-point tally: xla without x64)")
 
 
-@case("[sched] _primitive.FOLD on == off under jax.vmap of tm.vmap")
+@case("[sched] jax.vmap of tm.vmap (lax.map, one launch per member): every member == its unbatched call")
 def _(b):
-    # fixed-point outputs are never folded (_can_fold: stats['fixed_point_overflow'] is per launch): this program has
-    # none
     ths = jnp.stack([th_of(3) * s for s in (1.0, 1.1, 0.95)])
-    fo = walk_fn(b, fixed_point=False)
-    g = lambda: jax.jit(jax.vmap(lambda th: fo(XS, KEYS, TAB, th)))
-    jx = lambda: str(jax.make_jaxpr(jax.vmap(lambda th: fo(XS, KEYS, TAB, th)))(ths))
-    jo, A = jx(), g()(ths)
-    with patched(_P, FOLD=False):
-        jn, B = jx(), g()(ths)
-    if "folded_batch" not in jo or "folded_batch" in jn:
-        raise Fail(f"instrument: folded in default {'folded_batch' in jo}, with FOLD=False {'folded_batch' in jn}")
-    m = agree(A, B, "fold vs no fold")
-    for j in range(ths.shape[0]):                       # and the meaning: member j == the unbatched call at ths[j]
-        Cj = fo(XS, KEYS, TAB, ths[j])
-        agree(jax.tree_util.tree_map(lambda v: v[j], A), Cj, f"fold member {j} vs unbatched")
-    return m + "; every member == its unbatched call"
+    fo = walk_fn(b)
+    jx = str(jax.make_jaxpr(jax.vmap(lambda th: fo(XS, KEYS, TAB, th)))(ths))
+    if "tallymap" not in jx or "dual_lanes" in jx:
+        raise Fail("instrument: the batched call is not a plain (lax.map) tallymap call")
+    A = jax.jit(jax.vmap(lambda th: fo(XS, KEYS, TAB, th)))(ths)
+    for j in range(ths.shape[0]):
+        # (xla: the member runs inside lax.map's loop, a different XLA program: per-item floats within a few ulps)
+        m = agree(jax.tree_util.tree_map(lambda v: v[j], A), fo(XS, KEYS, TAB, ths[j]), f"member {j} vs unbatched",
+                  per_item="bitwise" if b == "cuda" else "tol", pi_tol=PI_LANE_TOL)
+    return f"{ths.shape[0]} members == their unbatched calls; last: {m}"
 
 
 LANE_VARIANTS = [("auto", "auto"), ("off", "off"), ("chunk4", 4), ("chunk16", 16), ("force", "force")]   # LANES

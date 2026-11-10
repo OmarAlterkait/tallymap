@@ -92,7 +92,7 @@ def _phys_in(x):
 def run(p, pi, bc, cuda_math="approx", schedule="item", **_):
     """schedule: 'item' (DEFAULT: a thread runs one whole item at a time) | 'step' (a thread is refilled with a new
     item at loop-STEP granularity: the item program must have exactly one top-level while loop, else
-    UnsupportedError; a program derived from it (jvp, lanes, a folded batch, an adjoint) uses the step schedule
+    UnsupportedError; a program derived from it (jvp, lanes, an adjoint) uses the step schedule
     where it splits and the item schedule otherwise; tm.diagnostics()['kernels'][i]['schedule'] is what ran).
     Measurements: docs/design.md section 1b.
     cuda_math: 'approx' (DEFAULT: div.full / sqrt.approx / rsqrt.approx, the PTX XLA:GPU itself emits for f32;

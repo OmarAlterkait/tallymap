@@ -1,5 +1,5 @@
 """Transformation composability matrix.  python tests/transforms.py
-env: BACKENDS=xla,cuda  TEST_X64=1  ONLY=substr  NDEV=2 (pmap/shard_map cells; CPU: XLA_FLAGS host device count)
+env: BACKENDS=xla,cuda  TEST_X64=1  ONLY=substr  NDEV=2 (pmap cell; CPU: XLA_FLAGS host device count)
      TX_UNFUSED=1 (the two-node jvp design that runs when JAX drops the partial-eval registries)
 
 A BIG function contains tm.vmap calls with pre/post-processing, a second tallymap call fed by the first one's output,
@@ -44,19 +44,6 @@ if NEG:
     elif NEG == "cotangent":                  # every replay-adjoint cotangent 0.1% too large
         _orig_v = _C._vjp_call
         _C._vjp_call = lambda *a: tuple([None if g is None else g * 1.001 for g in gs] for gs in _orig_v(*a))
-    elif NEG == "fold":                       # folded batches: member b's emits shifted to member (b+1)%B
-        _orig_f = _C.fold_prog
-        def _bad_fold(p, B, bbc):
-            q = _orig_f(p, B, bbc)
-            f = jax.extend.core.jaxpr_as_fun(q.cj)
-            nT, nP = p.nT, p.nP
-            def g(*a):
-                a = list(a)
-                a[nT + nP] = (a[nT + nP] + 1) % B
-                return f(*a)
-            avals = [jax.ShapeDtypeStruct(v.aval.shape, v.aval.dtype) for v in q.cj.jaxpr.invars]
-            return _C.dataclasses.replace(q, cj=jax.make_jaxpr(g)(*avals))
-        _C.fold_prog = _bad_fold
     print("NEGATIVE CONTROL", NEG, flush=True)
 GPU = jax.default_backend() == "gpu"
 BACKENDS = os.environ.get("BACKENDS", "xla,cuda" if GPU else "xla").split(",")
@@ -629,41 +616,6 @@ def _(b):
     close(a, jax.vmap(lambda t: big_vec(R(), t))(ths), what="pmap fwd")
     g = jax.pmap(jax.grad(lambda t: big(S(b), t)))(ths)
     return close(g, jax.vmap(jac_ref(lambda t: big(R(), t)))(ths), what="pmap grad")
-
-
-@case("shard_map over devices (items sharded)")
-def _(b):
-    nd = jax.local_device_count()
-    if nd < 2:
-        return f"skipped: {nd} device"
-    try:
-        from jax import shard_map as smap  # jax >= 0.7: default check_vma=True
-    except ImportError:
-        from jax.experimental.shard_map import shard_map as smap  # 0.5.3: default check_rep=True
-    kw = {}
-    from jax.sharding import Mesh
-    from jax.sharding import PartitionSpec as P
-    mesh = Mesh(np.array(jax.local_devices()[:nd]), ("d",))
-    n = (N // nd) * nd
-    f = S(b)
-
-    def local(x, k, th):
-        q = f(x, k, tab, th).outputs["Q"]
-        return lax.psum(q, "d")
-    g = smap(local, mesh=mesh, in_specs=(P("d"), P("d"), P()), out_specs=P(), **kw)
-    note = "default checks"
-    try:
-        q = jax.jit(g)(xs[:n], keys[:n], TH)
-    except Exception as e:
-        if "check_rep" not in str(e) and "replication" not in str(e):
-            raise
-        note = f"check_rep=False needed ({type(e).__name__}: {str(e)[:80]})"
-        g = smap(local, mesh=mesh, in_specs=(P("d"), P("d"), P()), out_specs=P(), check_rep=False)
-        q = jax.jit(g)(xs[:n], keys[:n], TH)
-    close(q, R()(xs[:n], keys[:n], tab, TH).outputs["Q"], what="fwd")
-    gr = jax.jit(jax.grad(lambda t: jnp.sum(g(xs[:n], keys[:n], t) * WQ)))(TH)
-    gref = jac_ref(lambda t: jnp.sum(R()(xs[:n], keys[:n], tab, t).outputs["Q"] * WQ))(TH)
-    return note + "; " + close(gr, gref, what="grad")
 
 
 @case("per-item results + truncated under grad / jacrev")

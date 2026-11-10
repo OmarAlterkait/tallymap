@@ -48,8 +48,8 @@ with a new item at loop-STEP granularity, so a thread whose item has finished do
 item in its warp ends (GPU path tracing calls this path regeneration). It splits an item with exactly ONE
 top-level while loop into pre / cond / body / post (`backends/cuda/kernel.py::_split`); `schedule='step'` on an
 item it cannot split raises `UnsupportedError` and says why (`kernel.split_blocker`: the number of top-level while
-loops, or the loop constant that cannot cross the split). Kernels derived from the item (jvp, dual lanes, a folded
-batch, an adjoint) use the step schedule wherever they split and the item schedule otherwise; every kernel record
+loops, or the loop constant that cannot cross the split). Kernels derived from the item (jvp, dual lanes, an
+adjoint) use the step schedule wherever they split and the item schedule otherwise; every kernel record
 in `tm.diagnostics()['kernels']` names the schedule that ran. Spawn works under both. (A warp is the group of 32
 GPU threads that execute together on NVIDIA hardware.)
 
@@ -178,23 +178,21 @@ ITEM function and binds the primitive again, so the rules recurse to any order o
   asserts no residual exceeds 4N elements. `linearize`, `grad` and `vjp` need no custom partial-evaluation rule on
   any tested JAX version.
 - **transpose**: a tangent node becomes an `adjoint` node (the replay adjoint, `_reverse.vjp_prog`); an adjoint
-  node becomes the tangent of its base; any other linear node (`dual_lanes`, `folded_batch`) becomes the generic
-  replay adjoint of its own item at zero linear inputs.
+  node becomes the tangent of its base; any other linear node (`dual_lanes`) becomes the generic replay adjoint
+  of its own item at zero linear inputs.
 - **batching**: when only operands the node is linear in are batched, which is the `jacfwd`, `jacrev` and
-  vmap-of-JVP case, the result is a `dual_lanes` node: one kernel with T dual lanes per item. Otherwise it is a
-  `folded_batch` node, which runs B*N items in ONE launch with member b's emits offset to the slice
-  `[b*S, (b+1)*S)` by a retrace emit hook. Folding requires that there is no spawn and no fixed-point output, that
-  every batched broadcast operand is small (at most 4096 elements per member) and, on CUDA, that ONE member's
-  launch of N items could not fill the device by itself (N below the multiprocessor count times 1024, the
-  smallest maximum-resident-threads-per-multiprocessor of any tested architecture, so the bound is a floor).
-  Otherwise it falls back to `lax.map`, one launch per member.
+  vmap-of-JVP case, the result is a `dual_lanes` node: one kernel with T dual lanes per item. Otherwise (a
+  batched non-linear operand: `jax.vmap` of a call) it is `lax.map`, one launch per member. (A batch fold, B*N
+  items in ONE launch, was removed before 0.6.0rc1: no application path reached it, and it paid only while one
+  member's launch could not fill the device; see below.)
 - **lowering** is per platform: `'cuda'` goes to the CUDA backend for `backend='auto'` and `'cuda'`, every other
   platform to xla. `backend='cuda'` lowered for another platform raises.
 - **impl** (eager, outside `jit`): one `jax.jit` per node STRUCTURE, in a 64-entry cache, so repeated eager calls
   with new values do not recompile. `disable_jit`, `debug_nans` and `debug_infs` run the backend operation by
   operation.
-- **shard_map**: operands are cast to the union of their varying axes (`lax.pvary` / `lax.pcast`) at every bind;
-  the abstract evaluation returns that union; the lowering traces the backends with plain abstract values.
+- **shard_map** is not supported (removed before 0.6.0rc1): the primitive does not follow shard_map's varying-axes
+  typing, which is experimental and moved on every JAX release from 0.7 to 0.11. Shard the items outside the
+  call (one call per device under `jax.pmap`, or `shard_map(..., check_vma=False)` at the user's own risk).
 - **fused JVP**: `jax.jvp` would otherwise run two kernels, the primal node and the tangent node. The JVP rule
   instead binds a `fused_jvp` node, a second primitive `tallymap_jvp` holding `jax.jvp(item)`, which is ONE
   kernel. Wherever JAX partially evaluates it (`linearize`, `grad`, `vjp`, `jax.checkpoint`, and partial
@@ -217,7 +215,8 @@ Measured on the toy walk, 1M items, 256 bins, against the old `custom_jvp` / `cu
 0.62 vs 0.63 ms; JVP with primal 0.68 ms in one launch, against 1.22 ms in two launches unfused; `jacfwd` with
 T=8 4.58 vs 4.70 ms; `grad` 4.16 vs 4.30 ms. Tracing one call takes 5.9 ms instead of 21 ms.
 
-The fold rule used to be "fold while every privatised tally stays privatised", and it got both ends wrong,
+The batch fold (removed before 0.6.0rc1; the measurement is kept as the reason it was not worth its code).
+Its rule used to be "fold while every privatised tally stays privatised", and it got both ends wrong,
 because what folding costs and buys has nothing to do with the tally: it makes B copies of every per-item
 operand and runs ONE launch of B*N items, which is a win exactly while one member's N items cannot fill the
 GPU by themselves. Measured on the toy walk, B=8, 2080 Ti (68 multiprocessors, so the rule folds below
@@ -250,7 +249,7 @@ taken.
 
 `tests/transforms.py` is the composability matrix: a big function with pre- and post-processing, two chained
 calls, and calls inside `scan`, `fori_loop`, `cond` and `while_loop`, every cell compared against the same
-transformation of the dense reference. Negative controls (`TEST_NEG=tangent|cotangent|fold`, which inject a 0.1%
+transformation of the dense reference. Negative controls (`TEST_NEG=tangent|cotangent`, which inject a 0.1%
 error) turn every affected cell into a failure, which is how the matrix is known to have power.
 
 ## 3. Reverse mode (`_reverse.py`)
@@ -404,7 +403,7 @@ emitted value AT THE SPAWN STEP, inside the parent's ordinary replay adjoint. No
 Unknown option names raise. The public options are the six in the README, and there are no private options.
 Every measurement switch and negative control is a TEST-ONLY module constant that the library never sets, patched
 by the tests (`tests/ab_rule.patched`): `codegen.FILL` and `codegen.INPLACE` (both in the cuda kernel key),
-`_primitive.FUSE_JVP`, `LANES` and `FOLD`, `_reverse.SINGLE`, `REPLAY_SHIFT`, `SPARSE_MIN` and `NODENSE`, and
+`_primitive.FUSE_JVP` and `LANES`, `_reverse.SINGLE`, `REPLAY_SHIFT`, `SPARSE_MIN` and `NODENSE`, and
 `_reverse_spawn.GEN_CAPACITY` and `TREE_NEG`. They were private options (`_cuda_inplace`, `_lanes`, `_fold`,
 `_rev_sparse_min`, `_rev_nodense`, `_rev_gen_capacity`, `_tree_neg`) carried in every node and cache key; as
 constants they are read when a program is traced or lowered, and the eager-call cache does not see them (the
@@ -418,8 +417,8 @@ options; `cuda_min_blocks` (at most 1.08x on any cell measured) and `rev_step_se
 independent workloads), both covered below; `Sum(tangent_scale=)`, which nothing ever set; event scheduling
 (section 1b); and the two reverse-mode
 cost-decomposition options (`_rev_phase`, `_tree_phase`), which produced wrong gradients on purpose and which no
-test used -- the decompositions they produced are quoted in section 6. The fold rule is one comparison against
-the device's resident-thread count and no longer consults the kernel's privatisation rule at all (section 2).
+test used -- the decompositions they produced are quoted in section 6. The batch fold went too (section 2):
+`jax.vmap` of a call is `lax.map`.
 
 Constant folding in the cuda emitter is removed too: an array equation whose inputs were all known at compile time
 was evaluated on the host and its result (16 elements or more, `FOLD_MIN`) hoisted into a read-only table, one

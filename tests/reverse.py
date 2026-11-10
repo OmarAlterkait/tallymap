@@ -767,7 +767,7 @@ def _(b):
     return f"clean 0/{n}; control flags exactly the K>=2 items ({int(want.sum())}), nested and T3"
 
 
-@case("grad(vmap) of a call == per-member grads (the batching rule's folded / mapped adjoint)")
+@case("grad(vmap) of a call == per-member grads (the batching rule's mapped adjoint)")
 def _(b):
     NB, n, B = 16, 1024, 2
     item = _replay_item(NB)

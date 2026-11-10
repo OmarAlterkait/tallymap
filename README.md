@@ -9,7 +9,7 @@ N independent items whose results go into commutative sums, called tallies. On a
 a single CUDA kernel in which each GPU thread runs one item at that item's own trip count and then claims the
 next, so a batch does not cost its longest item times the batch size. Everywhere else it runs the xla backend, a
 masked plain-JAX interpreter. Because it is all one JAX primitive, `jit`, `vmap`,
-`grad`, `jvp`, `jacfwd`, `jacrev`, `hessian`, `checkpoint` and `shard_map` work on it, and the result means
+`grad`, `jvp`, `jacfwd`, `jacrev`, `hessian`, `checkpoint` and `pmap` work on it, and the result means
 exactly `jax.vmap(item)` followed by a sum. tallymap was built for in-house photon-transport and particle-shower
 engines and has nothing in it about either.
 
