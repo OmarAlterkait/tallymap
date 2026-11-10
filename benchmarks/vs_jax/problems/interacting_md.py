@@ -202,7 +202,7 @@ def forces_of(ctx, arm, maxs):
     if arm.startswith("tm_"):
         f = tm.vmap(lambda t, xi, order, start, pos, th: _tm_item(t, xi, order, start, pos, th, nc, h, side),
                     outputs={"u": tm.Sum((NG,))}, in_axes=(0, None, None, None, None),
-                    backend="cuda" if arm == "tm_cuda" else "xla")
+                    backend="auto" if arm == "tm_cuda" else "xla")
 
         def call(pos, th):
             order, start = cell_list(pos, nc, side)

@@ -48,7 +48,7 @@ Changelog = "https://github.com/OmarAlterkait/tallymap/blob/main/CHANGELOG.md"
 [project.optional-dependencies]
 # cuda backend: JAX's CUDA plugin, which brings NVRTC (the only compiler the backend uses; jax[cuda12] requires
 # nvidia-cuda-nvrtc-cu12 itself from 0.6.2).  A C++17 compiler is needed once, to build the jax.ffi launch shim
-# (tallymap/backends/cuda/shim.cc).
+# (tallymap/backends/kernel/shim.cc).
 cuda = [
     "jax[cuda12]>=0.6.2",
 ]
@@ -62,7 +62,7 @@ version = { attr = "tallymap.__version__" }
 include = ["tallymap*"]
 
 [tool.setuptools.package-data]
-"tallymap.backends.cuda" = ["*.cc"]
+"tallymap.backends.kernel" = ["*.cc"]
 
 [tool.ruff]
 line-length = 120
@@ -78,7 +78,8 @@ ignore = ["E731", "E741"]
 "tests/*" = ["E402"]
 "benchmarks/*" = ["E402"]
 # the CUDA source template and the emitted C lines (re-wrapping them would change the generated kernels)
-"tallymap/backends/cuda/kernel.py" = ["E501"]
+"tallymap/backends/kernel/kernel.py" = ["E501"]
+"tallymap/backends/kernel/host.py" = ["E501"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["tallymap"]

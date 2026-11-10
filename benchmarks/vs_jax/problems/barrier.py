@@ -88,7 +88,7 @@ def sim_of(ctx, arm, maxs):
             t = t.add("ko", 0, (~c[2]).astype(jnp.float32))
             return t, (p[NK // 2], c[0])
         f = tm.vmap(path, outputs={"price": tm.Sum((NK,)), "ko": tm.Sum((1,))}, in_axes=(0, None, None),
-                    backend="cuda" if arm == "tm_cuda" else "xla")
+                    backend="auto" if arm == "tm_cuda" else "xla")
         return lambda th: f(keys, th, strikes).outputs["price"] / n
 
     def one(key, th):

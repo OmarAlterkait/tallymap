@@ -37,7 +37,7 @@ SCALE = 4
 
 
 def arm(math):
-    f = tm.vmap(T.walk, outputs={"Q": tm.Sum((T.NB,))}, in_axes=(0, 0, None, None), backend="cuda", cuda_math=math)
+    f = tm.vmap(T.walk, outputs={"Q": tm.Sum((T.NB,))}, in_axes=(0, 0, None, None), backend="auto", cuda_math=math)
     return dict(fwd=lambda th: f(T.xs, T.keys, T.tab, th).outputs["Q"],
                 jvp=lambda th: jax.jvp(lambda s: f(T.xs, T.keys, T.tab, s).outputs["Q"], (th,), (th,))[1],
                 grad=jax.grad(lambda th: jnp.sum(f(T.xs, T.keys, T.tab, th).outputs["Q"] * T.WQ)))

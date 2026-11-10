@@ -103,7 +103,7 @@ def sim_of(ctx, arm, maxs):
             acc = c[1] + bnd(project(c[0]), th)
             return t.add("u", p, acc), (acc, c[2])
         f = tm.vmap(walker, outputs={"u": tm.Sum((M,))}, in_axes=(0, 0, 0, None),
-                    backend="cuda" if arm == "tm_cuda" else "xla")
+                    backend="auto" if arm == "tm_cuda" else "xla")
         return lambda th: f(x0, pid, keys, th).outputs["u"] / w
 
     def one(x, key, th):

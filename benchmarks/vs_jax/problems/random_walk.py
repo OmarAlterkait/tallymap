@@ -80,7 +80,7 @@ def sim_of(ctx, arm, maxs):
             k, w, t = lax.while_loop(lambda c: c[1] > WMIN, body, (jnp.int32(0), jnp.float32(1.0), t))
             return t, k
         f = tm.vmap(walker, outputs={"hist": tm.Sum((NB,))}, in_axes=(0, 0, None),
-                    backend="cuda" if arm == "tm_cuda" else "xla")
+                    backend="auto" if arm == "tm_cuda" else "xla")
         return lambda th: f(keys, decay, th).outputs["hist"]
 
     vstep = jax.vmap(step, in_axes=((0, 0), 0, 0, None))

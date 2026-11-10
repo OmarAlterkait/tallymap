@@ -140,7 +140,7 @@ def sim_of(ctx, arm, maxs):
             s, t = lax.while_loop(lambda c: cond(c[0]), body, (s, t))
             return t
         f = tm.vmap(particle, outputs={"dep": tm.Sum((NZ,))}, in_axes=(0, None), spawn=tm.Queue(queue_capacity(ctx)),
-                    backend="cuda" if arm == "tm_cuda" else "xla")
+                    backend="auto" if arm == "tm_cuda" else "xla")
         return lambda th: f(roots, th).outputs["dep"]
 
     caps = capacities(ctx, arm, ctx.get("populations") or [n] * (DEPTH + 1))

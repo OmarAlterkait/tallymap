@@ -79,8 +79,10 @@ def main(argv):
                 None)
     suites = [s for s in SUITES if (only is None or s in only.split(",")) and (gpu or s not in GPU_ONLY)]
     env = dict(os.environ, PYTHONPATH=ROOT + os.pathsep + os.environ.get("PYTHONPATH", ""))
-    env["BACKENDS"] = "xla,cuda" if gpu else "xla"
-    env["TREE_BACKEND"] = "cuda" if gpu else "xla"
+    # the kernel backend runs on every platform JAX can lower it for (backend='auto': cuda on a GPU, the CPU target
+    # elsewhere), against the xla backend as the reference
+    env["BACKENDS"] = "xla,auto"
+    env["TREE_BACKEND"] = "auto"
     # JAX preallocates 75% of the GPU; the forced-dense reverse cases launch a kernel whose per-thread local memory
     # (~17 GiB on an L40S) the CUDA driver reserves outside that pool, so they need it off.  A value you set wins.
     env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")

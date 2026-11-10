@@ -56,7 +56,7 @@ def sim_of(ctx, arm, maxs):
                                (jnp.int32(0), jnp.float32(1.0), jnp.zeros((ell,), jnp.float32)))
             return t.add("s", 0, c[1]), c[2]
         f = tm.vmap(item, outputs={"s": tm.Sum((1,))}, in_axes=(0, None),
-                    backend="cuda" if arm == "tm_cuda" else "xla")
+                    backend="auto" if arm == "tm_cuda" else "xla")
         return lambda th: f(keys, th).per_item
 
     def one(key, th):

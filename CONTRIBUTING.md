@@ -37,7 +37,7 @@ supported JAX range. The GPU cells need hardware Actions does not have, so they 
 ## How the operation table works
 
 The CUDA backend compiles the item's jaxpr to C by walking its equations and emitting one piece of code per JAX
-primitive. The table of those rules, `tallymap/backends/cuda/op_table.py`, is the main maintenance surface: a new
+primitive. The table of those rules, `tallymap/backends/kernel/op_table.py`, is the main maintenance surface: a new
 or renamed JAX primitive in a user's program shows up as
 `tm.UnsupportedError: primitive 'foo' is not supported`.
 
@@ -58,7 +58,7 @@ or renamed JAX primitive in a user's program shows up as
    own algebraic rewrites; the backends agree statistically, not bitwise (`docs/float_semantics.md`).
 
 2. If the primitive is sugar for primitives that already have rules, put it in
-   `tallymap/backends/cuda/canon.py` instead, which rewrites it before emission. That is where `square`,
+   `tallymap/backends/kernel/canon.py` instead, which rewrites it before emission. That is where `square`,
    `integer_pow`, `clamp`, `squeeze`, `split` and the total-order comparisons live. A canonicalisation is
    preferable to a rule: it cannot drift from the primitives it decomposes into.
 

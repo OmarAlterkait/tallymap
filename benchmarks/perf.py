@@ -37,7 +37,7 @@ def run(cmd, env):
 
 
 def toy():
-    out = run([os.path.join(HERE, "toy_bench.py")], dict(MODES="fwd,jvp,jacfwd,grad", BK="cuda", MATH=MATH))
+    out = run([os.path.join(HERE, "toy_bench.py")], dict(MODES="fwd,jvp,jacfwd,grad", BK="auto", MATH=MATH))
     names = {"fwd": "fwd", "jvp (primal+tangent)": "jvp", "jacfwd T=8": "jacfwd8", "grad": "grad"}
     rows = {}
     for m in re.finditer(r"^BENCH \S+\s+(.+?)\s+([\d.]+) ms", out, re.M):

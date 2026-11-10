@@ -25,7 +25,8 @@ they recurse to any order.  Node kinds:
                most MAX_LANES (16) lanes whose lane-dependent loop arrays stay < LANES_MAX_LOCAL (512) elements, one
                launch per chunk.  Anything else (a batched non-linear operand: jax.vmap of a call) -> lax.map (one
                launch per member).
-  lowering     per PLATFORM: on 'cuda' the cuda backend (backend='auto'|'cuda'), elsewhere the xla backend.
+  lowering     per PLATFORM (the one JAX lowers for): on 'cuda' and 'cpu' the kernel backend for that target
+               (backend='auto'), elsewhere the xla backend.
   impl         eager calls go through a jax.jit cached on the node's structure.
 
 Registries used (the same ones emit_p uses): Primitive, ad.primitive_jvps, ad.primitive_transposes,
@@ -151,30 +152,34 @@ tallymap_jvp_p.def_abstract_eval(_abstract)
 
 
 # ------------------------------------------------------------------------------------------- lowering / impl
+KERNEL_PLATFORMS = ("cuda", "cpu")     # platforms the kernel backend compiles for; JAX's lowering platform decides
+
+
 def _run(node, args, platform):
+    """platform: the one JAX is lowering this computation for ('cuda', 'cpu', or another).  tallymap never picks a
+    device: jax.default_device, device_put and jit placement decide where the computation runs, and so which
+    kernel target (or, on a platform the kernel backend does not compile for, the xla backend) runs it."""
     from .backends import xla as XB
     p = node.prog
     pi, bc = _split(node, args)
     opts = dict(node.opts)
     b = node.backend
-    if b == "auto" and platform != "cuda":
-        _warn_once("tallymap: no CUDA GPU on this platform; running the xla backend (plain JAX)", node.site)
-    if b == "xla" or (b == "auto" and platform != "cuda"):
+    if b == "xla":
         return list(XB.run(p, pi, bc, **opts))
-    if b not in ("cuda", "auto"):
+    if b != "auto":
         raise ValueError(f"tallymap: unknown backend {b!r}")
-    if platform != "cuda":
-        raise UnsupportedError("tallymap: backend='cuda' needs a CUDA GPU, and there is none on this platform "
-                               f"(this computation is lowered for {platform!r}); pass backend='xla' to run "
-                               "the same program in plain JAX, or run it on a CUDA GPU")
-    from .backends import cuda as CB
+    if platform not in KERNEL_PLATFORMS:
+        _warn_once(f"tallymap: the kernel backend compiles for CUDA GPUs and CPUs, not for {platform!r}; running the "
+                   "xla backend (plain JAX)", node.site)
+        return list(XB.run(p, pi, bc, **opts))
+    from .backends import kernel as KB
     try:
-        return list(CB.run(p, pi, bc, **opts))
+        return list(KB.run(p, pi, bc, target=platform, **opts))
     except UnsupportedError as e:
         # (C1) backend='auto' never falls back: the xla backend is the portable interpreter, not a fast path
         # (measured: a 7 ms cuda program took 678 ms on it), so a silent fallback is a silent ~100x slowdown
-        raise UnsupportedError(f"{e}\ntallymap: the cuda backend cannot compile this program; pass "
-                               "backend='xla' to run it in plain JAX (the portable interpreter, ~100x slower; "
+        raise UnsupportedError(f"{e}\ntallymap: the kernel backend cannot compile this program; pass "
+                               "backend='xla' to run it in plain JAX (the portable interpreter, much slower; "
                                "it runs every JAX primitive that has no side effects)") from None
 
 
@@ -211,18 +216,33 @@ def _lowering(platform):
 
 for _p in (tallymap_call_p, tallymap_jvp_p):
     mlir.register_lowering(_p, _lowering("other"))
-    mlir.register_lowering(_p, _lowering("cuda"), platform="cuda")
+    for _plat in KERNEL_PLATFORMS:
+        mlir.register_lowering(_p, _lowering(_plat), platform=_plat)
 
 _EAGER = collections.OrderedDict()
 EAGER_CACHE = 64
+
+
+def _platform_of(args):
+    """the platform op-by-op execution runs on, decided the way JAX decides it: the device of a committed argument,
+    else jax.default_device, else the default backend's first device.  ('gpu' devices report 'cuda'.)"""
+    for a in args:
+        try:
+            if getattr(a, "committed", False):
+                return next(iter(a.devices())).platform
+        except Exception:
+            continue
+    d = jax.config.jax_default_device
+    if d is not None:
+        return d if isinstance(d, str) else d.platform
+    return jax.devices()[0].platform
 
 
 def _impl(*args, node):
     if jax.config.jax_disable_jit or jax.config.jax_debug_nans or jax.config.jax_debug_infs:
         # disable_jit: jit would re-enter this impl; debug_nans/infs: JAX re-runs a failing jit op by op, and that
         # re-run must not call the same cached jit again (RecursionError) -> run the backend op by op
-        plat = "cuda" if jax.default_backend() == "gpu" else jax.default_backend()
-        return _run(node, args, plat)
+        return _run(node, args, _platform_of(args))
     k = node.key()
     f = _EAGER.get(k)
     if f is None:
@@ -509,10 +529,10 @@ def _dual_lanes(args, dims, node, fused):
     if p.spawn is not None:     # spawned children carry per-lane tangents: every linear per-item leaf is laned
         bpi = tuple(b or l for b, l in zip(bpi, lin_pi))
     shared = (fwd.prog.nT, fwd.prog.nY) if fused else (0, 0)
-    gpu = mode == "auto" and _gpu(node)
-    T = _balanced(size, min(size, mode) if isinstance(mode, int) else min(size, MAX_LANES) if gpu else size)
-    if gpu:
-        # see LANES_MAX_LOCAL: the cuda kernel keeps T copies of every lane-dependent loop array in local memory.
+    kern = mode == "auto" and node.backend == "auto"
+    T = _balanced(size, min(size, mode) if isinstance(mode, int) else min(size, MAX_LANES) if kern else size)
+    if kern:
+        # see LANES_MAX_LOCAL: the kernel keeps T copies of every lane-dependent loop array in local memory.
         # Too big -> chunks of Tc < T lanes, one launch per chunk.  The lane state is LINEAR in T (every
         # lane-dependent value of the T-lane program is the unbatched one with a leading T axis), so it is measured
         # once on the UNBATCHED program and T is decided before the T-lane program is built: vmapping a large item
@@ -584,8 +604,9 @@ LANES_MAX_LOCAL = 512
 # batch (since removed) 533 ms; hessian 8x8 (8 lanes) 83 ms vs 102 ms folded.  A photon-transport jacfwd of 10
 # parameters stays one kernel.
 MAX_LANES = 16
-# TEST-ONLY (tests patch it, like FUSE_JVP): 'auto' (MAX_LANES and the LANES_MAX_LOCAL guard on a GPU, every lane in
-# one kernel elsewhere) | 'off' (never dual lanes) | 'force' (ignore the guard) | int (chunks of at most this many)
+# TEST-ONLY (tests patch it, like FUSE_JVP): 'auto' (MAX_LANES and the LANES_MAX_LOCAL guard for backend='auto', the
+# kernel backend on either target; every lane in one call for backend='xla') | 'off' (never dual lanes) | 'force'
+# (ignore the guard) | int (chunks of at most this many)
 LANES = "auto"
 
 
@@ -595,10 +616,6 @@ def _balanced(size, cap):
     MEASURED (LUCiD recon jacfwd, L40S): one chunk costs the primal plus ~12 ms per column, and 20 or 26 columns
     cost the same two 16-lane passes."""
     return -(-size // -(-size // max(1, cap)))
-
-
-def _gpu(node):
-    return node.backend == "cuda" or (node.backend == "auto" and jax.default_backend() == "gpu")
 
 
 def _taint_max(jaxpr, tin, in_loop):

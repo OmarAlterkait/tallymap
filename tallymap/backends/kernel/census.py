@@ -1,4 +1,5 @@
-"""What the cuda backend supports: the table behind tallymap.supported_primitives() and docs/primitives.md.
+"""What the kernel backend supports (one emitter, both targets): the table behind
+tallymap.supported_primitives() and docs/primitives.md.
 
 NOT_IN_JAX_EXTEND: op-table names that jax.extend.core.primitives does not export, and why they are still right.
 tests check  RULES | SUGAR  is a subset of  jax.extend.core.primitives names | NOT_IN_JAX_EXTEND  (catches a JAX rename,
@@ -30,7 +31,7 @@ NOT_IN_JAX_EXTEND = {
 
 
 def supported_primitives():
-    """-> [dict(name, how)] for every primitive the cuda backend compiles, sorted by name.
+    """-> [dict(name, how)] for every primitive the kernel backend compiles, sorted by name.
     how: 'rule' (one emission rule in op_table.py), 'canonicalised' (rewritten into rule primitives by canon.py),
     'tally' (tallymap's own emit / spawn).  Anything else raises tm.UnsupportedError on cuda (the xla backend runs every
     JAX primitive)."""
@@ -46,9 +47,9 @@ def supported_primitives():
 def primitives_table():
     """docs/primitives.md (markdown), generated from supported_primitives()."""
     rows = supported_primitives()
-    out = ["# Primitives the cuda backend compiles", "",
+    out = ["# Primitives the kernel backend compiles", "",
            "Generated from `tallymap.supported_primitives()` by",
-           "`tallymap.backends.cuda.census.primitives_table()` (a test checks that this file is current).",
+           "`tallymap.backends.kernel.census.primitives_table()` (a test checks that this file is current).",
            "`how`: `rule` = one emission rule in `backends/cuda/op_table.py`; `canonicalised` = rewritten into rule",
            "primitives by `backends/cuda/canon.py` before emission; `tally` = tallymap's own emit / spawn.",
            "Any other primitive raises `tm.UnsupportedError` on cuda; the xla backend runs every JAX",

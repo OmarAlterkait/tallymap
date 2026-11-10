@@ -282,7 +282,7 @@ def check_names():
     from jax.extend.core import Primitive
     from jax.extend.core import primitives as P
 
-    from tallymap.backends.cuda import canon, census, op_table
+    from tallymap.backends.kernel import canon, census, op_table
     jaxnames = {v.name for v in vars(P).values() if isinstance(v, Primitive)}
     ours = set(op_table.RULES) | set(canon.SUGAR)
     bad = sorted(ours - jaxnames - set(census.NOT_IN_JAX_EXTEND))

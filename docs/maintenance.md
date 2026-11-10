@@ -8,7 +8,7 @@ and how a release is made.
 - Python >= 3.10. CUDA 12 with NVRTC, NVIDIA's runtime compiler, the only compiler the cuda backend uses (the
   `cuda` extra installs the `nvidia-cuda-nvrtc-cu12` wheel; a CUDA toolkit's `libnvrtc` works too), plus a C++17
   compiler once, to build the `jax.ffi` launch shim
-  (`backends/cuda/shim.cc`, cached per toolchain and jaxlib version).
+  (`backends/kernel/shim.cc`, cached per toolchain and jaxlib version).
 - GPUs tested: compute capability 7.5 (RTX 2080 Ti) and 8.9 (L40S). A100 and H200 are untested. The spawn queue
   needs compute capability 7.0 or newer, for `__nanosleep`.
 - Every other platform runs the xla backend: `backend='auto'` warns once, `backend='cuda'` raises. TPU and
@@ -66,7 +66,7 @@ warning.
 | `jax.extend` | `core.{Primitive, ClosedJaxpr, Literal, jaxpr_as_fun, DropVar, primitives}`, `random.{threefry,rbg,unsafe_rbg}_prng_impl`, `source_info_util.{summarize, user_context, register_exclusion}` | `_api`, `_jaxpr`, `_compat` |
 | legacy modules: where a JAX upgrade would break us | `jax.core.{ShapedArray, Tracer}`; `jax.interpreters.ad.{primitive_jvps, primitive_transposes, Zero, instantiate_zeros, is_undefined_primal}`; `batching.fancy_primitive_batchers`; `mlir.{register_lowering, lower_fun}`; `partial_eval.{custom_partial_eval_rules, partial_eval_jaxpr_custom_rules}` (the fused JVP only) | `_tally`, `_primitive`, `_reverse`, `_compat` |
 | private | `aval.dtype._impl` of a typed pseudo-random key; the jaxpr equation parameters read by `_jaxpr.py`; `jax._src.interpreters.partial_eval` (`convert_constvars_jaxpr`, for `_reverse._dce`: the public name is missing on 0.9.2 and 0.10.2) | `_compat`, `_jaxpr`, `_reverse` |
-| jaxlib / XLA | the foreign-function-interface C++ headers (api_version 4), hashed into the shim's cache key | `backends/cuda/shim.cc`, `compile.py` |
+| jaxlib / XLA | the foreign-function-interface C++ headers (api_version 4), hashed into the shim's cache key | `backends/kernel/shim.cc`, `compile.py` |
 
 One `jax._src` import is left (`_reverse._dce`, above; it can go public at a floor of 0.11.2). Every other
 interface that differs between tested versions goes through
@@ -77,7 +77,7 @@ deliberate: it is what makes an upgrade a bounded job.
 
 | symptom | cause | fix |
 |---|---|---|
-| `UnsupportedError: primitive 'foo' is not supported` on cuda, for a program that used to run | a new or renamed JAX primitive | add a rule to `backends/cuda/op_table.py`, or a canonical form to `canon.py` if it is shorthand for primitives that already have rules; add a row to `tests/ops.py`; regenerate `docs/primitives.md` |
+| `UnsupportedError: primitive 'foo' is not supported` on cuda, for a program that used to run | a new or renamed JAX primitive | add a rule to `backends/kernel/op_table.py`, or a canonical form to `canon.py` if it is shorthand for primitives that already have rules; add a row to `tests/ops.py`; regenerate `docs/primitives.md` |
 | the edge cell "op table: names are JAX primitives" fails | a table name no longer exists in `jax.extend.core.primitives` (a rename, such as `pjit` to `jit`) | keep the old name if a tested version still uses it, add the new one, and explain the old one in the table's own exclusion list |
 | `KeyError` or `AttributeError` on a control-flow equation parameter (`cond_nconsts`, `body_jaxpr`, `num_consts`, `branches`, `call_jaxpr`, ...) | JAX changed how a control-flow or call equation stores its sub-jaxprs | fix the accessor in `_jaxpr.py` (`while_parts`, `cond_branches`, `scan_parts`, `call_jaxpr`); nothing else in the library reads those parameters |
 | `run_all.py --canary` fails with a DeprecationWarning from tallymap's own code | JAX deprecated an API the library uses | move to the replacement in `_compat.py`; if it is one of the legacy transformation registries, start the hijax port |
@@ -98,10 +98,10 @@ deliberate: it is what makes an upgrade a bounded job.
 |---|---|---|---|
 | `MAX_LANES` | 16 | `_primitive.py` | L40S: `jacrev` of 256 outputs in chunks of 4 / 8 / 16 / 32 / 64 lanes: 229 / 191 / 175 / 176 / 325 ms |
 | `LANES_MAX_LOCAL` | 512 elements | `_primitive.py` | L40S: `jacfwd` lane counts; the toy `jacfwd(grad)` went from 95 ms to 2.3 ms once a 6 KB stack frame was split |
-| `BLOCK` (cuda) | 128 threads | `backends/cuda/kernel.py` | L40S: 64, 128 and 256 within 1% |
-| `PRIV_BYTES` | 4096 bytes per block | `backends/cuda/kernel.py` | 2080 Ti: random walk 7.9 ms against 36.4 and barrier 14.4 against 56.6 (forward, 4M items) with privatisation off |
-| `UNROLL` / `MAX_LOCAL` | 32 / 16384 elements | `backends/cuda/codegen.py` | L40S and 2080 Ti: compile time against local memory |
-| `LAZY_GATHER` | 16 elements | `backends/cuda/op_table.py` | L40S and 2080 Ti: at 0 (every gather materialised) LUCiD's forward needs 108,160 B of local memory per thread instead of 68,048 and DTRAX's 255,840 B, and both fail to launch (out of memory) |
+| `BLOCK` (cuda) | 128 threads | `backends/kernel/kernel.py` | L40S: 64, 128 and 256 within 1% |
+| `PRIV_BYTES` | 4096 bytes per block | `backends/kernel/kernel.py` | 2080 Ti: random walk 7.9 ms against 36.4 and barrier 14.4 against 56.6 (forward, 4M items) with privatisation off |
+| `UNROLL` / `MAX_LOCAL` | 32 / 16384 elements | `backends/kernel/codegen.py` | L40S and 2080 Ti: compile time against local memory |
+| `LAZY_GATHER` | 16 elements | `backends/kernel/op_table.py` | L40S and 2080 Ti: at 0 (every gather materialised) LUCiD's forward needs 108,160 B of local memory per thread instead of 68,048 and DTRAX's 255,840 B, and both fail to launch (out of memory) |
 | `rev_checkpoints` default (`T3_MIN_EQNS`, `AUTO_C_SMALL`, `AUTO_CKPT_BYTES`, `LEAN_C`) | 'auto': 16 for a step under 1000 equations, else up to 64 within 64 KiB; 16 at second order | `_reverse.py` | L40S: lumen SK / SBND / ANNIE (306-318 B states) 1.3-1.6x faster at 64; `vs_jax` (8-25 B) 1.5-3x slower at 64 |
 | `SPARSE_MIN` | 32 elements | `_reverse.py` | L40S, toy walk |
 | `MIN_BUCKET` (tree adjoint) | 256 | `_reverse_spawn.py` | L40S |

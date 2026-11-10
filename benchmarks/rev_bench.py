@@ -40,7 +40,7 @@ print("jax", jax.__version__, DEV, "tallymap", tm.__file__, "N", N, flush=True)
 # --- instrument: record every cuda kernel built (hash + source) --------------------------------------------
 BUILT = []
 if GPU:
-    import tallymap.backends.cuda as SC
+    import tallymap.backends.kernel as SC
     _K0 = SC.Kernel.__init__
 
     def _kinit(self, p, **kw):
@@ -52,7 +52,7 @@ if GPU:
 def ptxas(src):
     """(registers, stack bytes, local bytes) of a generated kernel (sm of this GPU)."""
     try:
-        from tallymap.backends.cuda.compile import device_arch
+        from tallymap.backends.kernel.compile import device_arch
         d = tempfile.mkdtemp(dir=os.environ.get("TMPDIR", "/tmp"))
         cu = os.path.join(d, "k.cu")
         open(cu, "w").write(src)
@@ -122,7 +122,7 @@ def timed(fn, *args):
 def run_arm(backend, math, K, P, mode):
     item = make_item(K, P)
     opts = dict(backend=backend)
-    if backend == "cuda":
+    if backend == "auto":
         opts["cuda_math"] = math
     _reverse.SPARSE_MIN = 10 ** 9 if mode == "dense" else SPARSE_MIN0     # 'dense': every table on the dense path
     if mode.startswith("ckpt"):
@@ -155,7 +155,7 @@ def run_arm(backend, math, K, P, mode):
         fn = jax.grad(L, argnums=wrt)
     o, ms, comp, mem = timed(fn, th, tab, xs, keys)
     built = BUILT[nb0:]
-    row = dict(dev=DEV, backend=backend, math=math if backend == "cuda" else "-", K=K, P=P, mode=mode, N=N,
+    row = dict(dev=DEV, backend=backend, math=math if backend == "auto" else "-", K=K, P=P, mode=mode, N=N,
                ms=ms, compile_s=comp, xla_mem=mem, kernels=[h for h, _ in built])
     if built:
         rs = [ptxas(s) for _, s in built]
@@ -175,7 +175,7 @@ def run_arm(backend, math, K, P, mode):
 
 ROWS = []
 for backend in BACKENDS:
-    for math in (MATHS if backend == "cuda" else ["-"]):
+    for math in (MATHS if backend == "auto" else ["-"]):
         for P in PS:
             for K in KS:
                 arms = {}
@@ -207,7 +207,7 @@ for backend in BACKENDS:
                         cmp = dict(backend=backend, math=math, P=P, K=K, arm=m,
                                    ref="jacfwd" if "jacfwd" in arms else "ckpt", relerr=e)
                         print("CMP", json.dumps(cmp), flush=True)
-                if backend == "cuda":
+                if backend == "auto":
                     for a, b in (("ckpt", "dense"),):
                         if a in arms and b in arms and "kernels" in arms[a] and "kernels" in arms[b]:
                             same = set(arms[a]["kernels"]) & set(arms[b]["kernels"]) - {None}

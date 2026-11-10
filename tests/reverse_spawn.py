@@ -12,7 +12,7 @@ capacity per generation, children compacted in (parent, ordinal) order).  jax.gr
 tree adjoint must reproduce (ulp-level).  Also compared: tallymap jacfwd / jvp through spawn at the same keys.
 
 python tests/reverse_spawn.py
-env: TREE_BACKEND (xla|cuda|auto)  TREE_X64 (0|1)  TREE_N roots (48)  TREE_CG (512)  TREE_TOT (4096)
+env: TREE_BACKEND (xla|auto)  TREE_X64 (0|1)  TREE_N roots (48)  TREE_CG (512)  TREE_TOT (4096)
 """
 import json
 import os

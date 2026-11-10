@@ -111,7 +111,7 @@ def sim_of(ctx, arm, maxs, score=False):
         if score:
             outs["dmean"] = tm.Sum((1,))
         f = tm.vmap(real, outputs=outs, in_axes=(0, 0, None),
-                    backend="cuda" if arm == "tm_cuda" else "xla")
+                    backend="auto" if arm == "tm_cuda" else "xla")
         def tm_call(c):
             r = f(x0, keys, c)
             return (r.outputs["hist"], r.outputs["dmean"][0] / n) if score else r.outputs["hist"]

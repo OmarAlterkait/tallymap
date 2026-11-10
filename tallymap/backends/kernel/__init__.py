@@ -1,11 +1,18 @@
-"""cuda backend: item jaxpr -> CUDA C -> NVRTC -> one generic jax.ffi launch handler.
+"""The kernel backend: item jaxpr -> C (codegen, kernel) -> one compiled kernel, for one of two TARGETS:
 
-Float semantics (cuda_math=): 'approx' (DEFAULT) = XLA:GPU's own f32 div/sqrt/rsqrt PTX (div.full / sqrt.approx /
-rsqrt.approx), everything else IEEE round-to-nearest without FMA contraction; 'ieee' = correctly rounded div/sqrt as
-well: portable.
+  'cuda'  the GPU: NVRTC -> cubin, launched by shim.cc's jax.ffi CUDA handler (compile.py).
+  'cpu'   the host: the same source with host.HOST_PRELUDE, the system C++ compiler -> a shared object, run by
+          host_shim.cc's jax.ffi CPU handler on one host thread per CUDA thread (host.py).
 
-run(prog, pi, bc, cuda_math=, schedule=) -> [sum tallies] + [stats i32[5]] + [per-item results]
-Unsupported constructs raise tallymap.UnsupportedError (backend='auto' too; backend='xla' runs them).
+The target is the platform JAX lowers the computation for (_primitive), never a tallymap decision.
+
+Float semantics on cuda (cuda_math=): 'approx' (DEFAULT) = XLA:GPU's own f32 div/sqrt/rsqrt PTX (div.full /
+sqrt.approx / rsqrt.approx), everything else IEEE round-to-nearest without FMA contraction; 'ieee' = correctly
+rounded div/sqrt as well: portable.  On cpu every operation is IEEE without FMA contraction, with libm's math
+functions; cuda_math is ignored.
+
+run(prog, pi, bc, target=, cuda_math=, schedule=) -> [sum tallies] + [stats i32[5]] + [per-item results]
+Unsupported constructs raise tallymap.UnsupportedError on both targets (backend='xla' runs them).
 """
 import hashlib
 import os
@@ -48,18 +55,27 @@ MATH_OPTS = {"ieee": [], "approx": ["-DTALLYMAP_APPROX_DIVSQRT", "--prec-div=fal
 
 
 class Kernel:
-    def __init__(self, p, schedule="item", strict=False, math="approx"):
+    def __init__(self, p, target="cuda", schedule="item", strict=False, math="approx"):
         self.block = BLOCK
+        self.target = target
         try:
             self.src, self.L = build_source(p, schedule=schedule, strict=strict)
         except CodegenError as e:
             raise UnsupportedError(str(e)) from None
+        note = schedule_note(self.L)
+        if target == "cpu":
+            from . import host
+            self.src = host.source(self.src, self.L)
+            so, self.info = host.compile_so(self.src, p.where, note)   # run-or-raise on the stack bound
+            self.kid = host.register(so, self.info)
+            self.ext = ".cc"
+            return
         if math not in MATH_OPTS:
             raise ValueError("tallymap: cuda_math must be 'ieee' or 'approx'")
         cubin, self.info = C.compile_cubin(self.src, C.device_arch(), MATH_OPTS[math])
-        note = schedule_note(self.L)
         C.check_frame(cubin, p.where, note)      # run-or-raise: over CUDA's per-thread local limit never launches
         self.kid = C.register_kernel(cubin, note)
+        self.ext = ".cu"
 
 
 def schedule_note(L):
@@ -78,10 +94,11 @@ def kernel(p, **opts):
         _KERNELS[k] = Kernel(p, **opts)
     kern = _KERNELS[k]
     from ..._diagnostics import record_kernel
-    record_kernel(dict(tag=p.tag, schedule=kern.L.mode, hash=kern.info["hash"], cached=kern.info["cached"],
-                       kid=kern.kid, compile_s=round(kern.info["seconds"], 1),
-                       source=os.path.join(C.cache_dir(), kern.info["hash"] + ".cu"), prims=list(kern.L.prims),
-                       options=dict(opts)))
+    src = (os.path.join(C.cache_dir(), "host", f"k_{kern.info['hash']}.cc") if kern.target == "cpu" else
+           os.path.join(C.cache_dir(), kern.info["hash"] + ".cu"))
+    record_kernel(dict(tag=p.tag, target=kern.target, schedule=kern.L.mode, hash=kern.info["hash"],
+                       cached=kern.info["cached"], kid=kern.kid, compile_s=round(kern.info["seconds"], 1),
+                       source=src, prims=list(kern.L.prims), options=dict(opts)))
     return kern
 
 
@@ -89,7 +106,7 @@ def _phys_in(x):
     return jax.random.key_data(x) if is_key_dtype(x.dtype) else x
 
 
-def run(p, pi, bc, cuda_math="approx", schedule="item", **_):
+def run(p, pi, bc, target="cuda", cuda_math="approx", schedule="item", **_):
     """schedule: 'item' (DEFAULT: a thread runs one whole item at a time) | 'step' (a thread is refilled with a new
     item at loop-STEP granularity: the item program must have exactly one top-level while loop, else
     UnsupportedError; a program derived from it (jvp, lanes, an adjoint) uses the step schedule
@@ -100,8 +117,10 @@ def run(p, pi, bc, cuda_math="approx", schedule="item", **_):
     docs/validation.md) |
     'ieee' (correctly rounded f32 div/sqrt: portable)."""
     math = cuda_math or "approx"
+    if target == "cpu":
+        math = "ieee"                       # (no approx PTX on the host: every operation is IEEE)
     # strict: the user's own item program (tag 'primal') must split under schedule='step'
-    kern = kernel(p, schedule=schedule, strict=schedule == "step" and p.tag == "primal", math=math)
+    kern = kernel(p, target=target, schedule=schedule, strict=schedule == "step" and p.tag == "primal", math=math)
     L = kern.L
     N = int(pi[0].shape[0])
     consts = []
@@ -131,9 +150,15 @@ def run(p, pi, bc, cuda_math="approx", schedule="item", **_):
         rs.append(jax.ShapeDtypeStruct((8,), jnp.uint32))
     for sh, dt, _ in L.yav:
         rs.append(jax.ShapeDtypeStruct((N,) + tuple(sh), dt))
-    call = jax.ffi.ffi_call(C.TARGET, rs, has_side_effect=False)
-    res = call(*args, kernel_id=np.int64(kern.kid), block=np.int32(kern.block), n_zero=np.int32(L.n_zero),
-               flags=np.int32(L.flags), grid=np.int32(0), n_items=np.int64(N))
+    if target == "cpu":
+        from . import host
+        call = jax.ffi.ffi_call(host.TARGET, rs, has_side_effect=False)
+        res = call(*args, kernel_id=np.int64(kern.kid), n_zero=np.int32(L.n_zero), flags=np.int32(L.flags),
+                   n_items=np.int64(N))
+    else:
+        call = jax.ffi.ffi_call(C.TARGET, rs, has_side_effect=False)
+        res = call(*args, kernel_id=np.int64(kern.kid), block=np.int32(kern.block), n_zero=np.int32(L.n_zero),
+                   flags=np.int32(L.flags), grid=np.int32(0), n_items=np.int64(N))
     nO = len(outs)
     nscr = len(L.r_scr)
     stats = res[nO + nscr + 1]

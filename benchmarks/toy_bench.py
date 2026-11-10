@@ -14,7 +14,7 @@ from jax import lax
 import tallymap as tm
 from tallymap import _primitive as _P
 
-BK = os.environ.get("BK", "cuda")
+BK = os.environ.get("BK", "auto")
 N = int(os.environ.get("N", 1 << 20))
 MODES = os.environ.get("MODES", "fwd,jvp,jacfwd,grad,vmap,host").split(",")
 NB = int(os.environ.get("NBINS", 256))

@@ -51,7 +51,7 @@ def sim_of(ctx, arm, maxs):
             pay = jnp.maximum(c[1] - th[2], 0.0) * c[2].astype(jnp.float32)
             return t.add("p", 0, pay), c[0]
         f = tm.vmap(path, outputs={"p": tm.Sum((1,))}, in_axes=(0, None),
-                    backend="cuda" if arm == "tm_cuda" else "xla")
+                    backend="auto" if arm == "tm_cuda" else "xla")
         return lambda th: f(keys, th).outputs["p"]
 
     def one(key, th):

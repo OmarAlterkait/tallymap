@@ -24,7 +24,7 @@ import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 
 import tallymap as tm  # noqa: E402
-from tallymap.backends.cuda import codegen as CG  # noqa: E402
+from tallymap.backends.kernel import codegen as CG  # noqa: E402
 
 DEPTH, NK, N = 24, 4, 4096
 M61 = (1 << 61) - 1
@@ -80,7 +80,7 @@ def main():
         print(f"{name:70s} cuda     {msg}", flush=True)
 
     tm.diagnostics(reset=True)
-    rc = run("cuda")
+    rc = run("auto")
     kern = tm.diagnostics()["kernels"]
 
     def compiled():

@@ -45,8 +45,8 @@ if os.environ.get("TX_T3") == "1":                      # run_all --t3: the sing
     from tallymap import _reverse as _R0
     _R0.SINGLE = "force"
 GPU = jax.default_backend() == "gpu"
-BACKENDS = os.environ.get("BACKENDS", "xla,cuda" if GPU else "xla").split(",")
-B0 = "cuda" if "cuda" in BACKENDS else "xla"       # the backend under test; xla is R1's reference
+BACKENDS = os.environ.get("BACKENDS", "xla,auto").split(",")
+B0 = "auto" if "auto" in BACKENDS else "xla"       # the backend under test; xla is R1's reference
 ONLY = os.environ.get("ONLY", "")
 EX = bool(jax.config.jax_enable_x64)                    # fixed-point tallies need x64 on the xla backend
 F = jnp.float64 if EX else jnp.float32
@@ -65,7 +65,7 @@ class Unresolved(Exception):
 
 def case(name, gpu_only=False):
     def deco(fn):
-        if (ONLY and ONLY not in name) or (gpu_only and "cuda" not in BACKENDS):
+        if (ONLY and ONLY not in name) or (gpu_only and "auto" not in BACKENDS):
             return fn
         t0 = time.perf_counter()
         try:

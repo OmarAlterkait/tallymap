@@ -144,7 +144,7 @@ def sim_of(ctx, arm, maxs, mode="fwd"):
             o = obs(c[1])
             return t_.add("obs", g, o), (o, c[3] + c[4])
         f = tm.vmap(traj, outputs={"obs": tm.Sum((G,))}, in_axes=(0, 0, 0, None),
-                    backend="cuda" if arm == "tm_cuda" else "xla")
+                    backend="auto" if arm == "tm_cuda" else "xla")
         return lambda th: f(y0, mu, gid, th).outputs["obs"] / w
 
     def one(y, m, th):

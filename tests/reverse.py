@@ -36,7 +36,7 @@ jax.config.update("jax_default_matmul_precision", "highest")
 X64 = bool(jax.config.jax_enable_x64)
 F = jnp.float64 if X64 else jnp.float32
 GPU = jax.default_backend() == "gpu"
-BACKENDS = os.environ.get("BACKENDS", "xla,cuda" if GPU else "xla").split(",")
+BACKENDS = os.environ.get("BACKENDS", "xla,auto").split(",")
 ONLY = os.environ.get("ONLY", "")
 KS = [int(k) for k in os.environ.get("KS", "1,10,100,1000").split(",")]
 N = int(os.environ.get("RV_N", 48))
@@ -205,7 +205,7 @@ def _(b):
         raise Fail(f"instrument: slots {info['loops']}")
     dx = np.asarray(g1["x"]) - np.asarray(g2["x"])
     nd = int((dx != 0).sum())
-    if b == "cuda" and nd:
+    if b == "auto" and nd:
         raise Fail(f"cuda: {nd}/{dx.size} per-item cotangents differ between slots 16 and 3 "
                    f"(max {np.abs(dx).max():.3g})")
     return f"per-item x differs in {nd}/{dx.size} (max {np.abs(dx).max():.2g}); " + close(g1, g2, "slots 16 vs 3")
@@ -227,7 +227,7 @@ def _(b):
             ref = x
             continue
         nd = int((x != ref).sum())
-        if b == "cuda" and nd:
+        if b == "auto" and nd:
             raise Fail(f"cuda: slots {C} moved {nd}/{x.size} per-item cotangents against slots 4 "
                        f"(max {np.abs(x - ref).max():.3g})")
         out.append(f"C={C}: {nd}/{x.size} differ")
@@ -727,7 +727,7 @@ def _replay_item(NB):
 
 
 @case("REPLAY GATE: per-item reverse == forward-mode derivative (nested and T3); NEGATIVE CONTROL: a replay of "
-      "K-1 steps must fail it on every item of K >= 2", ["cuda"])
+      "K-1 steps must fail it on every item of K >= 2", ["auto"])
 def _(b):
     """the adjoint differentiates the trajectory the forward kernel ran (what the removed runtime replay check
     compared): every item's reverse derivative must equal its forward-mode derivative (the jvp kernel runs the
@@ -758,7 +758,7 @@ def _(b):
     counts = {k: int(v.sum()) for k, v in bad.items()}
     print(f"    REPLAY GATE counts {b}: K>=2 {int(want.sum())}/{n}; flagged {counts}", flush=True)
     for single in ("off", "force"):
-        if b == "cuda" and (not hashes[single, 0] or hashes[single, 0] & hashes[single, 1]):
+        if b == "auto" and (not hashes[single, 0] or hashes[single, 0] & hashes[single, 1]):
             raise Fail(f"{single}: control kernel == clean kernel")
         if counts[single, 0]:
             raise Fail(f"{single}: clean flags {counts[single, 0]}/{n}")
@@ -773,7 +773,7 @@ def _(b):
     item = _replay_item(NB)
     xs = jnp.stack([jnp.linspace(0.11, 1.9, n), jnp.linspace(0.2, 1.7, n)]).astype(F)
     wq = jnp.cos(jnp.arange(B * NB)).astype(F).reshape(B, NB)
-    f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend=b, **(dict(cuda_math="ieee") if b == "cuda" else {}))
+    f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, backend=b, **(dict(cuda_math="ieee") if b == "auto" else {}))
     g = np.asarray(jax.jit(jax.grad(lambda x2: jnp.sum(jax.vmap(lambda x: f(x).outputs["Q"])(x2) * wq)))(xs))
     ref = np.stack([np.asarray(jax.jit(jax.grad(lambda x, m=m: jnp.sum(f(x).outputs["Q"] * wq[m])))(xs[m]))
                     for m in range(B)])
@@ -820,7 +820,7 @@ def _(b):
     g, gr, _, _ = walk_case(b, 64, 6, rev_checkpoints=8)          # K in [3, 9]: spans C = 8
     g2, _, _, _ = walk_case(b, 64, 6, rev_checkpoints=2)          # K > C^2 for most items
     nx = int((np.asarray(g["x"]) != np.asarray(g2["x"])).sum())
-    if b == "cuda" and nx:
+    if b == "auto" and nx:
         raise Fail(f"cuda: C=8 vs C=2 moved {nx} per-item cotangents")
     return f"C=8 vs C=2 per-item differ {nx}; " + close(g, gr, "C=8") + "; " + close(g2, gr, "C=2")
 
@@ -870,7 +870,7 @@ def _(b):
 
 
 @case("FILL PATTERN: every uninitialised per-thread declaration 0x00 vs 0xFF -> bitwise-equal forward and per-item "
-      "cotangents", ["cuda"])
+      "cotangents", ["auto"])
 def _(b):
     # The reverse program's checkpoint buffers are tallymap_uninit (declared with no fill) and copies of them are
     # elided (codegen.Emitter.assign).  Correct only if no slot is read before it is written: filling EVERY
@@ -878,7 +878,7 @@ def _(b):
     # computes (per-item results and per-item cotangents; the tally sums and broadcast-operand cotangents are
     # atomics, whose float order is the hardware's, so those are compared within tolerance).
     from tallymap import _diagnostics as D
-    from tallymap.backends.cuda import codegen as CG
+    from tallymap.backends.kernel import codegen as CG
     out = {}
     try:
         for fb in (0x00, 0xFF):
@@ -961,7 +961,7 @@ def _(b):
         for cap in (64, 10):
             f = tm.vmap(item, outputs={"Q": tm.Sum((4,), F)}, in_axes=(0, None), backend=b, max_steps=cap)
             gq_f = jax.jit(jax.grad(lambda t_: jnp.sum(f(xs, t_).outputs["Q"])))
-            if b == "cuda":     # what runs: the custom calls left in the optimised program
+            if b == "auto":     # what runs: the custom calls left in the optimised program
                 hlo = _with_single(mode, lambda: gq_f.lower(th).compile().as_text())
                 nl = hlo.count('custom_call_target="tallymap_cuda_launch"')
                 if nl != 1:

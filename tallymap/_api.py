@@ -87,8 +87,8 @@ class Result(NamedTuple):
 
 
 class UnsupportedError(NotImplementedError):
-    """A backend cannot run this program.  backend='auto' on a GPU raises it too (it never falls back to the xla
-    backend: pass backend='xla' for that)."""
+    """A backend cannot run this program.  backend='auto' raises it too (the kernel backend never falls back to the
+    xla backend: pass backend='xla' for that)."""
 
 
 # ------------------------------------------------------------------------------------------- programs
@@ -225,13 +225,13 @@ def _out_tallies(p):
 
 # ------------------------------------------------------------------------------------------- vmap
 _OPTS = {                  # the public options; measurement switches and negative controls are module constants
-    "cuda_math": "cuda backend, f32 div/sqrt: 'approx' (default) | 'ieee'",
-    "schedule": "cuda backend: 'item' (default: a thread runs whole items) | 'step' (refill at loop-step granularity)",
+    "cuda_math": "kernel backend on a CUDA GPU, f32 div/sqrt: 'approx' (default) | 'ieee' (the CPU is always IEEE)",
+    "schedule": "kernel backend: 'item' (default: a thread runs whole items) | 'step' (refill per loop step)",
     "xla_batch_size": "xla backend: items per batch",
     "rev_checkpoints": "reverse mode: checkpoint buffer size C (default 'auto': from the loop state's size)",
     "rev_stats": "reverse through spawn: report the tree adjoint's stats to the host (costs jit's fast path)",
 }
-BACKENDS = ("auto", "cuda", "xla")
+BACKENDS = ("auto", "xla")
 
 
 def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="auto", **opts):
@@ -245,8 +245,10 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                that does not terminate does not terminate.  Setting it is the recommended safety net; an item that
                hits the cap is flagged in Result.truncated and POISONS every float tally of the call (see below)
     spawn:     tallymap.Queue(capacity) to allow tally.spawn(child)
-    backend:   'auto': cuda on a GPU (a program it cannot compile raises UnsupportedError; backend='xla' runs
-               it), the xla backend elsewhere (with a one-time warning) | 'cuda' | 'xla'
+    backend:   'auto' (default): the kernel backend, compiled for the platform JAX places the computation on (a
+               CUDA GPU or the CPU: jax.default_device / device_put / jit decide, never tallymap); a program it
+               cannot compile raises UnsupportedError; other platforms run the xla backend with a one-time warning
+               | 'xla': the plain-JAX reference interpreter
     opts:      cuda_math          cuda f32 div/sqrt: 'approx' (default; XLA:GPU's own PTX) | 'ieee' (correctly
                                   rounded and portable).
                schedule           cuda: 'item' (default: a thread runs one whole item, then claims the next) |
@@ -295,6 +297,9 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                          + ", ".join(_OPTS))
     if opts.get("schedule", "item") not in ("item", "step"):
         raise ValueError(f"tallymap: schedule must be 'item' or 'step', got {opts['schedule']!r}")
+    if backend == "cuda":
+        raise ValueError("tallymap: backend='cuda' was removed in 0.7: use backend='auto' (the default), which runs "
+                         "the compiled kernel on the platform JAX places the computation on (a CUDA GPU or the CPU)")
     if backend not in BACKENDS:
         raise ValueError(f"tallymap: unknown backend {backend!r}; backends are {', '.join(BACKENDS)}")
     if spawn is not None and not isinstance(spawn, Queue):

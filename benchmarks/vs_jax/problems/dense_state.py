@@ -61,7 +61,7 @@ def sim_of(ctx, arm, maxs):
             c = lax.while_loop(cond, lambda c: step(c, mat), (jnp.int32(0), x))
             return t.add("s", 0, jnp.sum(c[1])), None
         f = tm.vmap(item, outputs={"s": tm.Sum((1,))}, in_axes=(0, None),
-                    backend="cuda" if arm == "tm_cuda" else "xla")
+                    backend="auto" if arm == "tm_cuda" else "xla")
         return lambda mat: f(x0, mat).outputs["s"]
 
     def one(x, mat):

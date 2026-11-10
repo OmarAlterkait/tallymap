@@ -132,7 +132,7 @@ def propagate_of(ctx, arm, maxs):
             lw = logw_of(xn, y)
             return t.add("w", 0, jnp.exp(lw)), (xn, lw, c[3])
         f = tm.vmap(item, outputs={"w": tm.Sum((1,))}, in_axes=(0, 0, None, None),
-                    backend="cuda" if arm == "tm_cuda" else "xla")
+                    backend="auto" if arm == "tm_cuda" else "xla")
 
         def call(x, nz, th, y):
             r = f(x, nz, th, y)

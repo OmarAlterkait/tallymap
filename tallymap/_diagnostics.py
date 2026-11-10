@@ -8,7 +8,8 @@ Keys:
   versions   tallymap / jax / jaxlib / numpy / python
   env        TALLYMAP_CUDA_CACHE, JAX_PLATFORMS, XLA_FLAGS, CUDA_VISIBLE_DEVICES (when set), machine
   platform   jax.default_backend(), devices; on a GPU: name, compute capability, driver
-  cuda       compiler (the NVRTC build), cubin cache directory
+  cuda       compiler (the NVRTC build), cubin cache directory (on a GPU)
+  host       the CPU target: host C++ compiler and -march=native identity, kernel cache directory, threads
   reverse    single = whether the last adjoint built is the single-loop one (T3), and if not why not;
              tree   = stats of the last tree adjoint (reverse through spawn), filled only by tm.vmap(...,
                       rev_stats=True) calls (a host callback costs jax.jit's C++ fast path): generations, children,
@@ -17,10 +18,11 @@ Keys:
   programs   the last item programs bound by tm.vmap: tag, item jaxpr (text), and closed_over_floats: [(shape,
              dtype, size)] of the FLOAT constants the item function closed over, the values a derivative cannot reach
              (a constant's tangent is zero, silently): anything you differentiate must be an argument
-  kernels    the last cuda kernels used: tag, schedule, cubin hash, cached CUDA source (.cu), primitives, compile
-             seconds, and once a kernel has run `resources`: registers and local memory per thread, static shared
-             memory, resident blocks per SM, and the local memory the CUDA driver reserves for every resident
-             thread outside JAX's pool (local_reserved_gib: what an out-of-memory error at launch is about)
+  kernels    the last kernels used: tag, target ('cuda' | 'cpu'), schedule, binary hash, cached source (.cu / .cc),
+             primitives, compile seconds, and once a cuda kernel has run `resources`: registers and local memory
+             per thread, static shared memory, resident blocks per SM, and the local memory the CUDA driver reserves
+             for every resident thread outside JAX's pool (local_reserved_gib: what an out-of-memory error at launch
+             is about)
 With f: `programs` / `kernels` are those of f only (JAX's caches are cleared first so that everything is re-traced
 and re-lowered), plus `stablehlo_sha256` of the lowered program's text (from JAX 0.6.2 a host callback lowers
 without the address of the Python callable, so the text of one program is the same on every lowering).
@@ -115,9 +117,21 @@ def _platform():
 
 def _cuda():
     try:
-        from .backends.cuda import compile as C
+        from .backends.kernel import compile as C
         return dict(compiler=C.compiler_identity(), cache_dir=C.cache_dir())
     except Exception as e:                                   # no CUDA toolchain on this machine
+        return dict(error=f"{type(e).__name__}: {e}")
+
+
+def _host():
+    """the CPU target: the host compiler build and -march=native target identity, and the thread count."""
+    try:
+        from .backends.kernel import compile as C
+        from .backends.kernel import host as H
+        omp = os.environ.get("OMP_NUM_THREADS", "")
+        n = int(omp) if omp.isdigit() and int(omp) > 0 else len(os.sched_getaffinity(0))
+        return dict(compiler=H.compiler_identity(), cache_dir=os.path.join(C.cache_dir(), "host"), threads=n)
+    except Exception as e:                                   # no host C++ compiler on this machine
         return dict(error=f"{type(e).__name__}: {e}")
 
 
@@ -131,7 +145,7 @@ def diagnostics(fn=None, *args, reset=False, **kwargs):
     """-> dict (see the module docstring).  fn, args: also lower jax.jit(fn)(*args, **kwargs) and report its
     programs / kernels.  reset: clear the counters and the history after reading them."""
     d = dict(versions=_versions(), platform=_platform(), env=_env(),
-             cuda=_cuda() if jax.default_backend() == "gpu" else None, reverse=_reverse())
+             cuda=_cuda() if jax.default_backend() == "gpu" else None, host=_host(), reverse=_reverse())
     if fn is not None:
         jax.clear_caches()
         with _capture() as c:
@@ -155,13 +169,13 @@ def diagnostics(fn=None, *args, reset=False, **kwargs):
 def _with_resources(rec):
     """a kernel record plus sj_main's measured resources (registers, local memory, occupancy, the driver's
     local-memory reservation) once the kernel has run; the record is not modified."""
-    if "kid" not in rec:
+    if "kid" not in rec or rec.get("target") == "cpu":
         return rec
-    from .backends.cuda.compile import kernel_info
+    from .backends.kernel.compile import kernel_info
     info = kernel_info(rec["kid"])
     return dict(rec, resources=info) if info is not None else rec
 
 
 def _env():                                                    # the environment variables that matter
-    keys = ("TALLYMAP_CUDA_CACHE", "JAX_PLATFORMS", "XLA_FLAGS", "CUDA_VISIBLE_DEVICES")
+    keys = ("TALLYMAP_CUDA_CACHE", "JAX_PLATFORMS", "XLA_FLAGS", "CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "CXX")
     return {k: os.environ.get(k) for k in keys if os.environ.get(k) is not None} | {"machine": platform.machine()}

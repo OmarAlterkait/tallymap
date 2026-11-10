@@ -49,7 +49,7 @@ keys = jax.random.split(jax.random.PRNGKey(0), N)
 TH = jnp.full((max(T, 2),), 0.3, jnp.float32)
 
 for M in MS:
-    f = tm.vmap(make(M), outputs={"Q": tm.Sum((NB,))}, in_axes=(0, 0, None), backend="cuda")
+    f = tm.vmap(make(M), outputs={"Q": tm.Sum((NB,))}, in_axes=(0, 0, None), backend="auto")
     arms = [("fwd", lambda th: f(xs, keys, th).outputs["Q"])]
     if T:
         arms.append(("jacfwd", jax.jacfwd(lambda th: f(xs, keys, th).outputs["Q"])))

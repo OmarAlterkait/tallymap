@@ -29,7 +29,7 @@ if os.environ.get("TX_T3") == "1":                      # run_all --t3: the sing
 
 jax.config.update("jax_default_matmul_precision", "highest")
 GPU = jax.default_backend() == "gpu"
-BACKENDS = os.environ.get("BACKENDS", "xla,cuda" if GPU else "xla").split(",")
+BACKENDS = os.environ.get("BACKENDS", "xla,auto").split(",")
 ONLY = os.environ.get("ONLY", "")
 F = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
 print("jax", jax.__version__, jax.__file__, jax.devices(), "x64", jax.config.jax_enable_x64, flush=True)
@@ -244,7 +244,7 @@ def _(b):
         r = tm.vmap(lambda ti, y: ti.add("Q", 0, y * x), outputs={"Q": tm.Sum((NB,), F)}, backend="xla")(
             jnp.stack([x, 2 * x]))
         return t.add("Q", 3, r.outputs["Q"][0])
-    if b == "cuda":
+    if b == "auto":
         raises(tm.UnsupportedError, lambda: V(outer, b)(xs), "backend='xla'")
         b = "xla"
     q = V(outer, b)(xs).outputs["Q"]
@@ -306,7 +306,7 @@ def _(b):
     raises(ValueError, lambda: jax.eval_shape(f, jax.ShapeDtypeStruct((2 ** 31,), F)), "2^31")
 
 
-@case("large N (2^22 items, ids folded into one key)", ["cuda"] if GPU else ["xla"])
+@case("large N (2^22 items, ids folded into one key)", ["auto"])
 def _(b):
     n = 1 << 22
     ids = jnp.arange(n, dtype=jnp.uint32)
@@ -415,7 +415,7 @@ def _(b):
     close(jax.vmap(lambda s: f1(xs * s, idx).outputs["Q"])(ss),
           jax.vmap(lambda s: r1(xs * s, idx).outputs["Q"])(ss), what="vmap")
     msg = f"{want} of {2 * N} emits dropped"
-    if b == "cuda" or jax.config.jax_enable_x64:                   # fixed_point=True needs x64 on the xla backend
+    if b == "auto" or jax.config.jax_enable_x64:                   # fixed_point=True needs x64 on the xla backend
         E = tm.vmap(mk(1), outputs={"Q": tm.Sum((NB,), F, fixed_point=True, scale=2.0 ** 20)}, backend=b)(xs, idx)
         if int(E.stats["dropped_emits"]) != want or int(E.stats["fixed_point_overflow"]) != 0:
             raise Fail(f"fixed-point tally: dropped_emits {int(E.stats['dropped_emits'])} (want {want}), overflow "
@@ -449,7 +449,7 @@ def _(b):
                 a = a * (1.0 + 0.01 * th[k % P]) + x
                 return k + 1, a, t.add("Q", k % NB, jnp.sum(a))
             return lax.while_loop(lambda c: c[0] < 3, body, (0, jnp.full((S,), x, F), t))[2]
-        f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, in_axes=(0, None), backend="cuda")
+        f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, in_axes=(0, None), backend="auto")
         return lambda th: f(xs, th).outputs["Q"]
     # (S, P) -> the lane width the guard must choose: under the limit (all P lanes), chunked, refused (no lanes)
     want = {(10, 16): 16, (100, 16): 4, (300, 4): None}
@@ -600,8 +600,8 @@ def _(b):
     th, gs = jax.jit(lambda th: lax.scan(step, th, None, length=4))(TH)
     if not np.isfinite(np.asarray(gs)).all():
         raise Fail("non-finite")
-    if b == "cuda":
-        from tallymap.backends import cuda as CB
+    if b == "auto":
+        from tallymap.backends import kernel as CB
         n0 = len(CB._KERNELS)
         for n in (5, 9, 33):
             f(xs[:n], keys[:n], tab, TH).outputs["Q"].block_until_ready()
@@ -659,8 +659,8 @@ def _(b):
     def cb(t, x):
         y = jax.pure_callback(lambda v: np.asarray(v * 2), jax.ShapeDtypeStruct((), F), x, vmap_method="sequential")
         return t.add("Q", 0, y)
-    if b == "cuda":
-        raises(tm.UnsupportedError, lambda: V(cb, "cuda")(xs), "backend='xla'")
+    if b == "auto":
+        raises(tm.UnsupportedError, lambda: V(cb, "auto")(xs), "backend='xla'")
         raises(tm.UnsupportedError, lambda: V(cb, "auto")(xs), "backend='xla'")
         q = V(cb, "xla")(xs).outputs["Q"]
     else:
@@ -715,9 +715,9 @@ def _(b):
         src = open(ks_[-1]["source"]).read() if ks_ else ""
         return len(re.findall(r"\b(?:float|double) \w+\[12\];", src))
     n_in = run()
-    if b != "cuda":
+    if b != "auto":
         return ""
-    from tallymap.backends.cuda import codegen as CG
+    from tallymap.backends.kernel import codegen as CG
     with patched(CG, INPLACE=False):
         n_cp = run()
     if not n_in < n_cp:
@@ -822,12 +822,12 @@ def _(b):
     return _tangent_overflow(b, x2) + "; " + _f32_bins(b, x2, k2)
 
 
-@case("fixed_point: cuda == xla bitwise; jvp == jacfwd column bitwise", ["cuda"])
+@case("fixed_point: cuda == xla bitwise; jvp == jacfwd column bitwise", ["auto"])
 def _(b):
     if not jax.config.jax_enable_x64:
         return "skipped (needs x64 for the xla side)"
     out = {"Q": tm.Sum((NB,), F, fixed_point=True, scale=2.0 ** 24)}
-    fc = tm.vmap(walk, outputs=out, in_axes=AX, backend="cuda")
+    fc = tm.vmap(walk, outputs=out, in_axes=AX, backend="auto")
     fx = tm.vmap(walk, outputs=out, in_axes=AX, backend="xla")
     a, c = np.asarray(fc(xs, keys, tab, TH).outputs["Q"]), np.asarray(fx(xs, keys, tab, TH).outputs["Q"])
     p = jnp.concatenate([tab, jnp.array([TH])])
@@ -840,7 +840,7 @@ def _(b):
     # int64 tallies (u64 atomics): per-item values above 2^32 exercise the high word
     big = (jnp.arange(N, dtype=jnp.int64) + 1) * (1 << 33)
     q = tm.vmap(lambda t, v: t.add("I", (v >> 33) % NB, v), outputs={"I": tm.Sum((NB,), jnp.int64)},
-                backend="cuda")(big).outputs["I"]
+                backend="auto")(big).outputs["I"]
     want = np.zeros(NB, np.int64)
     np.add.at(want, (np.asarray(big) >> 33) % NB, np.asarray(big))
     if not np.array_equal(np.asarray(q), want):
@@ -914,7 +914,7 @@ def _(b):
 
 
 @case("compare protocol (tests/compare_protocol.py): cuda vs xla (CRN, ulp control, Poisson floor)",
-      ["cuda"])
+      ["auto"])
 def _(b):
     from compare_protocol import compare
 
@@ -930,7 +930,7 @@ def _(b):
     n = 1 << 14
     x2 = jnp.linspace(0.1, 3.0, n).astype(F)
     k2 = jax.random.split(jax.random.PRNGKey(7), n)
-    ok, rep = compare(V(walk, "cuda", in_axes=AX), x2, k2, tab, TH, other=V(walk, "xla", in_axes=AX),
+    ok, rep = compare(V(walk, "auto", in_axes=AX), x2, k2, tab, TH, other=V(walk, "xla", in_axes=AX),
                       floor_fn=V(walk_sq, "xla", in_axes=AX), verbose=False)
     if not ok:
         raise Fail(str(rep))
@@ -948,11 +948,11 @@ def _(b):
             raise Fail(f"missing key {k}")
     if not d["programs"] or "while" not in d["programs"][0]["jaxpr"]:
         raise Fail(f"no item jaxpr recorded: {d['programs']}")
-    if (b == "cuda") != bool(d["kernels"]):
+    if (b == "auto") != bool(d["kernels"]):
         raise Fail(f"kernels recorded: {d['kernels']}")
-    if b == "cuda" and not os.path.exists(d["kernels"][0]["source"]):
+    if b == "auto" and not os.path.exists(d["kernels"][0]["source"]):
         raise Fail(f"cached .cu missing: {d['kernels'][0]['source']}")
-    if b == "cuda":                      # once a kernel has run, its measured resources are reported
+    if b == "auto":                      # once a kernel has run, its measured resources are reported
         jax.block_until_ready(f(xs, keys, tab, TH).outputs["Q"])
         res = [k.get("resources") for k in tm.diagnostics()["kernels"]]
         if not any(r_ and r_["regs"] > 0 and r_["blocks_per_sm"] >= 1 and r_["local_reserved_gib"] >= 0
@@ -967,7 +967,7 @@ def _(b):
 @case("A/B rule: tests/ab_rule.assert_arms_differ (identical arms raise; different programs pass)")
 def _(b):
     g = lambda **o: (lambda x, k, t, th: V(walk, b, in_axes=AX, **o)(x, k, t, th).outputs["Q"])
-    if b == "cuda":
+    if b == "auto":
         same, diff = (dict(cuda_math="approx"), dict()), (dict(schedule="step"), dict(schedule="item"))
     else:
         same, diff = (dict(cuda_math="ieee"), dict()), (dict(xla_batch_size=8), dict())
@@ -1001,48 +1001,42 @@ def _(b):
     return f"sha {h1[:12]} twice, two callbacks {h3[:12]}; raw texts {'equal' if raw_same else 'DIFFER'}"
 
 
-@case("backend='auto': GPU raises on an unsupported program (the error points to backend='xla'); "
-      "elsewhere xla with a one-time warning", ["xla"])
+@case("backend='auto': the kernel backend (on the platform JAX lowers for) raises on an unsupported program, the "
+      "error points to backend='xla'; another platform runs the xla backend with a one-time warning; "
+      "backend='cuda' (removed) raises", ["xla"])
 def _(b):
+    from jax import export
+
     from tallymap import _api
     def cb(t, x):
         y = jax.pure_callback(lambda v: np.asarray(v * 2), jax.ShapeDtypeStruct((), F), x, vmap_method="sequential")
         return t.add("Q", 0, y)
     want = 2 * float(xs.sum())
-    if GPU:
-        m = raises(tm.UnsupportedError, lambda: V(cb, "auto")(xs), "pass backend='xla'")
-        close(V(cb, "xla")(xs).outputs["Q"][0], want)
-        close(V(walk, "auto", in_axes=AX)(xs, keys, tab, TH), R(walk, in_axes=AX)(xs, keys, tab, TH))
+    m = raises(tm.UnsupportedError, lambda: V(cb, "auto")(xs), "pass backend='xla'")
+    close(V(cb, "xla")(xs).outputs["Q"][0], want)
+    close(V(walk, "auto", in_axes=AX)(xs, keys, tab, TH), R(walk, in_axes=AX)(xs, keys, tab, TH))
 
-        def dbg(t, x):                      # an effect: the error says no backend runs it
-            jax.debug.print("x={x}", x=x)
-            return t.add("Q", 0, x)
-        raises(tm.UnsupportedError, lambda: V(dbg, "auto")(xs), "on any backend")
-        return "GPU: " + m.splitlines()[-1][:90]
+    def dbg(t, x):                      # an effect: the error says no backend runs it
+        jax.debug.print("x={x}", x=x)
+        return t.add("Q", 0, x)
+    raises(tm.UnsupportedError, lambda: V(dbg, "auto")(xs), "on any backend")
+    raises(ValueError, lambda: tm.vmap(walk, outputs={"Q": tm.Sum((NB,), F)}, backend="cuda"), "use backend='auto'")
+    # a platform the kernel backend does not compile for (lowered, never run: no such device here)
     _api._WARNED.clear()
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         line = sys._getframe().f_lineno + 1
-        close(V(cb, "auto")(xs).outputs["Q"][0], want)
-        close(V(walk, "auto", in_axes=AX)(xs, keys, tab, TH), R(walk, in_axes=AX)(xs, keys, tab, TH))
+        export.export(jax.jit(lambda *a: V(walk, "auto", in_axes=AX)(*a).outputs["Q"]), platforms=["rocm"])(
+            xs, keys, tab, TH)
     ws = [x for x in w if "xla backend" in str(x.message)]
     if len(ws) != 1:
         raise Fail(f"expected ONE xla warning, got {[str(x.message) for x in ws]}")
     msg = str(ws[0].message)
-    if msg != "tallymap: no CUDA GPU on this platform; running the xla backend (plain JAX)":
-        raise Fail(f"CPU warning text: {msg!r}")
+    if "not for 'rocm'" not in msg:
+        raise Fail(f"warning text: {msg!r}")
     if os.path.basename(ws[0].filename) != os.path.basename(__file__) or ws[0].lineno != line:
         raise Fail(f"warning attributed to {ws[0].filename}:{ws[0].lineno}, want this file line {line}")
-    _api._WARNED.clear()
-    with warnings.catch_warnings(record=True) as w2:          # under jax.jit too (the caller is JAX, not the user)
-        warnings.simplefilter("always")
-        jline = sys._getframe().f_lineno + 1
-        jax.jit(V(cb, "auto"))(xs).outputs["Q"].block_until_ready()
-    wj = [x for x in w2 if "xla backend" in str(x.message)]
-    if len(wj) != 1 or os.path.basename(wj[0].filename) != os.path.basename(__file__) or wj[0].lineno != jline:
-        raise Fail(f"jit: {[(x.filename, x.lineno) for x in wj]}, want this file line {jline}")
-    m = raises(tm.UnsupportedError, lambda: V(walk, "cuda", in_axes=AX)(xs, keys, tab, TH), "needs a CUDA GPU")
-    return "CPU: " + msg[:70] + " | cuda: " + m[:50]
+    return f"{jax.devices()[0].platform}: " + m.splitlines()[-1][:70] + " | rocm: " + msg[:60]
 
 
 @case("error messages name the item function and the source line (tally misuse, effects, unsupported op)")
@@ -1074,11 +1068,11 @@ def _(b):
     if "dbg" not in m3 or here not in m3:
         raise Fail(f"effects message: {m3}")
     out = [m.split("[")[-1][:60], m3.split("[")[-1][:60]]
-    if b == "cuda":
+    if b == "auto":
         def cb(t, x):
             y = jax.pure_callback(lambda v: np.asarray(v), jax.ShapeDtypeStruct((), F), x, vmap_method="sequential")
             return t.add("Q", 0, y)
-        m4 = raises(tm.UnsupportedError, lambda: V(cb, "cuda")(xs), "pure_callback")
+        m4 = raises(tm.UnsupportedError, lambda: V(cb, "auto")(xs), "pure_callback")
         if "item function" not in m4 or "cb (" not in m4 or here not in m4:
             raise Fail(f"unsupported-op message: {m4}")
         out.append(m4.split("[")[-1][:60])
@@ -1154,7 +1148,7 @@ def _(b):
 
 
 @case("kernel parameters: the struct has the program's own buffer count; more than 511 buffers run (CUDA large "
-      "kernel parameters); over 4094 raises", ["cuda"])
+      "kernel parameters); over 4094 raises", ["auto"])
 def _(b):
     def mk(nt):
         def item(t, x, tabs):
@@ -1197,7 +1191,7 @@ def _qt_flat(t, gen, x, kind):          # no children: every thread lives in the
 
 
 @case("spawn queue termination: every named item runs, launch after launch (cuda == xla, exact counts)",
-      ["cuda"])
+      ["auto"])
 def _(b):
     # dtrax tests_wavefront/test_qterm.py (b65e17a), the one-queue cells: a tree with children in flight while
     # roots are still being claimed, and roots only with N far above the resident grid.  An early exit loses
@@ -1283,7 +1277,7 @@ def _(b):
     return f"naive key repeats at id + {period}; fold_in(fold_in(key, id), step) and the chunked key do not"
 
 
-@case("in-place dynamic_update_slice: aliasing hazards == xla == codegen.INPLACE off (bitwise)", ["cuda"])
+@case("in-place dynamic_update_slice: aliasing hazards == xla == codegen.INPLACE off (bitwise)", ["auto"])
 def _(b):
     def item(t, x, key):
         buf0 = jnp.arange(8, dtype=jnp.int32) * x
@@ -1305,13 +1299,13 @@ def _(b):
         return t, (buf, acc)
     out = {"C": tm.Sum((8,), jnp.int32)}
     ii = jnp.arange(N, dtype=jnp.int32) % 5 + 1
-    from tallymap.backends.cuda import codegen as CG
+    from tallymap.backends.kernel import codegen as CG
     run = lambda bk: tm.vmap(item, outputs=out, backend=bk)
-    g = lambda a, k: run("cuda")(a, k).per_item[0]
+    g = lambda a, k: run("auto")(a, k).per_item[0]
     assert_arms_differ(g, g, ii, keys, patch_b=(CG, dict(INPLACE=False)))    # instrument: in-place updates happened
-    rs = [run("cuda")(ii, keys)]
+    rs = [run("auto")(ii, keys)]
     with patched(CG, INPLACE=False):
-        rs.append(run("cuda")(ii, keys))
+        rs.append(run("auto")(ii, keys))
     rs.append(run("xla")(ii, keys))
     for r in rs[1:]:
         for a, c in zip(jax.tree_util.tree_leaves(rs[0]), jax.tree_util.tree_leaves(r)):
@@ -1321,7 +1315,7 @@ def _(b):
 
 
 @case("buffer assignment (while init alias, cond destination, lazy write-back) == rule off == copying cuda == "
-      "xla", ["cuda"])
+      "xla", ["auto"])
 def _(b):
     """the dead initial carry IS the carry storage, the cond output is written into its dead operand (one branch
     updates it in place, the other returns a lazy whole-array select over it: v5), and the lazy body result goes
@@ -1332,9 +1326,9 @@ def _(b):
     import re
 
     from tallymap import _primitive as _P
-    from tallymap.backends import cuda as CB
-    from tallymap.backends.cuda import codegen as CG
-    from tallymap.backends.cuda import op_table as OT
+    from tallymap.backends import kernel as CB
+    from tallymap.backends.kernel import codegen as CG
+    from tallymap.backends.kernel import op_table as OT
 
     def item(t, x, key):
         def outer(c):
@@ -1375,7 +1369,7 @@ def _(b):
             _P._EAGER.clear()
         src = open(ks[-1]["source"]).read() if ks else ""
         return r, len(re.findall(r"\b(?:float|double) \w+\[32\];", src))
-    (ra, na), (ro, no), (rc, nc), (rl, _) = run("cuda"), run("cuda", off=True), run("cuda", inplace=False), \
+    (ra, na), (ro, no), (rc, nc), (rl, _) = run("auto"), run("auto", off=True), run("auto", inplace=False), \
         run("xla")
     if not na < no:
         raise Fail(f"instrument: {na} 32-element arrays declared with buffer assignment, {no} with the rule off")
@@ -1394,7 +1388,7 @@ def _(b):
 def _(b):
     import shutil
 
-    from tallymap.backends.cuda import compile as C
+    from tallymap.backends.kernel import compile as C
     old = os.environ.get("CXX")
     which = shutil.which
     try:
@@ -1423,7 +1417,7 @@ def _(b):
     from jax.extend.core import Primitive
     from jax.extend.core import primitives as P
 
-    from tallymap.backends.cuda import canon, census, op_table
+    from tallymap.backends.kernel import canon, census, op_table
     jaxnames = {v.name for v in vars(P).values() if isinstance(v, Primitive)}
     ours = set(op_table.RULES) | set(canon.SUGAR)
     bad = sorted(ours - jaxnames - set(census.NOT_IN_JAX_EXTEND))
@@ -1441,19 +1435,19 @@ def _(b):
         raise Fail(f"unknown 'how' values {sorted(hows)}")
     doc = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "primitives.md")
     if open(doc).read() != census.primitives_table():
-        raise Fail("docs/primitives.md is stale: regenerate it with tallymap.backends.cuda.census.primitives_table()")
+        raise Fail("docs/primitives.md is stale: regenerate it with tallymap.backends.kernel.census.primitives_table()")
     exported_unused = sorted(jaxnames - ours)
     return (f"{len(ours)} names, {len(ours & jaxnames)} exported by jax.extend; {len(exported_unused)} exported, "
             "not ours")
 
 
-@case("fixed_point=True on cuda without x64: equals the host fixed-point sum bitwise, order-independent", ["cuda"])
+@case("fixed_point=True on cuda without x64: equals the host fixed-point sum bitwise, order-independent", ["auto"])
 def _(b):
     n, scale = 1 << 15, 2.0 ** 20
     v = jnp.asarray(np.random.default_rng(3).uniform(-3, 3, n), jnp.float32)
     i = jnp.arange(n, dtype=jnp.int32)
     f = tm.vmap(lambda t, x, j: t.add("Q", j % NB, x).add("Q", (j + 1) % NB, x * 3.0),
-                outputs={"Q": tm.Sum((NB,), jnp.float32, fixed_point=True, scale=scale)}, backend="cuda")
+                outputs={"Q": tm.Sum((NB,), jnp.float32, fixed_point=True, scale=scale)}, backend="auto")
     a1, a2 = np.asarray(f(v, i).outputs["Q"]), np.asarray(f(v[::-1], i[::-1]).outputs["Q"])
     acc = np.zeros(NB, np.int64)
     vv = np.asarray(v).astype(np.float64)
@@ -1524,7 +1518,7 @@ def _(b):
     close(np.array([q2, q3]), np.array([2 * s, 3 * s]), what="callback results")
 
 
-@case("bitcast_convert_type between widths (shape-changing) on cuda == XLA bitwise", ["cuda"])
+@case("bitcast_convert_type between widths (shape-changing) on cuda == XLA bitwise", ["auto"])
 def _(b):
     u = jax.random.bits(jax.random.PRNGKey(4), (N,), jnp.uint32)
     x = lax.bitcast_convert_type(u, jnp.float32)
@@ -1549,9 +1543,9 @@ def _(b):
     return "f32<->u16[2], u32<->u8[4] bitwise" + (", f64<->u32[2] round trip" if jax.config.jax_enable_x64 else "")
 
 
-@case("long items: no typedef name collision, no lazy-expression blowup", ["cuda"])
+@case("long items: no typedef name collision, no lazy-expression blowup", ["auto"])
 def _(b):
-    from tallymap.backends.cuda.codegen import _RESERVED, Emitter
+    from tallymap.backends.kernel.codegen import _RESERVED, Emitter
     e = object.__new__(Emitter)                    # the counter is shared by every prefix: walk it past 8/16/32/64
     for p in ("i", "u", "v"):
         e.uid = 0
@@ -1601,7 +1595,7 @@ def _(b):
     return "leak: " + m.split(".")[1][:60] + "...; explicit argument: jvp matches; outer-jit closure runs"
 
 
-@case("jnp.linalg.solve / inv inside an item: cuda raises the ordinary UnsupportedError (no rule)", ["cuda"])
+@case("jnp.linalg.solve / inv inside an item: cuda raises the ordinary UnsupportedError (no rule)", ["auto"])
 def _(b):
     def mk(op):
         def item(t, x):
@@ -1617,9 +1611,9 @@ def _(b):
     return "; ".join(out)
 
 
-@case("step schedule: a large array loop carry is updated in place (no per-step copy), same result", ["cuda"])
+@case("step schedule: a large array loop carry is updated in place (no per-step copy), same result", ["auto"])
 def _(b):
-    from tallymap.backends.cuda.kernel import STEP_INPLACE_MIN
+    from tallymap.backends.kernel.kernel import STEP_INPLACE_MIN
     H = 2 * STEP_INPLACE_MIN
 
     def item(t, x, key, th):

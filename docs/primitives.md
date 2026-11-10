@@ -1,7 +1,7 @@
-# Primitives the cuda backend compiles
+# Primitives the kernel backend compiles
 
 Generated from `tallymap.supported_primitives()` by
-`tallymap.backends.cuda.census.primitives_table()` (a test checks that this file is current).
+`tallymap.backends.kernel.census.primitives_table()` (a test checks that this file is current).
 `how`: `rule` = one emission rule in `backends/cuda/op_table.py`; `canonicalised` = rewritten into rule
 primitives by `backends/cuda/canon.py` before emission; `tally` = tallymap's own emit / spawn.
 Any other primitive raises `tm.UnsupportedError` on cuda; the xla backend runs every JAX

@@ -60,7 +60,7 @@ import tallymap as tm  # noqa: E402
 from tallymap import _diagnostics as _D  # noqa: E402
 from tallymap import _primitive as _P  # noqa: E402
 from tallymap import reference  # noqa: E402
-from tallymap.backends.cuda import codegen as _CG  # noqa: E402
+from tallymap.backends.kernel import codegen as _CG  # noqa: E402
 
 if os.environ.get("TX_UNFUSED") == "1":                 # run_all --unfused: the two-node jvp design
     _P.FUSE_JVP = False
@@ -71,10 +71,10 @@ jax.config.update("jax_default_matmul_precision", "highest")
 X64 = bool(jax.config.jax_enable_x64)
 F = jnp.float64 if X64 else jnp.float32
 GPU = jax.default_backend() == "gpu"
-BACKENDS = os.environ.get("BACKENDS", "xla,cuda" if GPU else "xla").split(",")
+BACKENDS = os.environ.get("BACKENDS", "xla,auto").split(",")
 ONLY = os.environ.get("ONLY", "")
 # fixed_point=True outputs: the xla backend accumulates them in int64, so it needs jax_enable_x64 (edge.py).
-FIXED = {"xla": X64, "cuda": True}
+FIXED = {"xla": X64, "auto": True}
 # FT: a float tally is a SUM whose order the schedule decides (atomics on cuda, block / lane order on xla), so
 # two schedules agree only up to reassociation.  The sums here have at most a few hundred positive terms of similar
 # size: reassociation moves a bin by a few ulps of the bin, 1e-5 (f32) leaves 2 orders of margin, and a LOGIC error
@@ -219,7 +219,7 @@ PI_LANE_TOL = 1e-13 if X64 else 1e-6
 
 
 def lanes_same(b, a, ref, what):
-    return same(a, ref, what) if b == "cuda" else near(a, ref, PI_LANE_TOL, what)
+    return same(a, ref, what) if b == "auto" else near(a, ref, PI_LANE_TOL, what)
 
 
 def kernel_hashes():
@@ -287,7 +287,7 @@ def _(b):
     return f"trip counts {k.min()}..{k.max()} ({len(set(k.tolist()))} distinct); fixed-point tally {'E' in r.outputs}"
 
 
-@case("[sched] schedule step == item (cuda)", ["cuda"])
+@case("[sched] schedule step == item (cuda)", ["auto"])
 def _(b):
     fs, fi = walk_fn(b, schedule="step"), walk_fn(b, schedule="item")
     th = th_of(3)
@@ -314,7 +314,7 @@ def _(b):
     else:
         raise Fail("schedule='steps' was accepted")
     f = tm.vmap(two_loops, outputs=outs1(b, False), in_axes=AX1, backend=b, schedule="step")
-    if b != "cuda":
+    if b != "auto":
         jax.block_until_ready(f(XS, KEYS, TAB, th_of(3)))                      # xla has no schedules
         return "xla ignores schedule"
     try:
@@ -338,7 +338,7 @@ def spawn_walk(t, g, x):
     return t.spawn((g + 1, w), when=g < 3), k
 
 
-@case("[sched] schedule step == item through spawn; kernels record the schedule that ran (cuda)", ["cuda"])
+@case("[sched] schedule step == item through spawn; kernels record the schedule that ran (cuda)", ["auto"])
 def _(b):
     o = {"Q": tm.Sum((NB,), F), "C": tm.Sum((NB,), jnp.int32)}
     G = jnp.zeros((N1,), jnp.int32)
@@ -354,7 +354,7 @@ def _(b):
     return agree(res["step"], res["item"], "step vs item through spawn") + f"; schedules {ran}"
 
 
-@case("[sched] codegen.INPLACE on == off (cuda)", ["cuda"])
+@case("[sched] codegen.INPLACE on == off (cuda)", ["auto"])
 def _(b):
     f = walk_fn(b)
     th = th_of(3)
@@ -366,10 +366,10 @@ def _(b):
     return agree(A, B, "inplace on vs off")
 
 
-@case("[sched] xla == cuda (fixed-point/int bitwise, float to tol)", ["cuda"])
+@case("[sched] xla == cuda (fixed-point/int bitwise, float to tol)", ["auto"])
 def _(b):
     th = th_of(3)
-    A = walk_fn("cuda", fixed_point=X64)(XS, KEYS, TAB, th)        # (the xla fixed-point tally needs x64)
+    A = walk_fn("auto", fixed_point=X64)(XS, KEYS, TAB, th)        # (the xla fixed-point tally needs x64)
     B = walk_fn("xla", fixed_point=X64)(XS, KEYS, TAB, th)
     # Two compilers (NVRTC vs XLA:GPU).  The item uses only IEEE +, * without contraction (cuda: -fmad=false), so the
     # per-item floats are expected to agree to the last bit; held to 1e-6 rather than bitwise because XLA is free to
@@ -401,7 +401,7 @@ def _(b):
     for j in range(ths.shape[0]):
         # (xla: the member runs inside lax.map's loop, a different XLA program: per-item floats within a few ulps)
         m = agree(jax.tree_util.tree_map(lambda v: v[j], A), fo(XS, KEYS, TAB, ths[j]), f"member {j} vs unbatched",
-                  per_item="bitwise" if b == "cuda" else "tol", pi_tol=PI_LANE_TOL)
+                  per_item="bitwise" if b == "auto" else "tol", pi_tol=PI_LANE_TOL)
     return f"{ths.shape[0]} members == their unbatched calls; last: {m}"
 
 
@@ -414,7 +414,7 @@ def _chunk(b, T, mode):
         return None
     if isinstance(mode, int):
         return _P._balanced(T, min(T, mode))
-    if mode == "auto" and b == "cuda":
+    if mode == "auto" and b == "auto":
         return _P._balanced(T, min(T, _P.MAX_LANES))
     return _P._balanced(T, T)
 
@@ -547,7 +547,7 @@ def make_pairs(b):
 
     # 5. an option: cuda_math approx vs ieee (f32 div / sqrt; cuda only).  ieee must be correctly rounded (numpy
     #    f32); approx must differ from it somewhere (else the pair is void) but stay within a few ulps.
-    if b == "cuda":
+    if b == "auto":
         rng = np.random.default_rng(5)
         a32 = jnp.asarray(rng.uniform(0.1, 10.0, 4096), jnp.float32)
         c32 = jnp.asarray(rng.uniform(0.1, 10.0, 4096), jnp.float32)
@@ -770,9 +770,9 @@ def _neg_verdict(kind, res, expect, none):
 
 
 for _kind in ("text", "digest", "avals"):
-    @case(f"[key] NEGATIVE CONTROL: kernel key = {_kind} only must be caught (cuda _KERNELS)", ["cuda"])
+    @case(f"[key] NEGATIVE CONTROL: kernel key = {_kind} only must be caught (cuda _KERNELS)", ["auto"])
     def _(b, kind=_kind):
-        from tallymap.backends import cuda as CB
+        from tallymap.backends import kernel as CB
         real = CB._key
         CB._KERNELS.clear()
         _P._EAGER.clear()
@@ -943,7 +943,7 @@ def _kernel_resources():
     """the measured resources (registers, local bytes per thread: compile.kernel_info, the same numbers
     tm.diagnostics() reports as kernels[i]['resources']) of the cuda kernels recorded in the diagnostics history
     that have run; the callers clear the history first, so these are the kernels of the call under test"""
-    from tallymap.backends.cuda.compile import kernel_info
+    from tallymap.backends.kernel.compile import kernel_info
     out = []
     for rec in list(_D.KERNELS):
         info = kernel_info(rec["kid"])
@@ -997,9 +997,9 @@ for S in (8, 64, 512, 2048):
             if not _tm_error(e, f" {S}"):
                 raise Fail(f"raised without naming the size {S}: {type(e).__name__}: {str(e)[:200]}") from None
             raise Expected(f"{type(e).__name__}: {str(e).splitlines()[0][:160]}") from None
-        res = _kernel_resources() if b == "cuda" else []
+        res = _kernel_resources() if b == "auto" else []
         m = near(r.per_item, ref(xs, keys), 1e-12 if X64 else 1e-5, "per-item carry vs jax.vmap")
-        return f"{m}; {_res_str(res)}" if b == "cuda" else m
+        return f"{m}; {_res_str(res)}" if b == "auto" else m
 
 
 FRAME_K, FRAME_S = 12, 16384      # 12 live per-item arrays of 16,384 floats: >= 768 KiB of local memory per thread
@@ -1020,9 +1020,9 @@ def frame_item(t, x, key):
     return t
 
 
-@case("[size] a per-item frame over CUDA's 512 KiB per-thread local limit raises before launch, naming both", ["cuda"])
+@case("[size] a per-item frame over CUDA's 512 KiB per-thread local limit raises before launch, naming both", ["auto"])
 def _(b):
-    from tallymap.backends.cuda.compile import LOCAL_LIMIT
+    from tallymap.backends.kernel.compile import LOCAL_LIMIT
     keys = jax.random.split(jax.random.PRNGKey(3), NS)
     xs = jnp.linspace(0.5, 1.5, NS).astype(F)
     f = tm.vmap(frame_item, outputs={"Q": tm.Sum((1,), F)}, backend=b)
@@ -1249,16 +1249,16 @@ def _(b):
     return f"{nt}/{N1} truncated; per-item w {m}"
 
 
-@case("[trunc] max_steps: cuda == xla (flags, counts, partial tallies, per-item)", ["cuda"])
+@case("[trunc] max_steps: cuda == xla (flags, counts, partial tallies, per-item)", ["auto"])
 def _(b):
-    A, B = trunc_fn("cuda", fixed_point=X64)(XS, KEYS), trunc_fn("xla", fixed_point=X64)(XS, KEYS)
-    trunc_check(A, "cuda")
+    A, B = trunc_fn("auto", fixed_point=X64)(XS, KEYS), trunc_fn("xla", fixed_point=X64)(XS, KEYS)
+    trunc_check(A, "auto")
     trunc_check(B, "xla")
     # per-item floats: two compilers, IEEE +, * only (see the [sched] xla == cuda cell)
     return agree(A, B, "cuda vs xla", per_item="tol", pi_tol=1e-12 if X64 else 1e-6)
 
 
-@case("[trunc] max_steps: schedule step == item (cuda)", ["cuda"])
+@case("[trunc] max_steps: schedule step == item (cuda)", ["auto"])
 def _(b):
     A, B = trunc_fn(b, schedule="step")(XS, KEYS), trunc_fn(b, schedule="item")(XS, KEYS)
     trunc_check(A, "step")
@@ -1287,7 +1287,7 @@ def _(b):
     return f"n_active={na}: {int(A.stats['n_truncated'])} truncated, all in the prefix; n_active=0: zero, finite"
 
 
-@case("[trunc] n_active + schedule='step': runs the step schedule (value and jvp) and == item (cuda)", ["cuda"])
+@case("[trunc] n_active + schedule='step': runs the step schedule (value and jvp) and == item (cuda)", ["auto"])
 def _(b):
     # n_active is the launch's item count, not a cond around the item: the item keeps its one top-level loop, so
     # schedule='step' splits it (it used to raise: the cond hid the loop)

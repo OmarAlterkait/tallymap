@@ -79,7 +79,7 @@ def sim_of(ctx, arm, maxs):
                 t = t.add("hist", b, v)
             return t, k
         f = tm.vmap(walker, outputs={"hist": tm.Sum((NB,))}, in_axes=(0, None),
-                    backend="cuda" if arm == "tm_cuda" else "xla")
+                    backend="auto" if arm == "tm_cuda" else "xla")
         return lambda th: f(keys, th).outputs["hist"]
 
     if not per_step:

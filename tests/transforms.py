@@ -46,7 +46,7 @@ if NEG:
         _C._vjp_call = lambda *a: tuple([None if g is None else g * 1.001 for g in gs] for gs in _orig_v(*a))
     print("NEGATIVE CONTROL", NEG, flush=True)
 GPU = jax.default_backend() == "gpu"
-BACKENDS = os.environ.get("BACKENDS", "xla,cuda" if GPU else "xla").split(",")
+BACKENDS = os.environ.get("BACKENDS", "xla,auto").split(",")
 ONLY = os.environ.get("ONLY", "")
 F = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
 print("jax", jax.__version__, jax.__file__, jax.devices(), "x64", jax.config.jax_enable_x64, flush=True)
@@ -549,7 +549,7 @@ def _(b):
     try:
         exp = export.export(f)(TH)
     except Exception as e:
-        if b == "cuda" or (b == "auto" and GPU):
+        if b == "auto":
             err = e
             expect_raise(lambda: (_ for _ in ()).throw(err), "custom call")
         raise
@@ -560,11 +560,12 @@ def _(b):
     return note + "; " + close(exp2.call(TH), big_vec(R(), TH))
 
 
-@case("jax.export cuda with the custom-call check disabled", ["cuda"])
+@case("jax.export of a kernel program with the custom-call check disabled (in-process)", ["auto"])
 def _(b):
     from jax import export
     f = jax.jit(lambda t: big_vec(S(b), t))
-    exp = export.export(f, disabled_checks=[export.DisabledSafetyCheck.custom_call("tallymap_cuda_launch")])(TH)
+    tgt = "tallymap_cuda_launch" if GPU else "tallymap_host_launch"
+    exp = export.export(f, disabled_checks=[export.DisabledSafetyCheck.custom_call(tgt)])(TH)
     try:
         exp2, note = export.deserialize(exp.serialize()), "serialized roundtrip"
     except ImportError as e:

@@ -106,7 +106,7 @@ def exit_of(ctx, arm, maxs):
             i, v = deposit(c, ef)
             return t.add("Q", i, v), (i, c[3], v, c[2])
         f = tm.vmap(packet, outputs={"Q": tm.Sum((NS,))}, in_axes=(0, 0, None, None),
-                    backend="cuda" if arm == "tm_cuda" else "xla")
+                    backend="auto" if arm == "tm_cuda" else "xla")
         return lambda th: f(p0, keys, th, eff).per_item
     return lambda th: jax.vmap(one, in_axes=(0, 0, None))(p0, keys, th)
 
@@ -119,7 +119,7 @@ def sim_of(ctx, arm, maxs):
             i, v = deposit(c, ef)
             return t.add("Q", i, v), c[3]
         f = tm.vmap(packet, outputs={"Q": tm.Sum((NS,))}, in_axes=(0, 0, None, None),
-                    backend="cuda" if arm == "tm_cuda" else "xla")
+                    backend="auto" if arm == "tm_cuda" else "xla")
         return lambda th: f(p0, keys, th, eff).outputs["Q"]
 
     def one(p, key, th, ef):
