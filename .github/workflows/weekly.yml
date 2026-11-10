@@ -36,8 +36,8 @@ jobs:
             python: "3.12"
     name: jax ${{ matrix.jax }} (py${{ matrix.python }})
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - run: pip install -e ".[test]"
@@ -52,8 +52,8 @@ jobs:
     timeout-minutes: 90
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: pip install -e ".[test]"
