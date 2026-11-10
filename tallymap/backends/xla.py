@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax.extend.core import Literal
+from jax.extend.core import Literal, jaxpr_as_fun
 
 from .._errors import ad_advice
 from .._jaxpr import bind, call_jaxpr, cond_branches, lit, located, scan_parts, while_parts
@@ -238,50 +238,59 @@ def _while(st, e, ins):
 
 
 def _cond(st, e, ins):
+    """Each branch is interpreted ONCE, into a jaxpr (jax.make_jaxpr); lax.cond / lax.switch then bind that jaxpr,
+    so a cond nested d deep costs d interpretations, not 3^d (an interpretation per tally probe, per shape probe and
+    per lax trace).  Which outputs are virtual tallies, and the shapes of the others, come from the same trace."""
     idx, ops = ins[0], ins[1:]
     brs = cond_branches(e)
     n = len(brs)
     P = st.P
-    # outputs that are a virtual tally in ANY branch stay virtual: an inert (discard) tally may meet a filler value
-    # in another branch (JAX's cond partial eval pads a residual that only one branch produces with zeros)
-    vts = [None] * len(e.outvars)
+    ii = jnp.clip(idx.x, 0, n - 1)
 
-    def probe(k):
-        def f(packed):
-            st.unpack(packed)
-            for j, o in enumerate(_ev(st, brs[k].jaxpr, brs[k].consts, ops)):
-                if isinstance(o, VT) and vts[j] is None:
-                    vts[j] = o
-            return 0
-        return f
-    saved = st.pack()
-    for k in range(n):
-        jax.eval_shape(probe(k), saved)
-        st.unpack(saved)
+    def trace(k, mask):
+        vt = {}
 
-    def run_branch(k, mask):
         def f(packed):
             st.unpack(packed)
             saved = st.mask
             st.mask = mask
             out = _ev(st, brs[k].jaxpr, brs[k].consts, ops)
             st.mask = saved
-            return [_bc(o, P) for o, vt in zip(out, vts) if vt is None], st.pack()
-        return f
+            vt.update({j: o for j, o in enumerate(out) if isinstance(o, VT)})
+            return [None if isinstance(o, VT) else _bc(o, P) for o in out], st.pack()
+        saved = st.pack()
+        cj, shapes = jax.make_jaxpr(f, return_shape=True)(saved)
+        st.unpack(saved)
+        tree = jax.tree_util.tree_structure(shapes)
+        run = lambda packed: jax.tree_util.tree_unflatten(
+            tree, jaxpr_as_fun(cj)(*jax.tree_util.tree_leaves(packed)))
+        return run, vt, shapes[0]
+    masks = [st.mask if not idx.b else st.mask & (ii == k) for k in range(n)]
+    traced = [trace(k, masks[k]) for k in range(n)]
+    # outputs that are a virtual tally in ANY branch stay virtual: an inert (discard) tally may meet a filler value
+    # in another branch (JAX's cond partial eval pads a residual that only one branch produces with zeros)
+    vts = [None] * len(e.outvars)
+    for _, vt, _ in traced:
+        for j, o in vt.items():
+            vts[j] = vts[j] or o
+    keep = [j for j in range(len(vts)) if vts[j] is None]
+
+    def branch(k):
+        run = traced[k][0]
+
+        def g(packed):
+            out, packed = run(packed)
+            return [out[j] for j in keep], packed
+        return g
     if not idx.b:
-        res, packed = lax.switch(jnp.clip(idx.x, 0, n - 1), [run_branch(k, st.mask) for k in range(n)], st.pack())
+        res, packed = lax.switch(ii, [branch(k) for k in range(n)], st.pack())
         st.unpack(packed)
     else:
-        ii = jnp.clip(idx.x, 0, n - 1)
         outs = []
         for k in range(n):
-            mk = st.mask & (ii == k)
-            f = run_branch(k, mk)
-            saved = st.pack()
-            r0 = jax.eval_shape(f, saved)[0]
-            st.unpack(saved)
+            r0 = [traced[k][2][j] for j in keep]
             skip = lambda packed, r0=r0: ([jnp.zeros(a.shape, a.dtype) for a in r0], packed)
-            r, packed = lax.cond(jnp.any(mk), f, skip, st.pack())     # rare branches cost nothing
+            r, packed = lax.cond(jnp.any(masks[k]), branch(k), skip, st.pack())     # rare branches cost nothing
             st.unpack(packed)
             outs.append(r)
         res = [_select_n(ii, [o[j] for o in outs]) for j in range(len(outs[0]))]

@@ -1688,6 +1688,39 @@ def _(b):
     close(got["typed"], got["raw"], what="typed vs raw key")
     return "typed key == raw key, value and grad"
 
+
+@case("cond nested 4 deep: each item equation interpreted about once (not 3^depth)", ["xla"])
+def _(b):
+    from tallymap.backends import xla as XB
+    n = [0]
+    bind0 = XB.bind
+
+    def counting(e, ins):
+        n[0] += 1
+        return bind0(e, ins)
+
+    def item(t, x):
+        def blk(v, d):
+            if d == 0:
+                return jnp.sin(v) * 1.01 + 0.1
+            return lax.cond(v > 0.1 * d, lambda v: blk(v, d - 1), lambda v: blk(v * 0.9, d - 1), v)
+
+        def body(c):
+            i, v, t = c
+            v = blk(v, 4)
+            return i + 1, v, t.add("Q", i % NB, v)
+        return lax.while_loop(lambda c: c[0] < 6, body, (jnp.int32(0), x, t))[2]
+    XB.bind = counting
+    try:
+        got = jax.jit(lambda x: V(item, b)(x).outputs["Q"])(xs)
+    finally:
+        XB.bind = bind0
+    close(got, R(item)(xs).outputs["Q"], what="nested cond vs reference")
+    neq = 2 ** 5 * 3 + 8          # leaves of the binary cond tree, a few ops each, plus the loop: an upper bound
+    if n[0] > 2 * neq:
+        raise Fail(f"{n[0]} interpretations of primitive equations for a ~{neq}-equation item (3^depth re-tracing?)")
+    return f"{n[0]} primitive interpretations"
+
 print("\n================ SUMMARY", jax.__version__, "x64" if jax.config.jax_enable_x64 else "",
       jax.devices()[0].device_kind)
 for n, b, m in RES:
