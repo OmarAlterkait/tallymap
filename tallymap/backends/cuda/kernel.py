@@ -12,18 +12,16 @@ import numpy as np
 from .codegen import CodegenError, Emitter, Local, Scalar, Table, VTally, _size, ctype, elem, fill_decl, unravel
 from .op_table import phys
 
-# Every kernel takes ONE by-value struct of buffer pointers.  Up to SJ_SMALL = 504 (4,032 + 8 bytes with n_items)
-# it fits the classic 4 KB kernel-parameter limit every toolkit / driver / GPU supports, and its source is unchanged.
-# A program with more buffers gets SJ_MAXP = 2048 (16,392 bytes): CUDA 12.1+ large kernel parameters (up to 32,764
-# bytes on compute capability 7.0+ with a 12.1+ toolkit and driver).
-SJ_SMALL, SJ_MAXP = 504, 2048
+# Every kernel takes ONE by-value struct of buffer pointers, sized to the program's own buffer count r
+# (`struct SjParams { void* p[r]; }`).  The limits are the driver's: 8 r + 8 bytes (with n_items) within the classic
+# 4 KB kernel-parameter limit (r <= 511) everywhere, within 32,764 bytes (r <= SJ_MAXP = 4,094) with CUDA 12.1+
+# large kernel parameters (compute capability 7.0+, 12.1+ toolkit and driver).
+SJ_MAXP = 4094
 
 
 PRELUDE = r"""
 typedef signed char i8; typedef unsigned char u8; typedef short i16; typedef unsigned short u16;
 typedef int i32; typedef unsigned int u32; typedef long long i64; typedef unsigned long long u64;
-#define SJ_MAXP 504
-struct SjParams { void* p[SJ_MAXP]; };
 // the f32 math library behind ONE __noinline__ wrapper per function: one body per kernel instead of one per
 // call site (inlined at every site, the libdevice bodies made most of the compile time: NVRTC on the
 // benchmarks/compile_scaling 100-stage forward 195 -> 5.3 s, LUCiD with the scan change 1.5x; run time
@@ -472,10 +470,11 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
     r += len(yav)
     L.n_buf = r
     if r > SJ_MAXP:
-        raise CodegenError(f"too many buffers ({r} > {SJ_MAXP})")
+        raise CodegenError(f"too many buffers ({r} > {SJ_MAXP}: the kernel parameter struct would exceed the "
+                           "driver's 32,764-byte limit)")
     L.pav, L.yav = pav, yav
 
-    src = [PRELUDE if r <= SJ_SMALL else PRELUDE.replace(f"SJ_MAXP {SJ_SMALL}", f"SJ_MAXP {SJ_MAXP}"),
+    src = [PRELUDE, f"struct SjParams {{ void* p[{r}]; }};",
            f"#define SJ_CONST(j) (P.p[{base_const} + (j)])", f"#define SJ_STATS ((i32*)P.p[{L.r_stats}])"]
     if spawn is not None:
         src.append(f"#define SJ_QCTL ((u32*)P.p[{L.r_qctl}])\n#define SJ_SEQ ((u32*)P.p[{L.r_seq}])\n"

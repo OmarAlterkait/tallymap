@@ -48,6 +48,10 @@ for the schedules ("item schedule" / "step schedule"), and the spelling "materia
   stops running items at `min(n_items, n_active)` and writes zero per-item results for the rest, the xla backend
   masks `ids < n_active`. Semantics unchanged: items `i >= n_active` emit nothing, are never truncated, and their
   per-item results (and tangents / cotangents) are zero. `n_active` with `schedule='step'` now runs.
+- cuda: the kernel parameter struct has exactly the program's buffer count (`struct SjParams { void* p[r]; }`),
+  replacing the two-tier 504 / 2048 rule. The limits are the driver's own: up to 511 buffers within the classic
+  4 KB parameter block, up to 4,094 (32,764 bytes) with CUDA 12.1+ large kernel parameters; more raises naming
+  the limit. Every kernel's source (and cubin) changes once.
 
 ### Changed (tree adjoint)
 

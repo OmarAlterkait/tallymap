@@ -33,9 +33,10 @@ typedef void* CUcontext;
 typedef int CUdevice;
 typedef unsigned long long CUdeviceptr;
 
-// The host struct is the LARGEST kernel's (kernel.py SJ_MAXP): cuLaunchKernel copies the parameter size the
-// kernel's image declares (504 or 2048 pointers), so a smaller kernel reads its prefix.
-#define SJ_MAXP 2048
+// The host struct is the LARGEST kernel's (kernel.py SJ_MAXP, the driver's 32,764-byte parameter limit):
+// cuLaunchKernel copies the parameter size the kernel's image declares (the program's own buffer count), so a
+// kernel reads its prefix.
+#define SJ_MAXP 4094
 struct SjParams { void* p[SJ_MAXP]; };
 
 namespace {

@@ -1153,8 +1153,8 @@ def _(b):
     return str(n)[-60:]
 
 
-@case("kernel parameters: a program with more than 504 buffers runs (CUDA large kernel parameters); over 2048 "
-      "raises", ["cuda"])
+@case("kernel parameters: the struct has the program's own buffer count; more than 511 buffers run (CUDA large "
+      "kernel parameters); over 4094 raises", ["cuda"])
 def _(b):
     def mk(nt):
         def item(t, x, tabs):
@@ -1166,17 +1166,19 @@ def _(b):
         tabs = tuple(jnp.arange(4, dtype=F) * F(1 + j % 7) for j in range(nt))
         d = tm.diagnostics(lambda x, ts: mk(nt)(x, ts).outputs["Q"], xs, tabs)
         src = open(d["kernels"][0]["source"]).read()
-        want = 504 if nt <= 500 else 2048
-        if f"#define SJ_MAXP {want}" not in src:
-            raise Fail(f"{nt} tables: the kernel source does not declare SJ_MAXP {want}")
+        import re
+        m = re.search(r"struct SjParams \{ void\* p\[(\d+)\]; \};", src)
+        want = int(m.group(1)) if m else -1
+        if not nt + 4 <= want <= nt + 16:          # the tables + x + the hoisted / output / counter / stats buffers
+            raise Fail(f"{nt} tables: the kernel's parameter struct has {want} pointers")
         got = np.asarray(mk(nt)(xs, tabs).outputs["Q"])        # every table pointer is read: tab_j[i] = i (1 + j % 7)
         i = np.asarray((xs * 3).astype(jnp.int32) % 4)
         want_q = float(np.sum(np.asarray(xs, np.float64) * i) * sum(1 + j % 7 for j in range(nt)))
         close(got, np.array([want_q]), rtol=1e-4, what=f"{nt} tables")
-        msg.append(f"{nt}: SJ_MAXP {want}")
-    tabs = tuple(jnp.arange(4, dtype=F) for _ in range(2100))
-    m = raises(tm.UnsupportedError, lambda: mk(2100)(xs, tabs), "too many buffers")
-    return "; ".join(msg) + "; 2100: " + m[:40]
+        msg.append(f"{nt}: p[{want}]")
+    tabs = tuple(jnp.arange(4, dtype=F) for _ in range(4100))
+    m = raises(tm.UnsupportedError, lambda: mk(4100)(xs, tabs), "too many buffers")
+    return "; ".join(msg) + "; 4100: " + m[:40]
 
 
 QT_NK = 8
