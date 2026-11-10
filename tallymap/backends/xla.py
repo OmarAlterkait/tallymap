@@ -16,6 +16,11 @@ from .._errors import ad_advice
 from .._jaxpr import bind, call_jaxpr, cond_branches, lit, located, scan_parts, while_parts
 
 BLOCK = 1 << 18
+# f32 sum tallies: R partial accumulators (lane p adds into row p % R), summed by jnp.sum at the end.  One
+# accumulator takes every item's every emit in series (XLA:CPU's scatter-add is a serial loop), so its rounding
+# error grows with the number of adds per bin: 85x plain JAX's on a 3.6e3-per-bin tally (round4/xla, Q1).  R rows
+# cut the adds per bin R-fold; the rows cost R x the tally memory, so R shrinks to stay within ROWS_ELEMS.
+ROWS, ROWS_ELEMS = 64, 1 << 24
 
 
 class VT:
@@ -73,6 +78,14 @@ def _fixed(v, scale):
     return jnp.where(ok, jnp.round(x), 0).astype(jnp.int64), ok
 
 
+def _rows(spec):
+    """partial rows of a float, non-fixed-point sum tally (see ROWS); 1 for every other tally."""
+    if spec.kind != "sum" or spec.fixed_point or not jnp.issubdtype(spec.dtype, jnp.floating):
+        return 1
+    n = int(np.prod(spec.lead, dtype=np.int64)) * spec.S
+    return int(max(1, min(ROWS, ROWS_ELEMS // max(n, 1))))
+
+
 def _emit(st, t, idx, val):
     spec = st.p.tallies[t.slot]
     if spec.kind == "discard":
@@ -91,7 +104,12 @@ def _emit(st, t, idx, val):
     m = jnp.broadcast_to(st.mask.reshape((P,) + (1,) * (i.ndim - 1)), i.shape)
     live = m & (i >= 0) & (i < S)
     st.drops = st.drops + jnp.sum((m & ~live).astype(jnp.int32), dtype=jnp.int32)   # out of range: dropped
-    f = jnp.where(live, i, S).reshape(-1).astype(jnp.int32)
+    R = _rows(spec)
+    if R > 1:                                         # lane p -> partial row p % R; dropped stays out of range
+        row = jnp.broadcast_to((jnp.arange(P, dtype=jnp.int32) % R).reshape((P,) + (1,) * (i.ndim - 1)), i.shape)
+        f = jnp.where(live, row * S + i, R * S).reshape(-1).astype(jnp.int32)
+    else:
+        f = jnp.where(live, i, S).reshape(-1).astype(jnp.int32)
     nl = len(L)
     v = jnp.moveaxis(v, 0, nl).reshape(L + (-1,))      # [*L, P*I]
     a = st.accs[t.slot]
@@ -352,7 +370,7 @@ def run(p, pi, bc, xla_batch_size=None, **_):
             dt = jnp.int64 if s.fixed_point else s.dtype
             if s.fixed_point:
                 _fixed(jnp.zeros(()), 1.0)
-            accs[k] = jnp.zeros(tuple(s.lead) + (s.S,), dt)
+            accs[k] = jnp.zeros(tuple(s.lead) + (_rows(s) * s.S,), dt)
     ys0 = [jnp.zeros((N,) + tuple(a.shape), a.dtype) for a in ya]
     P = int(min(max(N, 1), xla_batch_size or BLOCK))
     cj = p.cj
@@ -437,6 +455,8 @@ def _finish(p, accs, sp, ys, st):
     for k, s in enumerate(p.tallies):
         if s.kind == "sum":
             a = accs[k]
+            if _rows(s) > 1:
+                a = jnp.sum(a.reshape(tuple(s.lead) + (_rows(s), s.S)), axis=-2)
             if s.fixed_point:                       # a bin that dropped an emit is NaN (as on cuda)
                 a = (a.astype(jnp.float64) / s.scale).astype(s.dtype)
                 if jnp.issubdtype(s.dtype, jnp.floating):

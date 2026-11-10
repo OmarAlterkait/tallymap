@@ -1721,6 +1721,45 @@ def _(b):
         raise Fail(f"{n[0]} interpretations of primitive equations for a ~{neq}-equation item (3^depth re-tracing?)")
     return f"{n[0]} primitive interpretations"
 
+
+@case("f32 tally accuracy: the xla backend's sum is about as close to the exact sum as plain JAX's", ["xla"])
+def _(b):
+    if F != jnp.float32:
+        return "f32 only (x64 run)"
+
+    @jax.tree_util.register_pytree_node_class
+    class Dense:                                     # a plain-JAX tally: the item's own (8,) array
+        def __init__(self, h):
+            self.h = h
+
+        def add(self, name, i, v):
+            return Dense(self.h.at[i].add(v))
+
+        def tree_flatten(self):
+            return (self.h,), None
+
+        @classmethod
+        def tree_unflatten(cls, aux, ch):
+            return cls(ch[0])
+
+    def item(t, x):
+        def body(c):
+            i, v, t = c
+            for _ in range(8):
+                v = jnp.sin(v) * 1.01 + 0.1
+            return i + 1, v, t.add("Q", i % NB, v)
+        return lax.while_loop(lambda c: (c[0] < 6) & (c[1] < 3.0), body, (jnp.int32(0), x, t))[2]
+    x = jnp.linspace(-1.0, 1.0, 4096).astype(F)
+    got = np.asarray(jax.jit(lambda x: V(item, b)(x).outputs["Q"])(x), np.float64)
+    per = np.asarray(jax.jit(jax.vmap(lambda xi: item(Dense(jnp.zeros(NB, F)), xi).h))(x))     # (N, 8) f32
+    exact = per.astype(np.float64).sum(0)
+    plain = np.asarray(jnp.asarray(per).sum(0), np.float64)                                     # XLA's f32 reduction
+    e_x, e_p = np.max(np.abs(got - exact)), np.max(np.abs(plain - exact))
+    if e_x > 8 * e_p + 1e-6 * np.max(np.abs(exact)):
+        raise Fail(f"xla f32 error {e_x:.3g} vs plain JAX {e_p:.3g} (|sum| {np.max(np.abs(exact)):.4g}): "
+                   "serial accumulation into one accumulator?")
+    return f"error {e_x:.3g} vs plain JAX {e_p:.3g} ({e_x / max(e_p, 1e-30):.1f}x), |sum| {np.max(np.abs(exact)):.4g}"
+
 print("\n================ SUMMARY", jax.__version__, "x64" if jax.config.jax_enable_x64 else "",
       jax.devices()[0].device_kind)
 for n, b, m in RES:
