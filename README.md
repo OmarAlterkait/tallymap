@@ -1,21 +1,93 @@
 # tallymap
 
-Dr.Jit-style per-thread execution of divergent Monte Carlo loops, as a JAX primitive that composes with `jit`,
-`vmap` and `grad`.
+`jax.vmap` for per-item loops of different lengths whose results are sums.
 
-You write one ordinary JAX function of ONE item, with its own `lax.while_loop`, its own trip count, its own
-gathers and its own `jax.random` draws: one walker, one photon, one trajectory, one chain. `tm.vmap` maps it over
-N independent items whose results go into commutative sums, called tallies. On an NVIDIA GPU the item compiles to
-a single CUDA kernel in which each GPU thread runs one item at that item's own trip count and then claims the
-next, so a batch does not cost its longest item times the batch size. Everywhere else it runs the xla backend, a
-masked plain-JAX interpreter. Because it is all one JAX primitive, `jit`, `vmap`,
-`grad`, `jvp`, `jacfwd`, `jacrev`, `hessian`, `checkpoint` and `pmap` work on it, and the result means
-exactly `jax.vmap(item)` followed by a sum. tallymap was built for in-house photon-transport and particle-shower
-engines and has nothing in it about either.
+You write an ordinary JAX function of ONE item (one photon, one walker, one trajectory, one chain) with its own
+`lax.while_loop`, its own trip count and its own `jax.random` draws. `tm.vmap` maps it over N independent items
+whose results go into commutative sums, called tallies. On an NVIDIA GPU the item compiles to a single CUDA kernel
+in which each thread runs one item for exactly as many steps as that item needs, then claims the next. Everywhere
+else it runs the xla backend, a plain-JAX interpreter. It is one JAX primitive, so `jit`, `vmap`, `grad`, `jvp`,
+`jacfwd`, `jacrev`, `hessian`, `checkpoint` and `pmap` work on it, and the result means exactly `jax.vmap(item)`
+followed by a sum.
+
+What it gives you that plain JAX does not:
+
+- **Divergent loops at the cost of the average item, not the longest.** 1.3 to 41x faster forward on the natural
+  problems below (one L40S).
+- **Reverse mode through `lax.while_loop`.** Plain JAX cannot reverse-differentiate a `while_loop` at all. tallymap
+  replays each item from its inputs, so gradient memory does not grow with the trip count and there is no step cap.
+
+**Status:** 0.6.0rc1, a release candidate. JAX >= 0.6.2. The CUDA backend needs Linux and an NVIDIA GPU of compute
+capability 7.0 or newer; the xla backend runs anywhere JAX does. Not on PyPI: install from GitHub (below).
+tallymap was built for in-house photon-transport and particle-shower engines and has nothing in it about either.
+
+## Quickstart
 
 ```python
+import jax, jax.numpy as jnp
+import numpy as np
+from jax import lax
 import tallymap as tm
+
+NB = 16                                                    # histogram bins
+
+def walker(t, x, key, theta):
+    """ONE item.  t is its Tally: thread it through the loop like a PRNG key."""
+    def body(c):
+        k, x, t = c
+        u = jax.random.uniform(jax.random.fold_in(key, k))
+        t = t.add("hist", (x * NB).astype(jnp.int32), theta * (1.0 - x))
+        return k + 1, x * (0.5 + 0.5 * u), t
+    k, x, t = lax.while_loop(lambda c: c[1] > 0.05, body, (0, x, t))
+    return t, k                                            # the Tally, plus an optional per-item result
+
+f = tm.vmap(walker, outputs={"hist": tm.Sum((NB,))}, in_axes=(0, 0, None), max_steps=100)
+
+N = 10_000
+xs = jnp.linspace(0.1, 0.99, N)
+keys = jax.random.split(jax.random.PRNGKey(0), N)
+theta = jnp.float32(2.0)
+
+res = jax.jit(f)(xs, keys, theta)
+print(res.outputs["hist"], res.per_item.mean(), res.stats)
+g = jax.jit(jax.grad(lambda th: f(xs, keys, th).outputs["hist"].sum()))(theta)
 ```
+
+`examples/quickstart.py` is this program with its checks; the other examples are listed at the end. Install it first (next section).
+
+**The rules of a Tally.** `t = t.add(name, index, value)` returns a NEW Tally. Tallies are write-only and used
+linearly: no reads, no forks, no dropped results. That is checked when the function is traced, and a violation
+raises `tm.TallyError`, because it would silently disagree with the dense meaning. `index` is an int array (a flat
+index for a 1-D output) or a tuple of int arrays, one per output dimension.
+
+A tally indexed by a TUPLE is the right way to get per-item vector outputs: `Sum((N, K))` indexed by
+`(item_id, slot)` gives each item its own K-element result without a per-item array in the kernel.
+
+## Install
+
+```
+pip install "tallymap @ git+https://github.com/OmarAlterkait/tallymap@v0.6.0rc1"         # CPU: the xla backend
+pip install "tallymap[cuda] @ git+https://github.com/OmarAlterkait/tallymap@v0.6.0rc1"   # + JAX's CUDA 12 plugin and NVRTC
+```
+
+For the tests, examples and benchmarks, clone the repository and install it editable:
+
+```
+git clone https://github.com/OmarAlterkait/tallymap && cd tallymap && pip install -e ".[cuda]"
+```
+
+In a project that depends on tallymap, pin a tag (`@v0.6.0rc1`) as above. Until 1.0 a minor release may change the
+API; `CHANGELOG.md` lists every change.
+
+A **C++17 compiler is needed once**, the first time you use the GPU backend, to build the `jax.ffi` launch shim.
+It is about 200 lines and the result is cached per toolchain and jaxlib version. If `$CXX` is set it is used.
+
+**GPU memory.** The CUDA driver reserves a kernel's per-thread local memory (large per-item arrays live there)
+outside JAX's memory pool, and JAX preallocates 75% of the GPU by default. If a call fails with `out of memory` at
+kernel launch, the error says how much the kernel needs; set `XLA_PYTHON_CLIENT_PREALLOCATE=false`, or a lower
+`XLA_PYTHON_CLIENT_MEM_FRACTION`, before JAX starts.
+
+Tested on Linux with NVIDIA GPUs of compute capability 7.5 (2080 Ti) and 8.9 (L40S); the spawn queue needs 7.0.
 
 ## Will it help you?
 
@@ -25,7 +97,6 @@ the same job. Every padded arm is padded to the trip count measured in the same 
 `docs/performance.md` has the method, every size, the 2080 Ti and JAX 0.11.2 rows, the agreement checks and the
 compile times.
 
-Measured against the fastest plain-JAX arm of each problem (`docs/performance.md` has the method, the padding and the losses):
 
 | problem | kind | size | forward: tallymap vs best plain JAX | gradient: tallymap vs best plain JAX | gradient peak memory |
 |---|---|---|---|---|---|
@@ -72,6 +143,24 @@ across items, resampling inside the loop. Those raise `TallyError` at trace time
 
 Uniform loops still gain 1.8 to 2.9x here, but nothing like the divergent cases.
 <!-- perf:end -->
+
+## The mental model
+
+Three sentences, and everything else follows from them.
+
+1. **One item is one GPU thread running its own loop.** Not one element of a wide batch: a real thread with its
+   own trip count, whose state lives in registers. When it finishes, the thread takes the next item (with
+   `schedule='step'`, already at the end of each loop step). This is why the batch does not cost its longest item
+   times the batch size, and why a per-item state of tens of scalars is fast
+   while a per-item D x D matrix is not.
+2. **Tallies are atomic sums.** There is no per-item output array. Every `t.add` goes into one accumulator, in
+   shared memory when the output is small enough and in global memory otherwise. Sums are commutative, so the
+   order is not fixed, which is where the float semantics below come from.
+3. **Reverse mode replays each item from its inputs.** The forward pass stores only the first C states of each
+   loop (an item whose loop is that short is never replayed). The adjoint
+   re-runs each item with two-level checkpointing and applies the vector-Jacobian product of one step at a time,
+   so **memory is O(1) per item in the trip count** and there is no step cap anywhere. That is the property
+   plain JAX cannot give you, and it is the reason to pay for a CUDA emitter in your dependency tree.
 
 ## Why not `jax.vmap`, `lax.map`, Dr.Jit, Warp or Pallas?
 
@@ -122,144 +211,6 @@ within 0.7x to 1.3x of the best plain-JAX program on the natural problems. Its g
 padded `lax.scan` given the oracle step cap (`docs/performance.md`, "cpu"). What it buys you there is a gradient
 through a `lax.while_loop` without choosing a cap, and memory proportional to the outputs. It does not buy speed.
 <!-- perf:end -->
-
-## Install
-
-```
-pip install tallymap                 # CPU: the xla backend, plain JAX
-pip install 'tallymap[cuda]'         # + JAX's CUDA 12 plugin and NVRTC (quote it: zsh treats [] as a glob)
-```
-
-Pin the minor release in a project that depends on tallymap: `tallymap>=0.6.0rc1,<0.7` (with the `cuda` extra:
-`tallymap[cuda]>=0.6.0rc1,<0.7`). Until 1.0 a minor release may change the API (`CHANGELOG.md`). A specifier
-that names a pre-release, as this one does, lets pip install the release candidate.
-
-A **C++17 compiler is needed once**, the first time you use the GPU backend, to build the `jax.ffi` launch shim.
-It is about 200 lines and the result is cached per toolchain and jaxlib version. If `$CXX` is set it is used.
-
-**GPU memory.** The CUDA driver reserves a kernel's per-thread local memory (large per-item arrays live there)
-outside JAX's memory pool, and JAX preallocates 75% of the GPU by default. If a call fails with `out of memory` at
-kernel launch, the error says how much the kernel needs; set `XLA_PYTHON_CLIENT_PREALLOCATE=false`, or a lower
-`XLA_PYTHON_CLIENT_MEM_FRACTION`, before JAX starts.
-
-Tested on Linux with NVIDIA GPUs of compute capability 7.0 and above (the spawn queue needs 7.0; the library is
-tested on 7.5 and 8.9). The CPU path is plain JAX and needs nothing extra. The wheel holds only the package: the
-tests, examples, benchmarks and docs are in the sdist and in the git repository.
-
-## Quickstart
-
-```python
-import jax, jax.numpy as jnp
-import numpy as np
-from jax import lax
-import tallymap as tm
-
-NB = 16                                                    # histogram bins
-
-def walker(t, x, key, theta):
-    """ONE item.  t is its Tally: thread it through the loop like a PRNG key."""
-    def body(c):
-        k, x, t = c
-        u = jax.random.uniform(jax.random.fold_in(key, k))
-        t = t.add("hist", (x * NB).astype(jnp.int32), theta * (1.0 - x))
-        return k + 1, x * (0.5 + 0.5 * u), t
-    k, x, t = lax.while_loop(lambda c: c[1] > 0.05, body, (0, x, t))
-    return t, k                                            # the Tally, plus an optional per-item result
-
-f = tm.vmap(walker, outputs={"hist": tm.Sum((NB,))}, in_axes=(0, 0, None), max_steps=100)
-
-N = 10_000
-xs = jnp.linspace(0.1, 0.99, N)
-keys = jax.random.split(jax.random.PRNGKey(0), N)
-theta = jnp.float32(2.0)
-
-res = jax.jit(f)(xs, keys, theta)
-print(res.outputs["hist"], res.per_item.mean(), res.stats)
-g = jax.jit(jax.grad(lambda th: f(xs, keys, th).outputs["hist"].sum()))(theta)
-```
-
-`examples/quickstart.py` is this program with its checks. The other examples are listed at the end.
-
-**The rules of a Tally.** `t = t.add(name, index, value)` returns a NEW Tally. Tallies are write-only and used
-linearly: no reads, no forks, no dropped results. That is checked when the function is traced, and a violation
-raises `tm.TallyError`, because it would silently disagree with the dense meaning. `index` is an int array (a flat
-index for a 1-D output) or a tuple of int arrays, one per output dimension.
-
-A tally indexed by a TUPLE is the right way to get per-item vector outputs: `Sum((N, K))` indexed by
-`(item_id, slot)` gives each item its own K-element result without a per-item array in the kernel.
-
-## The mental model
-
-Three sentences, and everything else follows from them.
-
-1. **One item is one GPU thread running its own loop.** Not one element of a wide batch: a real thread with its
-   own trip count, whose state lives in registers. When it finishes, the thread takes the next item (with
-   `schedule='step'`, already at the end of each loop step). This is why the batch does not cost its longest item
-   times the batch size, and why a per-item state of tens of scalars is fast
-   while a per-item D x D matrix is not.
-2. **Tallies are atomic sums.** There is no per-item output array. Every `t.add` goes into one accumulator, in
-   shared memory when the output is small enough and in global memory otherwise. Sums are commutative, so the
-   order is not fixed, which is where the float semantics below come from.
-3. **Reverse mode replays each item from its inputs.** The forward pass stores only the first C states of each
-   loop (an item whose loop is that short is never replayed). The adjoint
-   re-runs each item with two-level checkpointing and applies the vector-Jacobian product of one step at a time,
-   so **memory is O(1) per item in the trip count** and there is no step cap anywhere. That is the property
-   plain JAX cannot give you, and it is the reason to pay for a CUDA emitter in your dependency tree.
-
-## Nested loops: solvers inside an item
-
-An item may contain loops inside loops, each with its own data-dependent trip count: a `while_loop` inside a
-`while_loop` inside a `cond`. The cuda backend compiles every level into an ordinary loop of the item's own
-thread. Every transformation handles the nesting: `jvp`, `jacfwd` and `grad`. Reverse mode checkpoints each
-loop level recursively, so memory stays O(1) per item.
-
-This matters most for numerical methods that are themselves iterative inside each step. An implicit (stiff) ODE
-solver has three nested loops: adaptive time steps, the Runge-Kutta stages of each step, and a Newton or chord
-solve inside each stage. Under `jax.vmap` every one of those loops runs to the batch maximum, and each finished
-item executes masked iterations. In a tallymap item each loop runs exactly as often as that item needs.
-
-Measured on one L40S. The workload is an ensemble of stiff 3-state ODEs integrated with a Kvaerno3 / chord /
-PID-controller algorithm, written as a tallymap item, against `jax.vmap(diffrax.diffeqsolve(...))` with the same
-solver settings:
-
-| | forward | `grad` |
-|---|---|---|
-| tallymap item | 99 to 280x faster (step-count matched) | 19 to 125x faster, 2 to 67x less memory |
-| at 1M trajectories | | 2.8 s / 72 MB against 53 s / 4.8 GB |
-
-Two costs to know:
-
-- Replaying three nested loops is expensive. On that solver tallymap's `grad` costs about 84x its own forward
-  pass, where diffrax's checkpointed adjoint costs about 12x. The gradient margin is therefore one order of
-  magnitude where the forward margin is two.
-- `rev_checkpoints` trades recomputation against per-item state, and it is not monotone. On that solver,
-  raising it from 16 to 32 made `grad` 3x slower. Measure it per item rather than deriving it from
-  the trip count. (Those numbers predate the checkpoint-stride fix, which made C far less sensitive everywhere it
-  was re-measured: on the `benchmarks/vs_jax` problems the spread between C = 8, 16, 32 and 64 is now within a
-  factor of 1.6, against up to 20 before. The advice stands, but try fewer values.)
-
-## A plain-JAX pitfall tallymap avoids: `cond` around a loop under `vmap`
-
-Under `jax.vmap`, a `lax.cond` whose predicate differs per item is turned into a select. The batching rule
-broadcasts **every operand** of the `cond` to the batch size, including arrays the branch closes over. When the
-branch is straight-line code, XLA fuses that broadcast away. When the branch contains a `while_loop` that reads the
-array, the broadcast array becomes loop state and is materialised: **one full copy per item**.
-
-Measured (XLA temp memory, CPU, JAX 0.5.3 and 0.11.2 identical). The setup is a 1.2 MB table read inside the loop:
-
-| item body | N = 1,024 | N = 8,192 |
-|---|---|---|
-| `cond(p, while-loop reading the table, 0)` under `jax.vmap` | 1,152 MiB | 9,216 MiB (1.00 copy per item) |
-| the same work with `p` moved into the trip count, no `cond` | 0.0 MiB | 0.1 MiB |
-| `cond` around straight-line reads | 0.0 MiB | 0.0 MiB |
-| tallymap, xla backend (the cuda backend runs a real branch) | 0.0 MiB | 0.3 MiB |
-
-A ray tracer that tests a BVH leaf's triangles in an inner loop hits exactly this. With 32,768 triangles,
-`jax.vmap` asked for 104 GiB at 65,536 rays, and 6.5 TiB at 4.2M.
-
-**In plain JAX:** do not wrap a loop in a per-item `cond`. Fold the predicate into the loop's trip count
-(`n = jnp.where(p, n, 0)`), or unroll the inner loop if its maximum is small and static. **In tallymap** none of
-this is needed: a `cond` is a real branch of the item's thread.
 
 ## Correctness rules you need to know
 
@@ -331,7 +282,38 @@ never depend on scheduling. But `fold_in` takes a 32-bit message, so a key built
 `fold_in(fold_in(key, id), step)`, or chunk the work and fold the chunk index first,
 `fold_in(fold_in(key, chunk), local_id * stride + step)`. See `tests/edge.py`, the cell "per-item keys".
 
-## Gradients: exactly computed is not the same as what you want
+## Derivatives
+
+### Which derivative to use
+
+**Forward mode** (`jvp`, `jacfwd`, `linearize`): one kernel computes the primal and the tangent together.
+`jacfwd` with P parameters runs one kernel with P dual lanes sharing the primal, the control flow, the gathers
+and the random numbers. **Reverse mode** (`grad`, `vjp`, `jacrev`): the forward kernel stores the first C states
+of each loop and the adjoint replays each item from there. Large read-only tables receive their cotangents by atomic scatter into one
+accumulator, never a dense per-item copy. Programs that spawn use the tree adjoint, one launch per generation,
+deepest first.
+
+| situation | use |
+|---|---|
+| few parameters, or you need the Jacobian itself (Gauss-Newton) | `jacfwd` / `jvp` |
+| many parameters and a scalar loss (per-bin tables, network weights): the cost does not depend on P | `grad` |
+| a few globals plus big tables | `grad` for the loss; `jacfwd` over the globals only if you need a metric |
+
+Reverse mode costs roughly 3.5 to 10 times the forward pass independent of P, while forward dual lanes cost about
+forward x (1 + alpha P). So the break-even in P is the ratio of those, typically in the tens, and it is worth
+measuring once for your own program. Through spawn (the tree adjoint, measured on four spawning programs, L40S)
+the rule depends on whether `jacfwd` gets dual lanes: with lanes it wins up to about 64 parameters; when lanes are
+refused (a large per-lane loop state; `tm.diagnostics()['kernels']` then shows no `dual_lanes` tag) `jacfwd` is
+one launch per parameter and the tree adjoint wins from about 4 parameters (4-24x at 16-64). Do not run forward and reverse on one call: `jax.value_and_grad` computes
+the value once.
+
+Measured `jax.jit` wall time per call on the toy walk of `benchmarks/` (1M items, a 256-bin table, L40S, JAX
+0.5.3, `benchmarks/perf_baseline.json`): forward 0.65 ms, `jvp` 0.72 ms, `jacfwd(8)` 4.92 ms, `grad` 2.25 ms.
+
+Second order (`hessian`, Hessian-vector products, `jacrev(jacfwd)`, grad-of-grad) composes from the same rules,
+except through the spawn tree adjoint, which raises.
+
+### Exactly computed is not the same as what you want
 
 tallymap returns the exact derivative of the program you wrote. Whether that is the derivative of the quantity
 you are estimating is a different question, and it is the most likely way to get a wrong published number out of
@@ -397,7 +379,7 @@ They agree only when the two compiled programs round identically, and XLA:CPU fr
 Write `fac = lax.stop_gradient(fac)`, as diffrax does. The gradient is then that of the solution on the steps the
 solver chose.
 
-## When a gradient is NaN, check in this order
+### When a gradient is NaN, check in this order
 
 tallymap uses NaN as its own failure signal, which makes NaN ambiguous. Resolve it in this order, because the
 common cause is first:
@@ -434,34 +416,60 @@ Any other option name raises, and there are no private options: the measurement 
 are test-only module constants. The only environment variable is `TALLYMAP_CUDA_CACHE`, the cubin cache directory,
 which defaults to `~/.cache/tallymap`.
 
-### Which derivative to use
+## Nested loops: solvers inside an item
 
-**Forward mode** (`jvp`, `jacfwd`, `linearize`): one kernel computes the primal and the tangent together.
-`jacfwd` with P parameters runs one kernel with P dual lanes sharing the primal, the control flow, the gathers
-and the random numbers. **Reverse mode** (`grad`, `vjp`, `jacrev`): the forward kernel stores the first C states
-of each loop and the adjoint replays each item from there. Large read-only tables receive their cotangents by atomic scatter into one
-accumulator, never a dense per-item copy. Programs that spawn use the tree adjoint, one launch per generation,
-deepest first.
+An item may contain loops inside loops, each with its own data-dependent trip count: a `while_loop` inside a
+`while_loop` inside a `cond`. The cuda backend compiles every level into an ordinary loop of the item's own
+thread. Every transformation handles the nesting: `jvp`, `jacfwd` and `grad`. Reverse mode checkpoints each
+loop level recursively, so memory stays O(1) per item.
 
-| situation | use |
-|---|---|
-| few parameters, or you need the Jacobian itself (Gauss-Newton) | `jacfwd` / `jvp` |
-| many parameters and a scalar loss (per-bin tables, network weights): the cost does not depend on P | `grad` |
-| a few globals plus big tables | `grad` for the loss; `jacfwd` over the globals only if you need a metric |
+This matters most for numerical methods that are themselves iterative inside each step. An implicit (stiff) ODE
+solver has three nested loops: adaptive time steps, the Runge-Kutta stages of each step, and a Newton or chord
+solve inside each stage. Under `jax.vmap` every one of those loops runs to the batch maximum, and each finished
+item executes masked iterations. In a tallymap item each loop runs exactly as often as that item needs.
 
-Reverse mode costs roughly 3.5 to 10 times the forward pass independent of P, while forward dual lanes cost about
-forward x (1 + alpha P). So the break-even in P is the ratio of those, typically in the tens, and it is worth
-measuring once for your own program. Through spawn (the tree adjoint, measured on four spawning programs, L40S)
-the rule depends on whether `jacfwd` gets dual lanes: with lanes it wins up to about 64 parameters; when lanes are
-refused (a large per-lane loop state; `tm.diagnostics()['kernels']` then shows no `dual_lanes` tag) `jacfwd` is
-one launch per parameter and the tree adjoint wins from about 4 parameters (4-24x at 16-64). Do not run forward and reverse on one call: `jax.value_and_grad` computes
-the value once.
+Measured on one L40S. The workload is an ensemble of stiff 3-state ODEs integrated with a Kvaerno3 / chord /
+PID-controller algorithm, written as a tallymap item, against `jax.vmap(diffrax.diffeqsolve(...))` with the same
+solver settings:
 
-Measured `jax.jit` wall time per call on the toy walk of `benchmarks/` (1M items, a 256-bin table, L40S, JAX
-0.5.3, `benchmarks/perf_baseline.json`): forward 0.65 ms, `jvp` 0.72 ms, `jacfwd(8)` 4.92 ms, `grad` 2.25 ms.
+| | forward | `grad` |
+|---|---|---|
+| tallymap item | 99 to 280x faster (step-count matched) | 19 to 125x faster, 2 to 67x less memory |
+| at 1M trajectories | | 2.8 s / 72 MB against 53 s / 4.8 GB |
 
-Second order (`hessian`, Hessian-vector products, `jacrev(jacfwd)`, grad-of-grad) composes from the same rules,
-except through the spawn tree adjoint, which raises.
+Two costs to know:
+
+- Replaying three nested loops is expensive. On that solver tallymap's `grad` costs about 84x its own forward
+  pass, where diffrax's checkpointed adjoint costs about 12x. The gradient margin is therefore one order of
+  magnitude where the forward margin is two.
+- `rev_checkpoints` trades recomputation against per-item state, and it is not monotone. On that solver,
+  raising it from 16 to 32 made `grad` 3x slower. Measure it per item rather than deriving it from
+  the trip count. (Those numbers predate the checkpoint-stride fix, which made C far less sensitive everywhere it
+  was re-measured: on the `benchmarks/vs_jax` problems the spread between C = 8, 16, 32 and 64 is now within a
+  factor of 1.6, against up to 20 before. The advice stands, but try fewer values.)
+
+## A plain-JAX pitfall tallymap avoids: `cond` around a loop under `vmap`
+
+Under `jax.vmap`, a `lax.cond` whose predicate differs per item is turned into a select. The batching rule
+broadcasts **every operand** of the `cond` to the batch size, including arrays the branch closes over. When the
+branch is straight-line code, XLA fuses that broadcast away. When the branch contains a `while_loop` that reads the
+array, the broadcast array becomes loop state and is materialised: **one full copy per item**.
+
+Measured (XLA temp memory, CPU, JAX 0.5.3 and 0.11.2 identical). The setup is a 1.2 MB table read inside the loop:
+
+| item body | N = 1,024 | N = 8,192 |
+|---|---|---|
+| `cond(p, while-loop reading the table, 0)` under `jax.vmap` | 1,152 MiB | 9,216 MiB (1.00 copy per item) |
+| the same work with `p` moved into the trip count, no `cond` | 0.0 MiB | 0.1 MiB |
+| `cond` around straight-line reads | 0.0 MiB | 0.0 MiB |
+| tallymap, xla backend (the cuda backend runs a real branch) | 0.0 MiB | 0.3 MiB |
+
+A ray tracer that tests a BVH leaf's triangles in an inner loop hits exactly this. With 32,768 triangles,
+`jax.vmap` asked for 104 GiB at 65,536 rays, and 6.5 TiB at 4.2M.
+
+**In plain JAX:** do not wrap a loop in a per-item `cond`. Fold the predicate into the loop's trip count
+(`n = jnp.where(p, n, 0)`), or unroll the inner loop if its maximum is small and static. **In tallymap** none of
+this is needed: a `cond` is a real branch of the item's thread.
 
 ## Support boundary
 
@@ -499,7 +507,7 @@ spawn tree adjoint, per-operation CUDA parity (`--gpu`) and the examples.
 | `examples/photon_toy.py` | transport into sensor tallies, `jacfwd` and `grad` |
 | `examples/shower_toy.py` | `spawn`, and the tree-adjoint gradient |
 | `examples/ensemble_toy.py` | per-item results and `n_active` |
-| `examples/gradient_pitfall.py` | the gradient section above, runnable |
+| `examples/gradient_pitfall.py` | the gradient pitfalls in "Derivatives", runnable |
 
 Design decisions and the measurements behind them: `docs/design.md`. Validation and the A/B rules:
 `docs/validation.md`. Float semantics: `docs/float_semantics.md`. Terms: `docs/glossary.md`. Supported JAX
