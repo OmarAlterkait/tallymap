@@ -1200,6 +1200,31 @@ def _(b):
     return f"n_active={na}: {int(A.stats['n_truncated'])} truncated, all in the prefix; n_active=0: zero, finite"
 
 
+@case("[trunc] n_active + schedule='step': runs the step schedule (value and jvp) and == item (cuda)", ["cuda"])
+def _(b):
+    # n_active is the launch's item count, not a cond around the item: the item keeps its one top-level loop, so
+    # schedule='step' splits it (it used to raise: the cond hid the loop)
+    na = 20
+    res, tan, ran = {}, {}, {}
+    for s in ("step", "item"):
+        f = trunc_fn(b, schedule=s)
+        _D.KERNELS.clear()
+        res[s] = jax.jit(lambda n, f=f: f(XS, KEYS, n_active=n))(jnp.int32(na))
+        ran[s] = {k["schedule"] for k in _D.KERNELS}
+        tan[s] = jax.jit(lambda n, f=f: jax.jvp(lambda x: f(x, KEYS, n_active=n).per_item[0], (XS,),
+                                                (jnp.ones_like(XS),))[1])(jnp.int32(na))
+    if ran != {"step": {"step"}, "item": {"item"}}:
+        raise Fail(f"instrument: the schedules that ran {ran}")
+    A = res["step"]
+    trunc_check(A._replace(outputs={}, truncated=A.truncated[:na],
+                           per_item=jax.tree_util.tree_map(lambda v: v[:na], A.per_item)), "step, active prefix")
+    _check(not np.asarray(A.truncated)[na:].any(), "step: an inactive item is reported truncated")
+    _check(not np.asarray(A.per_item[1])[na:].any(), "step: inactive items ran")
+    _check(not np.asarray(tan["step"])[na:].any(), "step: inactive items have a non-zero tangent")
+    m = same(tan["step"], tan["item"], "per-item tangent step vs item")
+    return agree(A, res["item"], "n_active step vs item") + f"; tangent {m}; schedules {ran}"
+
+
 print("\n================ SUMMARY", jax.__version__, "x64" if X64 else "", jax.devices()[0].device_kind)
 for n, b, m in RES:
     print(f"{n:62s} {b:8s} {m[:220]}")

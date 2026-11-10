@@ -199,7 +199,7 @@ def split_blocker(jx):
     if n == 1:
         return None
     return (f"the item has {n} top-level while loops; the step schedule needs exactly one (a "
-            "while loop inside a cond, a scan or a call does not count, and n_active puts the item inside a cond)")
+            "while loop inside a cond, a scan or a call does not count)")
 
 
 def _split(cj):
@@ -563,12 +563,30 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
           my_next = __shfl_sync(m, base, leader) + rank; my_left = 1;
         }"""
     xdecl = "".join(svar("x", i, spc) for i, spc in enumerate(pav)) if spawn is not None else ""
+    nlim = ""
     if spawn is None:
         fetch = f"""        {claim}
         t = my_next; --my_left;
         if (t >= (u64)n_items) break;"""
+        if p.nact is not None:
+            # n_active: the launch's item count, read from its broadcast operand.  Items in [n_active, n_items) do
+            # not run: their per-item results are written as zero.
+            nlim = (f"  const i64 sj_na = (i64)sj_ld({tptr(L.i_bc[p.nact], np.int32)});\n"
+                    "  const i64 sj_nlim = sj_na < 0 ? 0 : (sj_na < n_items ? sj_na : n_items);\n")
+            yzero = "\n".join(
+                (f"          (({ctype(dt)}*)P.p[{L.r_ys[j]}])[t] = {ctype(dt)}{{}};" if sh == () else
+                 f"          for (int e = 0; e < {_size(sh)}; ++e) (({ctype(dt)}*)P.p[{L.r_ys[j]}])[t * {_size(sh)} + e] = "
+                 f"{ctype(dt)}{{}};")
+                for j, (sh, dt, _) in enumerate(yav))
+            fetch += f"""
+        if (t >= (u64)sj_nlim) {{
+{yzero}
+          continue;
+        }}"""
         finish = f"""{ywrite}"""
     else:
+        if p.nact is not None:
+            raise CodegenError("n_active with spawn is not supported (internal error)")
         Q = int(spawn.capacity)
         load_p = "\n".join(
             (f"            x{i} = sj_ld({tptr(L.i_pi[i], dt)} + t);" if sh == () else
@@ -618,7 +636,7 @@ extern "C" __global__ void {lb} sj_main(const SjParams P, const i64 n_items) {{
   u64* const sj_ctr = (u64*)P.p[{L.r_ctr}];
   const int lane = threadIdx.x & 31;
 {chr(10).join(acc_decl)}
-{decls}{xdecl}  u64 my_next = 0; u32 my_left = 0;
+{nlim}{decls}{xdecl}  u64 my_next = 0; u32 my_left = 0;
   u64 t = 0; i64 item = 0; bool active = false, done = false, child = false; i32 n_ctr = 0;
   while (true) {{
     if (!active) {{

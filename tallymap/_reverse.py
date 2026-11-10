@@ -961,7 +961,7 @@ def vjp_prog(p, pert_pi, pert_bc, opts=None):
           + tuple(TSpec(f"tok{i}", size(i), bav[i].dtype, kind="discard") for i in big))
     check_slots(cj, tl, p.tag + "+vjp")             # the cotangent tallies are threaded linearly (or raise)
     return ItemProgram(cj, tl, nP + len(yf), nB + len(tf), len(ip) if p.trunc is not None else None, None,
-                       p.tag + ("+fold" if sh else "") + "+vjp", where=p.where)
+                       p.tag + ("+fold" if sh else "") + "+vjp", where=p.where, nact=p.nact)
 
 
 def check_slots(cj, tl, tag):

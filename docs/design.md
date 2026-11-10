@@ -151,7 +151,8 @@ derivatives with spawn give children tangents for every float per-item leaf. Rev
   tangent tally uses its primal output's scale; a separate `tangent_scale` was an unused knob and was removed.
 - Keys: tallymap invents no randomness. Typed and raw uint32 keys both work. Results do not depend on scheduling.
 - `n_active`: `f(*args, n_active=k)` runs only items `i < k`, so a fixed capacity with a varying count never
-  recompiles.
+  recompiles. It is the launch's item count (the cuda kernel stops at `min(N, k)`, the xla backend masks
+  `ids < k`), not a cond around the item, so the item keeps its one top-level loop for the step schedule.
 - The xla backend's results may depend on its batch size at the level of one unit in the last place,
   because XLA (JAX's compiler) compiles the same body differently for a different batch size. `xla_batch_size` is
   therefore fixed by default, at 2^18.

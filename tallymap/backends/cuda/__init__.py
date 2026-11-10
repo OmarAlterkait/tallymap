@@ -39,7 +39,8 @@ def _key(p, opts):
     # the structural part is _jaxpr.digest (was str(p.cj.jaxpr): JAX's pretty-printer, 95 s per build on DTRAX)
     return (digest(p.cj.jaxpr), tuple(_const_sig(c) for c in p.cj.consts),
             tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.fixed_point, s.scale, s.kind) for s in p.tallies),
-            p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), tuple(sorted(opts.items())),
+            p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), p.nact,
+            tuple(sorted(opts.items())),
             codegen.FILL, codegen.INPLACE)          # (the test-only fill byte / in-place switch change the source)
 
 

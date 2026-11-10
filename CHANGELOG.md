@@ -39,6 +39,16 @@ for the schedules ("item schedule" / "step schedule"), and the spelling "materia
   `tests/ab_rule.patched`, which also clears the eager-call cache). `tm.vmap` takes the six public options only;
   any other name raises.
 
+### Changed (pre-rc1: the round-3 reviews)
+
+- `n_active` is the launch's item count, not program structure. It used to wrap the whole item in
+  `lax.cond(item_id < n_active, item, skip)` with an extra per-item id operand; that cond hid the item's loop, so
+  `n_active` and `schedule='step'` excluded each other (and the single-loop adjoint never applied). Now the count is
+  a broadcast operand the item does not read (`ItemProgram.nact`, kept by every derived program): the cuda kernel
+  stops running items at `min(n_items, n_active)` and writes zero per-item results for the rest, the xla backend
+  masks `ids < n_active`. Semantics unchanged: items `i >= n_active` emit nothing, are never truncated, and their
+  per-item results (and tangents / cotangents) are zero. `n_active` with `schedule='step'` now runs.
+
 ### Changed (tree adjoint)
 
 - Its private options `_rev_gen_capacity` and `_tree_neg` are now the test-only module constants

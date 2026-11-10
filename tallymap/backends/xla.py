@@ -315,8 +315,10 @@ def _scan(st, e, ins):
 
 # ------------------------------------------------------------------------------------------- driver
 def run(p, pi, bc, xla_batch_size=None, **_):
-    """-> [sum tally arrays] + [stats int32[5]] + [per-item results [N, ...]]"""
+    """-> [sum tally arrays] + [stats int32[5]] + [per-item results [N, ...]].  p.nact (n_active): items
+    i >= bc[p.nact] are masked off like the padding of the last batch (no emits, per-item results zero)."""
     N = int(pi[0].shape[0])
+    nlim = N if p.nact is None else jnp.clip(jnp.asarray(bc[p.nact], jnp.int32), 0, N)
     nT = p.nT
     ya = p.y_avals()
     accs = {}
@@ -359,7 +361,7 @@ def run(p, pi, bc, xla_batch_size=None, **_):
             packed, ys = s
             st.unpack(packed)
             ids = c * P + lanes
-            mask = ids < N
+            mask = ids < nlim
             lane_pi = [jnp.take(x, jnp.clip(ids, 0, N - 1), axis=0, mode="clip") for x in pi]
             ys, _ = block_fn(ids, mask, lane_pi, ys, mask)
             return st.pack(), ys

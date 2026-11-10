@@ -99,7 +99,8 @@ class Node:
             k = (digest(p.cj.jaxpr), tuple(id(c) for c in p.cj.consts),
                  tuple(id(c) for c in host_callbacks(p.cj.jaxpr)),
                  tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.fixed_point, s.scale, s.kind) for s in p.tallies),
-                 p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), self.backend, self.opts)
+                 p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), p.nact, self.backend,
+                 self.opts)
             object.__setattr__(self, "_key", k)
         return k
 
@@ -303,7 +304,7 @@ def tangent_prog(p, pp, pb):
     cj = _mk(L, [_sds(a) for a in q.in_avals()])
     tl = tuple(dataclasses.replace(s, kind="discard") if (k < nT and s.kind == "sum") else s
                for k, s in enumerate(q.tallies))
-    return ItemProgram(cj, tl, q.nP, q.nB, None, p.spawn, p.tag + "+tangent", where=p.where)
+    return ItemProgram(cj, tl, q.nP, q.nB, None, p.spawn, p.tag + "+tangent", where=p.where, nact=p.nact)
 
 
 def dual_lanes_prog(p, T, bpi, bbc, shared=(0, 0)):
@@ -729,8 +730,9 @@ FOLD = True             # TEST-ONLY (like FUSE_JVP): False never folds a batch i
 
 def _can_fold(node, args, dims, bat, size):
     p = node.prog
-    if not FOLD or p.spawn is not None:
-        return False            # spawn: one shared queue per launch would change capacity semantics
+    if not FOLD or p.spawn is not None or p.nact is not None:
+        return False            # spawn: one shared queue per launch would change capacity semantics; n_active is
+                                # one member's item count
     if any(s.fixed_point for s in p.tallies if s.kind == "sum"):
         return False            # stats['fixed_point_overflow'] is per launch, not per batch member
     for k in range(p.nP, len(args)):

@@ -115,6 +115,9 @@ class ItemProgram:
     spawn: Any = None      # Queue or None
     tag: str = "primal"
     where: str = ""        # the user's item function ('qualname (file:line)'), for error messages
+    nact: Any = None       # n_active: index among the broadcast operands of the int32 ACTIVE ITEM COUNT.  It is the
+                           # launch's item count: items i >= it do not run (no emits, per-item results zero).  The
+                           # item jaxpr does not read it; every derived program keeps it at the same index.
 
     @property
     def nT(self):
@@ -191,7 +194,8 @@ def jvp_prog(p, pert_pi, pert_bc):
     with forward_tangents():        # (sparse table reads of an adjoint program: see _reverse.tread)
         cj = _mk(J, [_sds(a) for a in avals])
     tl = list(p.tallies) + [dataclasses.replace(p.tallies[i], name=p.tallies[i].name + "'") for i in tf]
-    return ItemProgram(cj, tuple(tl), nP + len(ip), nB + len(ib), p.trunc, p.spawn, p.tag + "+jvp", where=p.where)
+    return ItemProgram(cj, tuple(tl), nP + len(ip), nB + len(ib), p.trunc, p.spawn, p.tag + "+jvp", where=p.where,
+                       nact=p.nact)
 
 
 def _poison_tally(t, bad):
@@ -262,8 +266,9 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                Any other name raises (there are no private options: measurement switches and negative
                controls are test-only module constants, e.g. codegen.FILL, _primitive.LANES).
     The returned function takes the mapped/broadcast args, plus optionally n_active=<traced int>: only items
-    i < n_active run (fixed capacity N, varying active count: no retrace / recompile).  Items i >= n_active do
-    nothing, so they never count as truncated.
+    i < n_active run (fixed capacity N, varying active count: no retrace / recompile).  n_active is the launch's
+    item count, not part of the item program: items i >= n_active do not run, so they emit nothing, never count
+    as truncated, and their per-item results are zero.
 
     Resource limits.  The result is exactly jax.vmap(fn) over the items followed by a sum, and deviates only where
     a tallymap resource limit intervenes: max_steps, or the spawn Queue capacity.  When one of them does, every
@@ -312,10 +317,9 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
         pi = [jnp.asarray(x) for x in pi]
         bc = [jnp.asarray(x) for x in bc]
         nmp, nbu = len(pi), len(bc)            # user leaves
-        if n_active is not None:               # F4: fixed (bucketed) capacity N, traced active count: no retrace
-            if spawn is not None:
+        if n_active is not None:               # fixed (bucketed) capacity N, traced active count: no retrace.  The
+            if spawn is not None:              # count is a broadcast operand the item does not read (ItemProgram.nact)
                 raise ValueError("tallymap: n_active with spawn is not supported")
-            pi = pi + [jnp.arange(pi[0].shape[0], dtype=jnp.int32)]
             bc = bc + [jnp.asarray(n_active, jnp.int32)]
         if not pi:
             raise ValueError("tallymap: at least one argument must be mapped (in_axes=0)")
@@ -342,14 +346,7 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
             b = jax.tree_util.tree_unflatten(btree, list(flat[nT + len(pi):nT + len(pi) + nbu]))
             mi, bi = iter(m), iter(b)
             uargs = [next(mi) if x == 0 else next(bi) for x in axes]
-            if n_active is None:
-                r = fn(t, *uargs)
-            else:                              # items >= n_active do nothing (outputs zero)
-                iid, nact = flat[nT + nmp], flat[-1]
-                shp = jax.eval_shape(lambda t_, a: fn(t_, *a), t, uargs)
-                skip = lambda t_, a: (t_ if isinstance(shp, Tally) else
-                                      (t_, jax.tree_util.tree_map(lambda s_: jnp.zeros(s_.shape, s_.dtype), shp[1])))
-                r = lax.cond(iid < nact, lambda t_, a: fn(t_, *a), skip, t, uargs)
+            r = fn(t, *uargs)
             if isinstance(r, Tally):
                 t2, y = r, None
             elif isinstance(r, tuple) and len(r) == 2 and isinstance(r[0], Tally):
@@ -380,7 +377,8 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
             _check_spawn(cj2, pav, where)
         nY = len(cj2.jaxpr.outvars) - nT
         prog = ItemProgram(cj2, tuple(tspecs), len(pi), len(bc) + len(hoisted),
-                           nY - 1 if max_steps is not None else None, spawn, where=where)
+                           nY - 1 if max_steps is not None else None, spawn, where=where,
+                           nact=nb0 - 1 if n_active is not None else None)
         bc_all = bc + hoisted
         from ._diagnostics import record_program
         record_program(prog)
