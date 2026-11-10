@@ -682,6 +682,18 @@ What remains is the volume of straight-line code itself. A large item's stack fr
 properties of the program; the levers that worked were in the program (fewer generic call sites, a static set of
 geometry types, a bounded stack depth), and on the library side the lazy-inline cap.
 
+- **Two emitter choices made most of that curve (round3 codegen review, 2026-11-10).** The tables above were
+  measured with two things nobody had measured: every libdevice f32 math call (`sinf`, `expf`, `powf`, ... ) was
+  inlined at its call site, and the scan rule asked NVRTC to unroll every scan of at most 16 steps
+  (`#pragma unroll`). Both are gone: each f32 math function has ONE `__noinline__` wrapper per kernel
+  (`kernel.PRELUDE`), and the emitter never asks the compiler to unroll (UNROLL alone decides what becomes
+  straight-line code). Same generated source with one text change each, NVRTC 12.9, `sm_75`: the 100-stage
+  forward above 195 -> 5.3 s and its cubin 2.36 -> 0.20 MB; LUCiD's forward item 370-378 -> 249 s; lumen SBND's
+  nested adjoint 591-619 -> 256 s. Run time: lumen -6% to +2%, LUCiD within 1%, forward outputs bitwise on both;
+  the worst case is this benchmark's 100-stage forward, which is nothing but 1,600 `sin` / `cos` calls: 1.30-1.34x
+  slower to run (2080 Ti; equal at 25 stages). The f32 `__fadd_rn` / `__fmul_rn` spelling is unchanged (spelling
+  them as operators was not shown bitwise). The tables above are pre-change and should be re-measured.
+
 ## 10. Fixed rules ported from the `wavefront-state` branch (consolidation, 2026-11)
 
 `wavefront-state` was a private experimental branch driven by the shower engine's exact Geant4 port (DTRAX), with

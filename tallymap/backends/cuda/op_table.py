@@ -1472,8 +1472,6 @@ def _scan(em, eqn, ins, **p):
         y.key_impl = impl
         ys.append(y)
     t = em.fresh("it")
-    if length <= 16:
-        em.line("#pragma unroll")
     em.open(f"for (int {t} = 0; {t} < {length}; ++{t})")
     ti = f"({length - 1} - {t})" if reverse else t
     xs_t = []

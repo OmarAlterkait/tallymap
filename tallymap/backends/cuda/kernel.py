@@ -24,6 +24,35 @@ typedef signed char i8; typedef unsigned char u8; typedef short i16; typedef uns
 typedef int i32; typedef unsigned int u32; typedef long long i64; typedef unsigned long long u64;
 #define SJ_MAXP 504
 struct SjParams { void* p[SJ_MAXP]; };
+// the f32 math library behind ONE __noinline__ wrapper per function: one body per kernel instead of one per
+// call site (inlined at every site, the libdevice bodies made most of the compile time: NVRTC on the
+// benchmarks/compile_scaling 100-stage forward 195 -> 5.3 s, LUCiD with the scan change 1.5x; run time
+// within -6%..+2% on lumen and LUCiD, outputs bitwise; docs/design.md section 9)
+#define SJ_NI1(f) __device__ __noinline__ float sj_n_##f(float x) { return f(x); }
+#define SJ_NI2(f) __device__ __noinline__ float sj_n_##f(float x, float y) { return f(x, y); }
+SJ_NI1(sinf) SJ_NI1(cosf) SJ_NI1(tanf) SJ_NI1(expf) SJ_NI1(logf) SJ_NI1(log1pf) SJ_NI1(expm1f) SJ_NI1(acosf) SJ_NI1(asinf)
+SJ_NI1(atanf) SJ_NI1(tanhf) SJ_NI1(sinhf) SJ_NI1(coshf) SJ_NI1(erff) SJ_NI1(erfcf) SJ_NI1(lgammaf) SJ_NI1(cbrtf)
+SJ_NI2(powf) SJ_NI2(atan2f) SJ_NI2(fmodf)
+#define sinf(x) sj_n_sinf(x)
+#define cosf(x) sj_n_cosf(x)
+#define tanf(x) sj_n_tanf(x)
+#define expf(x) sj_n_expf(x)
+#define logf(x) sj_n_logf(x)
+#define log1pf(x) sj_n_log1pf(x)
+#define expm1f(x) sj_n_expm1f(x)
+#define acosf(x) sj_n_acosf(x)
+#define asinf(x) sj_n_asinf(x)
+#define atanf(x) sj_n_atanf(x)
+#define tanhf(x) sj_n_tanhf(x)
+#define sinhf(x) sj_n_sinhf(x)
+#define coshf(x) sj_n_coshf(x)
+#define erff(x) sj_n_erff(x)
+#define erfcf(x) sj_n_erfcf(x)
+#define lgammaf(x) sj_n_lgammaf(x)
+#define cbrtf(x) sj_n_cbrtf(x)
+#define powf(x, y) sj_n_powf(x, y)
+#define atan2f(x, y) sj_n_atan2f(x, y)
+#define fmodf(x, y) sj_n_fmodf(x, y)
 #ifndef TALLYMAP_APPROX_DIVSQRT   // cuda_math='ieee': correctly rounded (portable)
 #define SJ_FDIV(a, b) __fdiv_rn(a, b)
 #define SJ_FSQRT(x) __fsqrt_rn(x)
