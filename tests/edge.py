@@ -1495,7 +1495,7 @@ def _(b):
 @case("version policy: the tested versions, a warning only above the newest tested", ["xla"])
 def _(b):
     from tallymap._compat import _check_jax_version
-    if tm.TESTED_JAX != ("0.5.3", "0.6.2", "0.7.2", "0.8.3", "0.9.2", "0.10.2", "0.11.2"):
+    if tm.TESTED_JAX != ("0.6.2", "0.7.2", "0.8.3", "0.9.2", "0.10.2", "0.11.2"):
         raise Fail(f"TESTED_JAX {tm.TESTED_JAX}")
     if hasattr(tm, "check_jax_version") or "check_jax_version" in tm.__all__:
         raise Fail("check_jax_version is still public")

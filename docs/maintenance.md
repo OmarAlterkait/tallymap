@@ -17,7 +17,7 @@ and how a release is made.
 
 ## Version policy
 
-The floor is **JAX 0.5.3 and Python 3.10**, with **no upper bound**, as equinox, optax and diffrax do. A release
+The floor is **JAX 0.6.2 and Python 3.10** (raised from 0.5.3 before 0.6.0rc1), with **no upper bound**, as equinox, optax and diffrax do. A release
 found to be broken gets a `!=` exclusion in `pyproject.toml` and a patch release; there are none so far.
 
 **Every minor release from the floor to the newest is tested**, not only the two ends, because the parts of JAX
@@ -25,23 +25,26 @@ this library leans on (the legacy transformation registries, the jaxpr equation 
 minors and not between patches. Each minor is tested at its latest patch, on
 CPU, with the full suite:
 
-| JAX | 0.5.3 | 0.6.2 | 0.7.2 | 0.8.3 | 0.9.2 | 0.10.2 | 0.11.2 |
-|---|---|---|---|---|---|---|---|
-| Python | 3.10 | 3.10 | 3.11 | 3.11 | 3.11 | 3.11 | 3.12 |
+| JAX | 0.6.2 | 0.7.2 | 0.8.3 | 0.9.2 | 0.10.2 | 0.11.2 |
+|---|---|---|---|---|---|---|
+| Python | 3.10 | 3.11 | 3.11 | 3.11 | 3.11 | 3.12 |
 
 `tm.TESTED_JAX` is that list. Importing tallymap warns once only when JAX is **newer than the newest tested
 version**: everything between the floor and the newest is tested, so nothing in the middle warns. That matters
-because the untested middle is where a default `pip install` can land: on Python 3.10 pip resolves `jax>=0.5.3`
-to 0.6.2, not to the floor and not to the newest.
+because the untested middle is where a default `pip install` can land (on Python 3.11 pip resolves `jax>=0.6.2` to
+0.10.2, not to the floor and not to the newest).
 
 ### Raising the floor
 
 Raise it **deliberately, never by accident**. Each raise deletes compatibility code in `_compat.py` and
 `_jaxpr.py`, which is the point, and drops users who cannot move, which is the cost.
 
-The scientific-Python convention (SPEC 0) is to keep a core dependency for 24 months after its release. JAX 0.5.3
-is inside that window until **2027-03**. Revisit the floor then. Do not raise it before there is something to
-gain: the planned hijax port (see "Watch item" below) is the first such thing, and it needs a floor of 0.11.
+The scientific-Python convention (SPEC 0) is to keep a core dependency for 24 months after its release. The
+0.5.3 -> 0.6.2 raise (round3/jaxfloor) removed every path that existed only for 0.5.3: the host-callback address
+scrubber in `tm.diagnostics`, `platform_index`'s `has_default`, the `custom_vjp_call_jaxpr` names, the NVRTC
+packaging workaround, plus three guards that were dead on every tested version. 0.6.2 is lumen's pin and has a
+GPU venv. Do not raise it again before there is something to gain: the planned hijax port (see "Watch item"
+below) is the first such thing, and it needs a floor of 0.11.
 
 ### When a new JAX release appears
 
@@ -61,11 +64,12 @@ warning.
 |---|---|---|
 | public (3-month deprecation policy) | `make_jaxpr`, `jvp` / `vjp` / `vmap`, `custom_jvp` / `custom_vjp` (with symbolic zeros), `checkpoint`, `typeof`, `tree_util`, `debug.callback`, `lax` control flow, `jax.random.{key_data, wrap_key_data, key_impl}`, `jax.ffi.*`, `jax.export.DisabledSafetyCheck`, `jax.test_util.check_grads` (tests only) | everywhere |
 | `jax.extend` | `core.{Primitive, ClosedJaxpr, Literal, jaxpr_as_fun, DropVar, primitives}`, `random.{threefry,rbg,unsafe_rbg}_prng_impl`, `source_info_util.{summarize, user_context, register_exclusion}` | `_api`, `_jaxpr`, `_compat` |
-| legacy modules: where a JAX upgrade would break us | `jax.core.{ShapedArray, Tracer}`; `jax.interpreters.ad.{primitive_jvps, primitive_transposes, Zero, instantiate_zeros, is_undefined_primal}`; `batching.fancy_primitive_batchers`; `mlir.{register_lowering, lower_fun}`; `partial_eval.{custom_partial_eval_rules, partial_eval_jaxpr_custom_rules}` (the fused JVP only, feature-detected) | `_tally`, `_primitive`, `_reverse`, `_compat` |
-| private | `aval.dtype._impl` of a typed pseudo-random key (with a name lookup as the fallback); the jaxpr equation parameters read by `_jaxpr.py` | `_compat`, `_jaxpr` |
+| legacy modules: where a JAX upgrade would break us | `jax.core.{ShapedArray, Tracer}`; `jax.interpreters.ad.{primitive_jvps, primitive_transposes, Zero, instantiate_zeros, is_undefined_primal}`; `batching.fancy_primitive_batchers`; `mlir.{register_lowering, lower_fun}`; `partial_eval.{custom_partial_eval_rules, partial_eval_jaxpr_custom_rules}` (the fused JVP only) | `_tally`, `_primitive`, `_reverse`, `_compat` |
+| private | `aval.dtype._impl` of a typed pseudo-random key; the jaxpr equation parameters read by `_jaxpr.py`; `jax._src.interpreters.partial_eval` (`convert_constvars_jaxpr`, for `_reverse._dce`: the public name is missing on 0.9.2 and 0.10.2) | `_compat`, `_jaxpr`, `_reverse` |
 | jaxlib / XLA | the foreign-function-interface C++ headers (api_version 4), hashed into the shim's cache key | `backends/cuda/shim.cc`, `compile.py` |
 
-No `jax._src` import is left. Every interface that differs between tested versions goes through
+One `jax._src` import is left (`_reverse._dce`, above; it can go public at a floor of 0.11.2). Every other
+interface that differs between tested versions goes through
 `tallymap/_compat.py` (version shims) or `tallymap/_jaxpr.py` (jaxpr structure). Keeping it to two modules is
 deliberate: it is what makes an upgrade a bounded job.
 
@@ -77,7 +81,7 @@ deliberate: it is what makes an upgrade a bounded job.
 | the edge cell "op table: names are JAX primitives" fails | a table name no longer exists in `jax.extend.core.primitives` (a rename, such as `pjit` to `jit`) | keep the old name if a tested version still uses it, add the new one, and explain the old one in the table's own exclusion list |
 | `KeyError` or `AttributeError` on a control-flow equation parameter (`cond_nconsts`, `body_jaxpr`, `num_consts`, `branches`, `call_jaxpr`, ...) | JAX changed how a control-flow or call equation stores its sub-jaxprs | fix the accessor in `_jaxpr.py` (`while_parts`, `cond_branches`, `scan_parts`, `call_jaxpr`); nothing else in the library reads those parameters |
 | `run_all.py --canary` fails with a DeprecationWarning from tallymap's own code | JAX deprecated an API the library uses | move to the replacement in `_compat.py`; if it is one of the legacy transformation registries, start the hijax port |
-| every JVP suddenly runs two kernels (`tallymap._primitive.FUSE_JVP` is False), while the numbers stay correct | the partial-evaluation registries are gone | nothing is wrong: that is the fallback design, and `run_all.py --unfused` already tests it. Regaining one kernel needs the hijax port |
+| `import tallymap` fails at `_pe.custom_partial_eval_rules` | the partial-evaluation registries are gone | set `_primitive.FUSE_JVP = False` and drop the two registrations: that is the two-node design `run_all.py --unfused` already tests. Regaining one kernel needs the hijax port |
 | batching rules not found, or a wrong batcher signature | the batching registry changed | adapt `_compat.register_batcher`, which is one wrapper |
 | typed-key randomness fails on cuda (`random_bits`, `split`, `fold_in`) | the pseudo-random implementation object or `dtype._impl` changed | adapt `_compat.key_impl` and the `random_*` shims; the RNG rows of `tests/ops.py` check it bitwise; meanwhile users can pass raw uint32 keys |
 | the shim does not build or does not load | a new jaxlib FFI header, or a different host compiler | `shim.cc` is about 200 lines and its cache key contains the headers, so a stale shared object is never reused; check `$CXX` first |
@@ -163,7 +167,7 @@ because each needs fresh JAX state.
 
 | cadence | where | cells |
 |---|---|---|
-| every push and pull request | GitHub Actions, `.github/workflows/ci.yml` | ruff; the short suite on Python 3.10 + jax 0.5.3 and on Python 3.12 + the newest jax; the full CPU suite on the newest |
+| every push and pull request | GitHub Actions, `.github/workflows/ci.yml` | ruff; the short suite on Python 3.10 + jax 0.6.2 and on Python 3.12 + the newest jax; the full CPU suite on the newest |
 | weekly | GitHub Actions, `.github/workflows/weekly.yml` | the full CPU suite on every minor in `TESTED_JAX`; a JAX nightly cell, allowed to fail |
 | weekly, and before a release | a GPU machine | the full suite on each supported GPU at the floor and at the newest JAX, once with `--x64`, plus `--unfused` and `--canary` on CPU |
 | weekly, and before a release | a GPU machine | `benchmarks/perf.py` against `benchmarks/perf_baseline.json` (more than 1.5x slower is a failure; `benchmarks/perf_negative_control.py` is its negative control) |

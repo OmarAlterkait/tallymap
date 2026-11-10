@@ -739,7 +739,7 @@ def checkpointed_while_single(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=N
 
 def _dce(cj):
     """ClosedJaxpr -> the same with its dead code removed (all inputs and outputs kept), INCLUDING inside while
-    bodies and cond branches (JAX 0.5.3's dce has no rule for while).  T3: the fold's cond carries every tally, and
+    bodies and cond branches (no tested JAX has a dce rule for while).  T3: the fold's cond carries every tally, and
     the transpose of a cond returns each tally input's pass-through cotangent as a cond OUTPUT, unused but
     materialised per item by the cuda emitter (lumen SK: an (88768,) local array, "too large")."""
     from jax._src.interpreters import partial_eval as pe

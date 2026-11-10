@@ -1158,7 +1158,7 @@ def _scatter(em, eqn, ins, dimension_numbers, mode=None, **p):
 
 # =============================================================================== control flow
 @rule("pjit", "jit", "closed_call", "core_call", "custom_jvp_call", "custom_vjp_call",
-      "custom_vjp_call_jaxpr", "checkpoint", "remat", "remat2", "custom_lin")
+      "checkpoint", "remat", "remat2", "custom_lin")
 def _primitive(em, eqn, ins, **params):
     if eqn.primitive.name == "custom_lin":
         from ..._errors import CUSTOM_VJP
@@ -1170,7 +1170,7 @@ def _primitive(em, eqn, ins, **params):
 
 
 TALLY_AWARE = {"while", "cond", "scan", "pjit", "jit", "closed_call", "core_call", "custom_jvp_call",
-               "custom_vjp_call", "custom_vjp_call_jaxpr", "checkpoint", "remat", "remat2"}
+               "custom_vjp_call", "checkpoint", "remat", "remat2"}
 
 
 # ------------------------------------------------------------------ buffer assignment at loop / cond boundaries
@@ -1541,14 +1541,13 @@ def _scan(em, eqn, ins, **p):
 
 
 @rule("platform_index")
-def _platform_index(em, eqn, ins, platforms, has_default=None, **p):
-    # JAX >= 0.10 drops has_default and marks the default branch with a None entry in `platforms`; older JAX
-    # listed only the real platforms and put the default branch at index len(platforms).
+def _platform_index(em, eqn, ins, platforms, **p):
+    # the default branch is the None entry in `platforms` (JAX >= 0.6; 0.5.3 had has_default)
     plats = list(platforms)
     for i, ps in enumerate(plats):
         if ps is not None and any(x in ("cuda", "gpu", "rocm") for x in ps):
             return Scalar(lit(i, np.int32), np.int32, cval=np.int32(i))
-    i = next((j for j, ps in enumerate(plats) if ps is None), len(plats) if has_default else None)
+    i = next((j for j, ps in enumerate(plats) if ps is None), None)
     if i is not None:
         return Scalar(lit(i, np.int32), np.int32, cval=np.int32(i))
     raise CodegenError("lax.platform_dependent without a cuda/gpu branch and without a default")

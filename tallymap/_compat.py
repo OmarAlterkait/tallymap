@@ -1,17 +1,17 @@
 """The JAX-version shims, in one place (docs/maintenance.md: "when X breaks, do Y").
 
-Every use of a JAX interface that changed between the tested versions (0.5.3, 0.11.2), or that JAX marks as legacy, is
+Every use of a JAX interface that changed between the tested versions (0.6.2 - 0.11.2), or that JAX marks as legacy, is
 routed through this module, so a JAX upgrade that breaks one of them breaks HERE, with one obvious fix.
 """
 import jax
 from jax.interpreters import batching
 
-NM = None                       # batching: an unmapped dimension (batching.not_mapped is None on 0.5.3; gone on 0.11)
+NM = None                       # batching: an unmapped dimension (batching.not_mapped: None up to 0.9, gone from 0.10)
 
 # ------------------------------------------------------------------------------------------- version policy
 # the CPU suite passes on every one of these (docs/maintenance.md, "Version policy"); the floor is also
-# pyproject's jax>=0.5.3 requirement
-TESTED_JAX = ("0.5.3", "0.6.2", "0.7.2", "0.8.3", "0.9.2", "0.10.2", "0.11.2")
+# pyproject's jax>=0.6.2 requirement
+TESTED_JAX = ("0.6.2", "0.7.2", "0.8.3", "0.9.2", "0.10.2", "0.11.2")
 
 
 def _vtuple(v):
@@ -28,7 +28,7 @@ def _check_jax_version(version=None, warn=True):
     """'newer' | 'ok' for a JAX version against TESTED_JAX: 'newer' above the newest tested version, 'ok'
     otherwise.  Only 'newer' warns (once, at import).  A version below the newest tested one is either tested or
     between two tested ones, which is best effort and not worth a warning; anything below the floor is already
-    refused by the jax>=0.5.3 requirement."""
+    refused by the jax>=0.6.2 requirement."""
     import warnings
     v = _vtuple(version or jax.__version__)
     status = "newer" if v > _vtuple(TESTED_JAX[-1]) else "ok"
@@ -45,13 +45,8 @@ def register_batcher(prim, rule):
 
     `batching.primitive_batchers` is a "backwards compat shim" on JAX 0.11 (slated for deletion): it wraps the rule
     into `fancy_primitive_batchers` (which takes a leading AxisData) and binds the primitive unchanged when no operand
-    is batched.  When `fancy_primitive_batchers` exists we register that wrapper ourselves (identical behaviour on
-    0.11; on 0.5.3 the BatchTrace reaches the same rule through the fancy registry instead of the plain one, and the
-    all-unbatched case binds the primitive on the parent trace either way), otherwise the plain registry."""
-    fancy = getattr(batching, "fancy_primitive_batchers", None)
-    if fancy is None:                                              # pragma: no cover (no tested version)
-        batching.primitive_batchers[prim] = rule
-        return
+    is batched.  We register that wrapper in `fancy_primitive_batchers` ourselves (present on every tested version)."""
+    fancy = batching.fancy_primitive_batchers
 
     def wrapped(axis_data, vals, dims, **params):
         del axis_data
@@ -64,7 +59,7 @@ def register_batcher(prim, rule):
 
 # ------------------------------------------------------------------------------------------- jaxpr types
 def drop_var(aval):
-    """a jaxpr DropVar of `aval` (jax.extend.core on newer JAX; jax.core on 0.5.3, removed there in 0.11)."""
+    """a jaxpr DropVar of `aval` (jax.extend.core from 0.10.2; jax.core up to 0.10.2, removed there in 0.11)."""
     try:
         from jax.extend.core import DropVar
     except ImportError:
@@ -74,18 +69,9 @@ def drop_var(aval):
 
 # ------------------------------------------------------------------------------------------- typed PRNG keys
 def key_impl(dtype):
-    """the PRNGImpl of a typed-key dtype: `dtype._impl` (the one private attribute left), else the impl whose tag
-    appears in the dtype name ('key<fry>') among jax.extend.random's public impls."""
-    impl = getattr(dtype, "_impl", None)
-    if impl is not None:
-        return impl
-    from jax.extend import random as xr
-    name = str(dtype)
-    for cand in (xr.threefry_prng_impl, xr.rbg_prng_impl, xr.unsafe_rbg_prng_impl):
-        if f"<{cand.tag}>" in name or name == cand.name:
-            return cand
-    raise NotImplementedError(f"tallymap: cannot determine the PRNG implementation of key dtype {name}; pass raw "
-                              "uint32 keys (jax.random.key_data) instead")
+    """the PRNGImpl of a typed-key dtype: `dtype._impl` (the one private attribute left; present on every tested
+    version)."""
+    return dtype._impl
 
 
 def _vmap_n(n, f):

@@ -37,7 +37,7 @@ jobs:
       matrix:
         include:
           - python: "3.10"
-            jax: "0.5.3"
+            jax: "0.6.2"
           - python: "3.12"
             jax: "newest"
     name: quick (py${{ matrix.python }}, jax ${{ matrix.jax }})

@@ -68,6 +68,13 @@ for the schedules ("item schedule" / "step schedule"), and the spelling "materia
 - REMOVED: shard_map support (casting operands to their varying axes at every bind, the varying-axes abstract
   evaluation and lowering adapter: `_varying`, `_with_varying`, `_plain`, `_cast_varying`). shard_map's typing is
   experimental and moved on every JAX minor from 0.7 to 0.11. `jax.pmap` over devices still works.
+- JAX floor 0.6.2 (was 0.5.3; round3/jaxfloor): `jax>=0.6.2`, `jax[cuda12]>=0.6.2` (which brings NVRTC itself,
+  so the separate `nvidia-cuda-nvrtc-cu12` requirement goes), `TESTED_JAX` from 0.6.2. Removed with it: the
+  host-callback address scrubber of `tm.diagnostics(...)['stablehlo_sha256']` (0.6.2+ lowers no address),
+  `platform_index`'s `has_default`, the `custom_vjp_call_jaxpr` names, and three guards dead on every tested
+  version (the plain batching-registry fallback, the key-impl name lookup, the partial-eval feature test).
+  `tests/ops_baseline.json` still holds 0.5.3 entries only, so `tests/ops.py` checks bounds alone on 0.6.2
+  until it is re-recorded.
 
 ### Changed (tree adjoint)
 

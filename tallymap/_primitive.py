@@ -679,10 +679,9 @@ def _largest_loop_array(jaxpr, in_loop=False):
 # not linear, so wherever JAX partially evaluates it (linearize / grad / vjp, jax.checkpoint, scan/cond/pjit partial
 # eval) the two rules below split it back into a KNOWN primal node and a STAGED tangent node (the unfused design), and
 # its batching rule unfuses too (jacfwd etc. are unchanged).  These are the two legacy registries
-# pe.custom_partial_eval_rules and pe.partial_eval_jaxpr_custom_rules: if a JAX release drops them, FUSE_JVP turns
-# off and everything keeps working (two kernels per jvp).
-_HAVE_PE = hasattr(_pe, "custom_partial_eval_rules") and hasattr(_pe, "partial_eval_jaxpr_custom_rules")
-FUSE_JVP = _HAVE_PE           # (tests may set tallymap._primitive.FUSE_JVP = False to exercise the two-node design)
+# pe.custom_partial_eval_rules and pe.partial_eval_jaxpr_custom_rules (present on every tested version; if a JAX
+# release drops them, set FUSE_JVP = False and everything keeps working: two kernels per jvp).
+FUSE_JVP = True               # (tests may set tallymap._primitive.FUSE_JVP = False to exercise the two-node design)
 
 
 def _ntf(p):
@@ -805,6 +804,5 @@ def _fused_pe_custom(saveable, unks_in, inst_in, eqn):
 ad.primitive_jvps[tallymap_jvp_p] = _fused_jvp
 ad.primitive_transposes[tallymap_jvp_p] = _fused_transpose
 register_batcher(tallymap_jvp_p, _fused_batch)
-if _HAVE_PE:
-    _pe.custom_partial_eval_rules[tallymap_jvp_p] = _fused_pe
-    _pe.partial_eval_jaxpr_custom_rules[tallymap_jvp_p] = _fused_pe_custom
+_pe.custom_partial_eval_rules[tallymap_jvp_p] = _fused_pe
+_pe.partial_eval_jaxpr_custom_rules[tallymap_jvp_p] = _fused_pe_custom

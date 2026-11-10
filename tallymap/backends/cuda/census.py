@@ -9,7 +9,6 @@ NOT_IN_JAX_EXTEND = {
     # call-like / control primitives that JAX does not re-export
     "pjit": "jit's primitive name on JAX < 0.7", "jit": "jit's primitive name on JAX >= 0.7",
     "core_call": "jax.core.call", "closed_call": "jax.core.closed_call (not re-exported on 0.11)",
-    "custom_vjp_call_jaxpr": "custom_vjp before JAX 0.7 (not re-exported on 0.11)",
     "checkpoint": "jax.checkpoint (older name)", "remat": "jax.checkpoint (older name)",
     "remat2": "jax.checkpoint (0.5.3 name; re-exported only on newer JAX)",
     "platform_index": "lax.platform_dependent", "optimization_barrier": "lax.optimization_barrier",

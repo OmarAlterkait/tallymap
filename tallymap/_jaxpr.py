@@ -20,7 +20,7 @@ _siu.register_exclusion(os.path.dirname(os.path.abspath(__file__)) + os.sep)
 # call-like primitives: ONE sub-jaxpr whose invars / outvars map 1:1 onto the equation's
 CALL_PARAM = {"pjit": "jaxpr", "jit": "jaxpr", "closed_call": "call_jaxpr", "core_call": "call_jaxpr",
               "custom_jvp_call": "call_jaxpr", "custom_vjp_call": "call_jaxpr",
-              "custom_vjp_call_jaxpr": "fun_jaxpr", "checkpoint": "jaxpr", "remat": "jaxpr", "remat2": "jaxpr"}
+              "checkpoint": "jaxpr", "remat": "jaxpr", "remat2": "jaxpr"}
 
 
 def closed(j):

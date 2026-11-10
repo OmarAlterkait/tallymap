@@ -49,7 +49,6 @@ primitive.
 | `custom_jvp_call` | rule |
 | `custom_lin` | rule |
 | `custom_vjp_call` | rule |
-| `custom_vjp_call_jaxpr` | rule |
 | `device_put` | canonicalised |
 | `div` | rule |
 | `dot_general` | rule |

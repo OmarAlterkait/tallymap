@@ -245,7 +245,7 @@ def _bind_out(outvars, slots, slot, state):
 
 # ---------------------------------------------------------------------------------------- re-tracing
 SELECT = ("gather", "dynamic_slice", "slice")          # reads that can get a sparse (emitted) cotangent
-_CUSTOM = ("custom_jvp_call", "custom_vjp_call", "custom_vjp_call_jaxpr")
+_CUSTOM = ("custom_jvp_call", "custom_vjp_call")
 
 
 def emit_p_bind(t, i, v):
