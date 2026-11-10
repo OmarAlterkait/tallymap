@@ -27,7 +27,9 @@ jobs:
       - run: pip install ruff
       - run: ruff check .
 
-  # The two ends of the supported range: the floor, and the newest JAX release.  `--only edge,reverse,examples`
+  # The two ends of the supported range: the floor, and the newest TESTED JAX (tallymap.TESTED_JAX[-1]), never an
+  # unpinned latest, so a JAX release cannot turn a push red (the version-policy test fails on an untested JAX by
+  # design).  A new JAX release is the weekly nightly cell's job (docs/maintenance.md).  `--only edge,reverse,examples`
   # is the short set; the whole suite runs in the `full` job below.
   quick:
     runs-on: ubuntu-latest
@@ -39,7 +41,7 @@ jobs:
           - python: "3.10"
             jax: "0.6.2"
           - python: "3.12"
-            jax: "newest"
+            jax: "newest-tested"
     name: quick (py${{ matrix.python }}, jax ${{ matrix.jax }})
     steps:
       - uses: actions/checkout@v4
@@ -48,12 +50,14 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: pip install -e ".[test]"
       - name: pin jax
-        if: matrix.jax != 'newest'
-        run: pip install "jax==${{ matrix.jax }}"
+        run: |
+          v="${{ matrix.jax }}"
+          [ "$v" = newest-tested ] && v=$(python -c "import tallymap; print(tallymap.TESTED_JAX[-1])")
+          pip install "jax==$v"
       - run: python -c "import jax, tallymap; print(jax.__version__, tallymap.__version__)"
       - run: python tests/run_all.py --only edge,reverse,examples
 
-  # The whole CPU suite on the newest JAX release: edge, transforms, reverse, reverse_spawn and the examples.
+  # The whole CPU suite on the newest tested JAX: edge, transforms, reverse, reverse_spawn and the examples.
   full:
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -63,5 +67,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e ".[test]"
+      - name: pin jax to the newest tested
+        run: pip install "jax==$(python -c 'import tallymap; print(tallymap.TESTED_JAX[-1])')"
       - run: python -c "import jax, tallymap; print(jax.__version__, tallymap.__version__)"
       - run: python tests/run_all.py

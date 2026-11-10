@@ -167,7 +167,7 @@ because each needs fresh JAX state.
 
 | cadence | where | cells |
 |---|---|---|
-| every push and pull request | GitHub Actions, `.github/workflows/ci.yml` | ruff; the short suite on Python 3.10 + jax 0.6.2 and on Python 3.12 + the newest jax; the full CPU suite on the newest |
+| every push and pull request | GitHub Actions, `.github/workflows/ci.yml` | ruff; the short suite on Python 3.10 + jax 0.6.2 and on Python 3.12 + the newest tested jax (`TESTED_JAX[-1]`); the full CPU suite on the newest tested |
 | weekly | GitHub Actions, `.github/workflows/weekly.yml` | the full CPU suite on every minor in `TESTED_JAX`; a JAX nightly cell, allowed to fail |
 | weekly, and before a release | a GPU machine | the full suite on each supported GPU at the floor and at the newest JAX, once with `--x64`, plus `--unfused` and `--canary` on CPU |
 | weekly, and before a release | a GPU machine | `benchmarks/perf.py` against `benchmarks/perf_baseline.json` (more than 1.5x slower is a failure; `benchmarks/perf_negative_control.py` is its negative control) |
