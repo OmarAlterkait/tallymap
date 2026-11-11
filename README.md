@@ -94,8 +94,8 @@ Tested on Linux with NVIDIA GPUs of compute capability 7.5 (2080 Ti) and 8.9 (L4
 <!-- perf:begin regimes: from benchmarks/vs_jax/readme_table.md (make_tables.py) -->
 Measured on one L40S, JAX 0.5.3, at the largest size of each problem, against the FASTEST plain-JAX arm that does
 the same job. Every padded arm is padded to the trip count measured in the same sweep, not to a guess.
-`docs/performance.md` has the method, every size, the 2080 Ti and JAX 0.11.2 rows, the agreement checks and the
-compile times.
+`docs/performance.md` is the summary; `docs/performance_detail.md` has the method, every size, the 2080 Ti and JAX
+0.11.2 rows and the agreement checks.
 
 
 | problem | kind | size | forward: tallymap vs best plain JAX | gradient: tallymap vs best plain JAX | gradient peak memory |
@@ -206,10 +206,9 @@ JAX 0.11.2; each demo's README states where the margin shrinks or tallymap loses
 | `adaptive_quadrature` | quadax 0.3.0 `quadgk` | 3-18x forward, 12x gradient, 98-380x less memory |
 | `branching_epidemic` | a plain-JAX generation-frontier program | 4-14x forward, 5-8x `jacfwd`; reverse is a tie |
 
-**On CPU** there is only the xla backend, which is plain JAX. Measured at N = 65,536, its forward pass is
-within 0.7x to 1.3x of the best plain-JAX program on the natural problems. Its gradient is 3x to 7x SLOWER than a
-padded `lax.scan` given the oracle step cap (`docs/performance.md`, "cpu"). What it buys you there is a gradient
-through a `lax.while_loop` without choosing a cap, and memory proportional to the outputs. It does not buy speed.
+**On CPU** the same kernel runs compiled for the host: on one 32-core socket, forward 2.8-5.1x faster than the
+best plain-JAX program on the divergent problems and at parity on long uniform loops, gradients 8.6-54x faster
+(the table is in "Backends").
 <!-- perf:end -->
 
 ## Correctness rules you need to know
@@ -411,6 +410,21 @@ Slurm allocation). Every feature works on both: forward, step schedule, jvp and 
 spawn and the tree adjoint, fixed-point sums, truncation, `n_active`. `backend='xla'` is the plain-JAX reference
 interpreter, for checking and for the platforms the kernel backend does not compile for.
 
+**Several devices.** Shard the item axis the usual JAX way and every device runs its own items; tallies and
+stats are summed across devices and per-item results stay sharded like the items. There is no tallymap API for it:
+
+```python
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+mesh = Mesh(jax.devices(), ("d",))                       # the quickstart's f, xs, keys, theta
+items = NamedSharding(mesh, P("d"))
+res = jax.jit(f)(jax.device_put(xs, items), jax.device_put(keys, items), theta)
+# res.outputs["hist"]: summed over the devices; res.per_item: sharded like xs
+```
+
+Derivatives and spawn work the same way. As with any JAX sharding, the item count must divide evenly among the
+devices. A spawn `Queue` holds its capacity per device. On the CPU the devices of
+one process share its CPUs, so the threads are divided among them.
+
 On the CPU every operation is IEEE (subnormals kept, no FMA contraction) and the math library is libm, so
 transcendentals differ from XLA:CPU by a few ulps (libm is the more accurate of the two:
 `docs/maintenance.md`). `cuda_math` has no effect there.
@@ -443,7 +457,7 @@ the gain there is the gradient. All rows and the method: `docs/performance.md`.
 | `rev_stats` | `False` | reverse through spawn: report the tree adjoint's counts to the host. Off by default because a host callback takes `jax.jit` off its C++ fast path, which can cost an order of magnitude. |
 
 Any other option name raises, and there are no private options: the measurement switches and negative controls
-are test-only module constants. tallymap's one environment variable is `TALLYMAP_CUDA_CACHE`, the kernel cache
+are test-only module constants. tallymap's one environment variable is `TALLYMAP_CACHE`, the kernel cache
 directory (default `~/.cache/tallymap`). On the CPU the standard OpenMP and compiler variables apply:
 `OMP_NUM_THREADS` (default: the CPUs the process may use), `OMP_STACKSIZE` (the worker threads' stack, where per-item
 arrays live; tallymap sets it to 16M if it is unset, and a kernel needing more than half of it raises before it runs)
@@ -452,7 +466,7 @@ and `CXX`.
 ## Nested loops: solvers inside an item
 
 An item may contain loops inside loops, each with its own data-dependent trip count: a `while_loop` inside a
-`while_loop` inside a `cond`. The cuda backend compiles every level into an ordinary loop of the item's own
+`while_loop` inside a `cond`. The kernel backend compiles every level into an ordinary loop of the item's own
 thread. Every transformation handles the nesting: `jvp`, `jacfwd` and `grad`. Reverse mode checkpoints each
 loop level recursively, so memory stays O(1) per item.
 
@@ -495,7 +509,7 @@ Measured (XLA temp memory, CPU, JAX 0.5.3 and 0.11.2 identical). The setup is a 
 | `cond(p, while-loop reading the table, 0)` under `jax.vmap` | 1,152 MiB | 9,216 MiB (1.00 copy per item) |
 | the same work with `p` moved into the trip count, no `cond` | 0.0 MiB | 0.1 MiB |
 | `cond` around straight-line reads | 0.0 MiB | 0.0 MiB |
-| tallymap, xla backend (the cuda backend runs a real branch) | 0.0 MiB | 0.3 MiB |
+| tallymap, xla backend (the kernel backend runs a real branch) | 0.0 MiB | 0.3 MiB |
 
 A ray tracer that tests a BVH leaf's triangles in an inner loop hits exactly this. With 32,768 triangles,
 `jax.vmap` asked for 104 GiB at 65,536 rays, and 6.5 TiB at 4.2M.
@@ -513,6 +527,8 @@ What is explicitly out of scope, so that you do not have to find out by trying:
   `backend='auto'` on the CPU raises `tm.UnsupportedError` naming the fix; `backend='xla'` runs there.
 - **CPU results are not bitwise equal to XLA:CPU** on transcendentals (libm vs XLA's own approximations, 1-7 ulps)
   or on subnormals (XLA:CPU flushes them to zero; the kernel is IEEE). On a GPU the bitwise checks against XLA stand.
+- **`shard_map` around a call is unsupported**: shard the items with `NamedSharding` and `jax.jit` instead
+  (see "Backends"). `jax.pmap` works.
 - **`jax.export` of a kernel program is unsupported.** Its custom call is not on JAX's export allow-list and its
   kernels are registered per process, so a deserialised program is not portable. Programs on the xla backend export
   normally.
@@ -545,10 +561,10 @@ spawn tree adjoint, per-operation CUDA parity (`--gpu`) and the examples.
 | `examples/ensemble_toy.py` | per-item results and `n_active` |
 | `examples/gradient_pitfall.py` | the gradient pitfalls in "Derivatives", runnable |
 
-Design decisions and the measurements behind them: `docs/design.md`. Validation and the A/B rules:
+Why each part exists: `docs/design.md` (the full record of measurements: `docs/design_notes.md`). Validation and the A/B rules:
 `docs/validation.md`. Float semantics: `docs/float_semantics.md`. Terms: `docs/glossary.md`. Supported JAX
 versions, the release process and a "when X breaks, do Y" table: `docs/maintenance.md`. Covered primitives:
-`docs/primitives.md`. Speed against plain JAX: `docs/performance.md`.
+`docs/primitives.md`. Speed against plain JAX: `docs/performance.md` (every table and plot: `docs/performance_detail.md`).
 
 If you use tallymap in published work, please cite it: see `CITATION.cff`.
 

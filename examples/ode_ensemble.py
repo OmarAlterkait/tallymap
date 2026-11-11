@@ -13,7 +13,7 @@ not depend on the trip count at all.
 
 Measured on an L40S at N = 1,048,576: the gradient takes 26 ms in 28 MB.  A padded scan given the oracle step
 cap takes 187 ms in 26 GB; a checkpointed one at a realistic 2x cap takes 450 ms in 2.5 GB.  See
-docs/performance.md, including the comparison against diffrax.
+docs/performance_detail.md, including the comparison against diffrax.
 """
 import jax
 import jax.numpy as jnp
@@ -88,7 +88,7 @@ print("d loss / d theta: grad", np.round(np.asarray(g), 5))
 print(f"grad vs jacfwd: rel {e:.1e}")
 
 # The same item in plain JAX, forward only: jax.vmap of the SAME trial step in a lax.while_loop.  JAX cannot
-# reverse-differentiate that loop, which is why the plain-JAX gradient arm in docs/performance.md is a padded
+# reverse-differentiate that loop, which is why the plain-JAX gradient arm in docs/performance_detail.md is a padded
 # masked scan instead.
 def plain(theta):
     def one(y0_, mu_):
@@ -103,7 +103,7 @@ e_fwd = float(jnp.max(jnp.abs(o_tm - jax.jit(plain)(theta))) / jnp.max(jnp.abs(o
 print(f"forward vs the plain-JAX arm: rel {e_fwd:.1e}")
 
 # grad and jacfwd sum the per-item contributions in a different order (measured 2e-6 to 4e-6, CPU JAX 0.6 to
-# 0.11 and L40S).  The forward bound is looser: the cuda backend's arithmetic is not XLA's bit for bit, so a stiff
+# 0.11 and L40S).  The forward bound is looser: the kernel backend's arithmetic is not XLA's bit for bit, so a stiff
 # trajectory can take a different step sequence and agree only to about the solver tolerance
 # (docs/float_semantics.md).
 bad = [n for n, v, tol in (("forward", e_fwd, 2e-3), ("grad-vs-jacfwd", e, 1e-4)) if not (v < tol)]

@@ -3,7 +3,7 @@
 Cache keys contain everything that determines the binary besides the source text: the NVRTC BUILD (realpath +
 version + size/mtime), arch, options, and the tallymap / jax / jaxlib versions (the jaxpr -> C mapping depends on
 JAX's primitive semantics).  The shim key adds the FFI headers, the host compiler and libc.  Cache directory: env
-TALLYMAP_CUDA_CACHE, else ~/.cache/tallymap (cubins are small).  NVRTC comes from the nvidia-cuda-nvrtc-cu12 wheel
+TALLYMAP_CACHE, else ~/.cache/tallymap (cubins are small).  NVRTC comes from the nvidia-cuda-nvrtc-cu12 wheel
 (tallymap's `cuda` extra), else a CUDA toolkit's libnvrtc; $CXX names the HOST C++ compiler that builds the FFI shim.
 """
 import ctypes
@@ -26,7 +26,9 @@ OPTS = ["-fmad=false", "--std=c++17", "--ftz=false", "--prec-div=true", "--prec-
 
 
 def cache_dir():
-    d = os.environ.get("TALLYMAP_CUDA_CACHE") or os.path.join(os.path.expanduser("~"), ".cache", "tallymap")
+    # (TALLYMAP_CUDA_CACHE: the name before 0.7.0, which still works; TALLYMAP_CACHE wins when both are set)
+    d = (os.environ.get("TALLYMAP_CACHE") or os.environ.get("TALLYMAP_CUDA_CACHE")
+         or os.path.join(os.path.expanduser("~"), ".cache", "tallymap"))
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -51,7 +53,7 @@ _NVRTC = []
 
 def nvrtc():
     """-> (ctypes library, path) of NVRTC: the nvidia-cuda-nvrtc-cu12 wheel, else a CUDA toolkit's libnvrtc.  Raises
-    a tallymap error naming the wheel when there is none (the cuda backend compiles with NVRTC only)."""
+    a tallymap error naming the wheel when there is none (the CUDA target compiles with NVRTC only)."""
     if not _NVRTC:
         cands = []
         try:
@@ -73,7 +75,7 @@ def nvrtc():
                 continue
         _NVRTC.append(found)
     if _NVRTC[0][0] is None:
-        raise RuntimeError("tallymap: the cuda backend compiles with NVRTC, and no libnvrtc was found (neither the "
+        raise RuntimeError("tallymap: the CUDA target compiles with NVRTC, and no libnvrtc was found (neither the "
                            "nvidia-cuda-nvrtc-cu12 wheel nor /usr/local/cuda/lib64 nor the loader path).  Fix: pip "
                            "install 'tallymap[cuda]' (or nvidia-cuda-nvrtc-cu12), or put a CUDA 12 toolkit's lib64 "
                            "on LD_LIBRARY_PATH; or run with backend='xla'.")
@@ -82,7 +84,7 @@ def nvrtc():
 
 def host_cxx():
     """the host C++ compiler that builds the FFI shim: $CXX when set, else g++ / c++ from PATH.  Raises a
-    tallymap error naming $CXX when there is none (the cuda backend cannot run without the shim)."""
+    tallymap error naming $CXX when there is none (the CUDA target cannot run without the shim)."""
     env = os.environ.get("CXX")
     if env:
         p = shutil.which(env) or (env if os.path.isfile(env) and os.access(env, os.X_OK) else None)

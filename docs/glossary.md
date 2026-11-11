@@ -23,11 +23,11 @@ Terms used in the code, the docs and the error messages.
 | term | meaning |
 |---|---|
 | **cuda** | the item jaxpr compiled to one CUDA kernel with NVRTC, NVIDIA's runtime compiler, launched through one `jax.ffi` handler (`tallymap_cuda_launch`). |
-| **xla** | the plain-JAX backend, on every platform: a masked interpreter of the item jaxpr over a batch of items, compiled and run by XLA.  Slow by design, about 100 times the cuda backend. |
+| **xla** | the plain-JAX backend, on every platform: a masked interpreter of the item jaxpr over a batch of items, compiled and run by XLA.  Slow by design, about 100 times the kernel backend. |
 | **item schedule** | cuda scheduling (`schedule='item'`, the default): a thread runs one whole item, then claims the next. |
 | **step schedule** | cuda scheduling (`schedule='step'`): a thread takes a new item when its current one finishes, at loop-STEP granularity (path regeneration, in GPU path tracing).  Needs exactly one top-level while loop, else it raises. |
 | **privatised tally** | a small sum output kept in shared memory per block and flushed once, instead of going to global atomics. |
-| **op table** | `backends/cuda/op_table.py`: one emission rule per JAX primitive.  The main maintenance surface. |
+| **op table** | `backends/kernel/op_table.py`: one emission rule per JAX primitive.  The main maintenance surface. |
 | **cuda_math** | `approx`, the default, uses the f32 division, sqrt and rsqrt PTX that XLA:GPU itself emits; `ieee` is correctly rounded.  `docs/float_semantics.md`. |
 
 ## Transformations (internal)

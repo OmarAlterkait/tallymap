@@ -670,7 +670,7 @@ def _(b):
 
 @case("in-place updates: a dead array is updated in place; an update that reads it is not (overlapping copies)")
 def _(b):
-    """x.at[k + arange(3)].set(...) with a traced k is a SCATTER, lax.dynamic_update_slice a DUS: the cuda backend
+    """x.at[k + arange(3)].set(...) with a traced k is a SCATTER, lax.dynamic_update_slice a DUS: the kernel backend
     writes both into a dead operand's storage.  Each step also copies x[k-1 : k+2] onto x[k : k+3] -- the update
     READS the storage it writes, so an element-by-element write in place would copy x[k-1] three times -- and
     accumulates into a second array in place.  The loop is NESTED (a single top-level while is split into step
@@ -1610,7 +1610,7 @@ def _(b):
         return item
     out = []
     for name, op in (("solve", lambda A: jnp.linalg.solve(A, jnp.ones(4, F))), ("inv", lambda A: jnp.linalg.inv(A)[0])):
-        m = raises(tm.UnsupportedError, lambda op=op: V(mk(op), b)(xs), "is not supported by the tallymap cuda backend")
+        m = raises(tm.UnsupportedError, lambda op=op: V(mk(op), b)(xs), "is not supported by the tallymap kernel backend")
         prim = re.search(r"primitive '(\w+)' is not supported", m)
         out.append(f"{name}: {prim.group(1) if prim else m[:60]}")
     return "; ".join(out)

@@ -50,7 +50,7 @@ body:
       label: Does it also happen with backend='xla'?
       options:
         - "Yes, the xla backend too"
-        - "No, only the cuda backend"
+        - "No, only the kernel backend"
         - "Not applicable (it raises before a backend is chosen)"
         - "Not tried"
     validations:

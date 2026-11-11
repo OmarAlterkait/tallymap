@@ -10,7 +10,7 @@ Sections (cell name prefixes):
            tolerance FT.
   [key]    cache-key soundness: programs that differ only in a closed-over array's values, a closed-over Python
            scalar, dtype, shape, an option, max_steps or table contents never share a compiled program (one process,
-           one fresh TALLYMAP_CUDA_CACHE).  NEGATIVE CONTROLS: the same pairs under a deliberately coarse key
+           one fresh TALLYMAP_CACHE).  NEGATIVE CONTROLS: the same pairs under a deliberately coarse key
            (jaxpr text only / the real keys' structural digest only / avals only) MUST be caught; the control cell
            PASSES when the stale reuse is detected.
   [tdep]   tangent-dependent control flow: a while loop whose trip count follows the tangent-carrying primal, and
@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # from another process cannot hide (or fake) a key collision.  Set before tallymap reads it (cache_dir() reads the
 # environment at every compile).
 _CACHE = tempfile.mkdtemp(prefix="tm_invariants_cache_", dir=os.environ.get("LSCRATCH") or None)
-os.environ["TALLYMAP_CUDA_CACHE"] = _CACHE
+os.environ["TALLYMAP_CACHE"] = _CACHE
 atexit.register(shutil.rmtree, _CACHE, True)
 if os.environ.get("TEST_X64"):
     import jax

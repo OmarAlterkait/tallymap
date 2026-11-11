@@ -124,7 +124,7 @@ def rel(a, b):
 
 
 class Unavailable(Exception):
-    """This arm cannot run here: no GPU for the cuda backend, or an optional dependency is missing.  Reported as
+    """This arm cannot run here: no GPU for the kernel backend, or an optional dependency is missing.  Reported as
     status='SKIP', which is not a failure."""
 
 

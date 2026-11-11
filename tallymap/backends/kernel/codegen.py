@@ -76,7 +76,7 @@ def ctype(dt):
     if dt == _FLOAT0:            # jvp tangent of an integer value: carries no data; represented as a bool false
         return "bool"
     if dt not in _CT:
-        raise CodegenError(f"dtype {dt} is not supported by the cuda backend")
+        raise CodegenError(f"dtype {dt} is not supported by the kernel backend")
     return _CT[dt]
 
 
@@ -677,6 +677,6 @@ class Emitter:
         if name not in op_table.TALLY_AWARE and name not in self.hooks and any(isinstance(v, VTally) for v in ins):
             raise CodegenError(f"primitive {name!r} reads a tally")
         if rule is None:
-            raise CodegenError(f"primitive {name!r} is not supported by the tallymap cuda backend "
+            raise CodegenError(f"primitive {name!r} is not supported by the tallymap kernel backend "
                                 f"(params: {sorted(eqn.params)}).")
         return rule(self, eqn, ins, **eqn.params)

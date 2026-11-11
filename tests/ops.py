@@ -315,7 +315,7 @@ def run_op(name, f, kinds, cls, bound):
 
 def check_names():
     """D16: every op-table name is a primitive jax.extend.core.primitives exports, or explained in
-    backends/cuda/census.NOT_IN_JAX_EXTEND (a JAX rename shows up here, not in a user's UnsupportedError)."""
+    backends/kernel/census.NOT_IN_JAX_EXTEND (a JAX rename shows up here, not in a user's UnsupportedError)."""
     from jax.extend.core import Primitive
     from jax.extend.core import primitives as P
 

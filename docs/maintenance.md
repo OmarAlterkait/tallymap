@@ -5,15 +5,14 @@ and how a release is made.
 
 ## Supported
 
-- Python >= 3.10. CUDA 12 with NVRTC, NVIDIA's runtime compiler, the only compiler the cuda backend uses (the
+- Python >= 3.10. CUDA 12 with NVRTC, NVIDIA's runtime compiler, the only compiler the CUDA target uses (the
   `cuda` extra installs the `nvidia-cuda-nvrtc-cu12` wheel; a CUDA toolkit's `libnvrtc` works too), plus a C++17
   compiler once, to build the `jax.ffi` launch shim
   (`backends/kernel/shim.cc`, cached per toolchain and jaxlib version).
 - GPUs tested: compute capability 7.5 (RTX 2080 Ti) and 8.9 (L40S). A100 and H200 are untested. The spawn queue
   needs compute capability 7.0 or newer, for `__nanosleep`.
-- Every other platform runs the xla backend: `backend='auto'` warns once, `backend='cuda'` raises. TPU and
-  ROCm are untested. The xla backend is the portable interpreter, slow by design, about 100 times the CUDA
-  backend.
+- Every other platform runs the xla backend: `backend='auto'` warns once. TPU and ROCm are untested. The xla
+  backend is the portable interpreter, slow by design, about 100 times slower than the kernel backend.
 
 ## Version policy
 
@@ -28,6 +27,9 @@ CPU, with the full suite:
 | JAX | 0.6.2 | 0.7.2 | 0.8.3 | 0.9.2 | 0.10.2 | 0.11.2 |
 |---|---|---|---|---|---|---|
 | Python | 3.10 | 3.11 | 3.11 | 3.11 | 3.11 | 3.12 |
+
+GitHub CI runs the CPU suite on 0.6.2 and the newest tested version on every push, and all six weekly. The GPU
+cells (2080 Ti, L40S) run on JAX 0.6.2 only.
 
 `tm.TESTED_JAX` is that list. Importing tallymap warns once only when JAX is **newer than the newest tested
 version**: everything between the floor and the newest is tested, so nothing in the middle warns. That matters
@@ -113,7 +115,7 @@ constant.
 
 ## Caches
 
-- **tallymap's own cubin cache** (`$TALLYMAP_CUDA_CACHE`, else `~/.cache/tallymap`): NVRTC output keyed by the
+- **tallymap's own cubin cache** (`$TALLYMAP_CACHE`, else `~/.cache/tallymap`): NVRTC output keyed by the
   CUDA source, the compiler build, the architecture, the options and the tallymap, jax and jaxlib versions. It
   also holds the built FFI shim. Safe to delete. The cached `.cu` next to each `.cubin` is what
   `tm.diagnostics()` points at.
@@ -127,9 +129,11 @@ constant.
   (`DisabledSafetyCheck.custom_call("tallymap_cuda_launch")` exports it anyway) and the cubin registry is per
   process, so a deserialised CUDA program only runs in a process that built the same kernels. Programs on the xla backend
   export normally.
-- **shard_map is not supported** (removed before 0.6.0rc1, with the varying-axes adapter it needed). Shard the
-  items outside the call: `jax.pmap` over devices works (tests/transforms.py), and `shard_map(...,
-  check_vma=False)` skips the typing the primitive does not follow (untested).
+- **shard_map is not supported** (removed before 0.6.0rc1, with the varying-axes adapter it needed). Sharded
+  `jax.jit` is the supported way (`_primitive`, "sharding": a `custom_partitioning` rule; `tests/sharding.py`), and
+  `jax.pmap` works. The rule needs one private JAX hook, `jax._src.dispatch.prim_requires_devices_during_lowering`
+  (`_compat.requires_devices`, feature-detected): without it JAX lowers the call without the device assignment, the
+  rule never fires, and XLA silently falls back to all-gathering the items -- which `tests/sharding.py` catches.
 
 ## Profiling
 
@@ -159,7 +163,7 @@ because each needs fresh JAX state.
 
 | flag | what it adds |
 |---|---|
-| `--gpu` | the CUDA backend as well as xla, the spawn tree adjoint, `tests/ops.py` (per-operation parity) and `tests/mulchain.py` |
+| `--gpu` | the kernel backend as well as xla, the spawn tree adjoint, `tests/ops.py` (per-operation parity) and `tests/mulchain.py` |
 | `--x64` | `jax_enable_x64` |
 | `--unfused` | the two-node JVP design, which is what runs if JAX drops the partial-evaluation registries |
 | `--canary` | DeprecationWarning and FutureWarning become errors: the JAX-upgrade canary |
@@ -184,7 +188,7 @@ working tree, so that editing the tree cannot change a queued run.
    StableHLO, identical generated CUDA sources and identical cubins between the previous release and this commit,
    with outputs bitwise equal wherever the previous release's own reruns are bitwise equal. Two reruns are a weak
    control for atomics-ordered float sums, so for those identical programs are the proof, not identical numbers.
-3. If `backends/cuda` math or the operation table changed (`tests/ops.py` reports CHANGED rows): rerun the
+3. If `backends/kernel` math or the operation table changed (`tests/ops.py` reports CHANGED rows): rerun the
    `compare` protocol unchanged (`docs/validation.md`), then re-record `tests/ops_baseline.json` in a commit of
    its own. Re-record `benchmarks/perf_baseline.json` only in a commit of its own, and only when a change in
    speed is intended.

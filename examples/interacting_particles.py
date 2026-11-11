@@ -17,7 +17,7 @@ The walk length is the particle's own neighbour count, which is where the diverg
 configuration it varies by an order of magnitude between particles.
 
 Measured: the comparison against the JAX-MD-style padded neighbour list, which has to size every particle's
-candidate list from the FULLEST cell, is in docs/performance.md.  The answer is not uniform: tallymap wins when
+candidate list from the FULLEST cell, is in docs/performance_detail.md.  The answer is not uniform: tallymap wins when
 the neighbour counts are spread out and loses when they are not.
 """
 import jax

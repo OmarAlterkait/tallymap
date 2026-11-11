@@ -8,7 +8,7 @@ limbs, as a JAX program has to spell it).  This is a STRUCTURAL test: the cuts a
 are BITWISE equal to the xla backend (integer arithmetic: any difference is a bug, not rounding); the compile
 bound is only a sanity limit.  It does not reproduce the cliff: with the rule patched off this item also compiles in
 under a second through NVRTC on the CI GPUs (job 43047843).  The off / on compile measurement is a one-off job,
-recorded in docs/design.md section 10.
+recorded in docs/design_notes.md section 10.
 """
 import os
 import shutil
@@ -17,7 +17,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _CACHE = tempfile.mkdtemp(prefix="tm_mulchain_cache_", dir=os.environ.get("LSCRATCH") or None)
-os.environ["TALLYMAP_CUDA_CACHE"] = _CACHE          # a fresh cache: the kernel is really compiled here
+os.environ["TALLYMAP_CACHE"] = _CACHE          # a fresh cache: the kernel is really compiled here
 import jax  # noqa: E402
 
 jax.config.update("jax_enable_x64", True)

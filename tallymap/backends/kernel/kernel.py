@@ -25,7 +25,7 @@ typedef int i32; typedef unsigned int u32; typedef long long i64; typedef unsign
 // the f32 math library behind ONE __noinline__ wrapper per function: one body per kernel instead of one per
 // call site (inlined at every site, the libdevice bodies made most of the compile time: NVRTC on the
 // benchmarks/compile_scaling 100-stage forward 195 -> 5.3 s, LUCiD with the scan change 1.5x; run time
-// within -6%..+2% on lumen and LUCiD, outputs bitwise; docs/design.md section 9)
+// within -6%..+2% on lumen and LUCiD, outputs bitwise; docs/design_notes.md section 9)
 #define SJ_NI1(f) __device__ __noinline__ float sj_n_##f(float x) { return f(x); }
 #define SJ_NI2(f) __device__ __noinline__ float sj_n_##f(float x, float y) { return f(x, y); }
 SJ_NI1(sinf) SJ_NI1(cosf) SJ_NI1(tanf) SJ_NI1(expf) SJ_NI1(logf) SJ_NI1(log1pf) SJ_NI1(expm1f) SJ_NI1(acosf) SJ_NI1(asinf)
@@ -207,7 +207,7 @@ def split_blocker(jx):
 def _split(cj):
     """The step schedule: split an item with exactly ONE top-level while loop into pre / (cond, body) / post, so the
     kernel refills a thread with a new item at STEP granularity (a thread whose item finished does not idle until
-    the whole warp's items finish; measurements: docs/design.md section 1b).  -> None (split_blocker says why) or a
+    the whole warp's items finish; measurements: docs/design_notes.md section 1b).  -> None (split_blocker says why) or a
     dict of closed jaxprs + wiring."""
     import jax
     from jax.extend.core import Literal

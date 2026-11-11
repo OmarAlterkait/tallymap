@@ -6,7 +6,7 @@
 
 Keys:
   versions   tallymap / jax / jaxlib / numpy / python
-  env        TALLYMAP_CUDA_CACHE, JAX_PLATFORMS, XLA_FLAGS, CUDA_VISIBLE_DEVICES (when set), machine
+  env        TALLYMAP_CACHE, JAX_PLATFORMS, XLA_FLAGS, CUDA_VISIBLE_DEVICES (when set), machine
   platform   jax.default_backend(), devices; on a GPU: name, compute capability, driver
   cuda       compiler (the NVRTC build), cubin cache directory (on a GPU)
   host       the CPU target: host C++ compiler and -march=native identity, kernel cache directory, threads
@@ -39,7 +39,7 @@ import numpy as np
 
 HISTORY = 16
 PROGRAMS = collections.deque(maxlen=HISTORY)       # (tag, jaxpr object) of item programs bound by tm.vmap
-KERNELS = collections.deque(maxlen=HISTORY)        # dicts recorded by backends/cuda.kernel()
+KERNELS = collections.deque(maxlen=HISTORY)        # dicts recorded by backends/kernel.kernel()
 _CAPTURE = []                                      # active diagnostics(f, ...) captures: dict(programs=, kernels=)
 
 
@@ -177,5 +177,5 @@ def _with_resources(rec):
 
 
 def _env():                                                    # the environment variables that matter
-    keys = ("TALLYMAP_CUDA_CACHE", "JAX_PLATFORMS", "XLA_FLAGS", "CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "CXX")
+    keys = ("TALLYMAP_CACHE", "JAX_PLATFORMS", "XLA_FLAGS", "CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "CXX")
     return {k: os.environ.get(k) for k in keys if os.environ.get(k) is not None} | {"machine": platform.machine()}

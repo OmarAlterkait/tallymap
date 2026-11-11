@@ -147,7 +147,7 @@ def _unphys(d, like):
 
 
 # An UNINITIALISED per-item buffer (a checkpoint buffer: every slot is written before it is read, by construction).
-# The cuda backend declares it without a fill; everywhere else it is zeros.  MEASURED (lumen/perf d6cb9fc): zero-
+# The kernel backend declares it without a fill; everywhere else it is zeros.  MEASURED (lumen/perf d6cb9fc): zero-
 # filling 3C+1 states per item (C = 64) cost the cheap-step benchmarks/vs_jax gradients up to 5x at 2^19 items
 # (random_walk 0.80 -> 3.98 ms) -- more than their whole step.  tests/reverse.py gates it: the cuda per-item
 # cotangents are bitwise equal with every uninitialised declaration filled with 0x00 and with 0xFF.
@@ -402,7 +402,7 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None, li
 
 # ------------------------------------------------------------------------------------------- T3: single-loop adjoint
 # The adjoint of checkpointed_while is a nest of loops (count pass; checkpoint pass; per segment: advance, fill,
-# sweep), so the cuda backend runs it under the item schedule: every phase costs the warp its LONGEST item (lumen:
+# sweep), so the kernel backend runs it under the item schedule: every phase costs the warp its LONGEST item (lumen:
 # warp max / mean trip count 2.3-3.8), and the step is instantiated five times (NVRTC time).  Here the adjoint of an
 # item's ONE top-level loop is ONE while loop whose iteration is one MICRO-STEP of a per-item state machine:
 #
@@ -415,7 +415,7 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None, li
 # Every micro-step evaluates the SAME linearized step at its x (jax.vjp(..., has_aux=True): the forward with its
 # residuals, the next state as aux), and only SWEEP lanes run the transpose (under a cond).  So lanes in different
 # phases execute the same instructions, the step is instantiated once, and the adjoint program has exactly one
-# top-level while: the cuda backend's step-granular refill applies.  Work and memory are those of checkpointed_while
+# top-level while: the kernel backend's step-granular refill applies.  Work and memory are those of checkpointed_while
 # (head of C+1 states, C checkpoints; the head doubles as the tape; stride max(C, ceil(K/C))).  The states are
 # advanced by the LINEARIZED step's primal, which is what jax.grad itself evaluates (a custom_jvp rule's primal
 # output; JAX requires it to equal the function's).  The item's post-loop code is FOLDED into the loop as one

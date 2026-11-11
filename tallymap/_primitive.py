@@ -681,7 +681,7 @@ def _dual_lanes(args, dims, node, fused):
 register_batcher(tallymap_call_p, _batch)
 
 
-# Lanes vmap the item: a dense intermediate of S elements inside a loop becomes [T, S].  The cuda backend keeps such
+# Lanes vmap the item: a dense intermediate of S elements inside a loop becomes [T, S].  The kernel backend keeps such
 # arrays in per-thread local memory; measured (L40S, 65k items): jacfwd(grad) of a walk gathering a 256-entry table
 # (its replay adjoint scatters the table cotangent into a dense [256] array every step) -> lanes kernel with [2, 256]
 # arrays: 6 KB stack frame, 95 ms vs 2.3 ms for one lane.  A particle-shower item with 129 lane-dependent elements

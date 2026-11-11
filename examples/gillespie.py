@@ -20,7 +20,7 @@ the same number at the same sample size.
 
 Measured: 10 to 25 times faster than jax.vmap + lax.while_loop forward on an L40S, because that baseline pays
 the batch maximum event count while tallymap pays the mean, and the score carry is free to within the
-measurement noise.  See docs/performance.md.
+measurement noise.  See docs/performance_detail.md.
 """
 import jax
 import jax.numpy as jnp

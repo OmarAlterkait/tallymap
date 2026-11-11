@@ -33,7 +33,7 @@ used to answer a B question.
   paths diverge from there to O(1) differences. This has produced more false alarms than any other mistake on
   this list.
 - Expect bitwise agreement only from deterministic sums: CPU, or `Sum(fixed_point=True)` (int64 fixed point). f32
-  tallies on a GPU are accumulated with atomics on the CUDA backend and with a GPU scatter-add on the xla
+  tallies on a GPU are accumulated with atomics on the kernel backend and with a GPU scatter-add on the xla
   backend, so their summation order, and their last bits, change from run to run. Rerun the same keys twice as
   the control before blaming a difference on anything else.
 - Set `jax_default_matmul_precision='highest'` for any GPU parity test. JAX's default on recent NVIDIA GPUs is a
@@ -47,7 +47,7 @@ used to answer a B question.
 
 `compare(f, *args, other=..., floor_fn=...)` in `tests/compare_protocol.py` compares two implementations of the
 same item program, for example `backend='cuda'` against `backend='xla'`, on the same per-item keys. It is a
-test protocol, not library API; `tests/edge.py` runs it on the CUDA backend. It is a statistical test, not an
+test protocol, not library API; `tests/edge.py` runs it on the kernel backend. It is a statistical test, not an
 equality check, because the two backends do not produce bitwise identical f32 sums by design
 (`docs/float_semantics.md`).
 
@@ -100,5 +100,5 @@ they were run on. Nothing in this repository depends on them.
 
 ## When to rerun the `compare` protocol
 
-Rerun it whenever `backends/cuda` math or the operation table changes in a way that `tests/ops.py` reports as a
+Rerun it whenever `backends/kernel` math or the operation table changes in a way that `tests/ops.py` reports as a
 changed number. Re-record `tests/ops_baseline.json` only after that, and in a commit of its own.

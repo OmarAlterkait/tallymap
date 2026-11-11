@@ -7,7 +7,7 @@ for anything that touches speed or numbers, a measurement of both arms.
 
 ```
 python tests/run_all.py                      # CPU: the xla backend
-python tests/run_all.py --gpu                # + the CUDA backend, the spawn tree adjoint, per-operation parity
+python tests/run_all.py --gpu                # + the kernel backend, the spawn tree adjoint, per-operation parity
 python tests/run_all.py --only edge,reverse  # one or more suites
 python tests/run_all.py --x64                # with jax_enable_x64
 python tests/run_all.py --unfused            # the two-node JVP design (the fallback if JAX drops a registry)
@@ -36,7 +36,7 @@ supported JAX range. The GPU cells need hardware Actions does not have, so they 
 
 ## How the operation table works
 
-The CUDA backend compiles the item's jaxpr to C by walking its equations and emitting one piece of code per JAX
+The kernel backend compiles the item's jaxpr to C by walking its equations and emitting one piece of code per JAX
 primitive. The table of those rules, `tallymap/backends/kernel/op_table.py`, is the main maintenance surface: a new
 or renamed JAX primitive in a user's program shows up as
 `tm.UnsupportedError: primitive 'foo' is not supported`.

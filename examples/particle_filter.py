@@ -18,7 +18,7 @@ The output is the log-likelihood estimate of the whole series.
 The gradient here is the standard stop-gradient-through-resampling estimator: the resampling indices are wrapped
 in lax.stop_gradient, which makes this the usual BIASED estimator of the gradient of the log-likelihood.  That is
 what practitioners use; it is a property of the estimator, not of tallymap, which returns the exact derivative of
-the program as written.  docs/performance.md has the measured comparison.
+the program as written.  docs/performance_detail.md has the measured comparison.
 """
 import jax
 import jax.numpy as jnp

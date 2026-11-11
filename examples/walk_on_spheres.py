@@ -13,7 +13,7 @@ The walk itself does not depend on theta, so the pathwise gradient is exact and 
 
 Measured: about 10x faster than jax.vmap + lax.while_loop forward on an L40S, with a reverse-mode gradient that
 plain JAX cannot take at all without first rewriting the loop as a padded masked scan.  The numbers, the arms
-and the padding rule are in docs/performance.md.
+and the padding rule are in docs/performance_detail.md.
 """
 import jax
 import jax.numpy as jnp
@@ -74,7 +74,7 @@ print("hops per walker: mean", round(float(res.per_item.mean()), 1), " max", int
       " truncated", int(res.stats["n_truncated"]))
 
 # The same program in plain JAX: jax.vmap of the SAME walker loop, then one scatter-add.  This is the arm
-# docs/performance.md calls `jax.vmap + while_loop`; it has no gradient, because JAX cannot
+# docs/performance_detail.md calls `jax.vmap + while_loop`; it has no gradient, because JAX cannot
 # reverse-differentiate a while_loop whose trip count depends on the data.
 def plain(theta):
     acc, _ = jax.vmap(walk, in_axes=(0, 0, None))(x0, keys, theta)

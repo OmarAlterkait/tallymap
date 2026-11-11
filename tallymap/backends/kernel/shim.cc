@@ -1,4 +1,4 @@
-// tallymap cuda backend: ONE generic XLA FFI handler that launches NVRTC-compiled simt kernels.
+// tallymap kernel backend, CUDA target: ONE generic XLA FFI handler that launches NVRTC-compiled simt kernels.
 //
 // Python compiles a kernel module (CUBIN) per program and registers its image here under a 64-bit id
 // (tallymap_register).  At execution the handler lazily loads the module into the CURRENT CUDA context

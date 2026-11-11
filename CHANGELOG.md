@@ -24,12 +24,30 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   and at parity (1.0-1.1x) on long uniform loops, gradients 8.6-54x; against plain `jax.jit` on one device, forward
   27-129x (README "Backends", `docs/performance.md`).
 
+### Several devices: sharded `jax.jit`
+
+- Shard the item axis with ordinary JAX sharding (`jax.device_put(xs, NamedSharding(mesh, P("d")))` and `jax.jit`)
+  and each device runs the call on its own items: tallies and stats are summed over the devices (`psum`), per-item
+  results stay split like the items. Before, XLA all-gathered every operand and ran the whole call on every
+  device. The rule is JAX's `custom_partitioning`, so it covers jvp, grad, jacfwd, spawn and the tree adjoint
+  with no tallymap API; GSPMD and Shardy both work. Measured at 2^20 items, 4 devices: L40S forward 0.22 ms
+  (0.93 ms before; one device 0.25 ms: this toy does not fill one GPU), CPU 4 forced host devices 25 ms against
+  39 ms on one, with half the CPU time.
+- On the CPU the devices running a call share the process's CPUs: each gets `OMP_NUM_THREADS` (else the CPU
+  set) divided by their number, instead of each oversubscribing the node.
+- A spawn `Queue(capacity)` is per device under sharding (the total capacity is capacity x devices).
+- New suite `tests/sharding.py` (4 forced CPU devices when there is one GPU or none), with a negative control.
+
 ### Removed
 
 - `backend='cuda'` raises `ValueError` saying to use `backend='auto'`, which runs the same kernel on a GPU.
 
 ### Changed
 
+- The cache directory variable is `TALLYMAP_CACHE` (it holds CPU kernels too); `TALLYMAP_CUDA_CACHE` still works.
+- `docs/performance.md` is the summary (method, headline, CPU); every per-problem table and plot moved to
+  `docs/performance_detail.md`. `docs/design.md` is a short map of why each part exists; the full record of
+  measurements, including the removed and refuted alternatives, is `docs/design_notes.md`.
 - `tm.diagnostics()['kernels'][i]` has `target` (`'cuda'` | `'cpu'`); CPU kernels report `resources` as their
   stack bound. `tm.diagnostics()['host']`: the CPU compiler, its `-march=native` identity, cache, thread count.
 - The one-time xla-backend warning names the platform it is for (`'rocm'`, ...).

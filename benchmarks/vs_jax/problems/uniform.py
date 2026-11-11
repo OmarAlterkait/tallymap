@@ -5,7 +5,7 @@ divergence at all, so tallymap's scheduling advantage is exactly zero and the on
 loop state in registers instead of round-tripping it to HBM.
 
 This problem was written expecting a loss, on the reasoning that a uniform loop is what `lax.scan` is for.  The
-measurement says otherwise: see `docs/performance.md`.  Register residency on its own is worth a few times the
+measurement says otherwise: see `docs/performance_detail.md`.  Register residency on its own is worth a few times the
 plain-JAX program even with nothing to schedule, and it is where the tally is WRITTEN, not whether the loop is
 uniform, that moves the margin.  The real losses are elsewhere: `dense_state` and `trajectory`, both of which
 have uniform loops too, and both of which lose because the per-item STATE is too big for registers.

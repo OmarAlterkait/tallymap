@@ -118,7 +118,7 @@ def run(p, pi, bc, target="cuda", cuda_math="approx", schedule="item", ndev=1, *
     item at loop-STEP granularity: the item program must have exactly one top-level while loop, else
     UnsupportedError; a program derived from it (jvp, lanes, an adjoint) uses the step schedule
     where it splits and the item schedule otherwise; tm.diagnostics()['kernels'][i]['schedule'] is what ran).
-    Measurements: docs/design.md section 1b.
+    Measurements: docs/design_notes.md section 1b.
     cuda_math: 'approx' (DEFAULT: div.full / sqrt.approx / rsqrt.approx, the PTX XLA:GPU itself emits for f32;
     measured 1.5x fwd / 1.65x jvp faster than ieee; validated by the pre-registered compare runs,
     docs/validation.md) |

@@ -46,7 +46,7 @@ Issues = "https://github.com/OmarAlterkait/tallymap/issues"
 Changelog = "https://github.com/OmarAlterkait/tallymap/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-# cuda backend: JAX's CUDA plugin, which brings NVRTC (the only compiler the backend uses; jax[cuda12] requires
+# kernel backend: JAX's CUDA plugin, which brings NVRTC (the only compiler the backend uses; jax[cuda12] requires
 # nvidia-cuda-nvrtc-cu12 itself from 0.6.2).  A C++17 compiler is needed once, to build the jax.ffi launch shim
 # (tallymap/backends/kernel/shim.cc).
 cuda = [

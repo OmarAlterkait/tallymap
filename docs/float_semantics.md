@@ -6,10 +6,10 @@ math modes, schedules and JAX versions.
 ## Guarantees
 
 1. **RNG is bit-exact.**  `jax.random` inside an item (threefry2x32, typed and raw keys) is emitted bitwise by the
-   cuda backend; the xla backend runs JAX's own ops.  `tests/ops.py` checks bits / uniform / split / randint
+   kernel backend; the xla backend runs JAX's own ops.  `tests/ops.py` checks bits / uniform / split / randint
    bitwise against `jax.jit(jax.vmap(op))`.
 2. **Per-item results do not depend on scheduling.**  Each item is a pure function of its inputs; the schedule (item or step), block
-   size, the item count N and the claim order do not change an item's trajectory on the cuda backend.
+   size, the item count N and the claim order do not change an item's trajectory on the kernel backend.
 3. **f32 sums agree within float reassociation.**  Sum outputs are accumulated with atomics (cuda) or a scatter-add
    (xla; on a GPU also atomic), so their summation order, and their last bits, change from run to run on a GPU.
    CPU runs are deterministic.
@@ -26,7 +26,7 @@ math modes, schedules and JAX versions.
 - **cuda, `cuda_math='approx'` (default)**: f32 division, sqrt and rsqrt use the PTX that XLA:GPU itself emits
   (`div.full.f32`, `sqrt.approx.f32`, `rsqrt.approx.f32`).  Everything else is as in `ieee`.  The justification for
   the default is that sentence: it is the arithmetic a plain JAX program on the same GPU already gets, so choosing
-  `ieee` makes the cuda backend differ from XLA:GPU, not agree with it.  It became the default after the
+  `ieee` makes the CUDA target differ from XLA:GPU, not agree with it.  It became the default after the
   pre-registered `compare` validation (`validation.md`), because IEEE division and square root were the whole gap
   to a hand-tuned kernel.
 - **cuda, `cuda_math='ieee'`**: correctly rounded f32 add / sub / mul / div / sqrt (round to nearest), rsqrt as

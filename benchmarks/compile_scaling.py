@@ -1,14 +1,14 @@
 """How NVRTC's compile time scales with the SIZE of one item, on a reproducible program.
 
 The cuda emitter inlines the whole item into one kernel, so for a large item the compile time IS the size of
-that one function.  `docs/design.md` section 9 has the numbers for the photon-transport engine's 4 MB kernel,
+that one function.  `docs/design_notes.md` section 9 has the numbers for the photon-transport engine's 4 MB kernel,
 which is not public; this is the same curve on a program this repository can run: an item whose loop body is M
 stages of 8-element array arithmetic, so every stage becomes straight-line code.
 
     CS_MS (stage counts, default 25,50,100,150,200)   CS_N (items, default 65536)   CS_LANES (jacfwd columns, 0 = off)
 
 Prints one `CS {json}` line per program: generated source bytes, NVRTC seconds, registers and local bytes.
-Run it with a FRESH TALLYMAP_CUDA_CACHE, or the cached cubins make every compile time 0.
+Run it with a FRESH TALLYMAP_CACHE, or the cached cubins make every compile time 0.
 """
 import json
 import os
