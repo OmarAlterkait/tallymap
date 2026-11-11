@@ -113,7 +113,7 @@ def _phys_in(x):
     return jax.random.key_data(x) if is_key_dtype(x.dtype) else x
 
 
-def run(p, pi, bc, target="cuda", cuda_math="approx", schedule="item", **_):
+def run(p, pi, bc, target="cuda", cuda_math="approx", schedule="item", ndev=1, **_):
     """schedule: 'item' (DEFAULT: a thread runs one whole item at a time) | 'step' (a thread is refilled with a new
     item at loop-STEP granularity: the item program must have exactly one top-level while loop, else
     UnsupportedError; a program derived from it (jvp, lanes, an adjoint) uses the step schedule
@@ -162,7 +162,7 @@ def run(p, pi, bc, target="cuda", cuda_math="approx", schedule="item", **_):
         call = jax.ffi.ffi_call(host.TARGET, rs, has_side_effect=False)
         stack = kern.info["stack"] if kern.info["stack"] is not None else 1 << 62    # (unknown: the caller waits)
         res = call(*args, kernel_id=np.int64(kern.kid), n_zero=np.int32(L.n_zero), flags=np.int32(L.flags),
-                   n_items=np.int64(N), stack=np.int64(stack))
+                   n_items=np.int64(N), stack=np.int64(stack), n_dev=np.int32(ndev))
     else:
         call = jax.ffi.ffi_call(C.TARGET, rs, has_side_effect=False)
         res = call(*args, kernel_id=np.int64(kern.kid), block=np.int32(kern.block), n_zero=np.int32(L.n_zero),

@@ -83,7 +83,7 @@ extern "C" int tallymap_host_register(int64_t id, void* fn) {
 extern "C" int tallymap_host_threads() { return default_threads(); }
 
 static ffi::Error HostLaunchImpl(ffi::RemainingArgs args, ffi::RemainingRets rets, int64_t kernel_id, int32_t n_zero,
-                                 int32_t flags, int64_t n_items, int64_t stack) {
+                                 int32_t flags, int64_t n_items, int64_t stack, int32_t n_dev) {
   SjHostRun run = nullptr;
   {
     std::lock_guard<std::mutex> lk(g_mu);
@@ -106,7 +106,9 @@ static ffi::Error HostLaunchImpl(ffi::RemainingArgs args, ffi::RemainingRets ret
     p.push_back(ptr);
   }
   if (n_items <= 0) return ffi::Error::Success();
-  int nt = default_threads();
+  // n_dev: the devices of this computation that run it at once (a sharded jit): they share the process's CPUs
+  int nt = default_threads() / (n_dev > 1 ? n_dev : 1);
+  if (nt < 1) nt = 1;
   if (!(flags & 4) && (long long)nt > n_items) nt = (int)n_items;
   // the caller works only when its own stack holds the kernel's frames; otherwise it is an extra, idle member
   const int idle = caller_free_stack() >= stack + CALLER_MARGIN ? 0 : 1;
@@ -145,4 +147,5 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(TallymapHostLaunch, HostLaunchImpl,
                                   .Attr<int32_t>("n_zero")
                                   .Attr<int32_t>("flags")
                                   .Attr<int64_t>("n_items")
-                                  .Attr<int64_t>("stack"));
+                                  .Attr<int64_t>("stack")
+                                  .Attr<int32_t>("n_dev"));

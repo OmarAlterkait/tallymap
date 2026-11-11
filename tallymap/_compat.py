@@ -57,6 +57,18 @@ def register_batcher(prim, rule):
     fancy[prim] = wrapped
 
 
+# ------------------------------------------------------------------------------------------- sharding
+def requires_devices(prim):
+    """mark `prim` as lowered with the concrete device assignment, as JAX marks custom_partitioning itself: its
+    lowering rule binds a custom_partitioning call, which needs the devices, and JAX finds that out only from this
+    set (jax._src.dispatch.prim_requires_devices_during_lowering; private, so feature-detected)."""
+    try:
+        from jax._src import dispatch
+        dispatch.prim_requires_devices_during_lowering.add(prim)
+    except (ImportError, AttributeError):
+        pass
+
+
 # ------------------------------------------------------------------------------------------- jaxpr types
 def drop_var(aval):
     """a jaxpr DropVar of `aval` (jax.extend.core from 0.10.2; jax.core up to 0.10.2, removed there in 0.11)."""

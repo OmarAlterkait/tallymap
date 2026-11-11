@@ -43,12 +43,12 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 from jax.core import ShapedArray
-from jax.extend.core import Primitive, jaxpr_as_fun
+from jax.extend.core import ClosedJaxpr, Primitive, jaxpr_as_fun
 from jax.interpreters import ad, mlir
 from jax.interpreters import partial_eval as _pe
 
 from ._api import _WARNED, ItemProgram, UnsupportedError, _mk, _sds, jvp_prog
-from ._compat import NM, drop_var, register_batcher
+from ._compat import NM, drop_var, register_batcher, requires_devices
 from ._reverse import vjp_prog
 from ._rewrite import isfloat
 
@@ -155,7 +155,7 @@ tallymap_jvp_p.def_abstract_eval(_abstract)
 KERNEL_PLATFORMS = ("cuda", "cpu")     # platforms the kernel backend compiles for; JAX's lowering platform decides
 
 
-def _run(node, args, platform):
+def _run(node, args, platform, ndev=1):
     """platform: the one JAX is lowering this computation for ('cuda', 'cpu', or another).  tallymap never picks a
     device: jax.default_device, device_put and jit placement decide where the computation runs, and so which
     kernel target (or, on a platform the kernel backend does not compile for, the xla backend) runs it."""
@@ -174,7 +174,7 @@ def _run(node, args, platform):
         return list(XB.run(p, pi, bc, **opts))
     from .backends import kernel as KB
     try:
-        return list(KB.run(p, pi, bc, target=platform, **opts))
+        return list(KB.run(p, pi, bc, target=platform, ndev=ndev, **opts))
     except UnsupportedError as e:
         # (C1) backend='auto' never falls back: the xla backend is the portable interpreter, not a fast path
         # (measured: a 7 ms cuda program took 678 ms on it), so a silent fallback is a silent ~100x slowdown
@@ -195,16 +195,105 @@ def _warn_once(msg, site=None):
         warnings.warn_explicit(msg, UserWarning, site[0], site[1])
 
 
+# ------------------------------------------------------------------------------------------- sharding
+# Under a sharded jax.jit, items are independent: each device runs the call on its own items (the per-item operands
+# split along the item axis, the broadcast operands whole), per-item results stay split, and the tallies and stats,
+# which are sums over items, are summed over the devices (psum).  Registered with JAX's custom_partitioning, the
+# usual way for a custom call; without it XLA gathers every operand and runs the whole call on every device.
+# `c` (the one static argument) = (node, platform, nc, call): the call's nc array constants come first among the
+# operands (replicated: custom_partitioning takes no closed-over constants), `call` is the whole-array program.
+def _item_axes(c, arg_shapes):
+    """the mesh axes the first per-item operand's item axis is split over (None: not split)."""
+    node, _, nc, _ = c
+    if not node.prog.nP:
+        return None
+    spec = getattr(arg_shapes[nc].sharding, "spec", None)
+    return spec[0] if spec is not None and len(spec) and spec[0] is not None else None
+
+
+def _shardings(c, mesh, arg_shapes, result_shape):
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    node, _, nc, _ = c
+    p = node.prog
+    out_avals = jax.tree_util.tree_leaves(result_shape)
+    ax = _item_axes(c, arg_shapes)
+    rep = NamedSharding(mesh, P())
+    item = (lambda nd: NamedSharding(mesh, P(ax, *([None] * (nd - 1))))) if ax is not None else (lambda nd: rep)
+    args = [rep] * nc + [item(len(a.shape)) for a in arg_shapes[nc:nc + p.nP]] + [rep] * (len(arg_shapes) - nc - p.nP)
+    nsum = len(out_avals) - p.nY                     # [sum tallies] + [stats]: replicated
+    outs = [rep] * nsum + [item(len(a.shape)) for a in out_avals[nsum:]]
+    return ax, tuple(args), outs                     # (pytrees: the operands are a tuple, the results a list)
+
+
+def _cp_infer(c, mesh, arg_shapes, result_shape):
+    return _shardings(c, mesh, arg_shapes, result_shape)[2]
+
+
+def _cp_partition(c, mesh, arg_shapes, result_shape):
+    node, plat, nc, _ = c
+    ax, args_sh, outs_sh = _shardings(c, mesh, arg_shapes, result_shape)
+    axes = () if ax is None else ax if isinstance(ax, tuple) else (ax,)
+    ndev = int(np.prod([mesh.shape[a] for a in axes]))
+    nsum = len(outs_sh) - node.prog.nY
+
+    def lower(*a):                                   # the call on this device's items
+        outs = _run(node, a[nc:], plat, ndev=ndev)
+        return [lax.psum(o, axes) for o in outs[:nsum]] + list(outs[nsum:]) if axes else outs
+    return mesh, lower, outs_sh, args_sh
+
+
+def _sharding_rule(c, mesh, arg_shapes, result_shape):
+    """the Shardy form of the same rule: factor i = the item axis; every other dimension its own factor."""
+    from jax.experimental.custom_partitioning import SdyShardingRule
+    node, _, nc, _ = c
+    p = node.prog
+    out_avals = jax.tree_util.tree_leaves(result_shape)
+    n = iter(range(1 << 30))
+    dims = lambda a, lead: (("i",) if lead else ()) + tuple(f"d{next(n)}" for _ in a.shape[lead:])
+    nsum = len(out_avals) - p.nY
+    ins = [dims(a, int(nc <= k < nc + p.nP)) for k, a in enumerate(arg_shapes)]
+    outs = [dims(a, int(k >= nsum)) for k, a in enumerate(out_avals)]
+    return SdyShardingRule(tuple(ins), tuple(outs))
+
+
+def _cp_fun(c, *a):
+    return jaxpr_as_fun(c[3])(*a)
+
+
+_CP = []
+
+
+def _partitioned(node, plat, args):
+    if not _CP:
+        from jax.experimental.custom_partitioning import custom_partitioning
+        f = custom_partitioning(_cp_fun, static_argnums=(0,))
+        f.def_partition(partition=_cp_partition, infer_sharding_from_operands=_cp_infer,
+                        sharding_rule=_sharding_rule)
+        _CP.append(f)
+    cj = jax.make_jaxpr(lambda *a: _run(node, a, plat))(*args)
+    call = ClosedJaxpr(_pe.convert_constvars_jaxpr(cj.jaxpr), ())
+    return _CP[0]((node, plat, len(cj.consts), call), *cj.consts, *args)
+
+
+def _multi_device(ctx):
+    """lowered for more than one device (a sharded jit); a single device needs no partitioning rule."""
+    da = getattr(ctx.module_context.axis_context, "device_assignment", None)
+    return da is not None and len(da) > 1
+
+
 def _lowering(platform):
     def f(*args, node, plat):
         return _run(node, args, plat)
-    low = mlir.lower_fun(f, multiple_results=True)
+
+    def fp(*args, node, plat):
+        return _partitioned(node, plat, args)
+    low, lowp = mlir.lower_fun(f, multiple_results=True), mlir.lower_fun(fp, multiple_results=True)
 
     def rule(ctx, *args, node):
         # the default rule (platform None) serves every platform without its own: name the one being lowered for
         plat = platform or (ctx.module_context.platforms[0] if ctx.module_context.platforms else "unknown")
         try:
-            return low(ctx, *args, node=node, plat=plat)
+            return (lowp if _multi_device(ctx) else low)(ctx, *args, node=node, plat=plat)
         except UnsupportedError:
             raise
         except Exception as e:
@@ -217,6 +306,7 @@ def _lowering(platform):
 
 
 for _p in (tallymap_call_p, tallymap_jvp_p):
+    requires_devices(_p)
     mlir.register_lowering(_p, _lowering(None))
     for _plat in KERNEL_PLATFORMS:
         mlir.register_lowering(_p, _lowering(_plat), platform=_plat)
