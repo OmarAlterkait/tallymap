@@ -5,7 +5,9 @@
 
 It runs the target JAX places the computation on: the cuda target on a GPU (both math modes), the CPU target
 elsewhere (one mode, 'ieee': the host target is IEEE whatever cuda_math says; judged by the ieee bounds, with the
-libm math library where the GPU has libdevice, so `lib` holds glibc to libdevice's documented bounds).
+libm math library where the GPU has libdevice, so `lib` holds glibc to libdevice's documented bounds).  XLA:CPU
+flushes subnormals to zero and the CPU target does not (IEEE), so there `exact` rows skip the elements with a
+subnormal f32 input (reported as subnormal_excluded) and the subnormal_ieee row asserts the IEEE results.
     env OPS=add,exp (subset)  N (262144 items)  OPS_BASELINE (another baseline file)
 
 Each op is one item (= one element): tm.vmap(op, backend='auto') for cuda_math in {ieee, approx}, against
@@ -255,6 +257,30 @@ def exact_ref(f, xs):
         jax.config.update("jax_enable_x64", x64)
 
 
+def _subnormal(x):
+    x = np.asarray(x)
+    if x.dtype != np.float32:
+        return np.zeros(x.shape[:1], bool)
+    v = (x != 0) & (np.abs(x) < np.finfo(np.float32).tiny)
+    return v.reshape(v.shape[0], -1).any(1)
+
+
+def subnormal_ieee():
+    """the CPU target keeps subnormals (IEEE), where XLA:CPU flushes them: results asserted, not compared with XLA."""
+    t = np.float32(1e-45)                                                  # the smallest subnormal
+    cases = {"sign": (jnp.sign, [t], np.float32(1.0)), "ceil": (jnp.ceil, [t], np.float32(1.0)),
+             "max": (jnp.maximum, [t, -t], t), "add": (lambda a, b: a + b, [t, t], np.float32(2.8e-45)),
+             "mul": (lambda a, b: a * b, [np.float32(1e-38), np.float32(0.5)], np.float32(5e-39)),
+             "cmp": (lambda a: (a > 0).astype(jnp.float32), [t], np.float32(1.0))}
+    bad = {}
+    for k, (f, a, want) in cases.items():
+        g = tm.vmap(lambda tt, *x: (tt, f(*x)), outputs={"_": tm.Sum((1,))}, in_axes=(0,) * len(a), backend="auto")
+        got = np.asarray(jax.jit(g)(*[jnp.asarray([v]) for v in a]).per_item)[0]
+        if got.view(np.int32) != np.float32(want).view(np.int32):
+            bad[k] = (repr(got), repr(np.float32(want)))
+    return dict(op="subnormal_ieee", cls="cr", math="ieee", n=len(cases), ok=not bad, wrong=bad)
+
+
 def run_op(name, f, kinds, cls, bound):
     xs = [inp(k) for k in kinds]
     xj = [jnp.asarray(x) for x in xs]
@@ -265,9 +291,16 @@ def run_op(name, f, kinds, cls, bound):
         g = tm.vmap(lambda t, *a: (t, f(*a)), outputs={"_": tm.Sum((1,))}, in_axes=(0,) * len(xs), backend="auto",
                     cuda_math=math)
         got = np.asarray(jax.jit(g)(*xj).per_item)
-        mx, ux, nx = diff(xla, got)
+        keep = None
+        if cls == "exact" and not GPU:
+            # XLA:CPU flushes subnormals to zero; the CPU target is IEEE (asserted by the subnormal_ieee row), so the
+            # elements with a subnormal f32 input are not compared with XLA here
+            keep = ~np.logical_or.reduce([_subnormal(x) for x in xs])
+        mx, ux, nx = diff(xla[keep] if keep is not None else xla, got[keep] if keep is not None else got)
         row = dict(op=name, cls=cls, math=math, n=int(np.asarray(xla).size), xla_mismatch=mx, xla_max_ulp=ux,
                    tm_sha=hashlib.sha1(np.ascontiguousarray(got).tobytes()).hexdigest()[:16])
+        if keep is not None:
+            row["subnormal_excluded"] = int((~keep).sum())
         if cls == "exact":
             row["ok"] = mx == 0
         elif cls in ("cr", "lib"):
@@ -331,6 +364,10 @@ def main():
                 print("OP", json.dumps(r), flush=True)
             rows += rs
     jax.config.update("jax_enable_x64", False)
+    if not GPU and not SEL:
+        r = subnormal_ieee()
+        print("OP", json.dumps(r), flush=True)
+        rows.append(r)
     meas = ("tm_sha", "exact_mismatch", "exact_max_ulp", "exact_nonfinite", "error")    # not xla_*: see the docstring
     cur = {f"{r['op']}/{r['math']}": {k: r.get(k) for k in meas if k in r} for r in rows}
     base = json.load(open(BASE)) if os.path.exists(BASE) else {}
