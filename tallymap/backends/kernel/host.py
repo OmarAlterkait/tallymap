@@ -15,6 +15,7 @@ sj_host_run(phase, buffers, n, n_items, tid, nthreads), which the shim calls on 
 per toolchain, like the cuda shim) owns the threads and the FFI binding.
 """
 import ctypes
+import glob
 import hashlib
 import os
 import platform
@@ -45,7 +46,9 @@ HOST_PRELUDE = r"""
 #include <sched.h>
 #define __device__
 #define __global__
-#define __forceinline__ inline __attribute__((always_inline))
+// __forceinline__ is a hint here: GCC's own inliner decides.  Forcing it (always_inline) inlined four threefry2x32
+// bodies into one loop and sent GCC 11's value-range pass past 100 s at -O2 on a 389-line kernel (2.2 s without)
+#define __forceinline__ inline
 #define __noinline__ __attribute__((noinline))
 #define __launch_bounds__(...)
 #define __shared__
@@ -238,12 +241,10 @@ def compile_so(src, where="", note=""):
         if r.returncode:
             raise RuntimeError(f"tallymap: compiling the host kernel failed (internal error; backend='xla' runs the "
                                f"program meanwhile):\n{' '.join(cmd)}\n{r.stderr[-4000:]}")
-        # -fstack-usage writes <output stem>.su next to the output; normalise its name to the kernel's
-        for cand in (tmp.rsplit(".", 1)[0] + ".su", os.path.join(d, os.path.basename(tmp) + ".su"),
-                     os.path.join(d, f"k_{h}.su")):
-            if os.path.exists(cand) and cand != su:
+        # -fstack-usage names its file after the output and the source (GCC 11: <tmp>-k_<h>.su); take it by pattern
+        for cand in glob.glob(os.path.join(d, f"*{h}*.su")):
+            if cand != su:
                 os.replace(cand, su)
-                break
         os.replace(tmp, so)
     dt = time.perf_counter() - t
     stack = _stack_bytes(su)
