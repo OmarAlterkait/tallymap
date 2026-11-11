@@ -54,6 +54,10 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 - `tm.diagnostics()['kernels'][i]` has `target` (`'cuda'` | `'cpu'`); CPU kernels report `resources` as their
   stack bound. `tm.diagnostics()['host']`: the CPU compiler, its `-march=native` identity, cache, thread count.
 - The one-time xla-backend warning names the platform it is for (`'rocm'`, ...).
+- `examples/demos/`: each demo is one short `run.py` (`python run.py [--n N]`: the arms, the agreement checks, a
+  timing) and a short README with the measured numbers unchanged. The sweep driver (`--full`/`--one`/`--plots`,
+  results JSON, plots) is gone; it is at tag `v0.6.0rc1` for reproducing the numbers. A missing incumbent library
+  is reported and skipped, not a failure.
 
 ## 0.6.0 - 2026-11-11
 

@@ -1,12 +1,11 @@
 # Demos: tallymap against the libraries people use
 
-Each folder takes a real library's own code or its own problem, runs it as that library ships it, and runs the
-same computation through tallymap.  Nothing is vendored: every demo imports the incumbent from a pinned
-release.  Where a demo re-implements an algorithm instead of calling it, or has no incumbent library at all,
-its README says so in its first section.
+Each folder runs a real library's own code or its own problem as that library ships it, and the same computation
+through tallymap.  Nothing is vendored: the incumbent is imported from a pinned release (`requirements.txt` in
+each folder).  Two of the eight have no incumbent library, because none exists in JAX for that problem; those
+compare against the best plain-JAX program and say so.
 
-Demos are optional.  They are not in the default test suite, they are not installed with the package, and each
-folder carries its own `requirements.txt`.
+Demos are optional: they are not in the test suite and not installed with the package.
 
 ## The demos
 
@@ -21,61 +20,23 @@ folder carries its own `requirements.txt`.
 | [`adaptive_quadrature`](adaptive_quadrature/) | quadax 0.3.0 | **2.8-18.1x** forward against `quadax.quadgk`, **12.4x** on the gradient with respect to the integrand amplitude, and **98-380x less** device memory for that gradient. | Two different algorithms (locally adaptive Simpson against globally adaptive Gauss-Kronrod), compared at the same tolerance: read it as an execution-model result, not an integration-quality one. |
 | [`branching_epidemic`](branching_epidemic/) | none (plain JAX; the R tools are single-lineage CPU codes) | A spawn tree against the best plain-JAX generation-frontier program: **3.8-13.5x** forward and **4.8-7.6x** on `jacfwd` over four parameters, with the incidence tally bitwise equal. | **Reverse mode is a tie** (1.2-1.7x) and uses 2-4x *more* memory than the frontier scan, so use `jacfwd` here. Two of the four parameters have no pathwise derivative at all. |
 
-Every number above is a row of that demo's `results/` and is reproduced in its README next to the arms it compares. Two of the eight have no incumbent library, because none exists in JAX for that problem; those compare against the best plain-JAX program instead and say so.
-
-The demos were measured at a few different commits of this branch, because two of them were re-measured after a fairness fix. Each `results/<demo>.json` records the commit its own numbers were taken at; the commits after it change plotting and driver plumbing, not the measured programs.
+The numbers are one GPU, one JAX version and one problem size per row: read the ranges, not the best row.  They
+were measured with the full sweep driver (per-measurement processes, peak device memory, results JSON and plots)
+that these folders carried up to tag `v0.6.0rc1`; check out `examples/demos/` at that tag to reproduce them.  A
+speed-up against a library is not a verdict on it: Ray-trax's per-ray grid, quadax's global interval mesh and
+crn-jax's scan-of-while are deliberate designs that buy accuracy, robustness and composability.
 
 ## Running a demo
 
-Every folder has the same entry points:
-
 ```
-python run.py --quick     # CPU, about a minute: runs every arm, checks their answers agree, prints PASS/FAIL
-python run.py --full      # the GPU sweep that regenerates results/*.json and plots/*.png
-python run.py --plots     # redraw plots/ from results/ (both git-ignored), no GPU and no measurement
+cd examples/demos/<demo>
+pip install -r requirements.txt     # the incumbent
+python run.py                       # CPU, small N: runs the arms, checks they agree, times them, prints PASS/FAIL
+python run.py --n 262144            # the same on a GPU at a larger size
 ```
 
-`--quick` is the one to run first: it is the honesty check.  It runs every arm on the same inputs and compares
-their answers, so you can see for yourself that the comparison is between two programs that compute the same
-thing.  `--full` re-execs itself once per measurement so that each one gets a fresh process and the device
-peak-memory counter means something.
-
-## What all the demos share
-
-`_demo.py` holds the measurement protocol, the results bookkeeping and the plotting, so that every demo
-measures the same way:
-
-- median `jax.jit` wall time per call after a warm-up, with `jax.block_until_ready` on the result;
-- compile time measured separately and reported as `lower_s` (trace, plus any CUDA kernel build) and
-  `xla_compile_s`;
-- peak device memory from the device allocator's own `peak_bytes_in_use` counter, one measurement per process;
-- one JSON row per measurement in `results/`, with the GPU, the JAX version, the incumbent versions and the
-  tallymap commit in the same file;
-- one plot per mode.  Forward time, gradient time and peak memory are never mixed in one axes, there is no
-  second y axis anywhere, and identity is carried by colour and marker and a direct end label.
-
-## How the comparisons are kept fair
-
-- The incumbent is imported from a pinned release and called the way its own documentation says to batch.
-  Where its docs recommend `jax.pmap` instead of `jax.vmap`, the demo runs that too and reports what it gives.
-- Where an arm has to be padded to a fixed trip count, it is padded to the **observed maximum** at the largest
-  N and the same divergence level, measured by a calibration run in the same sweep and recorded in
-  `results/<demo>.json` under `meta.scan_lengths`.  Nothing is padded to an inflated cap, which is the easiest
-  way to make a baseline look bad.
-- Every demo carries a control arm that runs the **identical Python function** as the tallymap item under
-  `jax.vmap`, so there is one column where the only difference is the execution model.
-- Every "x vs best baseline" column takes the **better** of the baselines at that row, never the worse one, and
-  never another tallymap arm.
-- Every demo's `--quick` compares the arms' answers, and its README says what kind of agreement to expect:
-  bitwise, one f32 ulp, the solver tolerance, or statistical where the two arms consume different random
-  streams.
-- Every README has a section on where tallymap loses or the margin shrinks, with the measurement behind it.
-
-## What these numbers are not
-
-- They are one GPU, one JAX version and one problem size per row.  Read the ranges, not the best row.
-- Several demos have no incumbent library, because none exists in JAX for that problem.  Those compare against
-  plain JAX, and their READMEs say so rather than implying a library comparison.
-- A speed-up against a library is not a verdict on that library.  Ray-trax's per-ray grid, quadax's global
-  interval mesh and crn-jax's scan-of-while are deliberate designs that buy accuracy, robustness and
-  composability; what is measured here is one configuration of each against a different execution model.
+`run.py` is the honesty check: it runs the tallymap item and the incumbent (or plain-JAX) arm on the same inputs
+and compares their answers, bitwise, to the solver tolerance, or statistically where the arms consume different
+random streams.  Where the item itself calls the library (`gillespie_crn`, `gymnax_rollouts`) a missing library
+makes the demo exit with a message saying which one it needs; elsewhere only the library's arm is skipped, and the
+tallymap item is still checked against the identical function under `jax.vmap` or a plain-JAX rewrite.

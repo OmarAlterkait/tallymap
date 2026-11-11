@@ -1,5 +1,5 @@
 # Ray-trax is a source repository with no packaging, so it cannot be pinned here.  Clone it at the commit the
-# measurements used and put it on PYTHONPATH, or pass --raytrax <dir>:
+# measurements used and put it in RAYTRAX_PATH:
 #
 #   git clone https://github.com/lorenzobranca/Ray-trax.git
 #   git -C Ray-trax checkout 89347946fba4eb47817ea6e7ab76ec8ff9117614
@@ -7,4 +7,3 @@
 #
 # This is the version the measurements used.
 jax==0.11.2
-matplotlib
