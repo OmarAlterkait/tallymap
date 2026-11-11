@@ -45,6 +45,9 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 ### Changed
 
 - The cache directory variable is `TALLYMAP_CACHE` (it holds CPU kernels too); `TALLYMAP_CUDA_CACHE` still works.
+- Nothing a program writes is in git any more: the benchmark plots, the measured rows, the demos' plots and results,
+  and the `tests/ops.py` and `benchmarks/perf.py` baselines (now recorded per machine in `$TALLYMAP_CACHE`). The
+  docs keep the numbers as tables; `make_tables.py` no longer draws figures.
 - `docs/performance.md` is the summary (method, headline, CPU); every per-problem table and plot moved to
   `docs/performance_detail.md`. `docs/design.md` is a short map of why each part exists; the full record of
   measurements, including the removed and refuted alternatives, is `docs/design_notes.md`.

@@ -294,7 +294,7 @@ def parser(**extra):
     g.add_argument("--full", action="store_true", help="the GPU sweep that regenerates results/ and the plots")
     g.add_argument("--one", action="store_true", help="one measurement; prints one ROW line")
     g.add_argument("--plots", action="store_true",
-                   help="redraw plots/ from the committed results/, without measuring anything")
+                   help="redraw plots/ from results/ (both git-ignored), without measuring anything")
     p.add_argument("--arm", default="tm")
     p.add_argument("--mode", default="fwd")
     p.add_argument("--n", type=int, default=1 << 16)

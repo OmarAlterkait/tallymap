@@ -105,9 +105,7 @@ Peak device memory on the same runs:
 | 16,384 | 64.7 | 64.7 | 2,113 | 1,073 | 1.44 | 1.44 | **32.7x** |
 | 65,536 | 65.3 | 65.3 | 8,305 | 1,073 | 5.5 | 5.5 | **127x** |
 
-![forward time](plots/ray_fwd_time.png)
 
-![forward peak memory](plots/ray_fwd_mem.png)
 
 ### Ray-trax's problem, reverse-mode gradient
 
@@ -121,9 +119,7 @@ A weighted least-squares loss against a target field, differentiated with respec
 | 16,384 | 0.749 | 0.697 | 14.6 | 18 | 4.94 | 5.61 | **6.6x** | 19.5x | 64.7 | 2,192 | 129 |
 | 65,536 | 2.77 | 2.45 | 48.1 | 71.7 | 11 | 11.1 | **3.96x** | 17.3x | 65.3 | 8,735 | 294 |
 
-![gradient time](plots/ray_grad_time.png)
 
-![gradient peak memory](plots/ray_grad_mem.png)
 
 ### The voxel-count sweep: the O(rays x voxels) wall
 
@@ -135,7 +131,6 @@ A weighted least-squares loss against a target field, differentiated with respec
 | 32^3 = 32,768 | 0.382 / 8.52 / 10.3 / 2.95 | 0.746 / 19.5 / 26.3 / 9.94 | 65 / 2,113 | **32.7x** |
 | 64^3 = 262,144 | 0.463 / 52.9 / 106 / 5.02 | 1.15 / 87.9 / 243 / 14.4 | 69 / 16,789 | **243x** |
 
-![forward time vs voxels](plots/ray_grid_fwd.png)
 
 ### The horizon sweep
 
@@ -159,7 +154,6 @@ arms pay the pad.
 | 1,048,576 | 1.86 | 48 | 165 | 166 | **25.8x** | 9.5 / 105 | 384 | 0 |
 | 4,194,304 | 6.68 | 330 | 1,000 | 1,000 | **49.4x** | 9.5 / 124 | 384 | 0 |
 
-![Monte-Carlo forward time](plots/mc_fwd_time.png)
 
 ### Volumetric Monte-Carlo transport, reverse-mode gradient
 
@@ -171,9 +165,7 @@ With respect to both fields (8,192 parameters) and the three global parameters.
 | 262,144 | 9.29 | 97.6 | 97.5 | **10.5x** | 74.1 | 4,542 | 522 | **61.3x** |
 | 1,048,576 | 54.8 | 384 | 427 | **7.01x** | 72.1 | 18,172 | 1,780 | **252x** |
 
-![Monte-Carlo gradient time](plots/mc_grad_time.png)
 
-![Monte-Carlo gradient peak memory](plots/mc_grad_mem.png)
 
 ## Where tallymap loses, or the margin shrinks
 

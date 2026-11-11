@@ -51,7 +51,6 @@ Median `jax.jit` wall time per call after warm-up, one measurement per process s
 | 262,144 | 5.81 | 28.5 | 57.8 | **4.91x** | 64.4 / 123 | 67 | 901 |
 | 1,048,576 | 20.3 | 368 | 403 | **18.1x** | 64.4 / 125 | 76 | 3,609 |
 
-![forward time](plots/fwd_time.png)
 
 ### Gradient with respect to the integrand amplitude
 
@@ -60,9 +59,7 @@ Median `jax.jit` wall time per call after warm-up, one measurement per process s
 | 65,536 | 17.5 | 216 | **12.4x** | 64.8 | 6,363 | **98.3x** |
 | 262,144 | 76.4 | 952 | **12.5x** | 67 | 25,491 | **380x** |
 
-![gradient time](plots/grad_time.png)
 
-![gradient peak memory](plots/grad_mem.png)
 
 quadax's `max_ninter=50` default is what makes its gradient need 24.9 GB at 262,144 integrals: it carries a global interval mesh per item and reverse mode keeps it. A user can lower `max_ninter`, which would cut that memory and change the algorithm's robustness; this demo leaves the library at its default rather than tuning it down to flatter the comparison.
 

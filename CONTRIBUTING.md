@@ -12,7 +12,7 @@ python tests/run_all.py --only edge,reverse  # one or more suites
 python tests/run_all.py --x64                # with jax_enable_x64
 python tests/run_all.py --unfused            # the two-node JVP design (the fallback if JAX drops a registry)
 python tests/run_all.py --canary             # DeprecationWarning and FutureWarning become errors
-python benchmarks/perf.py                    # jit wall times against benchmarks/perf_baseline.json
+python benchmarks/perf.py                    # jit wall times against this GPU's recorded baseline
 ```
 
 `python tests/run_all.py` is the entry point. **`pytest` is not the runner.** Each suite needs fresh JAX state,
@@ -112,8 +112,9 @@ silently ignored. Then:
 If a change is declared "no behaviour change", prove it: identical StableHLO, identical generated CUDA source and
 identical cubins, with bitwise-equal outputs wherever the base's own reruns are bitwise equal.
 
-Re-record `benchmarks/perf_baseline.json` or `tests/ops_baseline.json` only in a commit of its own, and only when
-the change in the numbers is intended.
+Re-record a baseline (`benchmarks/perf.py --record`, `tests/ops.py --record`) only when the change in the numbers is
+intended. Baselines are recorded per machine (`$TALLYMAP_CACHE`, or `PERF_BASELINE` / `OPS_BASELINE`) and are not
+committed: nothing a program writes goes in git.
 
 ## Code style
 

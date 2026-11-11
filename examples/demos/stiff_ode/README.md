@@ -82,9 +82,7 @@ This removes the step-count difference between the re-implementation and diffrax
 | 65,536 | 0.0788 | 7.58 | 13.6 | **96.2x** | **173x** |
 | 262,144 | 0.0638 | 2.71 | 6.16 | **42.5x** | **96.6x** |
 
-![forward time](plots/fwd_time.png)
 
-![forward cost per item-solver-step](plots/fwd_per_step.png)
 
 ### Reverse-mode gradient
 
@@ -98,9 +96,7 @@ is far smaller than it is against a padded scan in the other demos.
 | 65,536 | 166 | 3,916 | **23.6x** | 65.8 | 301 | **4.58x** |
 | 262,144 | 654 | 12,776 | **19.5x** | 70 | 1,203 | **17.2x** |
 
-![gradient time](plots/grad_time.png)
 
-![gradient peak memory](plots/grad_mem.png)
 
 ### Forward-mode derivatives
 

@@ -307,7 +307,7 @@ one launch per parameter and the tree adjoint wins from about 4 parameters (4-24
 the value once.
 
 Measured `jax.jit` wall time per call on the toy walk of `benchmarks/` (1M items, a 256-bin table, L40S, JAX
-0.5.3, `benchmarks/perf_baseline.json`): forward 0.65 ms, `jvp` 0.72 ms, `jacfwd(8)` 4.92 ms, `grad` 2.25 ms.
+0.5.3, the `benchmarks/perf.py` baseline): forward 0.65 ms, `jvp` 0.72 ms, `jacfwd(8)` 4.92 ms, `grad` 2.25 ms.
 
 Second order (`hessian`, Hessian-vector products, `jacrev(jacfwd)`, grad-of-grad) composes from the same rules,
 except through the spawn tree adjoint, which raises.

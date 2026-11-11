@@ -92,13 +92,13 @@ they were run on. Nothing in this repository depends on them.
 | every transformation against the same transformation of the dense reference | `tests/transforms.py` |
 | reverse mode, including sparse table cotangents, the single-loop adjoint and the replay gate | `tests/reverse.py` |
 | the spawn tree adjoint against `jax.grad` of a dense plain-JAX reference, with four negative controls | `tests/reverse_spawn.py` |
-| per-operation parity of the CUDA emitter against `jax.jit(jax.vmap(op))` and the host-exact result, with a bound per class and a per-GPU baseline | `tests/ops.py`, `tests/ops_baseline.json` |
+| per-operation parity of the CUDA emitter against `jax.jit(jax.vmap(op))` and the host-exact result, with a bound per class and a per-GPU baseline | `tests/ops.py` (baseline recorded per machine, not in git) |
 | edge cases and every documented failure mode | `tests/edge.py` |
 | a long chain of 64-bit integer multiplies compiles in seconds and matches xla bitwise | `tests/mulchain.py` |
-| speed, against a recorded baseline, as a regression net | `benchmarks/perf.py`, `benchmarks/perf_baseline.json` |
+| speed, against a recorded baseline, as a regression net | `benchmarks/perf.py` (baseline recorded per machine, not in git) |
 | speed and memory against plain JAX | `docs/performance.md` |
 
 ## When to rerun the `compare` protocol
 
 Rerun it whenever `backends/kernel` math or the operation table changes in a way that `tests/ops.py` reports as a
-changed number. Re-record `tests/ops_baseline.json` only after that, and in a commit of its own.
+changed number. Re-record the baseline (`tests/ops.py --record`) only after that.

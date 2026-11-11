@@ -32,7 +32,7 @@ Every folder has the same entry points:
 ```
 python run.py --quick     # CPU, about a minute: runs every arm, checks their answers agree, prints PASS/FAIL
 python run.py --full      # the GPU sweep that regenerates results/*.json and plots/*.png
-python run.py --plots     # redraw plots/ from the committed results/, no GPU and no measurement
+python run.py --plots     # redraw plots/ from results/ (both git-ignored), no GPU and no measurement
 ```
 
 `--quick` is the one to run first: it is the honesty check.  It runs every arm on the same inputs and compares

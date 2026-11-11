@@ -85,7 +85,6 @@ Median `jax.jit` wall time per call after warm-up, one measurement per process s
 
 The how-to's `jax.pmap` recommendation, at 4,096 chains on this single GPU: 20.2 ms against `jax.vmap`'s 20.2 ms. With one device there is nothing for it to spread over, which is exactly why it is not an answer on one GPU.
 
-![NUTS time](plots/nuts_fwd_time.png)
 
 ### NUTS: where the per-chain state stops fitting
 
@@ -106,7 +105,6 @@ absolute times are not comparable across rows.
 The compile column is not monotone in the dimension, because the CUDA kernel cache is warm for some of these
 item shapes and cold for others; read it as "seconds, not milliseconds", not as a trend.
 
-![NUTS vs dimension](plots/nuts_dim.png)
 
 ### Elliptical slice sampling, forward
 
@@ -119,7 +117,6 @@ item shapes and cold for others; read it as "seconds, not milliseconds", not as 
 | 16,384 | 0.594 | 35.7 | **60.1x** | 6,569,600 | 6,569,247 | 1.0001 | 64.8 | 80.8 |
 | 65,536 | 1.69 | 39.2 | **23.3x** | 26,293,879 | 26,276,707 | 1.0007 | 67.3 | 179 |
 
-![elliptical slice time](plots/ess_fwd_time.png)
 
 ### A gradient through the sampler
 
@@ -151,11 +148,8 @@ Reverse-mode gradient:
 
 The `vmap` + `while_loop` column is the error above, not a number: JAX cannot reverse-differentiate that program at all.
 
-![gradient through the sampler, forward](plots/essgrad_fwd_time.png)
 
-![gradient through the sampler, reverse](plots/essgrad_grad_time.png)
 
-![gradient through the sampler, peak memory](plots/essgrad_grad_mem.png)
 
 **Estimator caveat, stated and not fixed.**  The slice acceptance is a hard threshold, so this pathwise
 derivative misses a boundary term.  What is demonstrated is the mechanics: tallymap's gradient is the exact

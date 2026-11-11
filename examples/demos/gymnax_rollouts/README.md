@@ -62,9 +62,7 @@ Peak device memory on the same runs:
 | 65,536 | 64.5 | 81 | 81 |
 | 262,144 | 66 | 85 | 85 |
 
-![forward time](plots/fwd_time.png)
 
-![forward peak memory](plots/fwd_mem.png)
 
 ### The policy sweep, including a zero-divergence control
 
@@ -79,7 +77,6 @@ thing left is register residency, a per-thread kernel keeping the episode state 
 | mid | 28.8 / 187 | 0.336 | 9.86 | 6.56 | **19.5x** |
 | high | 22.3 / 154 | 0.279 | 9.84 | 5.38 | **19.3x** |
 
-![forward time vs policy](plots/fwd_div.png)
 
 ### Gradients
 

@@ -1,7 +1,7 @@
 """Per-operation parity of the kernel op table (backends/kernel/op_table.py), the main maintenance surface.
 
     python tests/ops.py              # judge every op against its stated bound, compare with the baseline
-    python tests/ops.py --record     # (re)write this (device, JAX) entry of tests/ops_baseline.json
+    python tests/ops.py --record     # (re)write this (device, JAX) entry of the baseline file
 
 It runs the target JAX places the computation on: the cuda target on a GPU (both math modes), the CPU target
 elsewhere (one mode, 'ieee': the host target is IEEE whatever cuda_math says; judged by the ieee bounds, with the
@@ -34,7 +34,8 @@ Classes and their bounds (STATED BEFORE THE FIRST RUN; a deliberate change of a 
          ieee 1 ulp; on JAX 0.11.2 it is a primitive and passed the original bound).
   info   compositions (fused patterns, complex arithmetic, dot / reductions, the RNG's normal) and f64 libdevice:
          reported against XLA only (mismatching elements, max ulp), not judged against a bound.
-Every row (all classes) is also compared with tests/ops_baseline.json for this (GPU model, JAX version): the same
+Every row (all classes) is also compared with the baseline file ($OPS_BASELINE, else ops_baseline.json in the
+tallymap cache directory; not in git) for this (GPU model, JAX version): the same
 cubin on the same inputs must give the same numbers, so ANY change is a FAIL until it is re-recorded on purpose.
 The baseline holds tallymap's own output (`tm_sha`, a hash of the per-item result) and the EXACT-judged fields, NOT
 the XLA comparison: XLA's side is not reproducible across processes.  MEASURED on L40S, JAX 0.11.2: in about 1 process
@@ -59,7 +60,8 @@ jax.config.update("jax_default_matmul_precision", "highest")
 import tallymap as tm
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BASE = os.environ.get("OPS_BASELINE") or os.path.join(HERE, "ops_baseline.json")
+CACHE = os.environ.get("TALLYMAP_CACHE") or os.path.expanduser("~/.cache/tallymap")
+BASE = os.environ.get("OPS_BASELINE") or os.path.join(CACHE, "ops_baseline.json")   # recorded per machine, not in git
 N = int(os.environ.get("N", 1 << 18))
 SEL = [o for o in os.environ.get("OPS", "").split(",") if o]
 RECORD = "--record" in sys.argv[1:]

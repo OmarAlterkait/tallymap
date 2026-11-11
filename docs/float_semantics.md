@@ -40,7 +40,7 @@ math modes, schedules and JAX versions.
 
 `tests/ops.py` states the per-operation bounds (bitwise for exact ops; <= 1 ulp for ieee arithmetic; 2-3 ulp for
 the approx PTX; the CUDA Programming Guide bounds for libdevice) and records the measured numbers per GPU and JAX
-version in `tests/ops_baseline.json`.
+version in the `tests/ops.py` baseline.
 
 ## Rules for users
 

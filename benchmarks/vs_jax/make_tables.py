@@ -1,30 +1,19 @@
 """Turn the measured rows in `results/` into the documentation.
 
-    python benchmarks/vs_jax/make_tables.py            # needs numpy and matplotlib; no JAX
+    python benchmarks/vs_jax/make_tables.py [--results DIR]     # needs numpy; no JAX
+
+The rows are what `run.py` writes: `results/` here (git-ignored) or `$VSJ_RESULTS`.  They are not committed.
 
 Writes
     docs/performance.md                  the summary: headline table and the CPU section
     docs/performance_detail.md           the whole measured comparison, per problem and per platform
-    docs/img/<problem>_<mode>.png        one panel per MODE, never two modes in one panel
     benchmarks/vs_jax/readme_table.md    a 12-row headline table for the README
-
-Plot rules kept deliberately tight, because these figures go in the public documentation:
-  * one panel per mode.  Forward time, gradient time and gradient memory are three figures, never three axes of
-    one figure, and there is no second y axis anywhere.
-  * at most three series per panel, so the categorical palette clears the all-pairs colour-vision checks.
-  * identity is carried by colour AND marker AND a label at the end of the line, so the figure survives being
-    printed in grey.
-  * every number in a figure is also in a table.
 """
 import argparse
 import json
 import os
 
-import matplotlib
 import numpy as np
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -44,40 +33,12 @@ ARM = {
     "jax_gen2x":   ("#00897b", "X", "generation vmap + compaction (2x cap)"),
     "diffrax":     ("#5d4037", "*", "diffrax"),
 }
-INK, INK2, GRID = "#0b0b0b", "#52514e", "#d9d8d4"
 MODE_LABEL = {"fwd": "Forward", "grad": "Reverse-mode gradient", "jvp": "Forward-mode jvp",
               "jacfwd": "jacfwd over all parameters", "score": "Forward with the score carry"}
 AXIS_LABEL = {"n": "items N", "d": "state dimension D", "L": "trajectory length L"}
 
-# The three series each panel shows, per problem.  Keep it at three.
-PANELS = {
-    "default": {"fwd": ("tm_cuda", "jax_while", "jax_scan2x"),
-                "grad": ("tm_cuda", "jax_scan2x", "jax_ckpt2x"),
-                "jvp": ("tm_cuda", "jax_scan2x", "jax_ckpt2x"),
-                "jacfwd": ("tm_cuda", "jax_scan2x", "jax_ckpt2x")},
-    "ode_ensemble": {"fwd": ("tm_cuda", "jax_while", "diffrax"),
-                     "grad": ("tm_cuda", "jax_ckpt2x", "diffrax"),
-                     "jvp": ("tm_cuda", "jax_scan2x", "diffrax"),
-                     "jacfwd": ("tm_cuda", "jax_scan2x", "diffrax")},
-    "interacting_md": {"fwd": ("tm_cuda", "jax_while", "jax_pad2x"),
-                       "grad": ("tm_cuda", "jax_ckpt2x", "jax_pad2x")},
-    "shower": {"fwd": ("tm_cuda", "jax_gen", "jax_gen2x"),
-               "grad": ("tm_cuda", "jax_gen", "jax_gen2x")},
-    "trajectory": {"fwd": ("tm_cuda", "jax_scan",)},
-    "dense_state": {"fwd": ("tm_cuda", "jax_while", "jax_scan"),
-                    "grad": ("tm_cuda", "jax_scan")},
-    "gillespie": {"fwd": ("tm_cuda", "jax_while", "jax_scan2x"),
-                  "score": ("tm_cuda", "jax_while", "jax_scan2x")},
-}
-# Figures are drawn for these modes only.  jvp, jacfwd and score stay in the tables: a panel per mode for every
-# mode of every problem would be fifty figures, and the two that carry the argument are forward and gradient.
-FIG_MODES = ("fwd", "grad")
 ORDER = ["random_walk", "transport", "walk_on_spheres", "ode_ensemble", "gillespie", "shower", "barrier",
          "interacting_md", "particle_filter", "uniform", "dense_state", "trajectory", "small_n"]
-
-
-def panels_for(problem, mode):
-    return PANELS.get(problem, {}).get(mode) or PANELS["default"].get(mode) or ()
 
 
 def load(results):
@@ -108,56 +69,6 @@ def platforms(rows):
     for r in rows:
         n[(r["platform"], r["jax"])] = n.get((r["platform"], r["jax"]), 0) + 1
     return sorted(n, key=lambda p: (p[0] == "cpu", -n[p], p))
-
-
-def style(ax, xlabel, ylabel, title, logx=True):
-    if logx:
-        ax.set_xscale("log", base=2)
-    ax.set_yscale("log")
-    ax.set_xlabel(xlabel, color=INK2, fontsize=9)
-    ax.set_ylabel(ylabel, color=INK2, fontsize=9)
-    ax.set_title(title, color=INK, fontsize=10, loc="left")
-    ax.grid(True, which="major", color=GRID, lw=0.6, zorder=0)
-    ax.grid(True, which="minor", color=GRID, lw=0.3, alpha=0.5, zorder=0)
-    for s in ("top", "right"):
-        ax.spines[s].set_visible(False)
-    for s in ("left", "bottom"):
-        ax.spines[s].set_color(GRID)
-    ax.tick_params(colors=INK2, labelsize=8)
-
-
-def panel(rows, problem, mode, field, ylabel, out, plat, div):
-    arms = panels_for(problem, mode)
-    series = [(a, ok(rows, problem=problem, mode=mode, arm=a, div=div, platform=plat[0], jax=plat[1]))
-              for a in arms]
-    series = [(a, rs) for a, rs in series if any(r.get(field) is not None for r in rs)]
-    if not series:
-        return None
-    axis = series[0][1][0]["axis"]
-    fig, ax = plt.subplots(figsize=(5.4, 3.7))
-    for a, rs in series:
-        c, m, lab = ARM[a]
-        x = np.array([r["val"] for r in rs], float)
-        y = np.array([np.nan if r.get(field) is None else r[field] for r in rs], float)
-        good = np.isfinite(y)
-        if not good.any():
-            continue
-        ax.plot(x[good], y[good], color=c, marker=m, ms=6, lw=2.0, zorder=3, label=lab,
-                markeredgecolor="white", markeredgewidth=0.8)
-        ax.annotate(lab, (x[good][-1], y[good][-1]), textcoords="offset points", xytext=(6, 0),
-                    color=INK2, fontsize=7.5, va="center")
-    title = f"{MODE_LABEL.get(mode, mode)}: {problem.replace('_', ' ')}"
-    style(ax, AXIS_LABEL.get(axis, axis), ylabel, title)
-    ax.margins(x=0.34)
-    ax.legend(frameon=False, fontsize=8, labelcolor=INK2, loc="upper center", bbox_to_anchor=(0.5, -0.22),
-              ncol=min(3, len(series)))
-    fig.text(0.01, 0.005, f"{plat[0]}, JAX {plat[1]}, divergence '{div}'", color=INK2, fontsize=7)
-    fig.tight_layout(rect=(0, 0.03, 1, 1))
-    name = f"{problem}_{mode}{'_mem' if field == 'peak_mb' else ''}.png"
-    path = os.path.join(out, name)
-    fig.savefig(path, dpi=130, bbox_inches="tight")
-    plt.close(fig)
-    return name
 
 
 def best_baseline(rows, problem, mode, val, div, plat, exclude=("tm_cuda", "tm_xla")):
@@ -302,11 +213,11 @@ def agreement(rows, plat):
 
 SUMMARY_HEAD = """# Measured performance: tallymap against plain JAX
 
-Generated by `benchmarks/vs_jax/make_tables.py` from the committed rows in `benchmarks/vs_jax/results/` (and, for
+Generated by `benchmarks/vs_jax/make_tables.py` from the rows `benchmarks/vs_jax/run.py` writes (kept outside the repo; and, for
 the CPU section, `benchmarks/vs_jax/cpu_section.md`). Each cell is the median `jax.jit` wall time per call, compile
 time excluded, against plain-JAX programs written for the same problem; the padded-scan baselines are padded to the
 OBSERVED longest item (an oracle no real program has). The GPU gradient rows predate a reverse-mode fix that made
-two of the problems 2.4-2.6x faster, so they are upper bounds (`docs/performance_detail.md`). The method, every size, every plot, the other GPUs, the
+two of the problems 2.4-2.6x faster, so they are upper bounds (`docs/performance_detail.md`). The method, every size, the other GPUs, the
 diffrax comparison and the cross-arm agreement are in `docs/performance_detail.md`. Reproduce any row with
 
     python benchmarks/vs_jax/run.py --problem <name>          # or --quick for the small sweep
@@ -315,7 +226,7 @@ diffrax comparison and the cross-arm agreement are in `docs/performance_detail.m
 DETAIL_HEAD = """# Measured performance: every table
 
 The detail behind `docs/performance.md`, generated by `benchmarks/vs_jax/make_tables.py` from
-`benchmarks/vs_jax/results/`.
+the rows `benchmarks/vs_jax/run.py` writes (kept outside the repo).
 
 ## What is measured
 
@@ -450,14 +361,13 @@ NOTES = {
 }
 
 
-def problem_section(rows, p, plat, out):
+def problem_section(rows, p, plat):
     rs = sel(rows, problem=p, platform=plat[0], jax=plat[1])
     if not rs:
         return ""
     divs = sorted({r["div"] for r in rs if r.get("div")}, key=lambda d: (d != "mid", d))
     group = rs[0].get("group", "")
     s = [f"\n### {p} ({group})\n", f"\n{NOTES[p]}\n" if p in NOTES else ""]
-    figs = []
     for mode in ("fwd", "grad", "jvp", "jacfwd", "score"):
         if not sel(rs, mode=mode):
             continue
@@ -466,33 +376,20 @@ def problem_section(rows, p, plat, out):
             s.append(table(rows, p, mode, d, plat, arms))
             if mode == "grad":
                 s.append(table(rows, p, mode, d, plat, arms, field="peak_mb", unit="peak MB"))
-        if mode in FIG_MODES:
-            f = panel(rows, p, mode, "ms", f"{MODE_LABEL.get(mode, mode)} time per call (ms)", out, plat,
-                      divs[0])
-            if f:
-                figs.append(f)
-        if mode == "grad":
-            f = panel(rows, p, mode, "peak_mb", "peak device memory (MB)", out, plat, divs[0])
-            if f:
-                figs.append(f)
     for d in divs:
         s.append(pad_table(rows, p, d, plat))
-    for f in figs:
-        s.append(f"\n![{p} {f}](img/{f})\n")
     return "".join(s)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--results", default=os.path.join(HERE, "results"))
-    ap.add_argument("--repo", default=ROOT, help="where docs/performance.md and docs/img/ are written")
+    ap.add_argument("--results", default=os.environ.get("VSJ_RESULTS") or os.path.join(HERE, "results"))
+    ap.add_argument("--repo", default=ROOT, help="where docs/performance.md is written")
     a = ap.parse_args()
     rows = load(a.results)
     if not rows:
         print("no rows in " + a.results)
         return 1
-    img = os.path.join(a.repo, "docs", "img")
-    os.makedirs(img, exist_ok=True)
     plats = platforms(rows)
     prim = plats[0]
     print(f"{len(rows)} rows, platforms {plats}, primary {prim}")
@@ -501,7 +398,7 @@ def main():
     doc.append(f"\n## Headline\n\nLargest measured size of each problem on {prim[0]}, JAX {prim[1]}. "
                f"`speedup` is against the FASTEST plain-JAX arm at that point, not against the slowest.\n\n")
     doc.append(headline(rows, prim))
-    doc.append("\nThe same table, as a file: `benchmarks/vs_jax/readme_table.md`. Every size and plot per problem: "
+    doc.append("\nThe same table, as a file: `benchmarks/vs_jax/readme_table.md`. Every size per problem: "
                "`docs/performance_detail.md`.\n")
     cpu = os.path.join(HERE, "cpu_section.md")
     if os.path.exists(cpu):
@@ -513,7 +410,7 @@ def main():
     doc = [DETAIL_HEAD]
     doc.append("\n## Per problem\n\nAll rows below are " + f"{prim[0]}, JAX {prim[1]}.\n")
     for p in ORDER:
-        doc.append(problem_section(rows, p, prim, img))
+        doc.append(problem_section(rows, p, prim))
     dfx = next((pl for pl in plats if sel(rows, platform=pl[0], jax=pl[1], arm="diffrax", status="ok")), None)
     if dfx:
         doc.append(f"\n## Against diffrax\n\nMeasured on {dfx[0]}, JAX {dfx[1]}, where diffrax installs. "
@@ -549,7 +446,7 @@ def main():
     doc.append("\n## Compile time\n\n"
                "Compile time is not in the tables above. It is in the raw rows as `lower_s` (trace and lower, "
                "including the CUDA kernel build) and `xla_compile_s`. tallymap builds and caches a kernel per "
-               "program; see `benchmarks/vs_jax/results/` for the per-cell figures.\n")
+               "program.\n")
     det = os.path.join(a.repo, "docs", "performance_detail.md")
     open(det, "w").write("".join(doc))
     print("wrote " + det)
@@ -560,14 +457,8 @@ def main():
                         "(`docs/performance_detail.md` has the method, the padding and the losses):\n\n"
                         + headline(rows, prim))
     print("wrote " + rt)
-    big = [(f, os.path.getsize(os.path.join(img, f))) for f in sorted(os.listdir(img))
-           if f.endswith(".png") and os.path.getsize(os.path.join(img, f)) > 200 * 1024]
-    for f, n in big:
-        print(f"PNG TOO BIG {f} {n / 1024:.0f} KB")
-    print(f"MAKE_TABLES {'FAIL' if big else 'PASS'} "
-          f"{len([f for f in os.listdir(img) if f.endswith('.png')])} figures")
-    return 1 if big else 0
-
+    print("MAKE_TABLES PASS")
+    return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())

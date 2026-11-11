@@ -76,9 +76,7 @@ Peak device memory on the same runs:
 | 262,144 | 8 | 356 | 293 | 293 | **44.5x** |
 | 1,048,576 | 32 | 1,400 | 624 | 628 | **43.7x** |
 
-![forward time](plots/fwd_time.png)
 
-![forward peak memory](plots/fwd_mem.png)
 
 ### The divergence sweep
 
@@ -114,7 +112,6 @@ So the gradient table here is not tallymap against crn-jax.  It is the cost of c
 | 262,144 | 15.3 | 19.9 | **+30%** |
 | 1,048,576 | 51.6 | 69.4 | **+35%** |
 
-![the cost of the score](plots/score_time.png)
 
 ## Where tallymap loses, or the margin shrinks
 

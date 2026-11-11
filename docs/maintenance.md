@@ -87,7 +87,7 @@ deliberate: it is what makes an upgrade a bounded job.
 | batching rules not found, or a wrong batcher signature | the batching registry changed | adapt `_compat.register_batcher`, which is one wrapper |
 | typed-key randomness fails on cuda (`random_bits`, `split`, `fold_in`) | the pseudo-random implementation object or `dtype._impl` changed | adapt `_compat.key_impl` and the `random_*` shims; the RNG rows of `tests/ops.py` check it bitwise; meanwhile users can pass raw uint32 keys |
 | the shim does not build or does not load | a new jaxlib FFI header, or a different host compiler | `shim.cc` is about 200 lines and its cache key contains the headers, so a stale shared object is never reused; check `$CXX` first |
-| `tests/ops.py` reports CHANGED rows | the CUDA emitter, NVRTC or the CUDA math library changed the numbers | if the change was intended: rerun the `compare` protocol (`docs/validation.md`), then re-record `tests/ops_baseline.json` in a commit of its own |
+| `tests/ops.py` reports CHANGED rows | the CUDA emitter, NVRTC or the CUDA math library changed the numbers | if the change was intended: rerun the `compare` protocol (`docs/validation.md`), then re-record its baseline (`tests/ops.py --record`) |
 | `stats['children_dropped'] > 0` and the float tallies are NaN | the spawn Queue is too small | size it (README, "Sizing the Queue") |
 | `stats['n_truncated'] > 0` and the float tallies are NaN | items hit `max_steps` | raise it, or put the budget in the loop condition if it is deliberate (README, `max_steps`) |
 | `stats['dropped_emits'] > 0` | an emit index was negative or at least the output size | an off-by-one in your binning; clip the index |
@@ -174,7 +174,7 @@ because each needs fresh JAX state.
 | every push and pull request | GitHub Actions, `.github/workflows/ci.yml` | ruff; the short suite on Python 3.10 + jax 0.6.2 and on Python 3.12 + the newest tested jax (`TESTED_JAX[-1]`); the full CPU suite on the newest tested |
 | weekly | GitHub Actions, `.github/workflows/weekly.yml` | the full CPU suite on every minor in `TESTED_JAX`; a JAX nightly cell, allowed to fail |
 | weekly, and before a release | a GPU machine | the full suite on each supported GPU at the floor and at the newest JAX, once with `--x64`, plus `--unfused` and `--canary` on CPU |
-| weekly, and before a release | a GPU machine | `benchmarks/perf.py` against `benchmarks/perf_baseline.json` (more than 1.5x slower is a failure; `benchmarks/perf_negative_control.py` is its negative control) |
+| weekly, and before a release | a GPU machine | `benchmarks/perf.py` against the machine's recorded baseline (more than 1.5x slower is a failure; `benchmarks/perf_negative_control.py` is its negative control) |
 
 GitHub Actions has no GPU, so the GPU cells run wherever the maintainer has one; each cell is one run of
 `tests/run_all.py --gpu` on a checkout of one commit. Run them from a snapshot of a commit, not from a live
@@ -189,9 +189,9 @@ working tree, so that editing the tree cannot change a queued run.
    with outputs bitwise equal wherever the previous release's own reruns are bitwise equal. Two reruns are a weak
    control for atomics-ordered float sums, so for those identical programs are the proof, not identical numbers.
 3. If `backends/kernel` math or the operation table changed (`tests/ops.py` reports CHANGED rows): rerun the
-   `compare` protocol unchanged (`docs/validation.md`), then re-record `tests/ops_baseline.json` in a commit of
-   its own. Re-record `benchmarks/perf_baseline.json` only in a commit of its own, and only when a change in
-   speed is intended.
+   `compare` protocol unchanged (`docs/validation.md`), then re-record its baseline (`tests/ops.py
+   --record`). Re-record the `benchmarks/perf.py` baseline only when a change in speed is intended. Both are
+   recorded per machine and are not in git.
 4. Update `CHANGELOG.md`: API changes, behaviour changes, and the measured cost of anything that got slower.
 5. Bump `tallymap.__version__` and `CITATION.cff`; tag.
 6. Build and check the distributions (`python -m build`, then `twine check dist/*`), confirm the sdist carries

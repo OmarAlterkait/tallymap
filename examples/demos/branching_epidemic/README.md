@@ -91,9 +91,7 @@ Peak device memory on the same runs:
 | 262,144 | 70 | 134 | - |
 | 1,048,576 | 84 | 308 | - |
 
-![forward time](plots/fwd_time.png)
 
-![forward peak memory](plots/fwd_mem.png)
 
 ### What the tree looks like, measured
 
@@ -124,11 +122,8 @@ Forward mode (`jacfwd` over all four parameters):
 | 65,536 | 3.64 | 24.4 | **6.72x** | 4.22x | 129 | 65.3 |
 | 262,144 | 6.54 | 49.3 | **7.55x** | 7.23x | 134 | 134 |
 
-![reverse-mode time](plots/grad_time.png)
 
-![forward-mode time](plots/jacfwd_time.png)
 
-![reverse-mode peak memory](plots/grad_mem.png)
 
 ### The divergence sweep
 

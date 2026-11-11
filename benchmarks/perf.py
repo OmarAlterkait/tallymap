@@ -1,9 +1,10 @@
 """Performance safety net: re-measure a small fixed set of timings and flag regressions > 50% (1.5x) against the
-committed baseline for THIS GPU model (benchmarks/perf_baseline.json).
+recorded baseline for THIS GPU model ($PERF_BASELINE, else perf_baseline.json in the tallymap cache
+directory; not in git).
 
     python benchmarks/perf.py              # compare (exit 1 if any row is > 1.5x slower than the baseline)
     python benchmarks/perf.py --record     # (re)write this GPU's baseline entry
-    env PERF_TOL=0.5     PERF_MATH=approx|ieee     PERF_BASELINE (another file)
+    env PERF_TOL=0.5     PERF_MATH=approx|ieee     PERF_BASELINE (the baseline file)
     (benchmarks/perf_negative_control.py: the comparator's negative control -- a known >= 2x slowdown must FAIL)
 
 The tolerance is the project's bar, 1.5x: a speedup or a slowdown under 1.5x does not matter, and identical reruns
@@ -24,7 +25,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 MATH = os.environ.get("PERF_MATH", "approx")
 ROOT = os.path.dirname(HERE)
-BASE = os.environ.get("PERF_BASELINE") or os.path.join(HERE, "perf_baseline.json")
+CACHE = os.environ.get("TALLYMAP_CACHE") or os.path.expanduser("~/.cache/tallymap")
+BASE = os.environ.get("PERF_BASELINE") or os.path.join(CACHE, "perf_baseline.json")   # recorded per machine, not in git
 
 
 def run(cmd, env):

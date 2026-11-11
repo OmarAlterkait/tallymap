@@ -5,3 +5,13 @@ build/
 .cache/
 out/
 .ci/
+# nothing a program writes goes in git: results, plots, images, data
+*.png
+*.jpg
+*.pdf
+*.npz
+*.npy
+*.h5
+benchmarks/vs_jax/results/
+examples/demos/*/results/
+examples/demos/*/plots/

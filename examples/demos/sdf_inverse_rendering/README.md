@@ -67,7 +67,6 @@ Scan length 241 steps, which is the longest march measured at 1,048,576 rays (th
 | 262,144 | 0.462 | 5.12 | 2.44 | 2.64 | **5.27x** | 20.6 / 206 | 59 |
 | 1,048,576 | 1.13 | 8.33 | 5.44 | 5.8 | **4.8x** | 20.6 / 241 | 100 |
 
-![forward time](plots/fwd_time.png)
 
 ### Inverse-rendering gradient with respect to five scene parameters
 
@@ -78,9 +77,7 @@ Scan length 241 steps, which is the longest march measured at 1,048,576 rays (th
 | 262,144 | 1.65 | 174 | 178 | **106x** | 59 | 23,846 | 1,651 | **28x** |
 | 1,048,576 | 5.4 | **OOM** | 852 | **158x** | 100 | **OOM** | 6,597 | **66x** |
 
-![gradient time](plots/grad_time.png)
 
-![gradient peak memory](plots/grad_mem.png)
 
 ### The divergence sweep
 
