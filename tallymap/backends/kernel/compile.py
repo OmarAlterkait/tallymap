@@ -88,14 +88,14 @@ def host_cxx():
         p = shutil.which(env) or (env if os.path.isfile(env) and os.access(env, os.X_OK) else None)
         if p is None:
             raise RuntimeError(f"tallymap: $CXX is set to {env!r}, which is not an executable C++ compiler, and "
-                               "the cuda backend needs one to build its FFI shim (built once, then cached).  Fix: "
-                               "point CXX at a working compiler (export CXX=$(command -v g++)), or unset CXX to "
-                               "use g++ from PATH.")
+                               "the kernel backend needs one (it builds the FFI shims, and on the CPU every "
+                               "kernel).  Fix: point CXX at a working compiler (export CXX=$(command -v g++)), or "
+                               "unset CXX to use g++ from PATH.")
         return p
     p = shutil.which("g++") or shutil.which("c++")
     if p is None:
-        raise RuntimeError("tallymap: no host C++ compiler on PATH (no g++, no c++), and the cuda backend needs "
-                           "one to build its FFI shim (built once, then cached).  Fix: install g++, or set $CXX "
+        raise RuntimeError("tallymap: no host C++ compiler on PATH (no g++, no c++), and the kernel backend needs "
+                           "one (it builds the FFI shims, and on the CPU every kernel).  Fix: install g++, or set $CXX "
                            "to a C++ compiler (export CXX=/path/to/g++).")
     return p
 

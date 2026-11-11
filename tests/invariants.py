@@ -1038,8 +1038,8 @@ def host_frame_item(t, x):
 
 
 def _host_frame():
-    from tallymap.backends.kernel.host import HOST_STACK
-    lim = HOST_STACK // 2
+    from tallymap.backends.kernel.host import stack_limit
+    lim = stack_limit()
     f = tm.vmap(host_frame_item, outputs={"Q": tm.Sum((1,), F)}, backend="auto")
     try:
         jax.block_until_ready(f(jnp.linspace(0.5, 1.5, 8).astype(F)))

@@ -32,9 +32,11 @@ TARGET = "tallymap_host_launch"
 # -O3 -march=native: the kernel is built on and for this machine (the CPU identity is in the cache key).
 # -ffp-contract=off: no FMA contraction, as on the cuda target (-fmad=false); -fno-math-errno changes no value.
 OPTS = ["-O3", "-march=native", "-ffp-contract=off", "-fno-math-errno", "-std=c++17", "-shared", "-fPIC", "-w"]
-# per-thread stack the shim reserves (host_shim.cc HOST_STACK); a kernel whose frames could exceed half of it raises
-# before it runs, as a cuda kernel over CUDA's local-memory limit does (compile.check_frame)
+# the worker threads' stack when OMP_STACKSIZE is not set (32 x CUDA's 512 KiB per-thread local-memory limit); a kernel
+# whose -fstack-usage bound is over half the effective size is refused before it runs, as a cuda kernel over CUDA's
+# local-memory limit is (compile.check_frame)
 HOST_STACK = 16 << 20
+_UNITS = {"B": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30}
 _LOCK = threading.Lock()
 
 HOST_PRELUDE = r"""
@@ -257,13 +259,65 @@ def compile_so(src, where="", note=""):
         os.replace(tmp, so)
     dt = time.perf_counter() - t
     stack = _stack_bytes(su)
-    if stack is not None and stack > HOST_STACK // 2:
+    if stack is not None and stack > stack_limit():
         from ..._api import UnsupportedError
         raise UnsupportedError(
             f"tallymap: the host kernel{' for ' + where if where else ''} may need up to {stack:,} bytes of stack "
-            f"per thread (the item's frame and its local arrays), over the {HOST_STACK // 2:,} bytes it may use.  "
+            f"per thread (the item's frame and its local arrays), over the {stack_limit():,} bytes it may use (half "
+            f"of OMP_STACKSIZE).  "
             f"{note + '  ' if note else ''}Make the per-item state smaller, or run it with backend='xla'.")
     return so, dict(hash=h, cached=cached, seconds=dt, stack=stack)
+
+
+def _parse_stacksize(v):
+    """OMP_STACKSIZE: a size with an optional B / K / M / G suffix, kilobytes without one (the OpenMP spec)."""
+    t = v.strip().upper()
+    unit = _UNITS.get(t[-1:], None)
+    num = t[:-1] if unit else t
+    if not num.isdigit():
+        raise ValueError(f"tallymap: OMP_STACKSIZE={v!r} is not a size (e.g. 16M)")
+    return int(num) * (unit or 1 << 10)
+
+
+_STACK = []
+
+
+def stack_limit():
+    """the largest per-thread stack bound a host kernel may have: half the worker threads' stack.  The workers'
+    stack is OMP_STACKSIZE, which libgomp reads once, when it loads: tallymap sets it (to HOST_STACK) when it is not
+    set and libgomp is not loaded yet, and raises when it cannot."""
+    if not _STACK:
+        v = os.environ.get("OMP_STACKSIZE")
+        if v is None:
+            try:
+                with open("/proc/self/maps") as f:
+                    loaded = any("libgomp" in ln for ln in f)
+            except OSError:
+                loaded = False
+            if loaded:
+                raise _unsupported("libgomp (OpenMP) was loaded before tallymap could set the worker threads' stack "
+                                   f"size.  Fix: set OMP_STACKSIZE={HOST_STACK >> 20}M in the environment before "
+                                   "starting Python")
+            os.environ["OMP_STACKSIZE"] = f"{HOST_STACK >> 20}M"
+            v = os.environ["OMP_STACKSIZE"]
+        _STACK.append(_parse_stacksize(v) // 2)
+    return _STACK[0]
+
+
+def _unsupported(msg):
+    from ..._api import UnsupportedError
+    return UnsupportedError(f"tallymap: the kernel backend cannot run on the CPU here: {msg}; or pass backend='xla' "
+                            "(plain JAX, much slower)")
+
+
+def toolchain():
+    """the CPU target's prerequisites: a C++17 compiler with OpenMP (GCC or Clang on Linux), the shim built with it,
+    and the worker stack size.  A missing prerequisite raises UnsupportedError naming the fix and backend='xla'."""
+    stack_limit()
+    try:
+        shim()
+    except RuntimeError as e:
+        raise _unsupported(f"{e}\nFix: install g++ (or point $CXX at GCC or Clang with OpenMP; Linux only)") from None
 
 
 _SHIM = []
@@ -295,12 +349,11 @@ def shim():
         so = os.path.join(d, f"libtallymap_host_{h}.so")
         if not os.path.exists(so):
             tmp = so + f".tmp{os.getpid()}"
-            cmd = [cxx, "-O2", "-std=c++17", "-shared", "-fPIC", "-w", "-pthread", f"-I{inc}", src, "-o", tmp]
+            cmd = [cxx, "-O2", "-std=c++17", "-shared", "-fPIC", "-w", "-fopenmp", f"-I{inc}", src, "-o", tmp]
             r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
             if r.returncode:
-                raise RuntimeError(f"tallymap: building the host FFI shim with the C++ compiler {cxx!r} failed "
-                                   f"(set $CXX to a working compiler, or run with backend='xla'):\n"
-                                   f"{' '.join(cmd)}\n{r.stdout}\n{r.stderr}")
+                raise RuntimeError(f"building the host FFI shim with the C++ compiler {cxx!r} (OpenMP) failed:\n"
+                                   f"{' '.join(cmd)}\n{r.stdout}\n{r.stderr[-2000:]}")
             os.replace(tmp, so)
         lib = ctypes.CDLL(so)
         lib.tallymap_host_register.argtypes = [ctypes.c_int64, ctypes.c_void_p]
@@ -324,6 +377,3 @@ def register(so, info):
     return kid
 
 
-def threads():
-    """the thread count the shim uses: $OMP_NUM_THREADS when set, else the CPUs this process may run on."""
-    return int(shim().tallymap_host_threads())

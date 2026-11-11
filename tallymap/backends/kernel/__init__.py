@@ -65,6 +65,7 @@ class Kernel:
         note = schedule_note(self.L)
         if target == "cpu":
             from . import host
+            host.toolchain()                                           # (UnsupportedError naming the fix)
             self.src = host.source(self.src, self.L)
             so, self.info = host.compile_so(self.src, p.where, note)   # run-or-raise on the stack bound
             self.kid = host.register(so, self.info)
@@ -101,7 +102,7 @@ def kernel(p, **opts):
         from . import host
         # the host target's resource: the per-thread stack bound (-fstack-usage) against the limit it is refused at
         rec.update(source=os.path.join(C.cache_dir(), "host", f"k_{kern.info['hash']}.cc"),
-                   resources=dict(stack_bytes=kern.info["stack"], stack_limit=host.HOST_STACK // 2))
+                   resources=dict(stack_bytes=kern.info["stack"], stack_limit=host.stack_limit()))
     else:
         rec.update(source=os.path.join(C.cache_dir(), kern.info["hash"] + ".cu"))
     record_kernel(rec)
@@ -159,8 +160,9 @@ def run(p, pi, bc, target="cuda", cuda_math="approx", schedule="item", **_):
     if target == "cpu":
         from . import host
         call = jax.ffi.ffi_call(host.TARGET, rs, has_side_effect=False)
+        stack = kern.info["stack"] if kern.info["stack"] is not None else 1 << 62    # (unknown: the caller waits)
         res = call(*args, kernel_id=np.int64(kern.kid), n_zero=np.int32(L.n_zero), flags=np.int32(L.flags),
-                   n_items=np.int64(N))
+                   n_items=np.int64(N), stack=np.int64(stack))
     else:
         call = jax.ffi.ffi_call(C.TARGET, rs, has_side_effect=False)
         res = call(*args, kernel_id=np.int64(kern.kid), block=np.int32(kern.block), n_zero=np.int32(L.n_zero),
