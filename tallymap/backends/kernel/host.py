@@ -95,7 +95,9 @@ static inline double __ddiv_rn(double a, double b) { return a / b; }
 static inline double __dsqrt_rn(double a) { return sqrt(a); }
 static inline float __double2float_rn(double a) { return (float)a; }
 static inline long long __double2ll_rn(double a) { return llrint(a); }
-static inline double rsqrt(double x) { return 1.0 / sqrt(x); }
+// glibc >= 2.41 declares C23's rsqrt in math.h, so ours has its own name (the kernel calls rsqrt, as CUDA's)
+static inline double sj_rsqrt(double x) { return 1.0 / sqrt(x); }
+#define rsqrt sj_rsqrt
 // erfinv (libdevice has it, libm does not), from Giles (2010)'s single-precision polynomial evaluated in double.
 // f32: that polynomial, rounded: <= 2 ulp from the correctly rounded result (libdevice's documented bound), 32 ns a
 // call.  f64: Halley steps on erf (erfc in the upper half, where 1 - |y| is exact) from that start until the step is

@@ -56,6 +56,11 @@ jobs:
           pip install "jax==$v"
       - run: python -c "import jax, tallymap; print(jax.__version__, tallymap.__version__)"
       - run: python tests/run_all.py --only edge,reverse,examples
+        env:
+          TEST_LOG: ${{ runner.temp }}/suite
+      - name: full output of the failing suites
+        if: failure()
+        run: tail -n 300 ${{ runner.temp }}/suite.*.log || true
 
   # The whole CPU suite on the newest tested JAX: edge, transforms, reverse, reverse_spawn and the examples.
   full:
@@ -71,3 +76,8 @@ jobs:
         run: pip install "jax==$(python -c 'import tallymap; print(tallymap.TESTED_JAX[-1])')"
       - run: python -c "import jax, tallymap; print(jax.__version__, tallymap.__version__)"
       - run: python tests/run_all.py
+        env:
+          TEST_LOG: ${{ runner.temp }}/suite
+      - name: full output of the failing suites
+        if: failure()
+        run: tail -n 300 ${{ runner.temp }}/suite.*.log || true
