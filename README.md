@@ -17,8 +17,8 @@ What it gives you that plain JAX does not:
 - **Reverse mode through `lax.while_loop`.** Plain JAX cannot reverse-differentiate a `while_loop` at all. tallymap
   replays each item from its inputs, so gradient memory does not grow with the trip count and there is no step cap.
 
-**Status:** 0.6.0rc1, a release candidate. JAX >= 0.6.2. The CUDA backend needs Linux and an NVIDIA GPU of compute
-capability 7.0 or newer; the xla backend runs anywhere JAX does. Not on PyPI: install from GitHub (below).
+**Status:** 0.7.0, unreleased. JAX >= 0.6.2. The kernel backend runs on Linux, on an NVIDIA GPU of compute
+capability 7.0 or newer or on the CPU (with a C++17 compiler); the xla backend runs anywhere JAX does. Not on PyPI: install from GitHub (below).
 tallymap was built for in-house photon-transport and particle-shower engines and has nothing in it about either.
 
 ## Quickstart
@@ -66,7 +66,7 @@ A tally indexed by a TUPLE is the right way to get per-item vector outputs: `Sum
 ## Install
 
 ```
-pip install "tallymap @ git+https://github.com/OmarAlterkait/tallymap@v0.6.0rc1"         # CPU: the xla backend
+pip install "tallymap @ git+https://github.com/OmarAlterkait/tallymap@v0.6.0rc1"         # CPU
 pip install "tallymap[cuda] @ git+https://github.com/OmarAlterkait/tallymap@v0.6.0rc1"   # + JAX's CUDA 12 plugin and NVRTC
 ```
 
@@ -79,8 +79,8 @@ git clone https://github.com/OmarAlterkait/tallymap && cd tallymap && pip instal
 In a project that depends on tallymap, pin a tag (`@v0.6.0rc1`) as above. Until 1.0 a minor release may change the
 API; `CHANGELOG.md` lists every change.
 
-A **C++17 compiler is needed once**, the first time you use the GPU backend, to build the `jax.ffi` launch shim.
-It is about 200 lines and the result is cached per toolchain and jaxlib version. If `$CXX` is set it is used.
+A **C++17 compiler** (GCC or Clang; `$CXX` if set) builds the `jax.ffi` launch shim once per toolchain and jaxlib
+version, and on the CPU it also compiles each program's kernel (about 0.5-2 s, cached on disk).
 
 **GPU memory.** The CUDA driver reserves a kernel's per-thread local memory (large per-item arrays live there)
 outside JAX's memory pool, and JAX preallocates 75% of the GPU by default. If a call fails with `out of memory` at
@@ -401,20 +401,53 @@ common cause is first:
 versions, GPU, compute capability, driver, the CUDA compiler and cache directory, these counters, and the last
 item jaxprs and generated kernels. `tm.diagnostics(f, *args)` reports what `jax.jit(f).lower(*args)` builds.
 
+## Backends
+
+There is one compiled backend, the **kernel** backend, and JAX's device placement decides where it runs: tallymap
+never picks a device. A computation placed on a CUDA GPU runs the CUDA kernel; one placed on the CPU
+(`jax.default_device`, `jax.device_put`, or simply no GPU) runs the same generated C compiled for the host, one host
+thread per GPU thread, as many threads as `OMP_NUM_THREADS` or else the CPUs the process may use (its cpuset or
+Slurm allocation). Every feature works on both: forward, step schedule, jvp and dual lanes, both reverse modes,
+spawn and the tree adjoint, fixed-point sums, truncation, `n_active`. `backend='xla'` is the plain-JAX reference
+interpreter, for checking and for the platforms the kernel backend does not compile for.
+
+On the CPU every operation is IEEE (subnormals kept, no FMA contraction) and the math library is libm, so
+transcendentals differ from XLA:CPU by a few ulps (libm is the more accurate of the two:
+`docs/maintenance.md`). `cuda_math` has no effect there.
+
+CPU, one AMD EPYC 7713 socket (32 cores, exclusive node, every arm pinned to the same cores), JAX 0.6.2. "vs best"
+is the fastest plain-JAX arm, often `pmap` over 32 host devices, which needs
+`XLA_FLAGS=--xla_force_host_platform_device_count=32` and code that shards the items; "vs jit" is plain `jax.jit` on
+one device, what a JAX program gets without that setup:
+
+| problem | N | forward ms | vs best | vs jit | gradient ms | vs best (= jit) |
+|---|---|---|---|---|---|---|
+| random_walk | 65,536 | 3.8 | 5.1x | 82x | 7.4 | 44x |
+| transport | 524,288 | 26.8 | 4.0x | 123x | 85.8 | 48x |
+| walk_on_spheres | 65,536 | 4.3 | 4.6x | 129x | 9.9 | 54x |
+| ode_ensemble | 65,536 | 36.1 | 1.0x | 32x | 202 | 18x |
+| barrier | 65,536 | 30.1 | 1.1x | 27x | 111 | 8.6x |
+
+Forward passes of long, fairly uniform loops (ode_ensemble, barrier) are at parity with a sharded plain-JAX program;
+the gain there is the gradient. All rows and the method: `docs/performance.md`.
+
 ## Options
 
 | option | default | meaning |
 |---|---|---|
-| `backend` | `'auto'` | `'auto'`: cuda on a GPU, where a program the cuda emitter cannot compile raises `tm.UnsupportedError` (pass `backend='xla'` to run it; it never falls back on its own, because the xla backend is about 100x slower); the xla backend elsewhere, with a one-time warning. `'cuda'`: cuda or raise. `'xla'`: always the plain-JAX interpreter, slow by design. |
-| `cuda_math` | `'approx'` | cuda f32 division, sqrt and rsqrt. `'approx'`: the PTX XLA:GPU itself emits, so it is the arithmetic a plain JAX program on the same GPU gets. `'ieee'`: correctly rounded and portable, about 1.5x slower. |
-| `schedule` | `'item'` | cuda: `'item'`, a thread runs one whole item at a time. `'step'`, the step schedule: a thread is refilled with a new item at loop-step granularity, so it does not idle while the longest item of its warp finishes. `'step'` needs an item with exactly one top-level `while_loop` and raises `tm.UnsupportedError` (saying why) otherwise. Neither wins everywhere (3.0x either way on real workloads), so measure yours; `tm.diagnostics()['kernels']` names the schedule each kernel ran. |
+| `backend` | `'auto'` | `'auto'`: the kernel backend on the platform JAX places the computation on (CUDA GPU or CPU); a program it cannot compile raises `tm.UnsupportedError` (pass `backend='xla'` to run it; it never falls back on its own, because the xla backend is far slower); other platforms run the xla backend with a one-time warning. `'xla'`: always the plain-JAX interpreter, slow by design. (`'cuda'` was removed in 0.7: use `'auto'`.) |
+| `cuda_math` | `'approx'` | GPU only (the CPU is always IEEE). f32 division, sqrt and rsqrt. `'approx'`: the PTX XLA:GPU itself emits, so it is the arithmetic a plain JAX program on the same GPU gets. `'ieee'`: correctly rounded and portable, about 1.5x slower. |
+| `schedule` | `'item'` | kernel backend: `'item'`, a thread runs one whole item at a time. `'step'`, the step schedule: a thread is refilled with a new item at loop-step granularity, so it does not idle while the longest item of its warp finishes. `'step'` needs an item with exactly one top-level `while_loop` and raises `tm.UnsupportedError` (saying why) otherwise. Neither wins everywhere (3.0x either way on real workloads), so measure yours; `tm.diagnostics()['kernels']` names the schedule each kernel ran. |
 | `xla_batch_size` | `2**18` | xla backend: items per batch, which bounds its memory. |
 | `rev_checkpoints` | `'auto'` | reverse mode: checkpoint buffer size C. `'auto'`: 16 for a loop step of fewer than 1000 equations, else the largest of 4 ... 64 whose 3C+1 states (single-loop adjoint: 2C+1) fit 64 KiB. A loop of K <= C steps is not replayed; O(K) work for K <= C^2. |
 | `rev_stats` | `False` | reverse through spawn: report the tree adjoint's counts to the host. Off by default because a host callback takes `jax.jit` off its C++ fast path, which can cost an order of magnitude. |
 
 Any other option name raises, and there are no private options: the measurement switches and negative controls
-are test-only module constants. The only environment variable is `TALLYMAP_CUDA_CACHE`, the cubin cache directory,
-which defaults to `~/.cache/tallymap`.
+are test-only module constants. tallymap's one environment variable is `TALLYMAP_CUDA_CACHE`, the kernel cache
+directory (default `~/.cache/tallymap`). On the CPU the standard OpenMP and compiler variables apply:
+`OMP_NUM_THREADS` (default: the CPUs the process may use), `OMP_STACKSIZE` (the worker threads' stack, where per-item
+arrays live; tallymap sets it to 16M if it is unset, and a kernel needing more than half of it raises before it runs)
+and `CXX`.
 
 ## Nested loops: solvers inside an item
 
@@ -475,10 +508,13 @@ this is needed: a `cond` is a real branch of the item's thread.
 
 What is explicitly out of scope, so that you do not have to find out by trying:
 
-- **No TPU and no ROCm.** Any non-CUDA platform runs the xla backend, which is correct and about 100x
-  slower than the CUDA backend.
-- **`jax.export` of a CUDA program is unsupported.** Its custom call is not on JAX's export allow-list and its
-  kernels are registered per process, so a deserialised CUDA program is not portable. Programs on the xla backend export
+- **No TPU and no ROCm.** Those platforms run the xla backend, which is correct and far slower.
+- **The CPU kernel needs Linux and a C++17 compiler (GCC or Clang).** Without one, or on macOS and Windows,
+  `backend='auto'` on the CPU raises `tm.UnsupportedError` naming the fix; `backend='xla'` runs there.
+- **CPU results are not bitwise equal to XLA:CPU** on transcendentals (libm vs XLA's own approximations, 1-7 ulps)
+  or on subnormals (XLA:CPU flushes them to zero; the kernel is IEEE). On a GPU the bitwise checks against XLA stand.
+- **`jax.export` of a kernel program is unsupported.** Its custom call is not on JAX's export allow-list and its
+  kernels are registered per process, so a deserialised program is not portable. Programs on the xla backend export
   normally.
 - **No second-order derivatives through spawn.** The tree adjoint raises for them.
 - **A100 and H200 are untested.** Nothing suggests they will not work; no tuning constant was measured on them.
@@ -486,7 +522,7 @@ What is explicitly out of scope, so that you do not have to find out by trying:
   together with spawn, effects inside the item (`jax.debug.print`, callbacks), `grad` through a `lax.while_loop`
   AROUND a call (that is JAX's own limitation, not tallymap's), 2^31 items or more in one call, and unknown
   option names.
-- **An `UnsupportedError` on a primitive the CUDA emitter does not know is a normal bug report**, not a dead end.
+- **An `UnsupportedError` on a primitive the kernel emitter does not know is a normal bug report**, not a dead end.
   Add `backend='xla'` and your program will run; attach `tm.diagnostics()` to the issue. Adding a primitive
   is usually one rule plus one test row (`CONTRIBUTING.md`).
 

@@ -4,6 +4,36 @@ All notable changes. Versions follow [SemVer](https://semver.org/) 0.x: until 1.
 API, and only after one minor release in which the old form still works and warns. Patch releases never change
 the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
+## 0.7.0 - unreleased
+
+### The kernel backend runs on the CPU
+
+- One compiled backend for both CUDA GPUs and the CPU: the emitter that produced CUDA C now also targets the host
+  (`tallymap/backends/cuda` is now `tallymap/backends/kernel`). JAX's device placement picks the target, so
+  `jax.default_device(jax.devices("cpu")[0])` on a GPU machine runs the CPU kernel; tallymap no longer consults
+  `jax.default_backend()` anywhere.
+- On the CPU: the system C++ compiler (`-O3 -march=native -ffp-contract=off`, cached per compiler, CPU and source),
+  one precompiled `jax.ffi` CPU handler running an OpenMP team, one thread per GPU thread (`OMP_NUM_THREADS`, else
+  the process's CPU set). IEEE arithmetic (subnormals kept) with libm; `cuda_math` has no effect. Per-item arrays live
+  on the worker threads' stacks (`OMP_STACKSIZE`, set to 16M when unset); a kernel whose stack bound is over half of
+  it is refused before it runs, as an over-limit CUDA kernel is. Without a C++ compiler with OpenMP, `backend='auto'`
+  on the CPU raises `UnsupportedError` naming the fix and `backend='xla'`.
+- Every feature runs on both targets; the whole test suite, including the op-parity suite (`tests/ops.py`), now runs
+  the CPU kernel against the xla reference, so CI exercises the emitter on every push.
+- CPU, one 32-core EPYC 7713 socket against the best plain-JAX program: forward 2.8-5.1x on the divergent problems
+  and at parity (1.0-1.1x) on long uniform loops, gradients 8.6-54x; against plain `jax.jit` on one device, forward
+  27-129x (README "Backends", `docs/performance.md`).
+
+### Removed
+
+- `backend='cuda'` raises `ValueError` saying to use `backend='auto'`, which runs the same kernel on a GPU.
+
+### Changed
+
+- `tm.diagnostics()['kernels'][i]` has `target` (`'cuda'` | `'cpu'`); CPU kernels report `resources` as their
+  stack bound. `tm.diagnostics()['host']`: the CPU compiler, its `-march=native` identity, cache, thread count.
+- The one-time xla-backend warning names the platform it is for (`'rocm'`, ...).
+
 ## 0.6.0 - 2026-11-11
 
 0.6.0rc1 plus the fixes below. Accepted by lumen (forward bitwise, reverse 0.82-0.93x the rc1 time, gradients within
