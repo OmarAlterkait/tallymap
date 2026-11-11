@@ -545,9 +545,10 @@ def make_pairs(b):
     P.append(Pair("shape (per-item (2,) vs (3,))", lambda: hs(x2), lambda: hs(x3), ok_sh(x2), ok_sh(x3),
                   lambda ra, rb: _np(ra.per_item).shape != _np(rb.per_item).shape, safe=False))
 
-    # 5. an option: cuda_math approx vs ieee (f32 div / sqrt; cuda only).  ieee must be correctly rounded (numpy
-    #    f32); approx must differ from it somewhere (else the pair is void) but stay within a few ulps.
-    if b == "auto":
+    # 5. an option: cuda_math approx vs ieee (f32 div / sqrt; cuda only: the host target is IEEE whatever the option).
+    #    ieee must be correctly rounded (numpy f32); approx must differ from it somewhere (else the pair is void)
+    #    but stay within a few ulps.
+    if b == "auto" and GPU:
         rng = np.random.default_rng(5)
         a32 = jnp.asarray(rng.uniform(0.1, 10.0, 4096), jnp.float32)
         c32 = jnp.asarray(rng.uniform(0.1, 10.0, 4096), jnp.float32)
@@ -778,7 +779,7 @@ for _kind in ("text", "digest", "avals"):
         _P._EAGER.clear()
         pairs = [p for p in make_pairs(b) if p.safe]
         expect, none = _with_power(kind, pairs, NEG_EXPECT[kind])
-        if "option cuda_math approx vs ieee" in NEG_EXPECT[kind]:
+        if "option cuda_math approx vs ieee" in NEG_EXPECT[kind] and GPU:      # (a cuda-only pair)
             expect.add("option cuda_math approx vs ieee")     # the coarse keys ignore options: always collides
             none.pop("option cuda_math approx vs ieee", None)
         CB._KERNELS.clear()
@@ -1020,8 +1021,44 @@ def frame_item(t, x, key):
     return t
 
 
-@case("[size] a per-item frame over CUDA's 512 KiB per-thread local limit raises before launch, naming both", ["auto"])
+HOST_FRAME_S = 1 << 14          # the emitter's largest local array (codegen.MAX_LOCAL), 64 KiB as f32 ...
+HOST_FRAME_K = 136              # ... 136 of them live at once: 8.5 MiB, over the host limit (8 MiB)
+
+
+def host_frame_item(t, x):
+    """HOST_FRAME_K per-item arrays of HOST_FRAME_S floats, all live at once: over the host target's stack limit"""
+    def body(c):
+        k, hs, t = c
+        hs = tuple(h.at[(k * (j + 3) + 1) % HOST_FRAME_S].set(h[(k * (j + 5)) % HOST_FRAME_S] * 0.5 + x)
+                   for j, h in enumerate(hs))
+        return k + 1, hs, t.add("Q", 0, sum(h[(k * 7 + j) % HOST_FRAME_S] for j, h in enumerate(hs)))
+    hs0 = tuple(jnp.full((HOST_FRAME_S,), x + j, F) for j in range(HOST_FRAME_K))
+    _, _, t = lax.while_loop(lambda c: c[0] < 3, body, (0, hs0, t))
+    return t
+
+
+def _host_frame():
+    from tallymap.backends.kernel.host import HOST_STACK
+    lim = HOST_STACK // 2
+    f = tm.vmap(host_frame_item, outputs={"Q": tm.Sum((1,), F)}, backend="auto")
+    try:
+        jax.block_until_ready(f(jnp.linspace(0.5, 1.5, 8).astype(F)))
+    except tm.UnsupportedError as e:
+        s = str(e)
+        if f"{lim:,}" not in s or "bytes of stack" not in s or "host_frame_item" not in s:
+            raise Fail(f"the refusal does not name the stack bound, the limit and the item: {s[:300]}") from None
+        need = int(s.split(" up to ")[1].split(" bytes")[0].replace(",", ""))
+        if need <= lim:
+            raise Fail(f"refused a stack of {need} B, which is under the limit {lim}") from None
+        raise Expected(f"{need:,} B > {lim:,} B: {s.splitlines()[0][:140]}") from None
+    raise Fail("a host kernel over the stack limit was run instead of refused")
+
+
+@case("[size] a per-item frame over the target's per-thread limit (cuda: 512 KiB local memory; cpu: half the host "
+      "thread's stack, from -fstack-usage) raises before launch, naming both", ["auto"])
 def _(b):
+    if not GPU:
+        return _host_frame()
     from tallymap.backends.kernel.compile import LOCAL_LIMIT
     keys = jax.random.split(jax.random.PRNGKey(3), NS)
     xs = jnp.linspace(0.5, 1.5, NS).astype(F)

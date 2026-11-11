@@ -34,7 +34,7 @@ TARGET = "tallymap_host_launch"
 OPTS = ["-O3", "-march=native", "-ffp-contract=off", "-fno-math-errno", "-std=c++17", "-shared", "-fPIC", "-w"]
 # per-thread stack the shim reserves (host_shim.cc HOST_STACK); a kernel whose frames could exceed half of it raises
 # before it runs, as a cuda kernel over CUDA's local-memory limit does (compile.check_frame)
-HOST_STACK = 64 << 20
+HOST_STACK = 16 << 20
 _LOCK = threading.Lock()
 
 HOST_PRELUDE = r"""
@@ -95,8 +95,9 @@ static inline float __double2float_rn(double a) { return (float)a; }
 static inline long long __double2ll_rn(double a) { return llrint(a); }
 static inline double rsqrt(double x) { return 1.0 / sqrt(x); }
 // erfinv (libdevice has it, libm does not): Giles (2010)'s single-precision polynomial as the starting point,
-// evaluated in double, then two Halley steps on erf (erfc in the upper half, where 1 - |y| is exact), which take
-// the f32-accurate start to double precision.  f32 rounds the double result.
+// evaluated in double, then Halley steps on erf (erfc in the upper half, where 1 - |y| is exact) until the step is
+// below an ulp: two from the f32-accurate start, up to five in the far tail (1 - |y| < 1e-12, where the polynomial
+// is outside its range).  f32 rounds the double result.
 static inline double erfinv(double y) {
   if (!(y > -1.0 && y < 1.0)) return y == 1.0 ? INFINITY : (y == -1.0 ? -INFINITY : NAN);
   if (y == 0.0) return y;
@@ -109,10 +110,12 @@ static inline double erfinv(double y) {
     p = -0.00367342844 + p * w; p = 0.00573950773 + p * w; p = -0.0076224613 + p * w; p = 0.00943887047 + p * w;
     p = 1.00167406 + p * w; p = 2.83297682 + p * w; }
   double x = p * a;
-  for (int i = 0; i < 2; ++i) {
+  for (int i = 0; i < 8; ++i) {
     const double f = a < 0.5 ? erf(x) - a : (1.0 - a) - erfc(x);
     const double d = 1.1283791670955126 * exp(-x * x);         // erf'(x) = 2/sqrt(pi) exp(-x^2)
-    x -= f / (d * (1.0 + x * f / d));                          // Halley: erf'' = -2x erf'
+    const double dx = f / (d * (1.0 + x * f / d));             // Halley: erf'' = -2x erf'
+    x -= dx;
+    if (fabs(dx) <= 2.3e-16 * x) break;
   }
   return copysign(x, y); }
 static inline float erfinvf(float x) { return (float)erfinv((double)x); }

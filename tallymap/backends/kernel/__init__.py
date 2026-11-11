@@ -94,11 +94,17 @@ def kernel(p, **opts):
         _KERNELS[k] = Kernel(p, **opts)
     kern = _KERNELS[k]
     from ..._diagnostics import record_kernel
-    src = (os.path.join(C.cache_dir(), "host", f"k_{kern.info['hash']}.cc") if kern.target == "cpu" else
-           os.path.join(C.cache_dir(), kern.info["hash"] + ".cu"))
-    record_kernel(dict(tag=p.tag, target=kern.target, schedule=kern.L.mode, hash=kern.info["hash"],
-                       cached=kern.info["cached"], kid=kern.kid, compile_s=round(kern.info["seconds"], 1),
-                       source=src, prims=list(kern.L.prims), options=dict(opts)))
+    rec = dict(tag=p.tag, target=kern.target, schedule=kern.L.mode, hash=kern.info["hash"],
+               cached=kern.info["cached"], kid=kern.kid, compile_s=round(kern.info["seconds"], 1),
+               prims=list(kern.L.prims), options=dict(opts))
+    if kern.target == "cpu":
+        from . import host
+        # the host target's resource: the per-thread stack bound (-fstack-usage) against the limit it is refused at
+        rec.update(source=os.path.join(C.cache_dir(), "host", f"k_{kern.info['hash']}.cc"),
+                   resources=dict(stack_bytes=kern.info["stack"], stack_limit=host.HOST_STACK // 2))
+    else:
+        rec.update(source=os.path.join(C.cache_dir(), kern.info["hash"] + ".cu"))
+    record_kernel(rec)
     return kern
 
 

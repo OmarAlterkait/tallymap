@@ -208,3 +208,24 @@ Keep the adapter in the calling program, never here: an optional import, a flag 
 unchanged by default, and a shadow mode in continuous integration that runs both paths and compares per item with
 the `compare` criterion against a FIXED reference. Validate gradients as per-output vectors, away from the truth,
 with common-random-number finite differences. Time with `jax.jit` wall time, not ahead-of-time compilation.
+
+## The CPU target's math library (measured)
+
+The CPU target calls glibc's libm where the cuda target calls libdevice; XLA:CPU uses its own approximations instead
+of libm, so the CPU kernel is not bitwise equal to the xla backend on transcendentals (tests compare to tolerance
+there; on cuda the bitwise checks stand).  Measured on the S3DF login node (glibc 2.35, GCC 11.4, JAX 0.6.2), 2^20
+f32 inputs per op: the fraction of results that differ from XLA:CPU, and each side's error against float64:
+
+| op | differ from XLA:CPU | host (libm) max / mean ulp | XLA:CPU max / mean ulp |
+|---|---|---|---|
+| exp | 9.5% | 0.50 / 0.250 | 0.99 / 0.267 |
+| log | 3.4% | 0.79 / 0.250 | 1.07 / 0.253 |
+| log1p | 7.6% | 0.79 / 0.258 | 1.62 / 0.289 |
+| expm1 | 7.1% | 0.75 / 0.248 | 5.18 / 0.285 |
+| tanh | 30.0% | 2.05 / 0.133 | 4.35 / 0.407 |
+| logistic | 4.1% | 2.48 / 0.414 | 2.48 / 0.419 |
+| erf | 49.0% | 0.84 / 0.204 | 6.71 / 0.635 |
+
+sin, cos, sqrt, division, pow and atan2 were bitwise equal on these inputs.  libm is the more accurate side on every op
+measured, so the CPU target keeps it (matching XLA:CPU would mean porting XLA's approximations, which change with
+XLA versions).

@@ -196,13 +196,15 @@ def _warn_once(msg, site=None):
 
 
 def _lowering(platform):
-    def f(*args, node):
-        return _run(node, args, platform)
+    def f(*args, node, plat):
+        return _run(node, args, plat)
     low = mlir.lower_fun(f, multiple_results=True)
 
     def rule(ctx, *args, node):
+        # the default rule (platform None) serves every platform without its own: name the one being lowered for
+        plat = platform or (ctx.module_context.platforms[0] if ctx.module_context.platforms else "unknown")
         try:
-            return low(ctx, *args, node=node)
+            return low(ctx, *args, node=node, plat=plat)
         except UnsupportedError:
             raise
         except Exception as e:
@@ -215,7 +217,7 @@ def _lowering(platform):
 
 
 for _p in (tallymap_call_p, tallymap_jvp_p):
-    mlir.register_lowering(_p, _lowering("other"))
+    mlir.register_lowering(_p, _lowering(None))
     for _plat in KERNEL_PLATFORMS:
         mlir.register_lowering(_p, _lowering(_plat), platform=_plat)
 

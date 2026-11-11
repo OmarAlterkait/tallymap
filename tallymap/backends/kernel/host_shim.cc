@@ -12,6 +12,7 @@
 // kernels need no OpenMP runtime.  T = $OMP_NUM_THREADS when set, else the CPUs this process may run on
 // (sched_getaffinity: the cpuset / Slurm allocation), capped by n_items unless flags & 4 (spawn: children).
 // The kernels themselves include no XLA headers: only this file does, and it is built once per toolchain.
+#include <fenv.h>
 #include <pthread.h>
 #include <sched.h>
 
@@ -32,7 +33,9 @@ typedef void (*SjHostRun)(int, void**, int, long long, int, int);
 
 namespace {
 
-constexpr size_t HOST_STACK = size_t(64) << 20;   // reserved per thread; pages are committed only when touched
+// reserved per thread (pages are committed only when touched): 32 x CUDA's 512 KiB per-thread local-memory limit;
+// a kernel whose -fstack-usage bound is over half of it is refused before it runs (host.py, HOST_STACK there)
+constexpr size_t HOST_STACK = size_t(16) << 20;
 
 std::mutex g_mu;
 std::unordered_map<int64_t, SjHostRun>& registry() {
@@ -77,7 +80,10 @@ struct Arg {
 void* worker(void* a) {
   const Arg* w = static_cast<const Arg*>(a);
   Job& j = *const_cast<Job*>(w->job);
-  if (w->tid != 0) {
+  // IEEE: a new thread inherits the creating thread's floating-point environment, and XLA:CPU's threads flush
+  // subnormals to zero (measured: 1e-45f + 1e-45f gave 0 in the kernel, as in XLA:CPU; IEEE gives 3e-45)
+  fesetenv(FE_DFL_ENV);
+  {
     std::unique_lock<std::mutex> lk(j.mu);
     j.cv.wait(lk, [&] { return j.state != 0; });
     if (j.state == 2) return nullptr;
@@ -143,7 +149,9 @@ static ffi::Error HostLaunchImpl(ffi::RemainingArgs args, ffi::RemainingRets ret
   pthread_attr_setstacksize(&attr, HOST_STACK);
   long long started = 0;
   std::string err;
-  for (long long t = 1; t < nt; ++t) {     // thread 0 is the calling thread
+  // every team member is a new thread with HOST_STACK: the calling thread is XLA's, with a stack tallymap does not
+  // control, so it only waits
+  for (long long t = 0; t < nt; ++t) {
     wa[t] = Arg{&job, (int)t};
     if (pthread_create(&th[t], &attr, worker, &wa[t]) != 0) { err = "pthread_create failed"; break; }
     ++started;
@@ -155,13 +163,11 @@ static ffi::Error HostLaunchImpl(ffi::RemainingArgs args, ffi::RemainingRets ret
   }
   job.cv.notify_all();
   if (!err.empty()) {
-    for (long long t = 1; t <= started; ++t) pthread_join(th[t], nullptr);
+    for (long long t = 0; t < started; ++t) pthread_join(th[t], nullptr);
     if (need_bar) pthread_barrier_destroy(&bar);
     return ffi::Error(ffi::ErrorCode::kResourceExhausted, "tallymap: could not start the host kernel's threads");
   }
-  wa[0] = Arg{&job, 0};
-  worker(&wa[0]);
-  for (long long t = 1; t < nt; ++t) pthread_join(th[t], nullptr);
+  for (long long t = 0; t < nt; ++t) pthread_join(th[t], nullptr);
   if (need_bar) pthread_barrier_destroy(&bar);
   return ffi::Error::Success();
 }

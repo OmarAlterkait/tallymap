@@ -963,7 +963,8 @@ def _(b):
             gq_f = jax.jit(jax.grad(lambda t_: jnp.sum(f(xs, t_).outputs["Q"])))
             if b == "auto":     # what runs: the custom calls left in the optimised program
                 hlo = _with_single(mode, lambda: gq_f.lower(th).compile().as_text())
-                nl = hlo.count('custom_call_target="tallymap_cuda_launch"')
+                nl = sum(hlo.count(f'custom_call_target="{tg}"')
+                         for tg in ("tallymap_cuda_launch", "tallymap_host_launch"))
                 if nl != 1:
                     raise Fail(f"{mode}: jax.grad of a linear loss runs {nl} kernels, want 1 (the adjoint)")
             gq = float(_with_single(mode, lambda: gq_f(th)))

@@ -1,7 +1,7 @@
 """The ONE test entry point.
 
-    python tests/run_all.py            # CPU: xla backend
-    python tests/run_all.py --gpu      # GPU: xla AND cuda backends (tree adjoint and op parity on cuda)
+    python tests/run_all.py            # xla backend AND the kernel backend on the platform JAX picks (CPU or GPU)
+    python tests/run_all.py --gpu      # the same; --gpu only labels the summary line
     python tests/run_all.py --x64      # with jax_enable_x64
     python tests/run_all.py --unfused  # the two-node jvp design (what runs if JAX drops the partial-eval registries)
     python tests/run_all.py --t3       # the single-loop adjoint forced wherever a program has its shape (TX_T3=1)
@@ -12,8 +12,8 @@
 Suites: edge (edge cases), transforms (composability matrix), reverse (reverse mode), reverse_spawn (tree adjoint),
 invariants (schedule invariance, cache-key soundness, run-or-raise, AD self-consistency, truncation),
 dice (DiCE gradients of discrete outcomes against closed forms, float score leaves through spawn),
-ops (cuda op table vs jit(vmap(op)) and the host-exact result; --gpu only), mulchain (a 64-bit multiply chain
-compiles fast and matches xla bitwise; --gpu only), examples (examples/*.py run as scripts).
+ops (kernel op table vs jit(vmap(op)) and the host-exact result), mulchain (a 64-bit multiply chain compiles fast
+and matches xla bitwise), examples (examples/*.py run as scripts).
 Each suite runs in its own process (fresh JAX state).  A suite passes iff its summary line was printed and every cell
 is PASS, an EXPECTED raise (RAISES-OK) or an expected failure (XFAIL: a known library defect pinned by the suite);
 anything else (FAIL, unexpected RAISE, XPASS -- an XFAIL cell that now passes, so its marker must go --, crash,
@@ -30,7 +30,6 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SUITES = ["edge", "transforms", "reverse", "reverse_spawn", "invariants", "dice", "ops", "mulchain", "examples"]
-GPU_ONLY = {"ops", "mulchain"}
 EXAMPLES = ["quickstart", "photon_toy", "shower_toy", "ensemble_toy", "walk_on_spheres",
             "ode_ensemble", "gillespie", "interacting_particles", "particle_filter", "gradient_pitfall"]
 
@@ -77,7 +76,7 @@ def main(argv):
     t3 = "--t3" in argv
     only = next((a.split("=", 1)[1] if "=" in a else argv[argv.index(a) + 1] for a in argv if a.startswith("--only")),
                 None)
-    suites = [s for s in SUITES if (only is None or s in only.split(",")) and (gpu or s not in GPU_ONLY)]
+    suites = [s for s in SUITES if (only is None or s in only.split(","))]
     env = dict(os.environ, PYTHONPATH=ROOT + os.pathsep + os.environ.get("PYTHONPATH", ""))
     # the kernel backend runs on every platform JAX can lower it for (backend='auto': cuda on a GPU, the CPU target
     # elsewhere), against the xla backend as the reference

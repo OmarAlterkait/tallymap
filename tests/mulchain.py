@@ -1,4 +1,5 @@
-"""Wide-multiply chains on cuda.  python tests/mulchain.py   (GPU; enables jax_enable_x64 itself)
+"""Wide-multiply chains in the kernel backend.  python tests/mulchain.py   (enables jax_enable_x64 itself; runs the
+target JAX places it on: cuda on a GPU, the CPU target elsewhere, where the cuts are the portable host.HOST_BRK)
 
 NVVM is exponential in the depth of a serial chain of 64-bit integer multiplies inside one function (127 s at depth
 16, > 300 s at 20), so the cuda emitter cuts such a chain every codegen.MULCHAIN_K links with a zero-instruction
@@ -59,10 +60,7 @@ def item(t, x, kind):
 
 
 def main():
-    if jax.default_backend() != "gpu":
-        print("SUITE SKIP (no GPU)")
-        print("TOTAL 0 PASS 0")
-        return 0
+    tgt = "cuda" if jax.default_backend() == "gpu" else "cpu"
     rng = np.random.default_rng(0)
     x = jnp.asarray(rng.integers(1, 1 << 62, N, dtype=np.int64)).astype(U)
     kind = jnp.asarray(rng.integers(0, NK, N), jnp.int32)
@@ -77,7 +75,7 @@ def main():
         except Exception as e:
             msg = f"RAISE {type(e).__name__}: {str(e)[:300]}"
         RES.append(msg)
-        print(f"{name:70s} cuda     {msg}", flush=True)
+        print(f"{name:70s} {tgt:8s} {msg}", flush=True)
 
     tm.diagnostics(reset=True)
     rc = run("auto")
@@ -99,7 +97,7 @@ def main():
         return f"tallies and {N} per-item values bitwise equal"
 
     cell(f"wide-multiply chain of {DEPTH} links: cut every {CG.MULCHAIN_K} (structural)", compiled)
-    cell("wide-multiply chain: cuda == xla bitwise", bitwise)
+    cell("wide-multiply chain: kernel == xla bitwise", bitwise)
     print("TOTAL", len(RES), "PASS", sum(m.startswith("PASS") for m in RES))
     return 0 if all(m.startswith("PASS") for m in RES) else 1
 

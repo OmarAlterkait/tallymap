@@ -232,11 +232,18 @@ r = jax.jit(lambda th, x: tallymap_fn()(x, th))(TH, X0)
 gens = sum(1 for s in sizes if s > 0)
 hr = np.asarray(o_ref["h"])
 fd = dict(h=float(np.abs(np.asarray(r.outputs["h"]) - hr).max() / np.abs(hr).max()),
-          y_equal=bool(np.array_equal(np.asarray(r.per_item), np.asarray(y_ref))), spawned=int(r.stats["spawned"]),
+          y_equal=bool(np.array_equal(np.asarray(r.per_item), np.asarray(y_ref))),
+          y_rel=float(np.abs(np.asarray(r.per_item) - np.asarray(y_ref)).max() / np.abs(np.asarray(y_ref)).max()),
+          spawned=int(r.stats["spawned"]),
           ref_children=int(sum(sizes)), generations=gens, max_gen=max(sizes),
           children_dropped=int(r.stats["children_dropped"]))
+# per-item y bitwise on cuda (libdevice on both sides) and on the xla backend; the CPU kernel calls libm, which
+# differs from XLA:CPU's own exp/log/log1p/expm1/tanh/erf/logistic by 1-7 ulps (and is the more accurate of the two:
+# measured in docs/maintenance.md), so there y is compared to tolerance
+Y_BITWISE = BK == "xla" or jax.default_backend() == "gpu"
+y_ok = fd["y_equal"] if Y_BITWISE else fd["y_rel"] < (1e-12 if X64 else 1e-5)
 report("forward tallymap == dense reference",
-       fd["h"] < (1e-9 if X64 else 1e-4) and fd["y_equal"] and fd["spawned"] == fd["ref_children"], **fd)
+       fd["h"] < (1e-9 if X64 else 1e-4) and y_ok and fd["spawned"] == fd["ref_children"], **fd)
 print("generation sizes", sizes, flush=True)
 assert max(sizes) <= CG and sum(sizes) <= TOT, "toy too big for the capacities"
 assert gens >= 25, f"toy not deep enough: {gens} generations"

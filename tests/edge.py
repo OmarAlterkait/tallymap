@@ -951,8 +951,13 @@ def _(b):
     if (b == "auto") != bool(d["kernels"]):
         raise Fail(f"kernels recorded: {d['kernels']}")
     if b == "auto" and not os.path.exists(d["kernels"][0]["source"]):
-        raise Fail(f"cached .cu missing: {d['kernels'][0]['source']}")
-    if b == "auto":                      # once a kernel has run, its measured resources are reported
+        raise Fail(f"cached kernel source missing: {d['kernels'][0]['source']}")
+    if b == "auto" and not GPU:          # the host target: its stack bound, known at compile time
+        res = [k.get("resources") for k in d["kernels"]]
+        if not all(k["target"] == "cpu" for k in d["kernels"]) or not all(
+                r_ and 0 < r_["stack_bytes"] <= r_["stack_limit"] for r_ in res):
+            raise Fail(f"host kernel records: {[(k['target'], k.get('resources')) for k in d['kernels']]}")
+    elif b == "auto":                    # once a cuda kernel has run, its measured resources are reported
         jax.block_until_ready(f(xs, keys, tab, TH).outputs["Q"])
         res = [k.get("resources") for k in tm.diagnostics()["kernels"]]
         if not any(r_ and r_["regs"] > 0 and r_["blocks_per_sm"] >= 1 and r_["local_reserved_gib"] >= 0
@@ -1032,7 +1037,7 @@ def _(b):
     if len(ws) != 1:
         raise Fail(f"expected ONE xla warning, got {[str(x.message) for x in ws]}")
     msg = str(ws[0].message)
-    if "not for 'rocm'" not in msg:
+    if "not for 'rocm'" not in msg:                           # (the platform being lowered for, by name)
         raise Fail(f"warning text: {msg!r}")
     if os.path.basename(ws[0].filename) != os.path.basename(__file__) or ws[0].lineno != line:
         raise Fail(f"warning attributed to {ws[0].filename}:{ws[0].lineno}, want this file line {line}")
@@ -1753,6 +1758,79 @@ def _(b):
         raise Fail(f"xla f32 error {e_x:.3g} vs plain JAX {e_p:.3g} (|sum| {np.max(np.abs(exact)):.4g}): "
                    "serial accumulation into one accumulator?")
     return f"error {e_x:.3g} vs plain JAX {e_p:.3g} ({e_x / max(e_p, 1e-30):.1f}x), |sum| {np.max(np.abs(exact)):.4g}"
+
+
+@case("erf_inv in the kernel: f64 inverts XLA's f64 erf/erfc to a few ulps across (-1, 1) incl. the tails, matches "
+      "two published values; erf_inv(+-1) = +-inf, |y| > 1 NaN; cpu: f32 = the f64 result rounded", ["auto"])
+def _(b):
+    x64 = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        t = np.concatenate([np.linspace(-0.999, 0.999, 4001), 1 - np.logspace(-15, -3, 200),
+                            -(1 - np.logspace(-15, -3, 50)), [0.0, 0.5, 0.9, 1.0, -1.0, 1.5, -2.0]])
+        g = lambda dt: jax.jit(tm.vmap(lambda tt, y: (tt, jax.scipy.special.erfinv(y)), outputs={"_": tm.Sum((1,), dt)},
+                                       backend=b))
+        y64 = jnp.asarray(t, jnp.float64)
+        x = np.asarray(g(jnp.float64)(y64).per_item)
+        fin = np.abs(t) < 1
+        lo, hi = fin & (np.abs(t) < 0.5), fin & (np.abs(t) >= 0.5)
+        e_lo = np.max(np.abs(np.asarray(jax.scipy.special.erf(x[lo])) - t[lo]) / np.spacing(np.abs(t[lo]) + 1e-300))
+        # the tails: compare 1 - |y| (exact in f64 for these y) with erfc(|x|)
+        q = 1 - np.abs(t[hi])
+        e_hi = np.max(np.abs(np.asarray(jax.scipy.special.erfc(np.abs(x[hi]))) - q) / q)
+        if not (e_lo <= 4 and e_hi <= 1e-13):
+            raise Fail(f"round trip: |erf(x) - y| {e_lo:.2f} ulp (|y| < 0.5), tail rel {e_hi:.2e}")
+        ref = {0.5: 0.4769362762044699, 0.9: 1.1630871536766743}
+        for y, xr in ref.items():
+            v = x[np.nonzero(t == y)[0][0]]
+            if abs(v - xr) > 4 * np.spacing(xr):
+                raise Fail(f"erfinv({y}) = {v!r}, published {xr!r}")
+        sp = {1.0: np.inf, -1.0: -np.inf}
+        for y, v in sp.items():
+            if x[np.nonzero(t == y)[0][0]] != v:
+                raise Fail(f"erfinv({y}) = {x[np.nonzero(t == y)[0][0]]}")
+        if not np.isnan(x[np.abs(t) > 1]).all():
+            raise Fail("erfinv(|y| > 1) is not NaN")
+        if GPU:                          # (cuda's f32 erfinvf is libdevice's own; ops.py bounds it at 2 ulp)
+            return f"f64 round trip {e_lo:.2f} ulp, tail rel {e_hi:.1e}"
+        y32 = jnp.asarray(t, jnp.float32)
+        x32 = np.asarray(g(jnp.float32)(y32).per_item)
+        r32 = np.asarray(g(jnp.float64)(jnp.asarray(np.asarray(y32), jnp.float64)).per_item).astype(np.float32)
+        if not np.array_equal(x32[np.isfinite(r32)], r32[np.isfinite(r32)]):
+            raise Fail("f32 erf_inv is not the f64 result rounded")
+        return f"f64 round trip {e_lo:.2f} ulp, tail rel {e_hi:.1e}; f32 = f64 rounded"
+    finally:
+        jax.config.update("jax_enable_x64", x64)
+
+
+@case("cpu target: the spawn queue's spin-wait with every team thread running at once, oversubscribed (64 threads) "
+      "and single-threaded, == xla (counts exact, tallies to tolerance)", ["auto"])
+def _(b):
+    if GPU:
+        return "n/a on cuda (the CPU target's thread team)"
+    def shower(t, x):
+        t = t.add("Q", jnp.clip((x * NB).astype(jnp.int32), 0, NB - 1), x)
+        return t.spawn(x * 0.5, when=x > 0.05).spawn(x * 0.25, when=x > 0.2)
+    x0 = jnp.linspace(0.1, 1.0, 512).astype(F)
+    mk = lambda bk: jax.jit(tm.vmap(shower, outputs={"Q": tm.Sum((NB,), F)}, spawn=tm.Queue(1 << 15), backend=bk))
+    ref = mk("xla")(x0)
+    old = os.environ.get("OMP_NUM_THREADS")
+    out = []
+    try:
+        for nt in ("64", "1"):
+            os.environ["OMP_NUM_THREADS"] = nt          # (read by the shim at every launch)
+            r = mk(b)(x0)
+            for k in ("spawned", "children_dropped"):
+                if int(r.stats[k]) != int(ref.stats[k]):
+                    raise Fail(f"{nt} threads: {k} {int(r.stats[k])} vs xla {int(ref.stats[k])}")
+            close(r.outputs["Q"], ref.outputs["Q"], what=f"{nt} threads")
+            out.append(f"{nt} threads spawned {int(r.stats['spawned'])}")
+    finally:
+        if old is None:
+            os.environ.pop("OMP_NUM_THREADS", None)
+        else:
+            os.environ["OMP_NUM_THREADS"] = old
+    return "; ".join(out)
 
 print("\n================ SUMMARY", jax.__version__, "x64" if jax.config.jax_enable_x64 else "",
       jax.devices()[0].device_kind)

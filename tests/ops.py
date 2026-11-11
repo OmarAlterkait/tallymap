@@ -1,11 +1,15 @@
-"""Per-operation parity of the cuda op table (backends/cuda/op_table.py), the main maintenance surface.
+"""Per-operation parity of the kernel op table (backends/kernel/op_table.py), the main maintenance surface.
 
-    python tests/ops.py              # GPU only: judge every op against its stated bound, compare with the baseline
-    python tests/ops.py --record     # (re)write this (GPU, JAX) entry of tests/ops_baseline.json
+    python tests/ops.py              # judge every op against its stated bound, compare with the baseline
+    python tests/ops.py --record     # (re)write this (device, JAX) entry of tests/ops_baseline.json
+
+It runs the target JAX places the computation on: the cuda target on a GPU (both math modes), the CPU target
+elsewhere (one mode, 'ieee': the host target is IEEE whatever cuda_math says; judged by the ieee bounds, with the
+libm math library where the GPU has libdevice, so `lib` holds glibc to libdevice's documented bounds).
     env OPS=add,exp (subset)  N (262144 items)  OPS_BASELINE (another baseline file)
 
-Each op is one item (= one element): tm.vmap(op, backend='cuda') for cuda_math in {ieee, approx}, against
-    XLA       jax.jit(jax.vmap(op)) on the same GPU, and
+Each op is one item (= one element): tm.vmap(op, backend='auto') for cuda_math in {ieee, approx}, against
+    XLA       jax.jit(jax.vmap(op)) on the same device, and
     EXACT     (classes cr / lib only) the op evaluated in float64 on the host CPU, rounded to float32.
 Inputs mix wide random ranges with the specials 0, -0, +-inf, NaN, the smallest subnormal, 1, -1, 3e38, 0.5.
 NaN == NaN, and +0 == -0 only where the class allows it (it never does for exact / cr).
@@ -257,8 +261,8 @@ def run_op(name, f, kinds, cls, bound):
     xla = np.asarray(jax.jit(jax.vmap(f))(*xj))
     ex = exact_ref(f, xs) if cls in ("cr", "lib") else None
     rows = []
-    for k, math in enumerate(("ieee", "approx")):
-        g = tm.vmap(lambda t, *a: (t, f(*a)), outputs={"_": tm.Sum((1,))}, in_axes=(0,) * len(xs), backend="cuda",
+    for k, math in enumerate(MATHS):
+        g = tm.vmap(lambda t, *a: (t, f(*a)), outputs={"_": tm.Sum((1,))}, in_axes=(0,) * len(xs), backend="auto",
                     cuda_math=math)
         got = np.asarray(jax.jit(g)(*xj).per_item)
         mx, ux, nx = diff(xla, got)
@@ -291,15 +295,26 @@ def check_names():
     return not bad
 
 
+GPU = jax.default_backend() == "gpu"
+MATHS = ("ieee", "approx") if GPU else ("ieee",)
+
+
+def _device():
+    if GPU:
+        return jax.devices()[0].device_kind
+    try:                                       # the host target: the CPU model (the kernels are -march=native)
+        with open("/proc/cpuinfo") as f:
+            return "cpu " + next(ln.split(":", 1)[1].strip() for ln in f if ln.startswith("model name"))
+    except (OSError, StopIteration):
+        import platform
+        return "cpu " + platform.machine()
+
+
 def main():
     names_ok = check_names()
-    gpu = jax.devices()[0].device_kind
-    key = f"{gpu} | jax {jax.__version__}"
-    print("ENV", json.dumps(dict(jax=jax.__version__, gpu=gpu, n=N)), flush=True)
-    if jax.default_backend() != "gpu":
-        print("ops.py needs a GPU (it tests the cuda backend)")
-        print("ALL FAIL 0/0")
-        return 1
+    dev = _device()
+    key = f"{dev} | jax {jax.__version__}"
+    print("ENV", json.dumps(dict(jax=jax.__version__, device=dev, n=N)), flush=True)
     rows = []
     for x64 in (False, True):
         jax.config.update("jax_enable_x64", x64)
@@ -337,7 +352,7 @@ def main():
     judged = [r for r in rows if r.get("cls") != "info"]
     n_ok = sum(r["ok"] for r in judged) - len(changed)
     tot = len(judged)
-    print(f"OPS {len(OPS)} ops x 2 math modes; judged {tot}, out of bound {len(bad)}, changed vs baseline "
+    print(f"OPS {len(OPS)} ops x {len(MATHS)} math modes; judged {tot}, out of bound {len(bad)}, changed vs baseline "
           f"{len(changed)}", flush=True)
     ok = not bad and not changed and names_ok
     print(f"ALL {'PASS' if ok else 'FAIL'} {max(n_ok, 0)}/{tot}", flush=True)
