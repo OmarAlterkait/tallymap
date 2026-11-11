@@ -4,6 +4,25 @@ All notable changes. Versions follow [SemVer](https://semver.org/) 0.x: until 1.
 API, and only after one minor release in which the old form still works and warns. Patch releases never change
 the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
+## 0.6.0 - 2026-11-11
+
+0.6.0rc1 plus the fixes below. Accepted by lumen (forward bitwise, reverse 0.82-0.93x the rc1 time, gradients within
+the rerun spread).
+
+### Fixed
+
+- `jax.jacrev` of a call with `max_steps` raised a broadcast error on the xla backend: truncated children are now
+  counted from a laned program's per-lane flags.
+- A typed PRNG key as a mapped input of a spawning call raised (`np.dtype` on a key dtype).
+- The xla backend interprets each `cond` branch once (traced with `make_jaxpr`, replayed by `lax.cond` /
+  `lax.switch`): 79 -> 0.99 binds per equation at nesting depth 4, first call 84 -> 3.6 s.
+- The xla backend's f32 `Sum` tallies accumulate into 64 partial rows summed at the end: error against f64
+  0.177 -> 0.0031 (plain JAX 0.0021), run time unchanged.
+
+### Changed
+
+- CI pins the per-push newest-JAX cells to the newest tested version, not an unpinned latest.
+
 ## 0.6.0rc1 - release candidate
 
 ### Renamed (a clean break: the old spellings raise)
