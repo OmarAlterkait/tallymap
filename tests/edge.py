@@ -1251,8 +1251,16 @@ def _(b):
             if sp + dr != F_OUT * int(c[:DEPTH].sum()):
                 raise Fail(f"cap {cap} rep {rep}: spawned + dropped {sp} + {dr} != attempted "
                            f"{F_OUT * int(c[:DEPTH].sum())}")
-            if dr == 0 or not np.all(np.isnan(np.asarray(r.outputs["Q"]))):
-                raise Fail(f"cap {cap} rep {rep}: dropped {dr}, Q {np.asarray(r.outputs['Q'])[:3]}")
+            # whether a queue overflows depends on how many threads drain it at once (the CPU target with 4
+            # threads never fills 1024 here; 16 threads or a GPU do), so the contract is per outcome: a drop
+            # poisons every float bin, no drop is the whole tree with finite tallies
+            q = np.asarray(r.outputs["Q"])
+            if dr and not np.all(np.isnan(q)):
+                raise Fail(f"cap {cap} rep {rep}: dropped {dr} but Q {q[:3]} is not NaN")
+            if not dr and (not np.all(np.isfinite(q)) or sp != sum(NR * F_OUT ** g for g in range(1, DEPTH + 1))):
+                raise Fail(f"cap {cap} rep {rep}: nothing dropped but spawned {sp}, Q {q[:3]}")
+            if cap == 8 and not dr:
+                raise Fail(f"cap 8 rep {rep}: a queue of 8 against {NR * F_OUT} first-generation children dropped none")
             seen.add((cap, sp))
     full = tm.vmap(item, outputs=out, spawn=tm.Queue(1 << 20), backend=b)(g0, x0)
     want = [NR * F_OUT ** g for g in range(DEPTH + 1)]
