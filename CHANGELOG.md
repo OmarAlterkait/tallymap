@@ -48,7 +48,7 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 - Nothing a program writes is in git any more: the benchmark plots, the measured rows, the demos' plots and results,
   and the `tests/ops.py` and `benchmarks/perf.py` baselines (now recorded per machine in `$TALLYMAP_CACHE`). The
   docs keep the numbers as tables; `make_tables.py` no longer draws figures.
-- `docs/performance.md` is the summary (method, headline, CPU); every per-problem table and plot moved to
+- `docs/performance.md` is the summary (method, headline, CPU); every per-problem table moved to
   `docs/performance_detail.md`. `docs/design.md` is a short map of why each part exists; the full record of
   measurements, including the removed and refuted alternatives, is `docs/design_notes.md`.
 - `tm.diagnostics()['kernels'][i]` has `target` (`'cuda'` | `'cpu'`); CPU kernels report `resources` as their
