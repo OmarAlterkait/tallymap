@@ -14,14 +14,15 @@ import sys
 if "xla_force_host_platform_device_count" not in os.environ.get("XLA_FLAGS", ""):
     os.environ["XLA_FLAGS"] = (os.environ.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=4").strip()
 
-import jax                                     # noqa: E402
-import jax.numpy as jnp                        # noqa: E402
-import numpy as np                             # noqa: E402
-from jax import lax                            # noqa: E402
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P   # noqa: E402
+import jax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
+from jax import lax  # noqa: E402
+from jax.sharding import Mesh, NamedSharding  # noqa: E402
+from jax.sharding import PartitionSpec as P
 
-import tallymap as tm                          # noqa: E402
-from tallymap import _primitive                # noqa: E402
+import tallymap as tm  # noqa: E402
+from tallymap import _primitive  # noqa: E402
 
 RES = []
 

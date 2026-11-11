@@ -212,7 +212,8 @@ def _item_axes(c, arg_shapes):
 
 
 def _shardings(c, mesh, arg_shapes, result_shape):
-    from jax.sharding import NamedSharding, PartitionSpec as P
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
     node, _, nc, _ = c
     p = node.prog
     out_avals = jax.tree_util.tree_leaves(result_shape)

@@ -171,7 +171,8 @@ def main():
                f"{int(ns_scan.sum())} vs {int(ns.sum())} steps"),
               ("ESS: forward, chains matching the same while_loop program", m.mean() >= 0.9,
                f"{int(m.sum())}/{n} chains to 1e-5"),
-              ("ESS: grad, tallymap vs the padded-scan rewrite", abs(gt - gs) / abs(gs) < 1e-4, f"{gt:.8g} vs {gs:.8g}"),
+              ("ESS: grad, tallymap vs the padded-scan rewrite", abs(gt - gs) / abs(gs) < 1e-4,
+               f"{gt:.8g} vs {gs:.8g}"),
               ("ESS: plain JAX cannot take grad of the while_loop", raised != "no error", raised)]
     blackjax = D.have("blackjax")
     nuts_arms = nuts_checks(blackjax, n, checks) if blackjax is not None else None

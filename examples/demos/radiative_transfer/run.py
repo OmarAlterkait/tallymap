@@ -123,7 +123,8 @@ def main():
     jf, kf = jnp.asarray(smooth_field(1, 0.0, 1.0)), jnp.asarray(smooth_field(2, 0.01, 0.4))
     src = jnp.full((3,), (G - 1) / 2.0, jnp.float32)
     rng = np.random.default_rng(0)
-    wts, tgt = jnp.asarray(rng.uniform(0.5, 1.5, G ** 3), jnp.float32), jnp.asarray(rng.uniform(0, 2, G ** 3), jnp.float32)
+    wts = jnp.asarray(rng.uniform(0.5, 1.5, G ** 3), jnp.float32)
+    tgt = jnp.asarray(rng.uniform(0, 2, G ** 3), jnp.float32)
     sims = {"tallymap": lambda j, k: f_tm(dirs, j, k, src).outputs["J"],
             "plain-JAX shared scan": lambda j, k: run_scan(dirs, j, k, src)}
     if rt is not None:

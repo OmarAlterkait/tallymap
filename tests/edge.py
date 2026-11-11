@@ -1610,7 +1610,8 @@ def _(b):
         return item
     out = []
     for name, op in (("solve", lambda A: jnp.linalg.solve(A, jnp.ones(4, F))), ("inv", lambda A: jnp.linalg.inv(A)[0])):
-        m = raises(tm.UnsupportedError, lambda op=op: V(mk(op), b)(xs), "is not supported by the tallymap kernel backend")
+        m = raises(tm.UnsupportedError, lambda op=op: V(mk(op), b)(xs),
+                   "is not supported by the tallymap kernel backend")
         prim = re.search(r"primitive '(\w+)' is not supported", m)
         out.append(f"{name}: {prim.group(1) if prim else m[:60]}")
     return "; ".join(out)
