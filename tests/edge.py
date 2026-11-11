@@ -1761,7 +1761,8 @@ def _(b):
 
 
 @case("erf_inv in the kernel: f64 inverts XLA's f64 erf/erfc to a few ulps across (-1, 1) incl. the tails, matches "
-      "two published values; erf_inv(+-1) = +-inf, |y| > 1 NaN; cpu: f32 = the f64 result rounded", ["auto"])
+      "two published values; erf_inv(+-1) = +-inf, |y| > 1 NaN; cpu: f32 within 2 ulp of the f64 result rounded",
+      ["auto"])
 def _(b):
     x64 = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
@@ -1796,9 +1797,11 @@ def _(b):
         y32 = jnp.asarray(t, jnp.float32)
         x32 = np.asarray(g(jnp.float32)(y32).per_item)
         r32 = np.asarray(g(jnp.float64)(jnp.asarray(np.asarray(y32), jnp.float64)).per_item).astype(np.float32)
-        if not np.array_equal(x32[np.isfinite(r32)], r32[np.isfinite(r32)]):
-            raise Fail("f32 erf_inv is not the f64 result rounded")
-        return f"f64 round trip {e_lo:.2f} ulp, tail rel {e_hi:.1e}; f32 = f64 rounded"
+        fin32 = np.isfinite(r32)
+        u32 = np.max(np.abs(x32[fin32].view(np.int32).astype(np.int64) - r32[fin32].view(np.int32).astype(np.int64)))
+        if u32 > 2 or not np.array_equal(x32[~fin32], r32[~fin32], equal_nan=True):
+            raise Fail(f"f32 erf_inv {u32} ulp from the f64 result rounded (bound 2, libdevice's) or a special differs")
+        return f"f64 round trip {e_lo:.2f} ulp, tail rel {e_hi:.1e}; f32 within {u32} ulp of f64 rounded"
     finally:
         jax.config.update("jax_enable_x64", x64)
 

@@ -94,13 +94,12 @@ static inline double __dsqrt_rn(double a) { return sqrt(a); }
 static inline float __double2float_rn(double a) { return (float)a; }
 static inline long long __double2ll_rn(double a) { return llrint(a); }
 static inline double rsqrt(double x) { return 1.0 / sqrt(x); }
-// erfinv (libdevice has it, libm does not): Giles (2010)'s single-precision polynomial as the starting point,
-// evaluated in double, then Halley steps on erf (erfc in the upper half, where 1 - |y| is exact) until the step is
-// below an ulp: two from the f32-accurate start, up to five in the far tail (1 - |y| < 1e-12, where the polynomial
-// is outside its range).  f32 rounds the double result.
-static inline double erfinv(double y) {
-  if (!(y > -1.0 && y < 1.0)) return y == 1.0 ? INFINITY : (y == -1.0 ? -INFINITY : NAN);
-  if (y == 0.0) return y;
+// erfinv (libdevice has it, libm does not), from Giles (2010)'s single-precision polynomial evaluated in double.
+// f32: that polynomial, rounded: <= 2 ulp from the correctly rounded result (libdevice's documented bound), 32 ns a
+// call.  f64: Halley steps on erf (erfc in the upper half, where 1 - |y| is exact) from that start until the step is
+// below an ulp (two, up to five in the far tail).  Measured (EPYC 7713 / Xeon 4114T, 2^22 f32 inputs): the f64
+// result rounded to f32 is 138 ns a call, and made jax.random.normal's barrier problem 2.6x slower per item.
+static inline double sj_giles(double y) {
   const double a = fabs(y);
   double w = -log((1.0 - a) * (1.0 + a)), p;
   if (w < 5.0) { w -= 2.5; p = 2.81022636e-08; p = 3.43273939e-07 + p * w; p = -3.5233877e-06 + p * w;
@@ -109,7 +108,12 @@ static inline double erfinv(double y) {
   else { w = sqrt(w) - 3.0; p = -0.000200214257; p = 0.000100950558 + p * w; p = 0.00134934322 + p * w;
     p = -0.00367342844 + p * w; p = 0.00573950773 + p * w; p = -0.0076224613 + p * w; p = 0.00943887047 + p * w;
     p = 1.00167406 + p * w; p = 2.83297682 + p * w; }
-  double x = p * a;
+  return p * a; }
+static inline double erfinv(double y) {
+  if (!(y > -1.0 && y < 1.0)) return y == 1.0 ? INFINITY : (y == -1.0 ? -INFINITY : NAN);
+  if (y == 0.0) return y;
+  const double a = fabs(y);
+  double x = sj_giles(y);
   for (int i = 0; i < 8; ++i) {
     const double f = a < 0.5 ? erf(x) - a : (1.0 - a) - erfc(x);
     const double d = 1.1283791670955126 * exp(-x * x);         // erf'(x) = 2/sqrt(pi) exp(-x^2)
@@ -118,7 +122,9 @@ static inline double erfinv(double y) {
     if (fabs(dx) <= 2.3e-16 * x) break;
   }
   return copysign(x, y); }
-static inline float erfinvf(float x) { return (float)erfinv((double)x); }
+static inline float erfinvf(float y) {
+  if (!(y > -1.0f && y < 1.0f)) return y == 1.0f ? INFINITY : (y == -1.0f ? -INFINITY : NAN);
+  return y == 0.0f ? y : (float)copysign(sj_giles(y), (double)y); }
 template <class T, class F> static inline T sj_f2i(F x) {   // CUDA's _rz conversions saturate; NaN -> 0
   if (x != x) return (T)0;
   const F lo = (F)std::numeric_limits<T>::min(), hi = (F)std::numeric_limits<T>::max();
