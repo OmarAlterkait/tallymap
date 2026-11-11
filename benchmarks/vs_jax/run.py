@@ -186,8 +186,6 @@ def drive(args):
                 rows.append(r)
                 maxs_by_val[v] = int(r["steps_max"])
                 probe_by_val[v] = json.dumps({k: r[k] for k in getattr(p, "PROBE_KEYS", ()) if k in r})
-                if r.get("backend") != "gpu" and "tm_cuda" in plist:
-                    plist = [a for a in plist if a != "tm_cuda"]      # CPU: only the xla backend exists
                 print(f"  probe {name:16s} {div:5s} val={v:<9} steps mean {r['steps_mean']:.1f} "
                       f"max {r['steps_max']}", flush=True)
             if args.check and hasattr(p, "check"):
