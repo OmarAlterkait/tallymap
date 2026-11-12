@@ -6,7 +6,7 @@ authors:
   - given-names: Omar
     family-names: Alterkait
     email: omar.alterkait@tufts.edu
-version: 0.7.0
+version: 0.7.1
 license: Apache-2.0
 repository-code: "https://github.com/OmarAlterkait/tallymap"
 url: "https://github.com/OmarAlterkait/tallymap"

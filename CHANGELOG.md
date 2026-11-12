@@ -4,10 +4,18 @@ All notable changes. Versions follow [SemVer](https://semver.org/) 0.x: until 1.
 API, and only after one minor release in which the old form still works and warns. Patch releases never change
 the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
-## Unreleased
+## 0.7.1 - 2026-11-12
 
 ### Fixed
 
+- Wrong results on the kernel backend (`backend='auto'`, GPU and CPU target) in 0.6.0rc1, 0.6.0 and 0.7.0: when one
+  array was both a while loop's initial carry and another operand of the same loop (a loop constant or a second
+  carry) and dead after the loop, its storage was reused as the carry, so the loop body read the updated value
+  where it should have read the original. The single-loop reverse adjoint (steps of >= 1000 equations) passes its
+  initial state this way, so its gradient was wrong for every item running more steps than `rev_checkpoints` (auto
+  or explicit) when the loop state holds an array; a forward program with the pattern was wrong too. The xla
+  backend was correct. The conflict check now excludes only the initial carry's own operand slot. Regression tests
+  in `tests/reverse.py` (array state, K on both sides of C) and `tests/edge.py`.
 - `Sum(fixed_point=True)`: a bin whose running total passed `2^63 / scale` (2^31 at the default scale 2^32) wrapped
   silently, with no `fixed_point_overflow`; a large tangent bin (a derivative of a large sum) was the usual victim.
   Each bin now keeps a signed carry word, the net carry out of its int64 word, counted from each atomic add's old
