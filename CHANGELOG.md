@@ -4,6 +4,22 @@ All notable changes. Versions follow [SemVer](https://semver.org/) 0.x: until 1.
 API, and only after one minor release in which the old form still works and warns. Patch releases never change
 the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
+## Unreleased
+
+### Changed
+
+- Kernel backend: no whole-array copies around in-place updates. A live read of an array element (`x = a[j]`
+  used after `a = a.at[k].set(...)`) is captured before the update, which is then done in place, instead of the
+  array being copied twice per update (a 1024-float loop carry: 37x on an L40S, 35x on a 2080 Ti). A loop carry
+  larger than a thread's 255 registers that is rebuilt from other elements of itself (a pivot step of an
+  elimination) gets two buffers swapped per iteration instead of a fresh array copied back: LUCiD's forward 1.23x
+  and its 6-column Jacobian 1.20x on an L40S (1.02x on a 2080 Ti), bitwise; lumen unchanged (gate: 650/650
+  arrays bitwise). `docs/design_notes.md` section 3, "In-place updates".
+- Kernel backend, spawn: the queue's five control words sit on separate 128-byte lines: every thread without work
+  polls the queue, and those polls queued every atomic on the same line behind them. The shower forward 1.3-1.8x
+  faster and a tree grown from a few roots 1.6-1.8x on both GPUs; a DTRAX-like segment 1.0-1.3x; spawn counts
+  exact. `docs/design_notes.md` 1c.
+
 ## 0.7.1 - 2026-11-12
 
 ### Fixed
@@ -29,16 +45,6 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 - JAX 0.12 is tested (`TESTED_JAX` adds 0.12.0.1; the full suite passes on CPU and L40S). JAX 0.12 wraps some
   `jax.numpy` functions (`searchsorted`) in a new `call_hi_primitive`; the kernel backend inlines its expansion.
-
-### Changed
-
-- Kernel backend: no whole-array copies around in-place updates. A live read of an array element (`x = a[j]`
-  used after `a = a.at[k].set(...)`) is captured before the update, which is then done in place, instead of the
-  array being copied twice per update (a 1024-float loop carry: 37x on an L40S, 35x on a 2080 Ti). A loop carry
-  larger than a thread's 255 registers that is rebuilt from other elements of itself (a pivot step of an
-  elimination) gets two buffers swapped per iteration instead of a fresh array copied back: LUCiD's forward 1.23x
-  and its 6-column Jacobian 1.20x on an L40S (1.02x on a 2080 Ti), bitwise; lumen unchanged (gate: 650/650
-  arrays bitwise). `docs/design_notes.md` section 3, "In-place updates".
 
 ## 0.7.0 - 2026-11-11
 

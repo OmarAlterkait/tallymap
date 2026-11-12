@@ -27,7 +27,7 @@ from ..._jaxpr import digest
 from . import codegen
 from . import compile as C
 from .codegen import CodegenError, is_key_dtype
-from .kernel import BLOCK, build_source
+from .kernel import BLOCK, QCTL_STRIDE, build_source
 
 _KERNELS = {}
 
@@ -155,7 +155,7 @@ def run(p, pi, bc, target="cuda", cuda_math="approx", schedule="item", ndev=1, *
         for sh, dt, _ in L.pav:
             rs.append(jax.ShapeDtypeStruct((Q * max(1, int(np.prod(sh, dtype=np.int64))),), dt))
         rs.append(jax.ShapeDtypeStruct((Q,), jnp.uint32))
-        rs.append(jax.ShapeDtypeStruct((8,), jnp.uint32))
+        rs.append(jax.ShapeDtypeStruct((8 * QCTL_STRIDE,), jnp.uint32))   # control words, one line each
     for sh, dt, _ in L.yav:
         rs.append(jax.ShapeDtypeStruct((N,) + tuple(sh), dt))
     if target == "cpu":

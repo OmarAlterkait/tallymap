@@ -267,6 +267,10 @@ def _split(cj):
 BLOCK = 128          # threads per block (measured: 64 / 128 / 256 within 1%)
 STEP_INPLACE_MIN = 64    # step schedule: array loop carries of at least this many elements are updated in place
 PRIV_BYTES = 4096    # shared-memory budget for privatised sum tallies per block
+# the spawn queue's 5 control words (claim / head / pending / occupancy / in flight) each on its own 128-byte line:
+# every idle thread polls two of them, every spawn and pop updates the others, and on one shared line the polls
+# queued every atomic behind them (docs/design_notes.md section 1c)
+QCTL_STRIDE = 32
 
 
 def privatised(tallies, budget=PRIV_BYTES):
@@ -482,7 +486,7 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
     src = [PRELUDE, f"struct SjParams {{ void* p[{r}]; }};",
            f"#define SJ_CONST(j) (P.p[{base_const} + (j)])", f"#define SJ_STATS ((i32*)P.p[{L.r_stats}])"]
     if spawn is not None:
-        src.append(f"#define SJ_QCTL ((u32*)P.p[{L.r_qctl}])\n#define SJ_SEQ ((u32*)P.p[{L.r_seq}])\n"
+        src.append(f"#define SJ_Q(i) (((u32*)P.p[{L.r_qctl}])[(i) * {QCTL_STRIDE}])\n#define SJ_SEQ ((u32*)P.p[{L.r_seq}])\n"
                    f"#define SJ_QBUF(i) (P.p[{L.r_q[0] if L.r_q else 0} + (i)])")
     flags, prep, post = 0, [], []
     priv = privatised(p.tallies)
@@ -620,19 +624,19 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
             for i, (sh, dt, _) in enumerate(pav))
         tr = f"y{p.trunc}" if p.trunc is not None else "false"
         fetch = f"""        child = false;
-        if ((i32)SJ_LDV(&SJ_QCTL[2]) > 0) {{                     // pop a child first (bounds the queue)
-          if ((i32)atomicAdd(&SJ_QCTL[2], 0xffffffffu) > 0) {{
-            const u32 h = atomicAdd(&SJ_QCTL[1], 1u);
+        if ((i32)SJ_LDV(&SJ_Q(2)) > 0) {{                     // pop a child first (bounds the queue)
+          if ((i32)atomicAdd(&SJ_Q(2), 0xffffffffu) > 0) {{
+            const u32 h = atomicAdd(&SJ_Q(1), 1u);
             const u32 sl = h % {Q}u;
             while (SJ_LDV(&SJ_SEQ[sl]) != h + 1u) __nanosleep(32);
             __threadfence();
 {load_q}
             __threadfence();
             atomicExch(&SJ_SEQ[sl], h + {Q}u);
-            atomicSub(&SJ_QCTL[3], 1u);
+            atomicSub(&SJ_Q(3), 1u);
             child = true;
           }} else {{
-            atomicAdd(&SJ_QCTL[2], 1u);
+            atomicAdd(&SJ_Q(2), 1u);
           }}
         }}
         if (!child) {{
@@ -640,10 +644,10 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
           t = my_next;
           if (t < (u64)n_items) {{
             --my_left;
-            atomicAdd(&SJ_QCTL[4], 1u);
+            atomicAdd(&SJ_Q(4), 1u);
 {load_p}
           }} else {{
-            if (SJ_LDV(&SJ_QCTL[4]) == 0u && (i32)SJ_LDV(&SJ_QCTL[2]) <= 0) break;
+            if (SJ_LDV(&SJ_Q(4)) == 0u && (i32)SJ_LDV(&SJ_Q(2)) <= 0) break;
             __nanosleep(200);
             continue;
           }}
@@ -652,7 +656,7 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
 {ywrite}
         }}
         __threadfence();
-        atomicSub(&SJ_QCTL[4], 1u);"""
+        atomicSub(&SJ_Q(4), 1u);"""
     main = f"""
 extern "C" __global__ void {lb} sj_main(const SjParams P, const i64 n_items) {{
   u64* const sj_ctr = (u64*)P.p[{L.r_ctr}];
@@ -776,13 +780,13 @@ def _spawn_rule(em, p, ins, pav):
     Q = int(p.spawn.capacity)
     old, tk, sl = em.fresh("qo"), em.fresh("qt"), em.fresh("qs")
     em.open(f"if ({elem(when, [])})")
-    em.line(f"const u32 {old} = atomicAdd(&SJ_QCTL[3], 1u);")
+    em.line(f"const u32 {old} = atomicAdd(&SJ_Q(3), 1u);")
     em.open(f"if ({old} >= {Q}u)")
-    em.line("atomicSub(&SJ_QCTL[3], 1u); atomicAdd(&SJ_STATS[1], 1);")
+    em.line("atomicSub(&SJ_Q(3), 1u); atomicAdd(&SJ_STATS[1], 1);")
     em.close("} else {")
     em.ind += 1
-    em.line("atomicAdd(&SJ_QCTL[4], 1u); atomicAdd(&SJ_STATS[0], 1);")
-    em.line(f"const u32 {tk} = atomicAdd(&SJ_QCTL[0], 1u);")
+    em.line("atomicAdd(&SJ_Q(4), 1u); atomicAdd(&SJ_STATS[0], 1);")
+    em.line(f"const u32 {tk} = atomicAdd(&SJ_Q(0), 1u);")
     em.line(f"const u32 {sl} = {tk} % {Q}u;")
     em.line(f"while (SJ_LDV(&SJ_SEQ[{sl}]) != {tk}) __nanosleep(32);")
     if len(leaves) > len(pav) or any(not np.issubdtype(np.dtype(dt), np.inexact) for _, dt, _ in pav[len(leaves):]):
@@ -803,7 +807,7 @@ def _spawn_rule(em, p, ins, pav):
                 f"{qp}[(i64){sl} * {n} + {_ravel(idx, sh)}] = {elem(x, idx)};"))
     em.line("__threadfence();")
     em.line(f"atomicExch(&SJ_SEQ[{sl}], {tk} + 1u);")
-    em.line("atomicAdd(&SJ_QCTL[2], 1u);")
+    em.line("atomicAdd(&SJ_Q(2), 1u);")
     em.close()
     em.close()
     return q

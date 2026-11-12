@@ -130,6 +130,26 @@ makes the float tallies NaN. There is no stall: a stalled mid-item step cannot b
 derivatives with spawn give children tangents for every float per-item leaf. Reverse mode uses the tree adjoint
 (section 4).
 
+The queue's latency floor (round5). A spawning launch has a full-occupancy grid (218k threads on an L40S) whatever
+the number of roots, and every thread without work polls the queue's control words (`__nanosleep(200)` between
+polls) while the threads with work update them with atomics. All five words shared one cache line, which serves
+about one request per 0.6 ns on an L40S and 1.6 ns on a 2080 Ti (a same-word microbenchmark), so each atomic on the
+critical path queued behind the polls. Each control word now sits on its own 128-byte line (`kernel.QCTL_STRIDE`).
+Measured, main -> padded (forward, ms; jobs 44567785 L40S, 44567786 2080 Ti for shower / segment; 44567364,
+44567365 for the tree, an item of depth d spawning d children, ~4M items):
+
+| | L40S | 2080 Ti |
+|---|---|---|
+| shower, 1k / 16k / 262k roots | 0.75 -> 0.57, 0.99 -> 0.73, 1.57 -> 0.87 | 0.66 -> 0.52, 0.76 -> 0.55, 2.27 -> 1.28 |
+| DTRAX-like segment, 1k / 16k / 262k | 12.6 -> 11.0, 98.6 -> 97.5, 1928 -> 1927 | 16.2 -> 12.4, 172 -> 171, 3039 -> 3041 |
+| tree, 4 / 1k / 16k / 262k roots | 8.26 -> 4.93, 2.91 -> 1.77, 2.05 -> 1.22, 1.82 -> 1.11 | 6.75 -> 3.84, 3.35 -> 2.13, 2.91 -> 1.88, 2.84 -> 2.03 |
+
+Spawned counts are exact. What is left is the polling rate itself: capping the grid at max(roots' blocks, one block
+per SM) made the segment at 1k / 16k roots 4.3x / 7.0x faster on the L40S (it has about one live item per root, so a
+full grid is ~200k idle pollers), but made the tree 1.6-3.4x slower on the 2080 Ti and 1.5x slower at 16k roots on
+the L40S (too few threads for work that grows), so it was not kept. Sleeping longer between polls is not a fixed
+answer either: 20 us helped the L40S (0.68 -> 0.23 ms) and hurt the 2080 Ti (0.59 -> 0.68).
+
 ### 1d. Float semantics, fallback, sizes
 
 - One CUDA emitter: IEEE round-to-nearest arithmetic without fused-multiply-add contraction, transcendental
