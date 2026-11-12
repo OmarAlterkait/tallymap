@@ -258,12 +258,12 @@ def _buckets(Cg):
 
 
 def _bucketed(n, Cg, f):
-    """f(b) for the smallest capacity bucket b >= n (static shapes: f pads its per-item outputs to Cg)."""
+    """f(b) for the smallest capacity bucket b >= n (static shapes: f pads its per-item outputs to Cg).  Under jax.vmap
+    a batched switch index would launch every bucket (a select: 4-17x B grads, round5/tree)."""
     bs = _buckets(Cg)
-    if len(bs) == 1:
-        return f(bs[0])
-    idx = jnp.sum(jnp.asarray([n <= b for b in bs[1:]]).astype(jnp.int32))
-    return lax.switch(idx, [lambda b=b: f(b) for b in bs])
+    pick = jax.custom_batching.custom_vmap(lambda n: jnp.sum(jnp.asarray([n <= b for b in bs[1:]]).astype(jnp.int32)))
+    pick.def_vmap(lambda axis_size, in_batched, n: (pick(jnp.max(n)), False))  # vmap: ONE bucket, the largest member's
+    return lax.switch(pick(n), [lambda b=b: f(b) for b in bs])
 
 
 def _pad(x, Cg):
