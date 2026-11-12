@@ -395,19 +395,21 @@ A spawn is an EMIT of the child's initial state into a child-slot output. The co
 child's initial-state cotangent, and the transpose of an emit hands it to the parent as the cotangent of the
 emitted value AT THE SPAWN STEP, inside the parent's ordinary replay adjoint. No new adjoint machinery is needed.
 
-- **Recording program** (a retrace with `spawn=` and `emit=` hooks): a spawn writes the child's float
-  leaves into a cotangent-carrier tally and the uint32 words of every leaf into an exact payload tally, advances
-  the slot counter and folds the words into a hash. Every emit also folds its value into the hash. A generation
-  of n items is a launch with `n_active` = n, so items beyond it do not run.
-- **Forward**, per generation: a count pass and a write pass, with payloads in (parent, ordinal) order in one
-  flat buffer. The two passes' count and hash must agree.
-- **Reverse**, deepest generation first, ONE adjoint launch per generation. The roots' initial-state cotangents
-  are the cotangents of the inputs. Generation launches use capacity buckets Cg, Cg/2, and so on, down to 256.
-- **Never silently wrong**: a generation, tree or depth overflow, a total child count above the Queue capacity
-  (which means the forward MAY have dropped children), or a replay or forward mismatch all make the gradient
-  NaN, with the counts in `tm.diagnostics()['reverse']['tree']` when `rev_stats=True`. The recorded tree holds at
-  most the Queue capacity in non-root items, which is exactly the bound under which the forward provably dropped
-  nothing. Second order through it raises, because the payloads are bit-cast.
+- **The record is the forward launch.** Under reverse mode the primal call runs a recording copy of the program:
+  each item carries four int32 leaves (its queue slot, its parent, its ordinal among its parent's children, its
+  generation); a spawn fills them in for the child, and the backend writes each item's slot when it starts. The
+  queue ring is returned with the outputs and reaches the transpose as residual operands of the tangent call.
+  With at most Q children no slot is reused, so the ring holds every child's initial state.
+- **Adjoint program** (a retrace with a `spawn=` hook): a spawn writes the child's float leaves into a
+  cotangent-carrier tally at the item's next child slot and counts it.
+- **Reverse**, deepest generation first, ONE adjoint launch per generation (1 + G launches in all, the recording
+  primal included); a child's cotangent goes to its parent's first child slot plus its ordinal. The roots'
+  initial-state cotangents are the cotangents of the inputs. A generation of n items is a launch with `n_active` = n;
+  launches use capacity buckets Cg, Cg/2, and so on, down to 256 (under `jax.vmap`, the largest member's bucket).
+- **Never silently wrong**: a generation overflow, more than Q children or a dropped child (the record is then
+  incomplete), or a child count the adjoint's replay does not reproduce make the gradient NaN, with the counts in
+  `tm.diagnostics()['reverse']['tree']` when `rev_stats=True`. Second order through it raises. Reverse mode through
+  spawn under `jax.checkpoint` raises (the record is an output of the primal call).
 - **Mechanics.** `tests/reverse_spawn.py` runs toy cascades: 128 roots, 25 to 26 generations, 6.2k to 7.4k items,
   with a theta-dependent split probability scored into an inherited causal score, compared against `jax.grad` of
   a dense plain-JAX reference. Agreement: 9 units in the last place on CPU in f32 (98% of items bitwise),
@@ -426,14 +428,11 @@ emitted value AT THE SPAWN STEP, inside the parent's ordinary replay adjoint. No
     4.1-6.0 at P = 16 and 16-24 at P = 64.
   An earlier engine measurement (70 to 100 times the forward pass on a shower step VJP with 255 registers and a
   13 KB frame) was the adjoint kernel of that engine, not the tree bookkeeping.
-- **Replay fingerprint: kept.** The per-item replay check was removed from production because `tests/reverse.py`
-  "REPLAY GATE" gates per-item replay deterministically. The tree adjoint's own check (`fwd_mismatch`: the count
-  and write passes agree on each item's child count and hash; `replay_mismatch`: the adjoint's replay of a
-  generation agrees with the write pass) is not covered by that gate: the gate exercises `vjp_prog` on items that
-  do not spawn, while the tree adjoint also depends on two different forward kernels agreeing and on child states
-  decoded from recorded payloads, and `tests/reverse_spawn.py`'s gradient comparisons (2,000 ulp in f32) cannot see
-  a replay that differs by one ulp. Until a gate of the same kind covers the tree, the check stays. It adds no
-  launch (the hash rides on the count, write and adjoint passes); its arithmetic cost was not measured.
+- **Replay check: child counts only.** The hash fingerprint went with the count and write passes (round5/tree,
+  1 + G launches): there is no second forward kernel to agree with and no payload to decode, since the child states
+  are the forward's own. The adjoint's replay must still reproduce each item's recorded child count
+  (`replay_mismatch`); a replay that differs only in values (no count change) is not detected at run time.
+  `tests/reverse.py` "REPLAY GATE" gates per-item replay on items that do not spawn.
 
 ## 5. Fewer knobs
 

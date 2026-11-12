@@ -120,6 +120,9 @@ class ItemProgram:
     nact: Any = None       # n_active: index among the broadcast operands of the int32 ACTIVE ITEM COUNT.  It is the
                            # launch's item count: items i >= it do not run (no emits, per-item results zero).  The
                            # item jaxpr does not read it; every derived program keeps it at the same index.
+    rec: Any = None        # spawn, the tree adjoint's recording primal (_reverse_spawn.rec_primal): index of the int32
+                           # per-item leaf `me`, which the backend sets to each item's queue slot (a child) or -1 - its
+                           # index (a root) when it starts; the queue leaves are returned after the per-item results.
 
     @property
     def nT(self):

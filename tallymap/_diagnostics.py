@@ -13,8 +13,8 @@ Keys:
   reverse    single = whether the last adjoint built is the single-loop one (T3), and if not why not;
              tree   = stats of the last tree adjoint (reverse through spawn), filled only by tm.vmap(...,
                       rev_stats=True) calls (a host callback costs jax.jit's C++ fast path): generations, children,
-                      launches, generation_overflow, drop_risk, replay_mismatch, fwd_mismatch (any of the last four
-                      -> NaN gradient)
+                      launches, generation_overflow, drop_risk, replay_mismatch (any of the last three -> NaN
+                      gradient)
   programs   the last item programs bound by tm.vmap: tag, item jaxpr (text), and closed_over_floats: [(shape,
              dtype, size)] of the FLOAT constants the item function closed over, the values a derivative cannot reach
              (a constant's tangent is zero, silently): anything you differentiate must be an argument

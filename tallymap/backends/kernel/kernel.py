@@ -623,6 +623,9 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
              f"            for (int e = 0; e < {_size(sh)}; ++e) x{i}[e] = (({ctype(dt)}*)P.p[{L.r_q[i]}])[(i64)sl * {_size(sh)} + e];")
             for i, (sh, dt, _) in enumerate(pav))
         tr = f"y{p.trunc}" if p.trunc is not None else "false"
+        # the recording primal (_reverse_spawn.rec_primal): the item's leaf `me` <- its queue slot / -1 - its index
+        rec_q = "" if p.rec is None else f"\n            x{p.rec} = (i32)sl;"
+        rec_p = "" if p.rec is None else f"\n            x{p.rec} = (i32)(-1 - (i64)t);"
         fetch = f"""        child = false;
         if ((i32)SJ_LDV(&SJ_Q(2)) > 0) {{                     // pop a child first (bounds the queue)
           if ((i32)atomicAdd(&SJ_Q(2), 0xffffffffu) > 0) {{
@@ -630,7 +633,7 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
             const u32 sl = h % {Q}u;
             while (SJ_LDV(&SJ_SEQ[sl]) != h + 1u) __nanosleep(32);
             __threadfence();
-{load_q}
+{load_q}{rec_q}
             __threadfence();
             atomicExch(&SJ_SEQ[sl], h + {Q}u);
             atomicSub(&SJ_Q(3), 1u);
@@ -645,7 +648,7 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
           if (t < (u64)n_items) {{
             --my_left;
             atomicAdd(&SJ_Q(4), 1u);
-{load_p}
+{load_p}{rec_p}
           }} else {{
             if (SJ_LDV(&SJ_Q(4)) == 0u && (i32)SJ_LDV(&SJ_Q(2)) <= 0) break;
             __nanosleep(200);

@@ -464,13 +464,15 @@ def run(p, pi, bc, xla_batch_size=None, **_):
                        for ql, x in zip(q["leaves"], pi)]
         else:
             lane_pi = [take(ql, qs) for ql in q["leaves"]]
+        if p.rec is not None:           # the recording primal (_reverse_spawn.rec_primal): `me` <- slot / -1 - index
+            lane_pi[p.rec] = jnp.where(is_child, qs, -1 - pid).astype(jnp.int32)
         q["head"] = q["head"] + kq
         ys, c = block_fn(pid, mask, lane_pi, ys, primary)
         return jnp.minimum(nxt + P - kq, N), st.pack(), ys, ctr + c
     _, packed, ys, ctr = lax.while_loop(cond_s, body_s, (jnp.int32(0), st.pack(), ys0, jnp.int32(0)))
     st.unpack(packed)
     q = st.queue
-    return _finish(p, st.accs, (q["spawned"], q["dropped"], ctr), ys, st)
+    return _finish(p, st.accs, (q["spawned"], q["dropped"], ctr), ys, st) + (q["leaves"] if p.rec is not None else [])
 
 
 def _lm(m, x):

@@ -97,7 +97,7 @@ class Node:
             k = (digest(p.cj.jaxpr), tuple(id(c) for c in p.cj.consts),
                  tuple(id(c) for c in host_callbacks(p.cj.jaxpr)),
                  tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.fixed_point, s.scale, s.kind) for s in p.tallies),
-                 p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), p.nact, self.backend,
+                 p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), p.nact, p.rec, self.backend,
                  self.opts)
             object.__setattr__(self, "_key", k)
         return k
@@ -144,6 +144,8 @@ def _abstract(*args, node):
     outs = [ShapedArray(tuple(p.tallies[k].lead) + (p.tallies[k].S,), p.tallies[k].dtype) for k in _out_specs(p)]
     outs.append(ShapedArray((5,), jnp.int32))
     outs += [ShapedArray((N,) + tuple(a.shape), a.dtype) for a in p.y_avals()]
+    if p.rec is not None:               # the queue ring (_reverse_spawn.rec_primal)
+        outs += [ShapedArray((p.spawn.capacity,) + tuple(a.shape), a.dtype) for a in p.in_avals()[p.nT:p.nT + p.nP]]
     return outs
 
 
@@ -221,8 +223,9 @@ def _shardings(c, mesh, arg_shapes, result_shape):
     rep = NamedSharding(mesh, P())
     item = (lambda nd: NamedSharding(mesh, P(ax, *([None] * (nd - 1))))) if ax is not None else (lambda nd: rep)
     args = [rep] * nc + [item(len(a.shape)) for a in arg_shapes[nc:nc + p.nP]] + [rep] * (len(arg_shapes) - nc - p.nP)
-    nsum = len(out_avals) - p.nY                     # [sum tallies] + [stats]: replicated
-    outs = [rep] * nsum + [item(len(a.shape)) for a in out_avals[nsum:]]
+    nr = 0 if p.rec is None else p.nP                # the tree adjoint's record (rec_primal): replicated, _global_ring
+    nsum = len(out_avals) - p.nY - nr                # [sum tallies] + [stats]: replicated
+    outs = [rep] * nsum + [item(len(a.shape)) for a in out_avals[nsum:nsum + p.nY]] + [rep] * nr
     return ax, tuple(args), outs                     # (pytrees: the operands are a tuple, the results a list)
 
 
@@ -235,12 +238,32 @@ def _cp_partition(c, mesh, arg_shapes, result_shape):
     ax, args_sh, outs_sh = _shardings(c, mesh, arg_shapes, result_shape)
     axes = () if ax is None else ax if isinstance(ax, tuple) else (ax,)
     ndev = int(np.prod([mesh.shape[a] for a in axes]))
-    nsum = len(outs_sh) - node.prog.nY
+    p = node.prog
+    nr = 0 if p.rec is None else p.nP
+    nsum = len(outs_sh) - p.nY - nr
 
     def lower(*a):                                   # the call on this device's items
         outs = _run(node, a[nc:], plat, ndev=ndev)
-        return [lax.psum(o, axes) for o in outs[:nsum]] + list(outs[nsum:]) if axes else outs
+        if not axes:
+            return outs
+        ring = _global_ring(p, outs[len(outs) - nr:], outs[nsum - 1], axes, a[nc].shape[0]) if nr else []
+        return [lax.psum(o, axes) for o in outs[:nsum]] + list(outs[nsum:nsum + p.nY]) + ring
     return mesh, lower, outs_sh, args_sh
+
+
+def _global_ring(p, ring, stats, axes, n):
+    """the record (queue leaves) of this device's items -> the call's: the devices' children packed in device order,
+    parents renumbered (a child slot -> its global slot, a root -> -1 - its global index; n roots per device)"""
+    d = lax.axis_index(axes)
+    cnt = lax.all_gather(stats[0], axes)
+    off = jnp.cumsum(cnt) - cnt
+    par = ring[p.rec + 1]
+    ring = list(ring)
+    ring[p.rec + 1] = jnp.where(par >= 0, off[d] + par, par - d * n).astype(par.dtype)
+    Q = ring[0].shape[0]
+    dest = jnp.where(jnp.arange(Q)[None] < cnt[:, None], off[:, None] + jnp.arange(Q)[None], Q).reshape(-1)
+    return [jnp.zeros_like(r).at[dest].set(lax.all_gather(r, axes).reshape((-1,) + r.shape[1:]), mode="drop")
+            for r in ring]
 
 
 def _sharding_rule(c, mesh, arg_shapes, result_shape):
@@ -251,9 +274,9 @@ def _sharding_rule(c, mesh, arg_shapes, result_shape):
     out_avals = jax.tree_util.tree_leaves(result_shape)
     n = iter(range(1 << 30))
     dims = lambda a, lead: (("i",) if lead else ()) + tuple(f"d{next(n)}" for _ in a.shape[lead:])
-    nsum = len(out_avals) - p.nY
+    nsum = len(out_avals) - p.nY - (0 if p.rec is None else p.nP)
     ins = [dims(a, int(nc <= k < nc + p.nP)) for k, a in enumerate(arg_shapes)]
-    outs = [dims(a, int(k >= nsum)) for k, a in enumerate(out_avals)]
+    outs = [dims(a, int(nsum <= k < nsum + p.nY)) for k, a in enumerate(out_avals)]
     return SdyShardingRule(tuple(ins), tuple(outs))
 
 
@@ -353,9 +376,10 @@ tallymap_jvp_p.def_impl(_impl)
 
 
 # ------------------------------------------------------------------------------------------- derived programs
-def tangent_prog(p, pp, pb):
+def tangent_prog(p, pp, pb, extra=()):
     """tangent part of jax.jvp(item) w.r.t. the per-item / broadcast operands flagged in pp / pb.
-    invars [t (primal tallies, discarded), t'] [pi, dpi] [bc, dbc] -> outvars [t, t'] + [dy (float results)]."""
+    invars [t (primal tallies, discarded), t'] [pi, dpi] [bc, dbc] [extra (unread: the tree adjoint's record)]
+    -> outvars [t, t'] + [dy (float results)]."""
     q = jvp_prog(p, pp, pb)
     nT = p.nT
     ntf = q.nT - nT
@@ -363,12 +387,13 @@ def tangent_prog(p, pp, pb):
     f = jaxpr_as_fun(q.cj)
 
     def L(*a):
-        o = f(*a)
+        o = f(*a[:len(a) - len(extra)])
         return list(o[:nT + ntf]) + list(o[nT + ntf + nY:])
-    cj = _mk(L, [_sds(a) for a in q.in_avals()])
+    cj = _mk(L, [_sds(a) for a in q.in_avals()] + list(extra))
     tl = tuple(dataclasses.replace(s, kind="discard") if (k < nT and s.kind == "sum") else s
                for k, s in enumerate(q.tallies))
-    return ItemProgram(cj, tl, q.nP, q.nB, None, p.spawn, p.tag + "+tangent", where=p.where, nact=p.nact)
+    return ItemProgram(cj, tl, q.nP, q.nB + len(extra), None, p.spawn, p.tag + "+tangent", where=p.where,
+                       nact=p.nact)
 
 
 def dual_lanes_prog(p, T, bpi, bbc, shared=(0, 0)):
@@ -435,16 +460,41 @@ def _jvp(primals, tangents, *, node):
         outs = [o[j] for j in prim_idx]
         touts = [o[j] for j in tan_idx]
         return outs, _tangents_out(p, outs, touts[:_ntf(p)] + [None] + touts[_ntf(p):])
+    if p.spawn is not None and node.kind == "primal":      # (the tree adjoint's record: _ring_node)
+        outs, ring = _bind_recorded(node, pi, bc)
+        touts = bind_call(*pi, *dl, *bc, *db, *ring, node=_ring_node(node, pp, pb))
+        return outs, _tangents_out(p, outs, touts)
     outs = bind_call(*primals, node=node)
     touts = bind_call(*pi, *dl, *bc, *db, node=_tangent_node(node, pp, pb))
     return outs, _tangents_out(p, outs, touts)
 
 
-def _tangent_node(node, pp, pb):
+def _tangent_node(node, pp, pb, ring=()):
+    """ring: avals of the tree adjoint's record (a spawning call under reverse mode, _recorded), trailing operands"""
     p = node.prog
-    q = tangent_prog(p, pp, pb)
-    return node.derived(q, "tangent", base=p, pp=pp, pb=pb,
-                        lin_pi=(False,) * p.nP + (True,) * sum(pp), lin_bc=(False,) * p.nB + (True,) * sum(pb))
+    q = tangent_prog(p, pp, pb, ring)
+    return node.derived(q, "tangent", base=p, pp=pp, pb=pb, lin_pi=(False,) * p.nP + (True,) * sum(pp),
+                        lin_bc=(False,) * p.nB + (True,) * sum(pb) + (False,) * len(ring))
+
+
+def _ring_node(node, pp, pb):
+    """the tangent node of a spawning call under reverse mode: its trailing operands are the tree adjoint's record,
+    [stats] + [queue leaves] of the recording primal (_reverse_spawn.rec_primal; _bind_recorded)"""
+    from ._reverse_spawn import rec_primal
+    r = rec_primal(node.prog)
+    Q = r.spawn.capacity
+    ring = [jax.ShapeDtypeStruct((5,), jnp.int32)] + [jax.ShapeDtypeStruct((Q,) + tuple(a.shape), a.dtype)
+                                                      for a in r.in_avals()[r.nT:r.nT + r.nP]]
+    return _tangent_node(node, pp, pb, ring)
+
+
+def _bind_recorded(node, pi, bc):
+    """-> (the primal outputs, the record) of a spawning call run as its recording primal"""
+    from ._reverse_spawn import rec_primal
+    N = pi[0].shape[0]
+    o = bind_call(*pi, *[jnp.zeros((N,), jnp.int32)] * 4, *bc, node=node.derived(rec_primal(node.prog), "primal"))
+    nt, nY = len(_out_specs(node.prog)), node.prog.nY
+    return o[:nt + 1 + nY], [o[nt]] + o[nt + 1 + nY:]
 
 
 def _tangents_out(p, outs, touts):
@@ -477,11 +527,15 @@ def _float_slots(p):
     return ot, tf, yf
 
 
-def _vjp_call(node, base, pi, bc, U_pi, U_bc, cts, N):
-    """cotangents of base's operands flagged U_pi / U_bc, given cotangents `cts` of ALL base outputs."""
+def _vjp_call(node, base, pi, bc, U_pi, U_bc, cts, N, ring=()):
+    """cotangents of base's operands flagged U_pi / U_bc, given cotangents `cts` of ALL base outputs.  ring: the
+    tree adjoint's record (a spawning base, _ring_node)."""
     if base.spawn is not None:          # reverse through spawn: the tree adjoint (one adjoint launch per generation)
+        if len(ring) != base.nP + 5:    # ([stats] + the queue leaves of rec_primal(base))
+            raise NotImplementedError("tallymap: reverse mode through spawn is supported for a spawning call's own "
+                                      "first-order jvp only (no second order)")
         from ._reverse_spawn import tree_vjp
-        return tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N)
+        return tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N, ring)
     ot, tf, yf = _float_slots(base)
     nt = len(ot)
     ya = base.y_avals()
@@ -541,9 +595,10 @@ def _transpose(cts, *args, node):
             full[j] = c
         for c, j in zip(cts[len(tf) + 1:], yf):
             full[len(ot) + 1 + j] = c
-        g_pi, g_bc = _vjp_call(node, base, pi[:nPb], bc[:nBb], U_pi, U_bc, full, N)
+        ring = bc[nBb + len(ib):]                         # (a spawning base: the tree adjoint's record, _ring_node)
+        g_pi, g_bc = _vjp_call(node, base, pi[:nPb], bc[:nBb], U_pi, U_bc, full, N, ring)
         res_pi = [None] * nPb + [g_pi[i] for i in ip]
-        res_bc = [None] * nBb + [g_bc[i] for i in ib]
+        res_bc = [None] * nBb + [g_bc[i] for i in ib] + [None] * len(ring)
         return res_pi + res_bc
     if node.kind == "adjoint":
         # adjoint of `base` -> its transpose is the tangent map of base, fed with the cotangents of the adjoint's
@@ -878,6 +933,17 @@ def _fused_pe(trace, *tracers, node):
     kn = [t.pval.get_known() for t in tracers]
     if all(k is not None for k in kn) or any(kn[i] is None for i in pos):
         return trace.default_process_primitive(tallymap_jvp_p, tracers, dict(node=node))
+    _, pp, pb, chain = node.base
+    if fwd.prog.spawn is not None and fwd.kind == "primal" and not chain:   # the tree adjoint's record: _ring_node
+        rn = node.__dict__.get("_ring")
+        if rn is None:
+            rn = _ring_node(fwd, pp, pb)
+            object.__setattr__(node, "_ring", rn)
+        nP = fwd.prog.nP
+        outs, ring = _bind_recorded(fwd, [kn[i] for i in pos[:nP]], [kn[i] for i in pos[nP:]])
+        touts = trace.default_process_primitive(tallymap_call_p, list(tracers) + [trace.new_const(r) for r in ring],
+                                                dict(node=rn))
+        return _assemble(fwd.prog, [trace.new_const(o) for o in outs], touts)
     outs = bind_call(*[kn[i] for i in pos], node=fwd)
     touts = trace.default_process_primitive(tallymap_call_p, tracers, dict(node=ln))
     return _assemble(fwd.prog, [trace.new_const(o) for o in outs], touts)
@@ -894,6 +960,9 @@ def _fused_pe_custom(saveable, unks_in, inst_in, eqn):
         return eqn, None, [False] * n, [False] * n, []
     if any(unks_in[i] for i in pos):                 # primal unknown: everything staged
         return None, eqn, [True] * n, [True] * n, res_of(eqn.invars, inst_in)
+    if fwd.prog.spawn is not None:
+        raise NotImplementedError("tallymap: reverse mode through spawn under jax.checkpoint (remat) is not supported "
+                                  "(the tree adjoint's record is an output of the primal call)")
     prim_idx, tan_idx = _fused_layout(fwd.prog)
     ntf = _ntf(fwd.prog)
     known = eqn.replace(primitive=tallymap_call_p, invars=[eqn.invars[i] for i in pos],

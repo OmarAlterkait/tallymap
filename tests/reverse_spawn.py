@@ -285,7 +285,7 @@ RS.TREE_NEG = ""
 c = cmp(g_d, g_r)
 report("NEG detach: detached-children gradient differs from the reference", c["max_rel"] > 1e-3, **c)
 
-# 5. replay fingerprint: the adjoint replays a 1-ulp perturbed item -> mismatches counted, gradient NaN
+# 5. replay check: the adjoint replays a perturbed item (other child counts) -> mismatches counted, gradient NaN
 #    (NEGATIVE CONTROL)
 tm.diagnostics(reset=True)
 RS.TREE_NEG = "replay"
@@ -293,8 +293,8 @@ _, g_p = grad_tallymap(TH, X0, tallymap_fn())
 RS.TREE_NEG = ""
 jax.block_until_ready(g_p)
 st = tm.diagnostics()["reverse"]["tree"]
-report("NEG replay: fingerprint detects a replay that differs from the forward", int(st["replay_mismatch"]) > 0
-       and np.isnan(flat(g_p)).all(), replay_mismatch=int(st["replay_mismatch"]))
+report("NEG replay: the replay check detects a replay whose child counts differ from the forward",
+       int(st["replay_mismatch"]) > 0 and np.isnan(flat(g_p)).all(), replay_mismatch=int(st["replay_mismatch"]))
 
 # 6. overflow: generation capacity too small -> NaN + overflow flag (never silently wrong)
 tm.diagnostics(reset=True)

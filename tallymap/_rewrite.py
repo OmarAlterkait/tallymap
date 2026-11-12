@@ -253,14 +253,13 @@ def emit_p_bind(t, i, v):
     return emit_p.bind(t, i, v)
 
 
-def retrace(cj, *, cap=None, rev=False, n_tally=0, emit=None, tables=None, report=None, spawn=None):
+def retrace(cj, *, cap=None, rev=False, n_tally=0, tables=None, report=None, spawn=None):
     """-> python function f(*invars) evaluating cj with (cap) every top-level while loop capped at `cap`
     iterations (f returns its outputs + [truncated:bool]), or (rev: True or _reverse.RevOpts) every while loop replaced
     by a reverse-differentiable loop (_reverse.checkpointed_while).  The first n_tally invars are tallies (rev: their
-    carries get a pass-through cotangent instead of a dense one).  emit: f(tally, idx, val) -> tally' replaces every
-    emit (the tree adjoint records its emits through it).
-    spawn: f(token, when, *child) -> token' replaces every spawn (the tree adjoint, _reverse_spawn.py).  With hooks a
-    tally value may be a python TUPLE (e.g. (array, hash)): equations it flows into are interpreted (never bound),
+    carries get a pass-through cotangent instead of a dense one).
+    spawn: f(token, when, *child) -> token' replaces every spawn (the tree adjoint, _reverse_spawn.py).  With the hook
+    the spawn token may be a python TUPLE (e.g. (token, count)): equations it flows into are interpreted (never bound),
     and lax control flow carries it as a pytree.  Only for rev=False (the hooked program is re-traced to a flat jaxpr).
     tables (rev only): {invar index: token index}.  Reads (gather/dynamic_slice/slice) of these operands become
     _reverse.tread calls threading a cotangent token; f then takes the tokens as extra trailing arguments and returns
@@ -272,7 +271,7 @@ def retrace(cj, *, cap=None, rev=False, n_tally=0, emit=None, tables=None, repor
     def f(*args):
         args = list(args)
         a, toks = (args[:len(args) - nt], args[len(args) - nt:]) if nt else (args, [])
-        ctx = {"trunc": jnp.bool_(False), "emit": emit, "spawn": spawn, "toks": list(toks),
+        ctx = {"trunc": jnp.bool_(False), "spawn": spawn, "toks": list(toks),
                "tread": nt > 0, "dense": set()}
         flags = [True] * n_tally + [False] * (len(a) - n_tally)
         tags = [tables.get(i) for i in range(len(a))]
@@ -285,7 +284,6 @@ def retrace(cj, *, cap=None, rev=False, n_tally=0, emit=None, tables=None, repor
 
 def _needs(jaxpr, rev, top, cap, ctx):
     return ((rev or (cap is not None and top)) and contains(jaxpr, ("while",))) or \
-        (ctx["emit"] is not None and contains(jaxpr, ("tallymap_emit",))) or \
         (ctx.get("spawn") is not None and contains(jaxpr, ("tallymap_spawn",)))
 
 
@@ -336,8 +334,6 @@ def _interp(jaxpr, consts, args, flags, ctx, cap, rev, top, tags=None):
                 if name == "while" and (force or rev or (top and (cap is not None or ctx.get("fp") is not None))
                                         or any(_needs(s.jaxpr, rev, top, cap, ctx) for s in subs)):
                     outs, oflags = _while(eqn, ins, fin, ctx, cap, rev, top)
-                elif name == "tallymap_emit" and ctx["emit"] is not None:
-                    outs = [ctx["emit"](*ins)]
                 elif name == "tallymap_spawn" and ctx.get("spawn") is not None:
                     outs = [ctx["spawn"](*ins)]
                 elif not force and not any(_needs(s.jaxpr, rev, top, cap, ctx) for s in subs):

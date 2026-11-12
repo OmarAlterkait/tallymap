@@ -46,7 +46,7 @@ def _key(p, opts):
     # the structural part is _jaxpr.digest (was str(p.cj.jaxpr): JAX's pretty-printer, 95 s per build on DTRAX)
     return (digest(p.cj.jaxpr), tuple(_const_sig(c) for c in p.cj.consts),
             tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.fixed_point, s.scale, s.kind) for s in p.tallies),
-            p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), p.nact,
+            p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), p.nact, p.rec,
             tuple(sorted(opts.items())),
             codegen.FILL, codegen.INPLACE)          # (the test-only fill byte / in-place switch change the source)
 
@@ -175,4 +175,8 @@ def run(p, pi, bc, target="cuda", cuda_math="approx", schedule="item", ndev=1, *
     yav = [v.aval for v in p.cj.jaxpr.outvars[p.nT:]]
     ys = [jax.random.wrap_key_data(y, impl=key_impl(a.dtype).name) if is_key_dtype(a.dtype) else y
           for y, a in zip(ys, yav)]
-    return list(res[:nO]) + [stats] + ys
+    ring = []
+    if p.rec is not None:               # the queue leaves (_reverse_spawn.rec_primal)
+        r0 = nO + nscr + 2
+        ring = [res[r0 + i].reshape((int(p.spawn.capacity),) + tuple(sh)) for i, (sh, _, _) in enumerate(L.pav)]
+    return list(res[:nO]) + [stats] + ys + ring
