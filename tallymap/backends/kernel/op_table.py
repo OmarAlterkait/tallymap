@@ -27,6 +27,7 @@ from .codegen import (
     _size,
     ctype,
     elem,
+    fill_decl,
     ia,
     im,
     is_key_dtype,
@@ -1288,10 +1289,15 @@ def _carry_val(c):
     return c
 
 
-def _update_carries(em, cars, outs, pass_through):
+def _update_carries(em, cars, outs, pass_through, start=None):
+    """write the body results `outs` back into the loop carries.  start: the index in em.lines of the loop's
+    opening line (the loop's own text runs from there): an array carry whose new value must be computed into a
+    fresh array (it reads the old carry at other indices) then gets a second buffer and a pointer swap instead of a
+    copy back (ping-pong) -> [(carry, pointer name)] for _pingpong_exit after the loop closes."""
     pass_through = [pt or isinstance(c, VTally) for c, pt in zip(cars, pass_through)]
     names = {c.name for c, pt in zip(cars, pass_through) if not pt}
     tmps = []
+    pp = []
     for c, o, pt in zip(cars, outs, pass_through):
         if pt:
             tmps.append(None)
@@ -1309,12 +1315,51 @@ def _update_carries(em, cars, outs, pass_through):
         elif (not isinstance(o, Local) and em.elementwise_self(c, o)
               and not any(nm != c.name and _refs(em, o, nm) for nm in names)):
             tmps.append(("self", o))             # (v5) written straight back into the carry, element by element
+        elif start is not None and em.inplace and isinstance(c, Local) and c.size * c.dtype.itemsize > 4 * 255:
+            # ping-pong: the new value is computed straight into the carry's second buffer and the two buffers
+            # swap at the end of the iteration, instead of computing it into a fresh array and copying that back
+            # (a Gaussian elimination in a fori loop over a 3x12x14 carry: one 504-float copy per pivot).  Only for
+            # a carry larger than a thread's 255 registers, which is in local memory whatever the compiler does: a
+            # smaller one may live in registers, where the copy is moves and a pointer would demote it to local
+            # memory (a 12x14 elimination: 4x slower on an L40S through a pointer)
+            q = Local(em.fresh("pq"), c.shape, c.dtype)
+            em.assign(q, o)
+            pp.append((c, q.name, em.fresh("pp")))
+            tmps.append(None)
         else:
             tmps.append(em.mat_copy(o))
     for c, t, pt in zip(cars, tmps, pass_through):
         if pt or t is None:
             continue
         em.assign(c, t[1] if isinstance(t, tuple) else t)
+    if not pp:
+        return []
+    import re
+    ct = {c.name: ctype(c.dtype) for c, _, _ in pp}
+    for c, q, p_ in pp:                          # inside the loop the carry is reached through its pointer
+        em.line(f"{{ {ct[c.name]}* const sj_t = {p_}; {p_} = {q}; {q} = sj_t; }}")
+    pat = re.compile(r"(?<![A-Za-z0-9_])(" + "|".join(re.escape(c.name) for c, _, _ in pp) + r")(?![A-Za-z0-9_])")
+    ptr = {c.name: p_ for c, _, p_ in pp}
+    em.lines[start:] = [pat.sub(lambda m: ptr[m.group(1)], ln) for ln in em.lines[start:]]
+    ind = em.lines[start][:len(em.lines[start]) - len(em.lines[start].lstrip())]
+    decl = []
+    for c, q, p_ in pp:
+        b = em.fresh("pb")
+        decl.append(f"{ind}{ct[c.name]} {b}[{c.size}];{fill_decl(b)} {ct[c.name]}* {p_} = {c.name}; "
+                    f"{ct[c.name]}* {q} = {b};")
+    em.lines[start:start] = decl
+    return [(c, p_) for c, _, p_ in pp]
+
+
+def _pingpong_exit(em, pp, swaps=None):
+    """after a ping-pong loop: the last value is in the buffer the pointer holds; copy it into the carry array when
+    that is the second buffer (swaps: the static trip count, else a run-time check)."""
+    for c, p_ in pp:
+        if swaps is not None and swaps % 2 == 0:
+            continue
+        em.open(f"if ({p_} != {c.name})" if swaps is None else "")
+        em.fill(c, lambda idx, c=c, p_=p_: f"{p_}[{ravel(idx, c.shape)}]")
+        em.close()
 
 
 def _pass_through(jaxpr, nconsts, ncarry, n_out_offset=0):
@@ -1335,6 +1380,7 @@ def _while(em, eqn, ins, **p):
     cars = _carry_vars(em, init, pt, dest)
     vals = [_carry_val(c) if not p_ else c for c, p_ in zip(cars, pt)]
     em.freeze(cc + bc + [c for c, p_ in zip(cars, pt) if p_])     # re-read every iteration: never in place
+    start = len(em.lines)
     em.open("while (true)")
     em.cf_depth += 1
     em.freeze(vals)                                                 # the predicate must not consume a carry
@@ -1345,10 +1391,11 @@ def _while(em, eqn, ins, **p):
         outs = em.run_closed(w.body, bc + vals)
     else:
         outs = _batched_body(em, w, pred, bc, cars, vals, pt)
-    _update_carries(em, cars, outs, pt)
+    pp = _update_carries(em, cars, outs, pt, start)
     em.cf_depth -= 1
     em.close()
     em.unfreeze()
+    _pingpong_exit(em, pp)
     return vals
 
 
@@ -1517,6 +1564,7 @@ def _scan(em, eqn, ins, **p):
         y.key_impl = impl
         ys.append(y)
     t = em.fresh("it")
+    start = len(em.lines)
     em.open(f"for (int {t} = 0; {t} < {length}; ++{t})")
     ti = f"({length - 1} - {t})" if reverse else t
     xs_t = []
@@ -1541,8 +1589,9 @@ def _scan(em, eqn, ins, **p):
             continue
         em.each(yv.shape, lambda idx, y=y, yv=yv: em.line(
             f"{y.name}[{ravel([ti] + list(idx), y.shape)}] = {elem(yv, idx)};"))
-    _update_carries(em, cars, outs[:num_carry], pt)
+    pp = _update_carries(em, cars, outs[:num_carry], pt, start)
     em.close()
+    _pingpong_exit(em, pp, length)
     return vals + ys
 
 

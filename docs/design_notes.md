@@ -317,6 +317,24 @@ error) turn every affected cell into a failure, which is how the matrix is known
   2080 Ti), 71,440 B in place (the private engine line: 70,160 B); `sEM1_lar_e` 557,248 B (over the 512 KiB
   limit) -> 156,496 B. Digests unchanged (`tab=85bce7a5ff627c27`, `97ceb69adae09286`). LUCiD's two kernels
   (fwd, jac6) are byte-identical with and without it (same `.cu` sha256; job 43897628).
+- **No whole-array copies around an in-place update** (round5). Two cases still copied a whole per-item array,
+  found by a residency probe and by LUCiD's kernel. (1) A lazy read of an element that is used AFTER an update of
+  the same array (`x = a[j]; a = a.at[k].set(f(x)); ... x`): the read is still live at the update, so the liveness
+  rule refused the in-place write and copied the array twice per update. `Emitter.can_mutate` now captures such
+  readers of the current scope (the wavefront "v4" rule, which DTRAX had not needed) when together they are
+  smaller than the array, and updates it in place: a 1,024-float carry read and written once per step, 1M items x
+  64 steps, 1,840 -> 49 ms on an L40S and 2,293 -> 65 ms on a 2080 Ti, frame 8,192 -> 4,096 B; 256 floats 6.0x /
+  10.4x. (2) A loop carry whose new value reads the old one at OTHER indices (a pivot step of an elimination)
+  cannot be written in place at all; it was computed into a fresh array and copied back every iteration. Now it
+  gets a second buffer and the two swap through pointers (ping-pong; after a run-time loop, one copy when the last
+  value ended in the second buffer). Only for a carry larger than a thread's 255 registers, which lives in local
+  memory whatever the compiler does: through a pointer, a 12x14 carry the compiler had kept in 253 registers was
+  4.0x slower on an L40S; and two buffers emitted under static names (two iterations per trip, no pointer) grew
+  LUCiD's frame by 2.2 KB, which no longer fits a 2080 Ti beside JAX's pool at LUCiD's memory fraction. Measured
+  (jobs 44503543-8): a 24x26 elimination 1.58x (L40S) / 1.41x (2080 Ti), a 12x14 one unchanged; LUCiD's forward
+  445 -> 362 ms and its 6-column Jacobian 464 -> 386 ms on an L40S, 1.200 -> 1.175 s and 1.43 -> 1.42 s on a
+  2080 Ti, bitwise on both, frame +64 B; lumen's gate (sk, sbnd, annie): 650/650 forward arrays bitwise,
+  value_and_grad within the rerun spread at 0.998-1.018x; the benchmark rows unchanged.
 - **Local memory is reserved for the device, not the launch.** The CUDA driver reserves `local bytes per thread x
   SMs x max resident threads per SM` at the first launch, whatever the grid: measured on a 2080 Ti (job
   43897685) 2,382 MiB at 36,864 B and 750 MiB at 12,288 B for n_items = 1, 128, 8,192 and 69,632, spawning or not,

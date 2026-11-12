@@ -1936,6 +1936,85 @@ def _(b):
         jax.config.update("jax_enable_x64", x64)
 
 
+@case("an array element read, then the array updated, then the read used: updated in place, not copied", ["auto"])
+def _(b):
+    # x = a[j]; a = a.at[k].set(f(x)); acc += x -- the read is a lazy value still live at the update, so before the
+    # fix the emitter copied the whole 512-element carry twice per loop step to keep x's old value
+    S = 512
+
+    def one(x, k0):
+        def body(c):
+            k, a, acc = c
+            j = (k * 37 + k0) % S
+            r = a[j]
+            return k + 1, a.at[(j * 11 + 5) % S].set(r * 0.5 + x), acc + r
+        _, a, acc = lax.while_loop(lambda c: c[0] < 64, body, (0, jnp.arange(S, dtype=F) * x, F(0.0)))
+        return acc + a[3]
+
+    def item(t, x, k0):
+        y = one(x, k0)
+        return t.add("Q", 0, y), y
+    xs_ = jnp.linspace(0.5, 1.5, 64).astype(F)
+    ks = jnp.arange(64, dtype=jnp.int32) % 13
+    tm.diagnostics(reset=True)
+    r = tm.vmap(item, outputs={"Q": tm.Sum((1,), F)}, backend=b)(xs_, ks)
+    close(r.per_item, jax.jit(jax.vmap(one))(xs_, ks), what="per-item")
+    ks_ = tm.diagnostics()["kernels"]
+    src = open(ks_[-1]["source"]).read()
+    n = len(re.findall(r"\b(?:float|double) \w+\[512\];", src))
+    if n != 1:
+        raise Fail(f"{n} {S}-element arrays declared (want 1: the carry, updated in place)")
+    return "one 512-element array (the carry, updated in place)"
+
+
+@case("a loop carry rebuilt from OTHER elements of itself (an elimination): two buffers swapped, no copy back",
+      ["auto"])
+def _(b):
+    # each pivot step reads row p and column p of the old matrix, so its new value cannot be written in place:
+    # before, every iteration computed it into a fresh array and copied that back into the carry.  (24 x 26: larger
+    # than a thread's 255 registers, the carries the rule applies to)
+    R_, C_ = 24, 26
+
+    def elim(x, k0, n):
+        A = (jnp.arange(R_ * C_, dtype=F).reshape(R_, C_) % 7 + 1.0) * x + jnp.eye(R_, C_, dtype=F) * (5.0 + k0)
+
+        def piv(p, A):
+            col = A[:, p] / A[p, p]
+            return A - jnp.where(jnp.arange(R_)[:, None] == p, 0.0, col[:, None] * A[p, :][None, :])
+        A = lax.fori_loop(0, n, piv, A)                       # a scan: static trip count
+        _, A = lax.while_loop(lambda c: c[0] < k0, lambda c: (c[0] + 1, c[1] * 0.5 + c[1][(c[0] + 1) % R_][None, :]),
+                              (0, A))                          # a while loop: run-time trip count 0..4
+        return jnp.sum(A ** 2)
+
+    xs_ = jnp.linspace(0.5, 1.5, 64).astype(F)
+    ks = (jnp.arange(64) % 5).astype(F)
+    out = []
+    for n in (24, 23):                                         # even and odd trip counts
+        def item(t, x, k0, n=n):
+            y = elim(x, k0, n)
+            return t.add("Q", 0, y), y
+        want = jax.jit(jax.vmap(lambda x, k: elim(x, k, n)))(xs_, ks)
+
+        def copies(item=item, want=want):
+            tm.diagnostics(reset=True)
+            r = tm.vmap(item, outputs={"Q": tm.Sum((1,), F)}, backend=b)(xs_, ks)
+            close(r.per_item, want, rtol=1e-5, what=f"per-item, {n} pivots")
+            src = open(tm.diagnostics()["kernels"][-1]["source"]).read()
+            # element copies inside a loop between two arrays at the same index (a copy back)
+            return len(re.findall(r"^\s*(\w+)\[(.+)\] = (\w+)\[\2\];$", src, re.M))
+        n_in = copies()
+        from tallymap.backends.kernel import codegen as CG
+        with patched(CG, INPLACE=False):
+            n_cp = copies()
+        # one copy remains: after the while loop, when its last value is in the second buffer (odd trips; an odd
+        # scan adds one more, which this count cannot tell from a copy back: that case is checked for its values)
+        if n % 2 == 0 and not (n_in <= 1 and n_in < n_cp):
+            raise Fail(f"{n} pivots: {n_in} array copy statements with in-place updates on, {n_cp} off: the carry "
+                       "is still copied back every iteration")
+        out.append(f"{n} pivots: {n_in} copies vs {n_cp}")
+    return "; ".join(out)
+
+
 @case("cpu target: the spawn queue's spin-wait with every team thread running at once, oversubscribed (64 threads) "
       "and single-threaded, == xla (counts exact, tallies to tolerance)", ["auto"])
 def _(b):

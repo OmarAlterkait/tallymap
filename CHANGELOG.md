@@ -30,6 +30,16 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 - JAX 0.12 is tested (`TESTED_JAX` adds 0.12.0.1; the full suite passes on CPU and L40S). JAX 0.12 wraps some
   `jax.numpy` functions (`searchsorted`) in a new `call_hi_primitive`; the kernel backend inlines its expansion.
 
+### Changed
+
+- Kernel backend: no whole-array copies around in-place updates. A live read of an array element (`x = a[j]`
+  used after `a = a.at[k].set(...)`) is captured before the update, which is then done in place, instead of the
+  array being copied twice per update (a 1024-float loop carry: 37x on an L40S, 35x on a 2080 Ti). A loop carry
+  larger than a thread's 255 registers that is rebuilt from other elements of itself (a pivot step of an
+  elimination) gets two buffers swapped per iteration instead of a fresh array copied back: LUCiD's forward 1.23x
+  and its 6-column Jacobian 1.20x on an L40S (1.02x on a 2080 Ti), bitwise; lumen unchanged (gate: 650/650
+  arrays bitwise). `docs/design_notes.md` section 3, "In-place updates".
+
 ## 0.7.0 - 2026-11-11
 
 ### The kernel backend runs on the CPU

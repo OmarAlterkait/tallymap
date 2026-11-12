@@ -546,7 +546,8 @@ class Emitter:
             return False
         import re
         pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(val.name) + r"(?![A-Za-z0-9_])")
-        for env_, rem_ in self._scopes:
+        readers = []                       # live lazy values of THIS scope whose elements read val's storage
+        for depth, (env_, rem_) in enumerate(self._scopes):
             for v, x in env_.items():
                 if rem_.get(v, 0) <= 0 or isinstance(x, (Table, VTally)):
                     continue
@@ -563,7 +564,19 @@ class Emitter:
                     self.lines, self.ind, self.uid = saved
                     return False
                 if pat.search(t):
-                    return False
+                    if depth != len(self._scopes) - 1:
+                        return False       # (a value of an enclosing scope: its C scope is not this one)
+                    readers.append((v, x))
+        if not readers:
+            return True
+        # A live lazy value reads the array (x = a[j], used after a = a.at[k].set(...)): updated in place, the array
+        # would change x.  Rather than copying the whole array, capture the reader's elements NOW, before the update
+        # is emitted, when it is smaller than the array: a scalar read costs one register instead of two full-array
+        # copies per update (a 512-element carry read this way was copied twice per loop step).
+        if sum(max(1, x.size) for _, x in readers) >= val.size:
+            return False
+        for v, x in readers:
+            env[v] = self.mat_copy(x, "r") if x.shape == () else self.mat(x)
         return True
 
     def elementwise_self(self, dst, x):
