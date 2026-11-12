@@ -6,6 +6,17 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ## Unreleased
 
+### Fixed
+
+- `Sum(fixed_point=True)`: a bin whose running total passed `2^63 / scale` (2^31 at the default scale 2^32) wrapped
+  silently, with no `fixed_point_overflow`; a large tangent bin (a derivative of a large sum) was the usual victim.
+  Each bin now keeps a signed carry word, the net carry out of its int64 word, counted from each atomic add's old
+  value (in the emits and in the flush of the shared-memory accumulators; on the CPU target the same code; on the
+  xla backend as separate sums of each value's low and high 32 bits). The readout is the exact total rounded once
+  to float64, then cast: bitwise today's value wherever no bin carries, and order-independent where one does. The
+  per-emit range check and its count are unchanged; a bin whose exact total does not fit the output dtype is now
+  counted in `fixed_point_overflow` too, and is NaN in a float output (it was `inf` or a wrapped integer).
+
 ### Added
 
 - JAX 0.12 is tested (`TESTED_JAX` adds 0.12.0.1; the full suite passes on CPU and L40S). JAX 0.12 wraps some

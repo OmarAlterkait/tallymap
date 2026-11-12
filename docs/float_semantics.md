@@ -17,6 +17,10 @@ math modes, schedules and JAX versions.
    (`round(v * scale)`) before an integer add: bitwise results across schedules, `vmap`, and the two backends.  On the
    xla backend it needs `jax_enable_x64`.  Unrepresentable values are dropped and counted
    (`stats['fixed_point_overflow']`), and the bin each was emitted to is NaN (primal and tangent bins each by their own emits).
+   A bin's running sum does not wrap: each bin keeps the net signed carry out of its int64 word as a high word (from
+   the old value of each atomic add, so it is a sum of +-1 and order-independent), and the readout is the exact
+   128-bit total rounded once to float64, then cast.  A total that does not fit the output dtype is counted in
+   `stats['fixed_point_overflow']` too, and a float bin then is NaN.
 5. **Forward, tangent and adjoint share one item program.**  The adjoint replays the same jaxpr with the same options
    (same math), so a replay is bit-exact on the same backend (gated in tests/reverse.py, "REPLAY GATE").
 

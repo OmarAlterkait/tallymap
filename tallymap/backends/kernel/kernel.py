@@ -3,7 +3,8 @@ run by persistent threads that claim items with warp-aggregated atomics.  Emits 
 (small outputs privatised in shared memory); spawned children go through a bounded MPMC ticket queue.
 
 Buffers (one by-value struct of pointers): [per-item inputs] [broadcast inputs] [hoisted constants]
-| results: [sum tallies] [scratch accumulators (fixed64 / f64)] [claim counter u64] [stats i32[5]]
+| results: [sum tallies] [scratch accumulators (fixed point: u64 low words, i32 carry words, u32 flags)]
+           [claim counter u64] [stats i32[5]]
            [spawn: queue leaves, seq, qctl] [per-item results].
 N (the item count) is a kernel ARGUMENT: one cubin serves every N.
 """
@@ -493,21 +494,39 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
         dst = f"(({ot}*)P.p[{L.r_out[k]}])"
         at = _acc_t(s)
         if s.fixed_point:
+            if WIDE not in src:
+                src.append(WIDE)
             gp = f"((u64*)P.p[{L.r_scr[k]}])"
             sc = float(s.scale)
             # an emit that cannot be represented is dropped, counted, and flags its bin (u32 flags after the
             # accumulators): post makes a flagged bin NaN, so each output (primal or tangent, any node) is poisoned
             # by its own overflows only
             fl = f"((u32*)P.p[{L.r_scr[k]}] + {2 * tot})"
+            # each bin's signed high word: the net carry out of its int64 low word (WIDE).  Every add into a bin
+            # (an emit, or a privatised accumulator's flush) adds its carry, so the bin's exact total is
+            # low + carry * 2^64 whatever order the adds ran in.  A privatised emit counts its shared-memory add's
+            # carry here too (the flush then adds the block's low word with its own carry).
+            cw = f"((i32*)P.p[{L.r_scr[k]}] + {3 * tot})"
             src.append(f"__device__ __forceinline__ void sj_emit{k}(const SjParams& P, u64* a, i64 i, {ot} v) {{ "
                        f"const double x = (double)v * {sc!r}; if (!(fabs(x) < 9.2e18)) {{ atomicAdd(&SJ_STATS[3], 1); "
                        f"{fl}[i] = 1u; return; }} "
-                       f"atomicAdd((unsigned long long*)&a[i], (unsigned long long)__double2ll_rn(x)); }}")
-            val = f"((double)(i64){gp}[i]) * {1.0 / sc!r}"
+                       f"sj_wadd(&a[i], {cw} + i, __double2ll_rn(x)); }}")
+            # readout: the exact low + carry * 2^64, rounded once to double (exactly today's value when the carry is
+            # 0), times 1/scale, cast to the output type.  A bin whose value does not fit the output type is counted
+            # with the dropped emits (stats[3]) and, for a float output, is NaN like a flagged bin.
+            val = f"sj_wide_f64({gp}[i], {cw}[i]) * {1.0 / sc!r}"
             if ot in ("float", "double"):
-                val = f"{fl}[i] ? __longlong_as_double(0x7ff8000000000000LL) : {val}"
-            post.append(f"for (i64 i = g; i < {tot}; i += s) {dst}[i] = ({ot})({val});")
-            op = lambda a, i, v: f"atomicAdd((unsigned long long*)&{a}[{i}], (unsigned long long){v});"
+                mx = "3.4028234663852886e38" if ot == "float" else "1.7976931348623157e308"
+                post.append(f"for (i64 i = g; i < {tot}; i += s) {{ const double v = {val}; const {ot} o = ({ot})v; "
+                            f"const bool big = !(fabs((double)o) <= {mx}); if (big && !{fl}[i]) atomicAdd(&SJ_STATS[3], 1); "
+                            f"{dst}[i] = ({fl}[i] || big) ? ({ot})__longlong_as_double(0x7ff8000000000000LL) : o; }}")
+            elif ot in _IRANGE:
+                lo, hi = _IRANGE[ot]
+                post.append(f"for (i64 i = g; i < {tot}; i += s) {{ const double v = {val}; "
+                            f"if (!(v >= {lo} && v < {hi})) atomicAdd(&SJ_STATS[3], 1); {dst}[i] = ({ot})(v); }}")
+            else:
+                post.append(f"for (i64 i = g; i < {tot}; i += s) {dst}[i] = ({ot})({val});")
+            op = lambda a, i, v, cw=cw: f"sj_wadd(&{a}[{i}], {cw} + {i}, (i64){v});"
         elif ot in ("i64", "u64"):
             gp = f"((u64*)P.p[{L.r_out[k]}])"
             src.append(f"__device__ __forceinline__ void sj_emit{k}(const SjParams& P, u64* a, i64 i, {ot} v) {{ "
@@ -664,6 +683,38 @@ extern "C" __global__ void {lb} sj_main(const SjParams P, const i64 n_items) {{
     src.append(main)
     L.prims = sorted(em.prims)
     return "\n".join(src), L
+
+
+# the carry-word ("wide") fixed-point accumulator: a bin is an int64 low word (two's complement, wrapping) plus an
+# i32 high word, the net signed carry out of the low word.  atomicAdd returns the old low word o: adding q wrapped iff
+# q > 0 and o + q < o (carry +1) or q < 0 and o + q > o (carry -1).  The exact total is low + carry * 2^64 (a sum of
+# +-1 per add, so independent of the order of the adds: bitwise deterministic).  sj_wide_f64 rounds it to double
+# once (correctly: a 128-bit magnitude rounded to 53 bits); with carry 0 it is (double)(i64)low, today's value.
+WIDE = r"""
+__device__ __forceinline__ void sj_wadd(u64* a, i32* c, i64 q) {
+  const i64 o = (i64)atomicAdd((unsigned long long*)a, (unsigned long long)q);
+  const i64 r = (i64)((u64)o + (u64)q);
+  if (q > 0 && r < o) atomicAdd(c, 1); else if (q < 0 && r > o) atomicAdd(c, -1); }
+__device__ __noinline__ double sj_wide_big(u64 lo, i32 c) {
+  u64 h = (u64)((i64)c - (i64)(lo >> 63)), l = lo;          // the 128-bit two's complement h:l
+  const bool neg = (i64)h < 0;
+  if (neg) { l = ~l + 1ull; h = ~h + (l == 0ull ? 1ull : 0ull); }
+  double m;
+  int e = 0;
+  if (h == 0ull) { m = (double)l; } else {
+    e = 64 - __clzll((long long)h);                          // h's bits: the magnitude has 64 + e
+    const u64 t = (e == 64 ? h : ((h << (64 - e)) | (l >> e)));   // its top 64 bits (bit 63 set)
+    const u64 st = (e == 64 ? l : (l << (64 - e)));          // the bits below them: sticky
+    m = (double)(t | (st != 0ull ? 1ull : 0ull));            // one rounding to 53 bits (bit 0 only as sticky)
+  }
+  m = ldexp(m, e);
+  return neg ? -m : m; }
+__device__ __forceinline__ double sj_wide_f64(u64 lo, i32 c) { return c == 0 ? (double)(i64)lo : sj_wide_big(lo, c); }
+"""
+# integer output types: [lo, hi) of the values a fixed-point bin converts to without overflow
+_IRANGE = {"i8": ("-128.0", "128.0"), "u8": ("0.0", "256.0"), "i16": ("-32768.0", "32768.0"), "u16": ("0.0", "65536.0"),
+           "i32": ("-2147483648.0", "2147483648.0"), "u32": ("0.0", "4294967296.0"),
+           "i64": ("-9223372036854775808.0", "9223372036854775808.0"), "u64": ("0.0", "18446744073709551616.0")}
 
 
 def _scratch(s):

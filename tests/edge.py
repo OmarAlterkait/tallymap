@@ -848,6 +848,90 @@ def _(b):
     return f"cuda==xla bitwise {NB}/{NB} bins; jvp==jacfwd column bitwise; int64 tally exact"
 
 
+def _exact_bins(qs, idx, nbins, scale, dt):
+    """the exact fixed-point sum of the emits qs (Python ints, already round(v * scale)) into bins idx, as the
+    output dtype dt: the int total / scale rounded once to float64 (Fraction), then cast -> (outputs, int totals)."""
+    from fractions import Fraction
+    tot = [0] * nbins
+    for q, i in zip(qs, idx):
+        tot[i] += q
+    return np.array([float(Fraction(t) / Fraction(scale)) for t in tot]).astype(dt), tot
+
+
+@case("fixed_point: the carry word -- a bin past 2^31 at scale 2^32 is exact (primal, jvp, linearize; privatised "
+      "and global bins), deterministic; non-carrying bins as before; a total beyond the output type is counted")
+def _(b):
+    if b == "xla" and not jax.config.jax_enable_x64:
+        return "skipped (fixed_point needs x64 on xla)"
+    n, sc, GB = 4096, 2.0 ** 32, 1024           # GB bins: over PRIV_BYTES, so G is a global (not privatised) tally
+    rng = np.random.default_rng(7)
+    mag = rng.uniform(1e6, 2e8, n)
+    bin_ = np.arange(n) % 4
+    # bin 0: all positive (total ~1e11 >> 2^31), bin 1: all negative, bin 2: +-pairs (the running sum crosses 2^31
+    # and back: carries that cancel), bin 3: small values (no carry ever)
+    v = np.where(bin_ == 0, mag, np.where(bin_ == 1, -mag, np.where(bin_ == 2, np.where((np.arange(n) // 4) % 2 == 0,
+                 mag, -mag * 0.999), mag * 1e-9)))
+    x = jnp.asarray(v, F)
+    xv = np.asarray(x, np.float64)                 # exactly the emitted values (F), so q = v * 2^32 exactly
+    qs = [int(np.round(a * sc)) for a in xv]
+    ib = jnp.asarray(bin_, jnp.int32)
+    out = {"Q": tm.Sum((NB,), F, fixed_point=True), "G": tm.Sum((GB,), F, fixed_point=True)}
+
+    def item(t, x, i, s):
+        y = x * s
+        return t.add("Q", i, y).add("G", i * 255, y)
+    g = tm.vmap(item, outputs=out, in_axes=(0, 0, None), backend=b)
+    wq, tot = _exact_bins(qs, bin_, NB, sc, np.dtype(F))
+    wg, _ = _exact_bins(qs, bin_ * 255, GB, sc, np.dtype(F))
+    if not (abs(tot[0]) >= 2 ** 63 and abs(tot[1]) >= 2 ** 63 and abs(tot[3]) < 2 ** 63):
+        raise Fail(f"test setup: totals {[t / 2 ** 63 for t in tot[:4]]} x 2^63")
+
+    def chk(nm, r, st=None):
+        q, gg = (np.asarray(r[k]) for k in ("Q", "G"))
+        if not (np.array_equal(q, wq) and np.array_equal(gg, wg)):
+            raise Fail(f"{nm}: not the exact sum: Q {q[:4]} want {wq[:4]}; G bins equal "
+                       f"{int((gg == wg).sum())}/{GB}")
+        if st is not None and int(st["fixed_point_overflow"]) != 0:
+            raise Fail(f"{nm}: fixed_point_overflow {int(st['fixed_point_overflow'])} (nothing overflowed)")
+    one = F(1.0)
+    r1 = g(x, ib, one)
+    chk("primal", r1.outputs, r1.stats)
+    # non-carrying bin 3: today's formula, (double)(int64 total) / scale cast, bitwise
+    if np.asarray(r1.outputs["Q"])[3] != np.asarray(np.float64(np.int64(tot[3])) * (1.0 / sc)).astype(F):
+        raise Fail("non-carrying bin differs from the plain int64 readout")
+    r2 = g(x[::-1], ib[::-1], one)                 # another item order: other carries, the same net carry
+    if not all(np.array_equal(np.asarray(r1.outputs[k]), np.asarray(r2.outputs[k])) for k in out):
+        raise Fail("carrying fixed-point sum depends on the item order")
+    r3 = g(x, ib, one)
+    if not all(np.array_equal(np.asarray(r1.outputs[k]), np.asarray(r3.outputs[k])) for k in out):
+        raise Fail("carrying fixed-point sum differs run to run")
+    f = lambda s: g(x, ib, s).outputs                                     # noqa: E731
+    p, t = jax.jvp(f, (one,), (one,))
+    chk("jvp primal", p)
+    chk("jvp tangent", t)
+    p, lin = jax.linearize(f, one)
+    chk("linearize tangent", lin(one))
+    # a total that does not fit the output type: counted (stats['fixed_point_overflow']); a float bin is NaN
+    # (and on the linearize path, where the tangent node's stats have no output to reach, its bin is NaN)
+    gb = tm.vmap(lambda t, x, s: t.add("A", 0, x * s).add("A", 1, x * 1e-30), outputs={"A": tm.Sum(
+                 (2,), jnp.float32, fixed_point=True, scale=2.0 ** -80)}, in_axes=(0, None), backend=b)
+    x4, s1 = jnp.full((4,), 3e38, jnp.float32), jnp.float32(1.0)
+    big = gb(x4, s1)
+    a = np.asarray(big.outputs["A"])
+    if not (np.isnan(a[0]) and np.isfinite(a[1]) and int(big.stats["fixed_point_overflow"]) == 1):
+        raise Fail(f"f32 total beyond FLT_MAX: {a}, overflow {int(big.stats['fixed_point_overflow'])} (want NaN, 1)")
+    a = np.asarray(jax.linearize(lambda s: gb(x4, s).outputs["A"], s1)[1](s1))
+    if not (np.isnan(a[0]) and np.isfinite(a[1])):
+        raise Fail(f"linearize: f32 tangent total beyond FLT_MAX not NaN: {a}")
+    ii = tm.vmap(lambda t, x: t.add("I", 0, x).add("I", 1, x // 4), outputs={"I": tm.Sum((2,), jnp.int32,
+                 fixed_point=True, scale=1.0)}, backend=b)(jnp.full((4,), 1 << 30, jnp.int32))
+    if int(ii.stats["fixed_point_overflow"]) != 1 or int(np.asarray(ii.outputs["I"])[1]) != 1 << 30:
+        raise Fail(f"int32 total 2^32: overflow {int(ii.stats['fixed_point_overflow'])} (want 1), "
+                   f"{np.asarray(ii.outputs['I'])}")
+    return (f"exact: bins at {tot[0] / 2 ** 63:+.0f} / {tot[1] / 2 ** 63:+.0f} x 2^63 (primal, jvp, linearize, "
+            f"{NB} privatised + {GB} global bins), order- and run-independent; out-of-type totals counted")
+
+
 @case("spawn: cascade counts, overflow counted, children truncated, jvp")
 def _(b):
     def item(t, gen, x):

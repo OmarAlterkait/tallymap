@@ -49,7 +49,8 @@ class _St:
         self.accs = accs                # slot -> array
         self.queue = queue              # None | dict(leaves, head, tail, spawned, dropped)
         self.ovf = jnp.int32(0)         # fixed-point overflow count
-        self.bad = {k: jnp.zeros(a.shape, bool) for k, a in accs.items() if p.tallies[k].fixed_point}   # flagged bins
+        self.bad = {k: jnp.zeros(a.shape[:-1] + (a.shape[-1] // 2,), bool)                         # flagged bins
+                    for k, a in accs.items() if p.tallies[k].fixed_point}
         self.drops = jnp.int32(0)       # out-of-range (dropped) emit indices
         self.mask = None
         self.lanes = []                 # enclosing while loops with a batched predicate: their [P, *B] masks
@@ -76,6 +77,28 @@ def _fixed(v, scale):
     x = v.astype(jnp.float64) * scale
     ok = jnp.abs(x) < 9.2e18
     return jnp.where(ok, jnp.round(x), 0).astype(jnp.int64), ok
+
+
+def _wide(a, s):
+    """a fixed-point tally's accumulator [*lead, 2S] (the sums of the values' low 32 bits, unsigned, and of their
+    high 32 bits, signed) -> (its output: the exact total / scale, in s.dtype; the bins that do not fit s.dtype).
+    The kernel backend's carry word made explicit: no int64 bin wraps (the low sums hold 2^31 values per bin).
+    A total that fits int64 converts as before; a larger one is hi * 2^32 + lo rounded once (|hi| < 2^53)."""
+    S = s.S
+    lo, hi = a[..., :S], a[..., S:]
+    hi = hi + (lo >> 32)
+    lo = lo & jnp.int64(0xFFFFFFFF)
+    fits = (hi >= -(1 << 31)) & (hi < (1 << 31))
+    f64 = jnp.float64
+    t = jnp.where(fits, ((hi << 32) + lo).astype(f64), hi.astype(f64) * 2.0 ** 32 + lo.astype(f64))
+    v = t / s.scale
+    if jnp.issubdtype(s.dtype, jnp.floating):
+        o = v.astype(s.dtype)
+        return o, ~jnp.isfinite(o)
+    if jnp.issubdtype(s.dtype, jnp.integer):
+        ii = jnp.iinfo(s.dtype)
+        return v.astype(s.dtype), ~((v >= float(ii.min)) & (v < float(ii.max) + 1.0))
+    return v.astype(s.dtype), jnp.zeros(v.shape, bool)
 
 
 def _rows(spec):
@@ -118,8 +141,12 @@ def _emit(st, t, idx, val):
         live = jnp.broadcast_to(f < S, ok.shape)
         st.ovf = st.ovf + jnp.sum((~ok & live).astype(jnp.int32), dtype=jnp.int32)
         st.bad[t.slot] = st.bad[t.slot].at[..., f].max(~ok, mode="drop")        # a bin that dropped an emit
-    else:
-        v = v.astype(a.dtype)
+        # the wide accumulator (_wide): the low 32 bits of each value into [0, S), the signed high 32 into [S, 2S)
+        fl, fh = jnp.where(f < S, f, 2 * S), jnp.where(f < S, f + S, 2 * S)
+        st.accs[t.slot] = a.at[..., jnp.concatenate([fl, fh])].add(
+            jnp.concatenate([v & jnp.int64(0xFFFFFFFF), v >> 32], axis=-1), mode="drop")
+        return t
+    v = v.astype(a.dtype)
     st.accs[t.slot] = a.at[..., f].add(v, mode="drop")
     return t
 
@@ -370,7 +397,7 @@ def run(p, pi, bc, xla_batch_size=None, **_):
             dt = jnp.int64 if s.fixed_point else s.dtype
             if s.fixed_point:
                 _fixed(jnp.zeros(()), 1.0)
-            accs[k] = jnp.zeros(tuple(s.lead) + (_rows(s) * s.S,), dt)
+            accs[k] = jnp.zeros(tuple(s.lead) + ((2 if s.fixed_point else _rows(s)) * s.S,), dt)
     ys0 = [jnp.zeros((N,) + tuple(a.shape), a.dtype) for a in ya]
     P = int(min(max(N, 1), xla_batch_size or BLOCK))
     cj = p.cj
@@ -458,9 +485,10 @@ def _finish(p, accs, sp, ys, st):
             if _rows(s) > 1:
                 a = jnp.sum(a.reshape(tuple(s.lead) + (_rows(s), s.S)), axis=-2)
             if s.fixed_point:                       # a bin that dropped an emit is NaN (as on cuda)
-                a = (a.astype(jnp.float64) / s.scale).astype(s.dtype)
+                a, big = _wide(a, s)
+                st.ovf = st.ovf + jnp.sum((big & ~st.bad[k]).astype(jnp.int32), dtype=jnp.int32)
                 if jnp.issubdtype(s.dtype, jnp.floating):
-                    a = jnp.where(st.bad[k], jnp.asarray(np.nan, s.dtype), a)
+                    a = jnp.where(st.bad[k] | big, jnp.asarray(np.nan, s.dtype), a)
             out.append(a)
     sp = sp if sp is not None else (jnp.int32(0),) * 3
     return out + [jnp.stack([jnp.asarray(x, jnp.int32) for x in (*sp, st.ovf, st.drops)])] + list(ys)

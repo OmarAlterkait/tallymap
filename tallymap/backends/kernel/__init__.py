@@ -146,7 +146,8 @@ def run(p, pi, bc, target="cuda", cuda_math="approx", schedule="item", ndev=1, *
     for k in outs:
         if k in L.r_scr:
             s = p.tallies[k]
-            rs.append(jax.ShapeDtypeStruct((3 * int(np.prod(s.lead, dtype=np.int64)) * s.S,), jnp.uint32))  # u64 + flag
+            n = int(np.prod(s.lead, dtype=np.int64)) * s.S
+            rs.append(jax.ShapeDtypeStruct((4 * n,), jnp.uint32))  # u64 low words + i32 carry words + u32 flags
     rs.append(jax.ShapeDtypeStruct((2,), jnp.uint32))          # claim counter (u64)
     rs.append(jax.ShapeDtypeStruct((5,), jnp.int32))           # stats
     if p.spawn is not None:

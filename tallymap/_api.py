@@ -55,8 +55,10 @@ class Sum:
     order-independent, each value rounded to a multiple of 1/scale (needs jax_enable_x64 on the xla backend).
     |v * scale| >= 9.2e18 cannot be represented: such an emit is dropped, counted in
     Result.stats['fixed_point_overflow'], and the BIN it was emitted to becomes NaN (every kernel flags its own bins: a
-    primal bin by the primal's emits, a jvp / jacfwd tangent bin by that tangent's emits, on every path).  A jvp /
-    vjp tangent tally of this output uses the same scale."""
+    primal bin by the primal's emits, a jvp / jacfwd tangent bin by that tangent's emits, on every path).  A BIN's sum
+    does not wrap: it keeps a signed high word (the net carry out of its int64 word), so its total is exact past
+    2^63 / scale; a total that does not fit `dtype` is counted in 'fixed_point_overflow' too (a float bin is NaN).
+    A jvp / vjp tangent tally of this output uses the same scale."""
     shape: Any
     dtype: Any = jnp.float32
     fixed_point: bool = False
