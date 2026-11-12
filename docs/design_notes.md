@@ -395,12 +395,10 @@ A spawn is an EMIT of the child's initial state into a child-slot output. The co
 child's initial-state cotangent, and the transpose of an emit hands it to the parent as the cotangent of the
 emitted value AT THE SPAWN STEP, inside the parent's ordinary replay adjoint. No new adjoint machinery is needed.
 
-- **Recording program** (a retrace with `spawn=`, `emit=` and `gate=` hooks): a spawn writes the child's float
+- **Recording program** (a retrace with `spawn=` and `emit=` hooks): a spawn writes the child's float
   leaves into a cotangent-carrier tally and the uint32 words of every leaf into an exact payload tally, advances
-  the slot counter and folds the words into a hash. Every emit also folds its value into the hash. Items at or
-  beyond the active count have their top-level loops gated off and their effects masked. This is a gate and not
-  a `cond` because JAX's partial evaluation of an item-level `cond` forwards the item's constant tables as
-  residual outputs, which the CUDA emitter cannot hold.
+  the slot counter and folds the words into a hash. Every emit also folds its value into the hash. A generation
+  of n items is a launch with `n_active` = n, so items beyond it do not run.
 - **Forward**, per generation: a count pass and a write pass, with payloads in (parent, ordinal) order in one
   flat buffer. The two passes' count and hash must agree.
 - **Reverse**, deepest generation first, ONE adjoint launch per generation. The roots' initial-state cotangents

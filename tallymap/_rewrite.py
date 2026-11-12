@@ -253,7 +253,7 @@ def emit_p_bind(t, i, v):
     return emit_p.bind(t, i, v)
 
 
-def retrace(cj, *, cap=None, rev=False, n_tally=0, emit=None, tables=None, report=None, spawn=None, gate=None):
+def retrace(cj, *, cap=None, rev=False, n_tally=0, emit=None, tables=None, report=None, spawn=None):
     """-> python function f(*invars) evaluating cj with (cap) every top-level while loop capped at `cap`
     iterations (f returns its outputs + [truncated:bool]), or (rev: True or _reverse.RevOpts) every while loop replaced
     by a reverse-differentiable loop (_reverse.checkpointed_while).  The first n_tally invars are tallies (rev: their
@@ -262,8 +262,6 @@ def retrace(cj, *, cap=None, rev=False, n_tally=0, emit=None, tables=None, repor
     spawn: f(token, when, *child) -> token' replaces every spawn (the tree adjoint, _reverse_spawn.py).  With hooks a
     tally value may be a python TUPLE (e.g. (array, hash)): equations it flows into are interpreted (never bound),
     and lax control flow carries it as a pytree.  Only for rev=False (the hooked program is re-traced to a flat jaxpr).
-    gate: a traced bool; every top-level while loop runs only while `gate` holds (an inactive item skips its loops
-    without a cond around the item; the caller masks its effects).
     tables (rev only): {invar index: token index}.  Reads (gather/dynamic_slice/slice) of these operands become
     _reverse.tread calls threading a cotangent token; f then takes the tokens as extra trailing arguments and returns
     them as extra trailing outputs.  report: a dict that receives 'dense' = token indices of tables that also have
@@ -274,7 +272,7 @@ def retrace(cj, *, cap=None, rev=False, n_tally=0, emit=None, tables=None, repor
     def f(*args):
         args = list(args)
         a, toks = (args[:len(args) - nt], args[len(args) - nt:]) if nt else (args, [])
-        ctx = {"trunc": jnp.bool_(False), "emit": emit, "spawn": spawn, "gate": gate, "toks": list(toks),
+        ctx = {"trunc": jnp.bool_(False), "emit": emit, "spawn": spawn, "toks": list(toks),
                "tread": nt > 0, "dense": set()}
         flags = [True] * n_tally + [False] * (len(a) - n_tally)
         tags = [tables.get(i) for i in range(len(a))]
@@ -288,8 +286,7 @@ def retrace(cj, *, cap=None, rev=False, n_tally=0, emit=None, tables=None, repor
 def _needs(jaxpr, rev, top, cap, ctx):
     return ((rev or (cap is not None and top)) and contains(jaxpr, ("while",))) or \
         (ctx["emit"] is not None and contains(jaxpr, ("tallymap_emit",))) or \
-        (ctx.get("spawn") is not None and contains(jaxpr, ("tallymap_spawn",))) or \
-        (ctx.get("gate") is not None and top and contains(jaxpr, ("while",)))
+        (ctx.get("spawn") is not None and contains(jaxpr, ("tallymap_spawn",)))
 
 
 def _set_tok(ctx, i, v):
@@ -336,8 +333,7 @@ def _interp(jaxpr, consts, args, flags, ctx, cap, rev, top, tags=None):
                 if tagged:                     # any other use of a sparse table: it needs a dense cotangent too
                     ctx["dense"].update(t for t in itags if t is not None)
                 force = any(isinstance(x, tuple) for x in ins)   # a hooked (tuple-valued) tally flows in: interpret
-                if name == "while" and (force or rev or (top and (cap is not None or ctx.get("fp") is not None
-                                                                  or ctx.get("gate") is not None))
+                if name == "while" and (force or rev or (top and (cap is not None or ctx.get("fp") is not None))
                                         or any(_needs(s.jaxpr, rev, top, cap, ctx) for s in subs)):
                     outs, oflags = _while(eqn, ins, fin, ctx, cap, rev, top)
                 elif name == "tallymap_emit" and ctx["emit"] is not None:
@@ -470,10 +466,6 @@ def _while(eqn, ins, fin, ctx, cap, rev, top, itags=None):
                     tags=btags + [None] * len(init))
     cfn = lambda cc_, c: condf(*cc_, *c)[0]
     bfn = lambda bc_, c: list(bodyf(*bc_, *c))
-    g = ctx.get("gate") if top and not rev else None
-    if g is not None:
-        cfn0 = cfn
-        cfn = lambda cc_, c: g & cfn0(cc_, c)
     if cap is not None and top:
         M = int(cap)
 

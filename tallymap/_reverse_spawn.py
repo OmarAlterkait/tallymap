@@ -12,10 +12,8 @@ Rewritten item program (the "rec" program, built once per ItemProgram by re-trac
     every emit also folds the bits of its value into h.
     q starts at the item's per-item operand `off` (its first child slot); the item returns n = q_end - off
     (its number of children) and h (a hash of every value it emitted and spawned, in program order).
-    Items i >= nact (a broadcast int) do nothing (fixed capacity, traced count): their top-level loops are gated off
-    and their emits / spawns masked -- NOT a cond around the item (JAX's partial eval of such a cond forwards the
-    item's big constant tables as residual OUTPUTS of the cond, which the cuda emitter cannot hold per item).  The
-    caller feeds them a copy of a valid item (row 0) so their straight-line code stays finite.
+    A generation of n items is a launch with n_active (ItemProgram.nact) = n: items i >= n do not run.  The caller
+    feeds them a copy of a valid item (row 0): the xla backend computes masked lanes.
 
 Forward (recording), generation by generation (roots = generation 0):
     count pass   (q from 0)              -> n_k, h_k
@@ -40,8 +38,9 @@ mismatches poison too.  Never silently wrong.
 Capacities are derived from the Queue capacity Q (the user sets nothing): the tree holds up to Q children
 (non-root items: exactly the bound under which the forward provably dropped nothing), a generation up to Q (a
 larger generation poisons: stats 'generation_overflow'), depth up to Q.  Generation launches use capacity buckets
-Cg, Cg/2, Cg/4, ... (>= 256) so a small generation does not pay for Cg idle items.  The test-only module constants
-GEN_CAPACITY and TREE_NEG (below) lower the generation capacity and select the negative controls.
+Cg, Cg/2, Cg/4, ... (>= 256) so a small generation does not pay for Cg idle items, nor for Cg-sized XLA work around
+the launch.  The test-only module constants GEN_CAPACITY and TREE_NEG (below) lower the generation capacity and select
+the negative controls.
 Stats of the last tree adjoint (host side, via jax.debug.callback, OPT-IN: rev_stats=True -- a host callback takes
 jax.jit off its C++ dispatch path): tallymap.diagnostics()['reverse']['tree'] (= _reverse_spawn.LAST[-1]).
 Second order through this adjoint raises (the recorded payloads are bit-cast, they carry no tangent).
@@ -134,7 +133,7 @@ def _size(shape):
 
 def build_rec(p, Cg, neg=""):
     """the rewritten item program of base ItemProgram p (see module docstring).
-    invars : [user tallies][SPf_l (float leaves)][BIT_l (all leaves)][FP] + [pi][off, iid, cnt, H, z] + [bc][nact]
+    invars : [user tallies][SPf_l (float leaves)][BIT_l (all leaves)][FP] + [pi][off, cnt, H, z] + [bc][nact]
     outvars: same tallies + [user per-item results][n, h]"""
     from ._api import _mk, _sds
     nT, nP, nB = p.nT, p.nP, p.nB
@@ -154,26 +153,23 @@ def build_rec(p, Cg, neg=""):
 
     def make(neg_replay):
         def item(*a):
-            sizes = (nU, nF, nP, 1, nP, 5, nB, 1)
+            sizes = (nU, nF, nP, 1, nP, 4, nB, 1)
             cuts = np.cumsum((0,) + sizes)
             tu, tf_, tb, tfp, pi, scal, bc, nact = (list(a[i:j]) for i, j in zip(cuts[:-1], cuts[1:]))
-            tfp, nact = tfp[0], nact[0]
-            off, iid, cnt, H, z = scal
+            tfp = tfp[0]           # (nact: the launch's n_active, ItemProgram.nact; the item does not read it)
+            off, cnt, H, z = scal
             if neg_replay:        # NEGATIVE CONTROL ONLY: the adjoint replays a 1-ulp different item
                 x0 = pi[fl[0]]
                 xs = lax.stop_gradient(x0)
                 pi[fl[0]] = x0 + (jnp.nextafter(xs, jnp.asarray(np.inf, x0.dtype)) - xs)
 
-            act = iid < nact          # items >= nact: loops skipped, effects masked (no cond: see build_rec doc)
-
             def em(t, idx, val):
                 arr, h = t
-                i = jnp.asarray(idx)
-                return emit_p_bind(arr, jnp.where(act, i, -1), val), _mix(h, _wsum(val))
+                return emit_p_bind(arr, idx, val), _mix(h, _wsum(val))
 
             def sp(tok, when, *child):
                 q, h, spf, bits = tok
-                w = jnp.asarray(when) & act
+                w = jnp.asarray(when)
                 spf2, bits2, hw = [], [], U32(0)
                 for j, i in enumerate(fl):
                     L = ls[i]
@@ -191,16 +187,14 @@ def build_rec(p, Cg, neg=""):
             for kk, t in zip(us, tu):
                 targs[kk] = (t, U32(0))
             targs[ks] = (off, U32(0), tuple(tf_), tuple(tb))
-            outs = retrace(p.cj, n_tally=nT, emit=em, spawn=sp, gate=act)(*targs, *pi, *bc)
+            outs = retrace(p.cj, n_tally=nT, emit=em, spawn=sp)(*targs, *pi, *bc)
             tv, y = outs[:nT], outs[nT:]
             q, h, spf, bits = tv[ks]
             for kk in us:
                 h = _mix(h, tv[kk][1])
-            n = jnp.where(act, q - off, 0).astype(jnp.int32)
-            h = jnp.where(act, h, U32(0))
-            mm = (act & ((n != cnt) | (h != H))).astype(z.dtype)
+            n = (q - off).astype(jnp.int32)
+            mm = ((n != cnt) | (h != H)).astype(z.dtype)
             fp = emit_p_bind(tfp, jnp.int32(0), z * mm)
-            y = [jnp.where(act, jnp.asarray(v), jnp.zeros_like(jnp.asarray(v))) for v in y]
             return [tv[kk][0] for kk in us] + list(spf) + list(bits) + [fp] + y + [n, h]
 
         avals = ([_sds(tav[k]) for k in us]
@@ -208,7 +202,7 @@ def build_rec(p, Cg, neg=""):
                  + [jax.ShapeDtypeStruct((Cg * nw[i],), jnp.int32) for i in range(nP)]
                  + [jax.ShapeDtypeStruct((1,), jnp.float32)]
                  + [_sds(a) for a in pav]
-                 + [jax.ShapeDtypeStruct((), d) for d in (jnp.int32, jnp.int32, jnp.int32, U32, jnp.float32)]
+                 + [jax.ShapeDtypeStruct((), d) for d in (jnp.int32, jnp.int32, U32, jnp.float32)]
                  + [_sds(a) for a in bav] + [jax.ShapeDtypeStruct((), jnp.int32)])
         return _mk(item, avals)
     cj = make(False)
@@ -229,7 +223,7 @@ def _rec_specs(p, R, user, spf, bit, fp):
 
 def _rec_prog(p, R, cj, specs, tag):
     from ._api import ItemProgram
-    return ItemProgram(cj, specs, p.nP + 5, p.nB + 1, None, None, p.tag + tag, where=p.where)
+    return ItemProgram(cj, specs, p.nP + 4, p.nB + 1, None, None, p.tag + tag, where=p.where, nact=p.nB)
 
 
 def _progs(p, Cg, U_bc, o):
@@ -248,7 +242,7 @@ def _progs(p, Cg, U_bc, o):
     adj_specs = _rec_specs(p, R, None, "sum", "discard", "sum")
     check_slots(R.cj_adj, adj_specs, p.tag + "+rec_adj")
     adj = _rec_prog(p, R, R.cj_adj, adj_specs, "+rec_adj")
-    pert_pi = tuple(i in R.fl for i in range(p.nP)) + (False, False, False, False, True)
+    pert_pi = tuple(i in R.fl for i in range(p.nP)) + (False, False, False, True)
     pert_bc = tuple(U_bc) + (False,)
     T = vjp_prog(adj, pert_pi, pert_bc, o)          # (rev_checkpoints etc. as for any reverse call)
     cache[key] = (R, count, write, adj, T, pert_pi, pert_bc)
@@ -327,11 +321,10 @@ def tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N):
 
     def fwd_gen(X, b, nact):
         """count + write passes over b items -> (user sums, BIT payloads, n, h, mismatch count)"""
-        iid = jnp.arange(b, dtype=jnp.int32)
         z = jnp.zeros((b,), jnp.float32)
-        oc = call(n_count, list(X) + [i32(b), iid, i32(b), jnp.zeros((b,), U32), z], list(bc) + [nact])
+        oc = call(n_count, list(X) + [i32(b), i32(b), jnp.zeros((b,), U32), z], list(bc) + [nact])
         nc, hc = oc[-2], oc[-1]
-        ow = call(n_write, list(X) + [_excl_cumsum(nc), iid, nc, hc, z], list(bc) + [nact])
+        ow = call(n_write, list(X) + [_excl_cumsum(nc), nc, hc, z], list(bc) + [nact])
         sums, bits = ow[:nut], ow[nut:nut + nP]
         nw_, hw_ = ow[-2], ow[-1]
         fmm = jnp.sum(((nw_ != nc) | (hw_ != hc)).astype(jnp.int32))
@@ -386,12 +379,10 @@ def tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N):
 
     # ---- reverse: generations G-1 .. 1, then the roots
     def adj_gen(X, cnt, H, b, nact, Gc, cy):
-        iid = jnp.arange(b, dtype=jnp.int32)
-        cnt = jnp.where(iid < nact, cnt, 0)
         if TREE_NEG == "detach":     # NEGATIVE CONTROL ONLY: children's cotangents are not injected
             Gc = [jnp.zeros_like(g_) for g_ in Gc]
         ct = ct_user + [g_.reshape(-1) for g_ in Gc] + [jnp.ones((1,), jnp.float32)]
-        outs = call(t_node, list(X) + [_excl_cumsum(cnt), iid, cnt, H, jnp.zeros((b,), jnp.float32)] + list(cy),
+        outs = call(t_node, list(X) + [_excl_cumsum(cnt), cnt, H, jnp.zeros((b,), jnp.float32)] + list(cy),
                     list(bc) + [nact] + ct)
         gt = list(outs[:len(ib)])
         dp = list(outs[len(ib) + 1:])
@@ -408,7 +399,7 @@ def tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N):
         g, Gc, gt, mm = s
         st, n = goff[g], ng[g]
         X = decode(FB, st, n)
-        cnt = lax.dynamic_slice_in_dim(FC, st, Cg)
+        cnt = lax.dynamic_slice_in_dim(FC, st, Cg)     # (entries >= n: the next generation's; those items do not run)
         H = lax.dynamic_slice_in_dim(FH, st, Cg)
 
         def one(b):
