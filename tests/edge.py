@@ -1502,7 +1502,7 @@ def _(b):
 @case("version policy: the tested versions, a warning only above the newest tested", ["xla"])
 def _(b):
     from tallymap._compat import _check_jax_version
-    if tm.TESTED_JAX != ("0.6.2", "0.7.2", "0.8.3", "0.9.2", "0.10.2", "0.11.2"):
+    if tm.TESTED_JAX != ("0.6.2", "0.7.2", "0.8.3", "0.9.2", "0.10.2", "0.11.2", "0.12.0.1"):
         raise Fail(f"TESTED_JAX {tm.TESTED_JAX}")
     if hasattr(tm, "check_jax_version") or "check_jax_version" in tm.__all__:
         raise Fail("check_jax_version is still public")
@@ -1511,10 +1511,10 @@ def _(b):
         raise Fail(f"this JAX ({jax.__version__}) is {st}: the matrix should run on tested versions")
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        got = [_check_jax_version(v) for v in ("0.6.2", "0.12.0.dev20261014", "0.4.38", "0.11.3")]
+        got = [_check_jax_version(v) for v in ("0.6.2", "0.13.0.dev20270101", "0.4.38", "0.12.1")]
     if got != ["ok", "newer", "ok", "newer"] or len(w) != 2 or "newer" not in str(w[0].message):
         raise Fail(f"policy {got}, warnings {[str(x.message) for x in w]}")
-    return f"jax {jax.__version__}: ok; {len(tm.TESTED_JAX)} tested; 0.12 dev warns, 0.4.38 does not"
+    return f"jax {jax.__version__}: ok; {len(tm.TESTED_JAX)} tested; 0.13 dev warns, 0.4.38 does not"
 
 
 @case("eager calls: items that differ only in a host callback are different programs (cache key)", ["xla"])

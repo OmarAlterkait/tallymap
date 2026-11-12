@@ -11,7 +11,7 @@ NM = None                       # batching: an unmapped dimension (batching.not_
 # ------------------------------------------------------------------------------------------- version policy
 # the CPU suite passes on every one of these (docs/maintenance.md, "Version policy"); the floor is also
 # pyproject's jax>=0.6.2 requirement
-TESTED_JAX = ("0.6.2", "0.7.2", "0.8.3", "0.9.2", "0.10.2", "0.11.2")
+TESTED_JAX = ("0.6.2", "0.7.2", "0.8.3", "0.9.2", "0.10.2", "0.11.2", "0.12.0.1")
 
 
 def _vtuple(v):

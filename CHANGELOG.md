@@ -4,6 +4,13 @@ All notable changes. Versions follow [SemVer](https://semver.org/) 0.x: until 1.
 API, and only after one minor release in which the old form still works and warns. Patch releases never change
 the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
+## Unreleased
+
+### Added
+
+- JAX 0.12 is tested (`TESTED_JAX` adds 0.12.0.1; the full suite passes on CPU and L40S). JAX 0.12 wraps some
+  `jax.numpy` functions (`searchsorted`) in a new `call_hi_primitive`; the kernel backend inlines its expansion.
+
 ## 0.7.0 - 2026-11-11
 
 ### The kernel backend runs on the CPU

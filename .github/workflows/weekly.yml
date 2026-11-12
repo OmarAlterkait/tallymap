@@ -34,6 +34,8 @@ jobs:
             python: "3.11"
           - jax: "0.11.2"
             python: "3.12"
+          - jax: "0.12.0.1"
+            python: "3.12"
     name: jax ${{ matrix.jax }} (py${{ matrix.python }})
     steps:
       - uses: actions/checkout@v5

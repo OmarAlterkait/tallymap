@@ -10,9 +10,11 @@ import os
 import weakref
 from typing import NamedTuple
 
+import jax
 import numpy as np
 from jax.extend import source_info_util as _siu
 from jax.extend.core import ClosedJaxpr, Literal
+from jax.tree_util import tree_leaves, tree_unflatten
 
 # frames inside tallymap are not "user" frames: source summaries of item equations point at the user's code
 _siu.register_exclusion(os.path.dirname(os.path.abspath(__file__)) + os.sep)
@@ -29,10 +31,23 @@ def closed(j):
 
 def call_jaxpr(eqn):
     """the sub-jaxpr (closed) of a call-like equation, or None."""
+    if eqn.primitive.name == "call_hi_primitive":     # JAX >= 0.12: a hijax primitive (e.g. searchsorted)
+        return hi_jaxpr(eqn.params["_prim"])
     p = CALL_PARAM.get(eqn.primitive.name)
     if p is None or p not in eqn.params:
         return None
     return closed(eqn.params[p])
+
+
+HI_EXPANSIONS = weakref.WeakKeyDictionary()
+
+
+def hi_jaxpr(prim):
+    """a hijax primitive's expansion into ordinary primitives (its `expand`), traced once per primitive instance."""
+    if prim not in HI_EXPANSIONS:
+        HI_EXPANSIONS[prim] = jax.make_jaxpr(lambda *a: tree_leaves(prim.expand(*tree_unflatten(prim.in_tree, a))))(
+            *prim.in_avals_flat)
+    return HI_EXPANSIONS[prim]
 
 
 class While(NamedTuple):
@@ -277,6 +292,6 @@ def digest(jaxpr):
     return _d_jaxpr(jaxpr).decode()
 
 
-__all__ = ["CALL_PARAM", "Literal", "closed", "call_jaxpr", "While", "while_parts", "cond_branches", "Scan",
+__all__ = ["CALL_PARAM", "Literal", "closed", "call_jaxpr", "hi_jaxpr", "While", "while_parts", "cond_branches", "Scan",
            "scan_counts", "scan_parts", "subjaxprs", "contains", "host_callbacks", "is_dropvar", "lit", "with_source",
            "bind", "source_summary", "item_name", "located", "digest"]

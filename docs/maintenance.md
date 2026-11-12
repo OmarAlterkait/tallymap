@@ -24,11 +24,11 @@ this library leans on (the legacy transformation registries, the jaxpr equation 
 minors and not between patches. Each minor is tested at its latest patch, on
 CPU, with the full suite:
 
-| JAX | 0.6.2 | 0.7.2 | 0.8.3 | 0.9.2 | 0.10.2 | 0.11.2 |
-|---|---|---|---|---|---|---|
-| Python | 3.10 | 3.11 | 3.11 | 3.11 | 3.11 | 3.12 |
+| JAX | 0.6.2 | 0.7.2 | 0.8.3 | 0.9.2 | 0.10.2 | 0.11.2 | 0.12.0.1 |
+|---|---|---|---|---|---|---|---|
+| Python | 3.10 | 3.11 | 3.11 | 3.11 | 3.11 | 3.12 | 3.12 |
 
-GitHub CI runs the CPU suite on 0.6.2 and the newest tested version on every push, and all six weekly. The GPU
+GitHub CI runs the CPU suite on 0.6.2 and the newest tested version on every push, and all seven weekly. The GPU
 cells (2080 Ti, L40S) run on JAX 0.6.2 only.
 
 `tm.TESTED_JAX` is that list. Importing tallymap warns once only when JAX is **newer than the newest tested

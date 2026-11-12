@@ -12,6 +12,7 @@ NOT_IN_JAX_EXTEND = {
     "core_call": "jax.core.call", "closed_call": "jax.core.closed_call (not re-exported on 0.11)",
     "checkpoint": "jax.checkpoint (older name)", "remat": "jax.checkpoint (older name)",
     "remat2": "jax.checkpoint (0.5.3 name; re-exported only on newer JAX)",
+    "call_hi_primitive": "a hijax primitive (JAX >= 0.12, e.g. searchsorted), inlined as its expansion",
     "platform_index": "lax.platform_dependent", "optimization_barrier": "lax.optimization_barrier",
     # array / RNG internals
     "copy_p": "lax copy (older name)", "empty": "lax.empty (older name)", "empty2": "lax.empty (0.5.3)",

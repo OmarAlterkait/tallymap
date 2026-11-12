@@ -1,10 +1,10 @@
 """Sugar canonicalisation: a jaxpr -> jaxpr pre-pass of the cuda emitter.
 
-Some JAX primitives are shorthand for a few others: square = mul(x, x), clamp = min(hi, max(lo, x)), integer_pow =
-a chain of muls, expand_dims / squeeze = reshape, split / unstack = slices, stack = concatenate, the total-order
-compares = integer compares of the sign-folded bit patterns, copy / stop_gradient / ... = identity.  Instead of one
-emission rule each, the item jaxpr is re-traced once with every such equation replaced by its canonical form, so the
-op table only needs the canonical primitives.
+Some JAX primitives are shorthand for a few others: square = mul(x, x), clamp = min(hi, max(lo, x)), integer_pow = a
+chain of muls, expand_dims / squeeze = reshape, split / unstack = slices, stack = concatenate, the total-order
+compares = integer compares of the sign-folded bit patterns, copy / stop_gradient / ... = identity, a hijax
+primitive (JAX >= 0.12) = its expansion. Instead of one emission rule each, the item jaxpr is re-traced once with
+every such equation replaced by its canonical form, so the op table only needs the canonical primitives.
 
 No numerics change: each canonical form performs the SAME IEEE operations, in the same order and with the same
 operands, as the rule it replaces (checked bitwise by tests/ops.py: square, clip, ipow3 and the rest keep their
@@ -19,7 +19,7 @@ import numpy as np
 from jax import lax
 from jax.extend.core import ClosedJaxpr, Literal
 
-from ..._jaxpr import bind, closed, contains, is_dropvar, lit, subjaxprs, with_source
+from ..._jaxpr import bind, closed, contains, hi_jaxpr, is_dropvar, lit, subjaxprs, with_source
 
 
 def _float_kind(dt):
@@ -112,6 +112,7 @@ SUGAR = {
     "unstack": (None, _unstack),
     "copy": (None, _identity), "copy_p": (None, _identity), "device_put": (None, _identity),
     "stop_gradient": (None, _identity), "optimization_barrier": (None, _identity),
+    "call_hi_primitive": (None, lambda *ins, _prim: _eval(hi_jaxpr(_prim).jaxpr, hi_jaxpr(_prim).consts, ins)),
 }
 _RESHAPE = ("expand_dims", "squeeze")
 
@@ -126,7 +127,7 @@ def _expand(eqn, ins):
     if name in _RESHAPE:
         return [lax.reshape(ins[0], tuple(eqn.outvars[0].aval.shape))]
     fn = SUGAR[name][1]
-    if name in ("split", "unstack", "integer_pow", "stack"):
+    if name in ("split", "unstack", "integer_pow", "stack", "call_hi_primitive"):
         out = fn(*ins, **eqn.params)
     else:
         out = fn(*ins)
