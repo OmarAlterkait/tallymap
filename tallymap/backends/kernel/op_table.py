@@ -1217,13 +1217,14 @@ def _src_locals(x, out=None, d=0):
 
 def _lazy_dest(em, v, others, used):
     """(v5) a dead Local the lazy initial carry v reads only at its own index, and nothing else live or another
-    operand of the loop reads: v is evaluated INTO it.  -> that Local or None."""
+    operand of the loop (`others`: every operand but v's own slot) reads: v is evaluated INTO it.  -> that Local or
+    None."""
     for X in _src_locals(v).values():
         if X.name in used or tuple(X.shape) != tuple(v.shape) or X.dtype != v.dtype:
             continue
         if not em.elementwise_self(X, v) or not em.can_mutate(None, X):
             continue
-        if any(_refs(em, o, X.name) for o in others if o is not v):
+        if any(_refs(em, o, X.name) for o in others):
             continue
         return X
     return None
@@ -1231,17 +1232,22 @@ def _lazy_dest(em, v, others, used):
 
 def _init_alias(em, inits, ivars, pt, others):
     """(v3, v5) per initial carry of a while loop: None (copy it into a fresh carry), or the Local that IS the carry
-    storage (the init itself, dead after the loop; or for a lazy init, the dead storage it is evaluated into)."""
+    storage (the init itself, dead after the loop; or for a lazy init, the dead storage it is evaluated into).
+    others = the loop's operands, inits last.  The conflict check excludes the init's own SLOT, not every operand
+    that is the same value: one value can be an initial carry AND a loop constant or another carry (the single-loop
+    adjoint restarts from its initial state), and the body must then read it unchanged."""
     dest, used = [], set()
-    for v, ivar, p_ in zip(inits, ivars, pt):
+    n0 = len(others) - len(inits)
+    for k, (v, ivar, p_) in enumerate(zip(inits, ivars, pt)):
         X = None
+        rest = others[:n0 + k] + others[n0 + k + 1:]
         if not p_ and not isinstance(v, VTally) and v.shape != ():
             if isinstance(v, Local):
                 if (v.name not in used and em.can_mutate(ivar, v)
-                        and not any(_refs(em, x, v.name) for x in others if x is not v)):
+                        and not any(_refs(em, x, v.name) for x in rest)):
                     X = v
             elif not isinstance(v, Table):
-                X = _lazy_dest(em, v, others, used)
+                X = _lazy_dest(em, v, rest, used)
         if X is not None:
             used.add(X.name)
         dest.append(X)

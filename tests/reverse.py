@@ -825,6 +825,77 @@ def _(b):
     return f"C=8 vs C=2 per-item differ {nx}; " + close(g, gr, "C=8") + "; " + close(g2, gr, "C=2")
 
 
+@case("ARRAY state, K on both sides of C: nested and T3 adjoints, C = 2 / 5 / 16, state sizes 1 / 16 == grad(padded)")
+def _(b):
+    """the walk toys carry SCALARS, which the kernel backend never aliases; this state is a per-item ARRAY v (an
+    array state is the case lumen and DTRAX have).  K in [6, 18]: K > C^2 at C = 2, K > C at C = 5, K <= C at
+    C = 16 (head only, no replay), so every C below 16 replays from checkpoints.  Regression: on 0.6.0-0.7.0 the
+    single-loop adjoint's restart from the initial state read the CURRENT state on the kernel backend (the
+    initial-carry alias, op_table._init_alias, ignored that the same array was a loop constant): every item of
+    K > C was differentiated along a wrong trajectory, while K <= C was exact."""
+    NB, K = 8, 12
+    KMAX = K // 2 + K + 1
+    xs, keys, _, th, wq = inputs(NB)
+    AX = (0, 0, None)
+
+    def make(S):
+        def length(key):
+            return (K // 2 + kb(key, 999_999) % jnp.uint32(K + 1)).astype(jnp.int32)
+
+        def step(c, key, th):
+            k, v = c
+            v2 = v * (0.99 + 0.01 * jnp.cos(th[0] * v + th[1])) + 0.01 * jnp.sin(th[2] * v[::-1])
+            return (k + 1, v2), (kb(key, k) % jnp.uint32(NB)).astype(jnp.int32), jnp.sum(v2 * v2) / S
+
+        def init(x):
+            return x + jnp.arange(S, dtype=F) * 0.01
+
+        def item(t, x, key, th):
+            L = length(key)
+
+            def body(c):
+                s, t = c
+                s2, i, w = step(s, key, th)
+                return s2, t.add("Q", i, w)
+            (k, v), t = lax.while_loop(lambda c: c[0][0] < L, body, ((0, init(x)), t))
+            return t, jnp.sum(jnp.sin(v))
+
+        def padded(t, x, key, th):
+            L = length(key)
+
+            def body(c, _):
+                s, t = c
+                act = s[0] < L
+                s2, i, w = step(s, key, th)
+                return (mask_tree(act, s2, s), t.add("Q", jnp.where(act, i, -1), w)), None
+            ((k, v), t), _ = lax.scan(body, ((0, init(x)), t), None, length=KMAX)
+            return t, jnp.sum(jnp.sin(v))
+        return item, padded
+
+    def G(f):
+        L = lambda x, th: jnp.sum(f(x, keys, th).outputs["Q"] * wq) + jnp.sum(f(x, keys, th).per_item)
+        g = jax.jit(jax.grad(L, argnums=(0, 1)))(xs, th)
+        return dict(x=g[0], th=g[1])
+    out, s0 = [], _reverse.SINGLE
+    try:
+        for S in (1, 16):
+            item, padded = make(S)
+            gr = G(reference(padded, outputs={"Q": tm.Sum((NB,), F)}, in_axes=AX))
+            for single in ("off", "force"):
+                _reverse.SINGLE = single
+                for C in (2, 5, 16):
+                    g = G(tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, in_axes=AX, backend=b, rev_checkpoints=C))
+                    if _reverse.LAST_SINGLE.get("used") != (single == "force"):
+                        raise Fail(f"instrument: SINGLE={single}: {_reverse.LAST_SINGLE}")
+                    if _reverse.LAST["loops"][0]["checkpoints"] != C:
+                        raise Fail(f"instrument: slots {_reverse.LAST['loops']}")
+                    close(g, gr, f"S={S} {'T3' if single == 'force' else 'nested'} C={C}")
+                out.append(f"S={S} {single}")
+    finally:
+        _reverse.SINGLE = s0
+    return "all == padded: " + ", ".join(out)
+
+
 @case("live state: a carry the step never reads is not stored; grad == padded")
 def _(b):
     """_rewrite._live_carries: a per-step diagnostic the body overwrites without reading, and a pass-through

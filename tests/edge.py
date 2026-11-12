@@ -1396,6 +1396,43 @@ def _(b):
     return f"bitwise vs rule-off and copying cuda; 32-element arrays declared {na} / rule off {no} / copying {nc}"
 
 
+@case("while init that is ALSO a loop constant (the body reads the initial value): == copying cuda == xla", ["auto"])
+def _(b):
+    """one per-item array v is a while loop's initial carry AND a constant its body reads (the single-loop adjoint's
+    restart from its initial state has this shape).  The init-alias rule (v3) must not make v the carry storage:
+    the body would read the updated carry where it reads v.  Top-level loop and a loop nested in another one (the
+    two code paths of the kernel backend's top-level while); the arm codegen.INPLACE = False copies every carry."""
+    from tallymap.backends.kernel import codegen as CG
+
+    def item(t, x):
+        v = jnp.sin(x * jnp.arange(1, 5, dtype=F))
+        v = jnp.where(v > 0.3, v * jnp.cos(v), 2.0 * v)            # a materialised per-item array
+
+        def run(v):
+            def body(c):
+                k, w = c
+                return k + 1, 0.5 * w + v[::-1]                      # reads v, the initial carry
+            return lax.while_loop(lambda c: c[0] < 5, body, (jnp.int32(0), v))[1]
+
+        def outer(c):
+            m, a = c
+            u = v + m.astype(F)
+            return m + 1, a + lax.while_loop(lambda c: c[0] < 3, lambda c: (c[0] + 1, c[1] * 0.5 + u), (0, u))[1]
+        w1 = run(v)
+        w2 = lax.while_loop(lambda c: c[0] < 2, outer, (jnp.int32(0), jnp.zeros(4, F)))[1]
+        return t.add("Q", jnp.arange(4), w1), (w1, w2)
+    xs = jnp.linspace(0.1, 1.0, N).astype(F)
+    out = {"Q": tm.Sum((4,), F)}
+    ra = tm.vmap(item, outputs=out, backend="auto")(xs)
+    with patched(CG, INPLACE=False):
+        rc = tm.vmap(item, outputs=out, backend="auto")(xs)
+    rx = tm.vmap(item, outputs=out, backend="xla")(xs)
+    val = lambda r: [r.outputs["Q"], *r.per_item]
+    close(val(ra), val(rc), 1e-5, 1e-6, "in-place cuda vs copying cuda (the body read an updated init?)")
+    close(val(ra), val(rx), 1e-5, 1e-6, "cuda vs xla")
+    return "== copying cuda == xla"
+
+
 @case("$CXX: a missing or wrong host C++ compiler is a tallymap error naming the variable and the fix",
       ["xla"])
 def _(b):
