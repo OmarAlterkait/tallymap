@@ -960,11 +960,30 @@ def _fused_pe_custom(saveable, unks_in, inst_in, eqn):
         return eqn, None, [False] * n, [False] * n, []
     if any(unks_in[i] for i in pos):                 # primal unknown: everything staged
         return None, eqn, [True] * n, [True] * n, res_of(eqn.invars, inst_in)
-    if fwd.prog.spawn is not None:
-        raise NotImplementedError("tallymap: reverse mode through spawn under jax.checkpoint (remat) is not supported "
-                                  "(the tree adjoint's record is an output of the primal call)")
     prim_idx, tan_idx = _fused_layout(fwd.prog)
     ntf = _ntf(fwd.prog)
+    _, pp, pb, chain = node.base
+    if fwd.prog.spawn is not None and fwd.kind == "primal" and not chain:   # the tree adjoint's record (_fused_pe):
+        # the known side runs the recording primal (a closed call: its outputs + the record), the record becomes
+        # a residual, and the staged side is the ring tangent node
+        from jax.extend.core import Var
+        from jax.extend.core.primitives import closed_call_p
+        rn = node.__dict__.get("_ring")
+        if rn is None:
+            rn = _ring_node(fwd, pp, pb)
+            object.__setattr__(node, "_ring", rn)
+        nP, pin = fwd.prog.nP, [eqn.invars[i] for i in pos]
+        cj = jax.make_jaxpr(lambda *a: (lambda o, r: list(o) + list(r))(*_bind_recorded(fwd, a[:nP], a[nP:])))(
+            *[jax.ShapeDtypeStruct(v.aval.shape, v.aval.dtype) for v in pin])
+        ring = [Var(a) for a in cj.out_avals[len(prim_idx):]]
+        known = eqn.replace(primitive=closed_call_p, invars=pin, outvars=[eqn.outvars[j] for j in prim_idx] + ring,
+                            params=dict(call_jaxpr=cj))
+        drop = drop_var(eqn.outvars[prim_idx[len(_out_specs(fwd.prog))]].aval)
+        tvars = [eqn.outvars[j] for j in tan_idx]
+        staged = eqn.replace(primitive=tallymap_call_p, outvars=tvars[:ntf] + [drop] + tvars[ntf:],
+                             params=dict(node=rn), invars=list(eqn.invars) + ring)
+        unk = [j in tan_idx for j in range(n)]
+        return known, staged, unk, list(unk), res_of(pin, [inst_in[i] for i in pos]) + ring
     known = eqn.replace(primitive=tallymap_call_p, invars=[eqn.invars[i] for i in pos],
                         outvars=[eqn.outvars[j] for j in prim_idx], params=dict(node=fwd))
     # the tangent node has its own stats output: give it a fresh (dropped) var (reusing the fused node's stats var is

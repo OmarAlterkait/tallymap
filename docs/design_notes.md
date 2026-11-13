@@ -408,8 +408,8 @@ emitted value AT THE SPAWN STEP, inside the parent's ordinary replay adjoint. No
   launches use capacity buckets Cg, Cg/2, and so on, down to 256 (under `jax.vmap`, the largest member's bucket).
 - **Never silently wrong**: a generation overflow, more than Q children or a dropped child (the record is then
   incomplete), or a child count the adjoint's replay does not reproduce make the gradient NaN, with the counts in
-  `tm.diagnostics()['reverse']['tree']` when `rev_stats=True`. Second order through it raises. Reverse mode through
-  spawn under `jax.checkpoint` raises (the record is an output of the primal call).
+  `tm.diagnostics()['reverse']['tree']` when `rev_stats=True`. Second order through it raises. Under `jax.checkpoint` the
+  saved forward runs the recording primal and the record is one of its residuals.
 - **Mechanics.** `tests/reverse_spawn.py` runs toy cascades: 128 roots, 25 to 26 generations, 6.2k to 7.4k items,
   with a theta-dependent split probability scored into an inherited causal score, compared against `jax.grad` of
   a dense plain-JAX reference. Agreement: 9 units in the last place on CPU in f32 (98% of items bitwise),

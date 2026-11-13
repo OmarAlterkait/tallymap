@@ -259,6 +259,12 @@ tol = 64 if X64 else 2e3
 report("reverse(tree) == grad(dense reference)", c["ulps"] < tol and st.get("replay_mismatch", 1) == 0,
        loss_tallymap=float(v_s), loss_ref=float(v_r), **c, **{k: (np.asarray(v).tolist()) for k, v in st.items()})
 
+# 2b. under jax.checkpoint (remat): the record is a residual of the saved forward; same gradient as without
+_L_ck = jax.checkpoint(lambda th, E, z: L_tallymap(th, dict(X0, E=E, z=z)))
+v_c, g_c = jax.jit(jax.value_and_grad(_L_ck, argnums=(0, 1, 2)))(TH, X0["E"], X0["z"])
+c = cmp(g_c, g_r)
+report("reverse(tree) under jax.checkpoint == grad(dense reference)", c["ulps"] < tol, **c)
+
 # 3. reverse vs jacfwd through spawn (tallymap forward mode) at the same keys: theta columns + jvp along root E and z
 keys_th = sorted(TH)
 
