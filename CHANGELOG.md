@@ -19,6 +19,14 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   polls the queue, and those polls queued every atomic on the same line behind them. The shower forward 1.3-1.8x
   faster and a tree grown from a few roots 1.6-1.8x on both GPUs; a DTRAX-like segment 1.0-1.3x; spawn counts
   exact. `docs/design_notes.md` 1c.
+- Reverse mode through spawn (the tree adjoint): the forward launch records the tree (each item's queue slot,
+  parent, ordinal and generation), so a gradient takes 1 + G launches instead of 1 + 3G: grad and value_and_grad
+  1.2-1.7x faster on an L40S, a 2080 Ti and the CPU target, 1.6-2.1x on the xla backend, memory -20%. Generation
+  launches are sized by `n_active` instead of a gate, and under `jax.vmap` every member shares one capacity bucket
+  (vmap of a tree gradient 3.3-17.5x faster, now 0.6-1.5x the cost of the members' gradients run one by one).
+  The replay check compares child counts (`replay_mismatch`); the value fingerprint and its `fwd_mismatch` entry in
+  `tm.diagnostics()['reverse']['tree']` are gone. Works under `jax.checkpoint` (tests/reverse_spawn.py 2b).
+  `docs/design_notes.md` section 4.
 
 ## 0.7.1 - 2026-11-12
 
