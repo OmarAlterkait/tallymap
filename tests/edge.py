@@ -1628,7 +1628,9 @@ def _(b):
     if hasattr(tm, "check_jax_version") or "check_jax_version" in tm.__all__:
         raise Fail("check_jax_version is still public")
     st = _check_jax_version(warn=False)
-    if st != "ok":
+    # the weekly nightly cell runs a JAX DEV build, which is newer than every tested version by construction; any
+    # other JAX newer than TESTED_JAX means a release the matrix does not list yet
+    if st != "ok" and not (st == "newer" and "dev" in jax.__version__):
         raise Fail(f"this JAX ({jax.__version__}) is {st}: the matrix should run on tested versions")
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
