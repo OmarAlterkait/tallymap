@@ -9,7 +9,7 @@ XLA's own algebraic rewrites or approximations.
 import jax
 import numpy as np
 
-from ..._compat import key_impl, random_bits, random_fold_in, random_seed, random_split
+from ..._compat import key_impl, random_bits, random_bits_streams, random_fold_in, random_seed, random_split
 from ..._jaxpr import call_jaxpr, cond_branches, scan_parts, while_parts
 from .codegen import (
     _ST,
@@ -1625,7 +1625,7 @@ def _threefry(em, eqn, ins, **p):
 
 
 @rule("iota_2x32_shape")
-def _iota2x32(em, eqn, ins, shape):
+def _iota2x32(em, eqn, ins, shape, out_sharding=None):   # out_sharding: JAX > 0.12.0, a placement only
     shape = tuple(shape)
     hi = Lazy(shape, np.uint32,
               lambda idx: "0u" if _size(shape) < 2 ** 32 else f"(u32)((u64)({ravel(idx, shape)}) >> 32)")
@@ -1671,16 +1671,20 @@ def _rclone(em, eqn, ins, **p):
 
 
 @rule("random_bits")
-def _rbits(em, eqn, ins, bit_width, shape):
+def _rbits(em, eqn, ins, bit_width, shape, num_streams=None, out_sharding=None):
+    # JAX > 0.12.0: `num_streams` (and `out_sharding`, a placement only) and the primitive has MULTIPLE results, one
+    # per stream; before it, one result and neither parameter.
     impl = _key_impl(ins[0], eqn.invars[0].aval)
     kndim = len(eqn.invars[0].aval.shape)
     base = View(ins[0], ins[0].shape, lambda idx: idx)
     base.key_impl = None
-    return _expand(em, lambda k: random_bits(impl, k, kndim, bit_width, shape), [base])[0]
+    if num_streams is None:
+        return _expand(em, lambda k: random_bits(impl, k, kndim, bit_width, shape), [base])[0]
+    return list(_expand(em, lambda k: random_bits_streams(impl, k, kndim, bit_width, shape, num_streams), [base]))
 
 
 @rule("random_split")
-def _rsplit(em, eqn, ins, shape):
+def _rsplit(em, eqn, ins, shape, out_sharding=None):
     impl = _key_impl(ins[0], eqn.invars[0].aval)
     kndim = len(eqn.invars[0].aval.shape)
     base = View(ins[0], ins[0].shape, lambda idx: idx)

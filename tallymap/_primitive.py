@@ -48,7 +48,7 @@ from jax.interpreters import ad, mlir
 from jax.interpreters import partial_eval as _pe
 
 from ._api import _WARNED, ItemProgram, UnsupportedError, _mk, _sds, jvp_prog
-from ._compat import NM, drop_var, register_batcher, requires_devices
+from ._compat import NM, convert_constvars_jaxpr, drop_var, register_batcher, requires_devices
 from ._reverse import vjp_prog
 from ._rewrite import isfloat
 
@@ -295,7 +295,7 @@ def _partitioned(node, plat, args):
                         sharding_rule=_sharding_rule)
         _CP.append(f)
     cj = jax.make_jaxpr(lambda *a: _run(node, a, plat))(*args)
-    call = ClosedJaxpr(_pe.convert_constvars_jaxpr(cj.jaxpr), ())
+    call = ClosedJaxpr(convert_constvars_jaxpr(cj.jaxpr), ())
     return _CP[0]((node, plat, len(cj.consts), call), *cj.consts, *args)
 
 

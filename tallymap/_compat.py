@@ -121,6 +121,25 @@ def random_bits(impl, keys, keys_ndim, bit_width, shape):
     return _vmap_n(keys_ndim, lambda k: impl.random_bits(k, bit_width, shape))(keys)
 
 
+def random_bits_streams(impl, keys, keys_ndim, bit_width, shape, num_streams):
+    """random_bits_p with `num_streams` (JAX > 0.12.0: the primitive returns a TUPLE of num_streams arrays), through
+    JAX's own per-key implementation, so 2- and 4-stream draws are the bits JAX itself produces."""
+    try:
+        from jax._src.random.prng import _call_impl_random_bits
+    except ImportError:                                   # no multi-stream support in this JAX: one stream only
+        if num_streams != 1:
+            raise
+        return (random_bits(impl, keys, keys_ndim, bit_width, shape),)
+    return _vmap_n(keys_ndim, lambda k: tuple(_call_impl_random_bits(impl, k, bit_width, shape, num_streams)))(keys)
+
+
+def convert_constvars_jaxpr(jaxpr):
+    """partial_eval.convert_constvars_jaxpr: the public `jax.interpreters.partial_eval` alias is deprecated in 0.9 and
+    removed in 0.10; the implementation in jax._src is the one every tested version has."""
+    from jax._src.interpreters import partial_eval as pe
+    return pe.convert_constvars_jaxpr(jaxpr)
+
+
 def random_split(impl, keys, keys_ndim, shape):
     return _vmap_n(keys_ndim, lambda k: impl.split(k, shape))(keys)
 
