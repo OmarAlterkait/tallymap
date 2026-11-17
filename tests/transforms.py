@@ -715,6 +715,52 @@ def _(b):
     return f"jit caches 1/1; eager cache +{len(_primitive._EAGER) - n0} for 3 eager calls"
 
 
+# ONE array in two operand slots of a lax.cond (dead after it) and two cond outputs of its shape: the kernel's cond
+# destination passing gave both outputs that one storage, so the second overwrote the first.  Under jax.vmap(jax.jvp)
+# over ONE tangent the lane tangents have shape (1,) and so meet a (1,)-shaped primal operand (2 or 3 tangents and
+# the plain jvp have other shapes): lumen's single-tangent vmap of a jvp was wrong this way.
+def _twice_fwd(t, x, th):
+    a = jnp.cumsum(jnp.stack([x, 2 * x, 3 * x]))
+    p, q = lax.cond(x > 1, lambda u, v: (jnp.cumsum(u), jnp.cumsum(v * th)),
+                    lambda u, v: (jnp.cumsum(u * 2), jnp.cumsum(v)), a, a)
+    return t.add("Q", jnp.arange(3), p).add("R", jnp.arange(3), q)
+
+
+def _twice_jvp(t, x, th):
+    a = jnp.cumsum(jnp.stack([x]))
+    p, q = lax.cond(x > 1, lambda u, v: (jnp.sum(u) * th, jnp.sum(v) * th * th),
+                    lambda u, v: (jnp.sum(u) * th * 2, jnp.sum(v) + th), a, a)
+    return t.add("Q", jnp.int32(0), p).add("R", jnp.int32(1), q)
+
+
+OUT2 = {"Q": tm.Sum((3,), F), "R": tm.Sum((3,), F)}
+
+
+@case("one array in two cond operand slots, two outputs of its shape (cond destinations)")
+def _(b):
+    f = tm.vmap(_twice_fwd, outputs=OUT2, in_axes=(0, None), backend=b)
+    r = reference(_twice_fwd, outputs=OUT2, in_axes=(0, None))
+    return close(jax.jit(f)(xs, TH[0]).outputs, r(xs, TH[0]).outputs)
+
+
+@case("vmap(jvp) over 1, 2, 3 tangents == plain jvp (one cond operand meets the T=1 lane shape)")
+def _(b):
+    def loss(fn):
+        return lambda th: jnp.sum(fn(xs, th).outputs["Q"]) + 3 * jnp.sum(fn(xs, th).outputs["R"])
+    lS = loss(tm.vmap(_twice_jvp, outputs=OUT2, in_axes=(0, None), backend=b))
+    lR = loss(reference(_twice_jvp, outputs=OUT2, in_axes=(0, None)))
+    th0, one = TH[0], jnp.ones((), F)
+    plain = jax.jit(lambda th: jax.jvp(lS, (th,), (one,))[1])(th0)
+    close(plain, jax.jvp(lR, (th0,), (one,))[1], what="plain jvp vs reference")
+    for n in (1, 2, 3):
+        vs = jnp.arange(1, n + 1, dtype=F)
+        vm = lambda th, v: jax.vmap(lambda u: jax.jvp(lS, (th,), (u,))[1])(v)
+        if f"+dual_lanes{n}" not in str(jax.make_jaxpr(vm)(th0, vs)):
+            raise Fail(f"instrument: no {n}-lane program was built")
+        close(jax.jit(vm)(th0, vs), plain * vs, what=f"vmap of {n} tangent(s)")
+    return f"|plain| {float(plain):.4g}; 1/2/3 lanes"
+
+
 print("\n================ SUMMARY", jax.__version__, "x64" if jax.config.jax_enable_x64 else "",
       jax.devices()[0].device_kind, "ndev", jax.local_device_count())
 for n, b, m in RES:

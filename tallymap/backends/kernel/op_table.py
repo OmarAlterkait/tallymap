@@ -1499,7 +1499,8 @@ def _cond(em, eqn, ins, **p):
 def _cond_dest(em, eqn, ops, bodies):
     """(v3, v5) per cond output: the dead operand Local it is written into, or None (a fresh array).  Exactly one
     branch runs; in it the other outputs are assigned first, so only another DESTINATION reading this storage could
-    see it overwritten, which the second loop excludes."""
+    see it overwritten, which the second loop excludes.  A storage is the destination of at most one output: `used`
+    holds storage NAMES, not operand slots, since one array can fill several slots (the same value passed twice)."""
     civ = list(eqn.invars[1:])
     n = len(eqn.outvars)
     dest, used = [None] * n, set()
@@ -1511,7 +1512,7 @@ def _cond_dest(em, eqn, ops, bodies):
             continue
         for k in ([j] if j < len(ops) else []) + [k for k in range(len(ops)) if k != j]:
             op = ops[k]
-            if k in used or not isinstance(op, Local) or op.shape != tuple(shape) or op.dtype != dt:
+            if not isinstance(op, Local) or op.name in used or op.shape != tuple(shape) or op.dtype != dt:
                 continue
             if not em.can_mutate(civ[k], op):
                 continue
@@ -1520,7 +1521,7 @@ def _cond_dest(em, eqn, ops, bodies):
             if all((isinstance(r, Local) and r.name == op.name) or not _refs(em, r, op.name)
                    or em.elementwise_self(op, r) for r in (bd[1][j] for bd in bodies)):
                 dest[j] = op
-                used.add(k)
+                used.add(op.name)
                 break
     changed = True
     while changed:                     # a destination whose branch result reads ANOTHER written destination: drop it
