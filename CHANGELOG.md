@@ -6,6 +6,13 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ## Unreleased
 
+### Fixed
+
+- Kernel backend: a `lax.cond` whose operand array filled two operand slots could write two outputs of that
+  array's shape into its one storage, the second overwriting the first (the in-place destination rule tracked
+  slots, not storages). Seen as `jax.vmap` of a jvp over exactly one tangent being wrong; any cond with that
+  pattern was exposed, on CPU and GPU. tests/transforms.py.
+
 ### Changed
 
 - Kernel backend: no whole-array copies around in-place updates. A live read of an array element (`x = a[j]`
