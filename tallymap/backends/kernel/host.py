@@ -253,8 +253,7 @@ def compile_so(src, where="", note=""):
         C._atomic_write(cc, src.encode())
         # built in a private directory (its name unique across nodes), where the -fstack-usage file is this build's
         # whatever the compiler names it (GCC 11: <output>-k_<h>.su), never another build's half-written one
-        tmp = C.tmp_path(so)
-        os.mkdir(tmp)
+        tmp = C.tmp_dir(so)
         try:
             out = os.path.join(tmp, f"k_{h}.so")
             cmd = [C.host_cxx(), *OPTS, "-fstack-usage", cc, "-o", out]
@@ -361,13 +360,17 @@ def shim():
         os.makedirs(d, exist_ok=True)
         so = os.path.join(d, f"libtallymap_host_{h}.so")
         if not os.path.exists(so):
-            tmp = C.tmp_path(so)
-            cmd = [cxx, "-O2", "-std=c++17", "-shared", "-fPIC", "-w", "-fopenmp", f"-I{inc}", src, "-o", tmp]
-            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
-            if r.returncode:
-                raise RuntimeError(f"building the host FFI shim with the C++ compiler {cxx!r} (OpenMP) failed:\n"
-                                   f"{' '.join(cmd)}\n{r.stdout}\n{r.stderr[-2000:]}")
-            os.replace(tmp, so)
+            tmp = C.tmp_dir(so)
+            try:
+                out = os.path.join(tmp, os.path.basename(so))
+                cmd = [cxx, "-O2", "-std=c++17", "-shared", "-fPIC", "-w", "-fopenmp", f"-I{inc}", src, "-o", out]
+                r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+                if r.returncode:
+                    raise RuntimeError(f"building the host FFI shim with the C++ compiler {cxx!r} (OpenMP) failed:\n"
+                                       f"{' '.join(cmd)}\n{r.stdout}\n{r.stderr[-2000:]}")
+                os.replace(out, so)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
         lib = ctypes.CDLL(so)
         lib.tallymap_host_register.argtypes = [ctypes.c_int64, ctypes.c_void_p]
         lib.tallymap_host_threads.restype = ctypes.c_int

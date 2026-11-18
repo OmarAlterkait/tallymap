@@ -2178,27 +2178,32 @@ def _(b):
     return "; ".join(out)
 
 
-@case("kernel cache temp names: two nodes with the same pid get different names (the cache dir is shared)",
+@case("kernel cache temp names: two nodes with the same pid get different build directories (the cache dir is shared)",
       ["xla"])
 def _(b):
+    import tempfile
+
     from tallymap.backends.kernel import compile as C
     gethost, getpid = C.socket.gethostname, C.os.getpid
-    p = "/cache/host/k_0123.so"
-    try:
-        C.os.getpid = lambda: 4242
-        names = {}
-        for host in ("nodeA", "nodeB"):
-            C.socket.gethostname = lambda host=host: host
-            names[host] = C.tmp_path(p)
-        again = C.tmp_path(p)                                  # nodeB, same pid again
-    finally:
-        C.socket.gethostname, C.os.getpid = gethost, getpid
-    if names["nodeA"] == names["nodeB"] or again == names["nodeB"]:
-        raise Fail(f"temp names collide: {names}, again {again}")
-    for host, n in names.items():
-        if not (n.startswith(p + ".tmp") and host in n and "4242" in n):
-            raise Fail(f"{host}: {n!r} is not <path>.tmp... naming the host and pid")
-    return f"{names['nodeA']} != {names['nodeB']}"
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "k_0123.so")
+        try:
+            C.os.getpid = lambda: 4242
+            names = {}
+            for host in ("nodeA", "nodeB"):
+                C.socket.gethostname = lambda host=host: host
+                names[host] = C.tmp_dir(p)
+            again = C.tmp_dir(p)                               # nodeB, same pid again
+        finally:
+            C.socket.gethostname, C.os.getpid = gethost, getpid
+        if len({names["nodeA"], names["nodeB"], again}) != 3:
+            raise Fail(f"temp names collide: {names}, again {again}")
+        for host, n in [*names.items(), ("nodeB", again)]:
+            if not (os.path.isdir(n) and os.path.dirname(n) == d and os.path.basename(n).startswith(".k_0123.so.tmp")
+                    and host in n and "4242" in n):
+                raise Fail(f"{host}: {n!r} is not a new directory .<name>.tmp... beside the path, naming the host "
+                           "and pid")
+    return f"{os.path.basename(names['nodeA'])} != {os.path.basename(names['nodeB'])}"
 
 
 @case("host kernel cache: a missing -fstack-usage file is an error, a cached .so without its .su is rebuilt, and "

@@ -12,7 +12,6 @@ import glob
 import hashlib
 import os
 import platform
-import secrets
 import shutil
 import socket
 import subprocess
@@ -35,10 +34,12 @@ def cache_dir():
     return d
 
 
-def tmp_path(path):
-    """a temporary name beside `path` for a compiler to write and os.replace into place.  The cache directory may be
-    shared by many nodes, where a pid alone is not unique: the name carries the host, the pid and a random token."""
-    return f"{path}.tmp.{socket.gethostname()}.{os.getpid()}.{secrets.token_hex(4)}"
+def tmp_dir(path):
+    """a new private directory beside `path` for a compiler to write into, then os.replace its output into place and
+    remove the directory.  tempfile.mkdtemp creates it exclusively under a random name; the cache directory may be
+    shared by many nodes, so the name also carries the host and the pid."""
+    return tempfile.mkdtemp(dir=os.path.dirname(path),
+                            prefix=f".{os.path.basename(path)}.tmp.{socket.gethostname()}.{os.getpid()}.")
 
 
 def _atomic_write(path, data):
@@ -200,14 +201,18 @@ def shim():
         os.makedirs(d, exist_ok=True)
         so = os.path.join(d, f"libtallymap_cuda_{h}.so")
         if not os.path.exists(so):
-            tmp = tmp_path(so)
-            cmd = [cxx, "-O2", "-std=c++17", "-shared", "-fPIC", "-w", f"-I{inc}", src, "-o", tmp, "-ldl"]
-            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
-            if r.returncode:
-                raise RuntimeError(f"tallymap: building the cuda FFI shim with the host C++ compiler {cxx!r} "
-                                   f"failed (set $CXX to a working compiler):\n{' '.join(cmd)}\n{r.stdout}\n"
-                                   f"{r.stderr}")
-            os.replace(tmp, so)
+            tmp = tmp_dir(so)
+            try:
+                out = os.path.join(tmp, os.path.basename(so))
+                cmd = [cxx, "-O2", "-std=c++17", "-shared", "-fPIC", "-w", f"-I{inc}", src, "-o", out, "-ldl"]
+                r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+                if r.returncode:
+                    raise RuntimeError(f"tallymap: building the cuda FFI shim with the host C++ compiler {cxx!r} "
+                                       f"failed (set $CXX to a working compiler):\n{' '.join(cmd)}\n{r.stdout}\n"
+                                       f"{r.stderr}")
+                os.replace(out, so)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
         lib = ctypes.CDLL(so)
         lib.tallymap_register.argtypes = [ctypes.c_int64, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p]
         jax.ffi.register_ffi_target(TARGET, jax.ffi.pycapsule(lib.TallymapLaunch), platform="CUDA")
