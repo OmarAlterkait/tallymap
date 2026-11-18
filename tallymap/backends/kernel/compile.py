@@ -23,7 +23,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 _LOCK = threading.Lock()
 TARGET = "tallymap_cuda_launch"
-OPTS = ["-fmad=false", "--std=c++17", "--ftz=false", "--prec-div=true", "--prec-sqrt=true"]   # IEEE
+# IEEE; cuda_math='approx' (the default) overrides the div / sqrt flags (kernel/__init__.MATH_OPTS)
+OPTS = ["-fmad=false", "--std=c++17", "--ftz=false", "--prec-div=true", "--prec-sqrt=true"]
 
 
 def cache_dir():

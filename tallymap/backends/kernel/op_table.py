@@ -1,9 +1,11 @@
 """Per-primitive emission rules for the cuda emitter (see codegen.py).
 
 Every rule has the signature ``rule(em, eqn, ins, **params) -> Val | [Val]``.
-IEEE semantics only: round-to-nearest +,-,*,/,sqrt with no FMA contraction; transcendentals from the CUDA math
-library (libdevice).  Sugar primitives (square, clamp, integer_pow, squeeze, split, the total-order compares, ...)
-have no rule: canon.py rewrites them into the canonical primitives before emission.  No attempt is made to reproduce
+Float semantics (codegen.py): +, -, * round to nearest with no FMA contraction (the __f*_rn / __d*_rn intrinsics);
+f32 div / sqrt / rsqrt go through kernel.PRELUDE's SJ_FDIV / SJ_FSQRT / SJ_FRSQRT, which follow cuda_math (default
+'approx': XLA:GPU's own PTX; 'ieee': correctly rounded); transcendentals from the CUDA math library (libdevice).
+Sugar primitives (square, clamp, integer_pow, squeeze, split, the total-order compares, ...) have no rule: canon.py
+rewrites them into the canonical primitives before emission.  No attempt is made to reproduce
 XLA's own algebraic rewrites or approximations.
 """
 import jax

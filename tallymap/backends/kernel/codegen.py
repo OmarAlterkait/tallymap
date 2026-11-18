@@ -14,8 +14,11 @@ and each jaxpr equation is emitted as straight-line C (elementwise math with
 explicit round-to-nearest intrinsics, no FMA contraction), C loops / ifs for
 while / cond / scan, address arithmetic + loads for gathers from tables.
 
-Float semantics: IEEE-754 round-to-nearest +,-,*,/,sqrt, no FMA contraction; transcendentals call the CUDA
-math library (libdevice).  Results agree with XLA only statistically (see docs/validation.md), never bitwise by design.
+Float semantics: +, -, * round to nearest with no FMA contraction (f32 and f64).  f32 division, sqrt and rsqrt follow
+the cuda_math option (kernel/__init__.py): 'approx', the DEFAULT, is the div.full / sqrt.approx / rsqrt.approx PTX
+XLA:GPU emits; 'ieee' rounds them correctly (f64 always does, and so does the CPU target).  Transcendentals call the
+CUDA math library (libdevice; libm on the CPU).  Results agree with XLA only statistically (see docs/validation.md),
+never bitwise by design.
 """
 
 import jax
