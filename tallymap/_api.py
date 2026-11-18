@@ -56,14 +56,14 @@ class Sum:
     fixed_point=True with dtype float32 (the default) is EXACT: each bin is the correctly rounded float32 of the exact
     sum of every finite f32 value emitted into it, bitwise independent of the order of the emits (run to run, AD mode,
     backend), with no scale, no floor and no cap (`scale` is not used).  Every finite f32 is an integer multiple of
-    2^-149 below 2^128, and a bin keeps that integer sum (5 signed int64 words on the kernel backend).  It cannot
-    overflow while a bin receives fewer than 2^64 adds (stated, not checked: centuries of atomics into one address)
-    and the call makes fewer than 2^31 emits of magnitude >= 2^96 into that output (counted: past it every bin of the
-    output is NaN and counted in stats['fixed_point_overflow']).  A non-finite emit makes its bin NaN, and so does a
-    total beyond float32's range; both are counted in 'fixed_point_overflow'.  Its jvp / jacfwd tangents are exact
-    too.  Device memory on the
-    kernel backend: 44 B per bin (a 40 B accumulator + the output).  The xla backend needs jax_enable_x64 (it raises
-    without it).  docs/float_semantics.md.
+    2^-149 below 2^128, and a bin keeps that integer sum (5 signed int64 words on the kernel backend).  A bin is
+    exact or NaN: a non-finite emit, a running sum past the accumulator's top word (about 2^166: 2^38 emits near
+    float32's maximum) and a total beyond float32's range each make it NaN, counted in
+    stats['fixed_point_overflow'].  Its jvp / jacfwd tangents, and reverse-mode cotangents of float32 broadcast
+    operands, are exact too.  Device memory on the kernel backend: 44 B per bin (a 40 B accumulator + the output).
+    The xla backend keeps an exact sum in int64 words, so it needs jax_enable_x64: an exact Sum (or its tangent)
+    raises without it.  The one exception: reverse-mode cotangents of float32 broadcast operands, which tallymap
+    makes itself, are added in float32 there without x64 (exact with it).  docs/float_semantics.md item 4.
 
     fixed_point=True with another dtype accumulates round(v * scale) in int64 fixed point: bitwise
     order-independent, each value rounded to a multiple of 1/scale (needs jax_enable_x64 on the xla backend).
@@ -122,8 +122,8 @@ class TSpec:
                            # Sum(fixed_point=True) of dtype float32, its jvp / jacfwd tangents, and the reverse
                            # program's cotangent tallies (vjp_prog).  The kernel backend keeps DENSE_WORDS int64 words
                            # per bin, the xla backend EXACT_WORDS int64 words (needs jax_enable_x64).
-    x64_fallback: bool = False   # an exact tally the xla backend may add in float32 without jax_enable_x64 (the
-                                 # reverse cotangents, as before they were exact); any other exact tally raises there
+    x64_fallback: bool = False   # an exact tally the xla backend adds in float32 without jax_enable_x64 (the reverse
+                                 # cotangents: the one documented exception); any other exact tally raises there
 
 
 # an f32 value is m * 2^(p - 149), m < 2^24, p = max(biased exponent - 1, 0) <= 253: an integer below 2^277 in units of

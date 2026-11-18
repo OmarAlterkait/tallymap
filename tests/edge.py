@@ -1703,6 +1703,12 @@ def _(b):
     p, t = jax.jvp(lambda s: g(x, i, j, s).outputs, (one,), (one,))
     chk("jvp primal", p)
     chk("jvp tangent", t)
+    if b == "xla":                             # the carry normalisation (xla._xnorm), run many times in the call
+        from tallymap.backends import xla as X
+        with patched(X, XNORM=64):
+            chk("primal, normalised every 64 pieces", tm.vmap(
+                lambda t, x, i, j, s: t.add("Q", i, x * s).add("G", j, x * s), outputs=out, in_axes=(0, 0, 0, None),
+                backend=b, xla_batch_size=4096)(x, i, j, one).outputs)
     return (f"{len(vals)} emits, {NB} privatised + {GB} global bins bitwise the reference (incl. 0 and 2^-149) in 3 "
             "orders and the jvp" + (" (XLA:CPU: subnormal emits flushed to 0 by XLA)" if ftz else ""))
 

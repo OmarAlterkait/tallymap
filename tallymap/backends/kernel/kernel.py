@@ -4,7 +4,7 @@ run by persistent threads that claim items with warp-aggregated atomics.  Emits 
 
 Buffers (one by-value struct of pointers): [per-item inputs] [broadcast inputs] [hoisted constants]
 | results: [sum tallies] [scratch accumulators (fixed point: u64 low words, i32 carry words, u32 flags;
-           exact: DENSE_WORDS int64 words per bin, flag bits, 2 u32 big-emit words)]
+           exact: DENSE_WORDS int64 words per bin, then flag bits)]
            [claim counter u64] [stats i32[5]]
            [spawn: queue leaves, seq, qctl] [per-item results].
 N (the item count) is a kernel ARGUMENT: one cubin serves every N.
@@ -502,27 +502,25 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
         at = _acc_t(s)
         nacc = tot * (DENSE_WORDS if s.exact else 1)      # accumulator words
         if s.exact:
-            # the exact f32 sum (DENSE): DENSE_WORDS int64 words per bin (bin i's at a[i * W]); after them one flag bit
-            # per bin (a non-finite emit: counted in stats[3], the bin NaN), then the tally's count of emits of
-            # |v| >= 2^96 and its sticky word, set when that count passes 2^31 or a carry leaves a top word (then
-            # every bin is NaN and counted: the sum could alias)
+            # the exact f32 sum (DENSE): DENSE_WORDS int64 words per bin (bin i's at a[i * W]), then one flag bit per
+            # bin: a non-finite emit, or a carry out of the bin's top word, flags it (counted in stats[3]; the bin is
+            # NaN), so a bin is exact or NaN, never silently wrong
             if DENSE not in src:
                 src.append(DENSE)
             W = DENSE_WORDS
             gp = f"((u64*)P.p[{L.r_scr[k]}])"
             fl = f"((u32*)P.p[{L.r_scr[k]}] + {2 * nacc})"
-            big = f"((u32*)P.p[{L.r_scr[k]}] + {2 * nacc + (tot + 31) // 32})"
             src.append(f"__device__ __forceinline__ void sj_emit{k}(const SjParams& P, u64* a, i64 i, float v) {{ "
-                       f"const int r = sj_demit(&a[i * {W}], v); if (r == 0) return; if (r == 1) {{ "
-                       f"atomicAdd(&SJ_STATS[3], 1); atomicOr(&{fl}[i >> 5], 1u << (i & 31)); return; }} "
-                       f"if ((r & 4) || ((r & 2) && atomicAdd(&{big}[0], 1u) == 0x7fffffffu)) {big}[1] = 1u; }}")
-            post.append(f"for (i64 i = g; i < {tot}; i += s) {{ bool bad = {big}[1] != 0u; "
+                       f"if (sj_demit(&a[i * {W}], v)) {{ atomicAdd(&SJ_STATS[3], 1); "
+                       f"atomicOr(&{fl}[i >> 5], 1u << (i & 31)); }} }}")
+            post.append(f"for (i64 i = g; i < {tot}; i += s) {{ bool bad = false; "
                         f"const float o = sj_dread(&{gp}[i * {W}], &bad); const bool f = (({fl}[i >> 5] >> (i & 31)) & 1u) "
                         f"!= 0u; if (bad && !f) atomicAdd(&SJ_STATS[3], 1); "
                         f"{dst}[i] = (f || bad) ? __int_as_float(0x7fc00000) : o; }}")
             # a privatised copy's flush: each of its signed words added into the same word of the global bin
-            op = lambda a, i, v, W=W, big=big: (f"if (sj_dadd(&{a}[({i}) / {W} * {W}], (int)(({i}) % {W}), (i64){v})) "
-                                                f"{big}[1] = 1u;")
+            op = lambda a, i, v, W=W, fl=fl: (f"if (sj_dadd(&{a}[({i}) / {W} * {W}], (int)(({i}) % {W}), (i64){v})) {{ "
+                                              f"atomicAdd(&SJ_STATS[3], 1); atomicOr(&{fl}[({i}) / {W} >> 5], "
+                                              f"1u << ((({i}) / {W}) & 31)); }}")
         elif s.fixed_point:
             if WIDE not in src:
                 src.append(WIDE)
@@ -753,9 +751,10 @@ __device__ __forceinline__ double sj_wide_f64(u64 lo, i32 c) { return c == 0 ? (
 # words represent the exact total, whatever the order of the adds (the words themselves may differ; sj_dread
 # canonicalises them): bitwise deterministic, no scale, no floor, no cap.  A carry is needed only when a word drifts by
 # 2^63, never because the total changes sign (a two's-complement bin would ripple through every upper word at each zero
-# crossing: measured 1.20x lumen's SK time).  The top word cannot overflow while sum|v| < 2^165: an emit of |v| >= 2^96
-# returns 2 (the caller counts it per tally), so with fewer than 2^31 of them and fewer than 2^64 adds into a bin,
-# sum|v| < 2^159 + 2^160; a carry out of the top word would return 4 (the caller flags the tally: never silent).
+# crossing: measured 1.20x lumen's SK time).  A carry out of the top word (word 4, weight 2^252: only once a bin's
+# running sum passes about 2^315 units = 2^166, i.e. 2^38 emits near FLT_MAX) is detected from the old value too and
+# returns true: the caller flags the bin (NaN, counted), so a bin is exact or NaN, never silently wrong.  (Only in that
+# regime can the flag depend on the order: a running sum that passes 2^166 and comes back.)
 # sj_dread sums the words into a two's-complement 384-bit integer, takes its magnitude, its top 64 bits plus a sticky
 # bit, and rounds once to 24 bits (nearest, ties to even): the correctly rounded f32 of the exact total (an
 # f32-subnormal total is below 2^24 units, so exact).  tallymap/backends/xla.py (_xemit, _xread) keeps the same integer
@@ -772,18 +771,18 @@ __device__ __forceinline__ bool sj_dadd(u64* a, int j, i64 q) {     // word j +=
   if (q > 0 && r < o) return sj_dwrap(a, j + 1, 2);
   if (q < 0 && r > o) return sj_dwrap(a, j + 1, -2);
   return false; }
-__device__ __forceinline__ int sj_demit(u64* a, float v) {          // 0 added, 1 non-finite (not added), | 2: |v| >= 2^96, | 4: carry lost
+__device__ __forceinline__ bool sj_demit(u64* a, float v) {         // true: flag the bin (non-finite, or a carry lost)
   const u32 b = __float_as_uint(v), e = (b >> 23) & 255u;
-  if (e == 255u) return 1;
+  if (e == 255u) return true;
   const u64 m = (u64)(b & 0x7fffffu) | (e ? 0x800000ull : 0ull);
-  if (m == 0ull) return 0;                                          // +-0 adds nothing
+  if (m == 0ull) return false;                                      // +-0 adds nothing
   const u32 p = e ? e - 1u : 0u, j = p / 63u, s = p - 63u * j;
   const i64 lo = (i64)((m << s) & 0x7fffffffffffffffull), hi = s >= 40u ? (i64)(m >> (63u - s)) : 0ll;
   const bool neg = (b >> 31) != 0u;
   bool lost = false;
   if (lo) lost = sj_dadd(a, (int)j, neg ? -lo : lo);
   if (hi) lost = sj_dadd(a, (int)j + 1, neg ? -hi : hi) || lost;
-  return (e >= 223u ? 2 : 0) | (lost ? 4 : 0); }
+  return lost; }
 __device__ __noinline__ float sj_dread(const u64* a, bool* bad) {
   u64 d[6] = {0ull, 0ull, 0ull, 0ull, 0ull, 0ull};                  // sum_j word_j 2^(63 j), two's complement
   for (int j = 0; j < 5; ++j) {

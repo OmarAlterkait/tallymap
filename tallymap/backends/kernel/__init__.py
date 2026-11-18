@@ -150,8 +150,8 @@ def run(p, pi, bc, target="cuda", cuda_math="approx", schedule="item", ndev=1, *
             s = p.tallies[k]
             n = int(np.prod(s.lead, dtype=np.int64)) * s.S
             # u32 words: fixed point: per bin a u64 low word, an i32 carry word and a u32 flag; exact: per bin
-            # DENSE_WORDS int64 words, then one flag bit per bin and the tally's two big-emit words (kernel.DENSE)
-            w = 2 * DENSE_WORDS * n + (n + 31) // 32 + 2 if s.exact else 4 * n
+            # DENSE_WORDS int64 words, then one flag bit per bin (kernel.DENSE)
+            w = 2 * DENSE_WORDS * n + (n + 31) // 32 if s.exact else 4 * n
             rs.append(jax.ShapeDtypeStruct((w,), jnp.uint32))
     rs.append(jax.ShapeDtypeStruct((2,), jnp.uint32))          # claim counter (u64)
     rs.append(jax.ShapeDtypeStruct((5,), jnp.int32))           # stats

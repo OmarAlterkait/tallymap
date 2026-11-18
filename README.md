@@ -254,8 +254,8 @@ EXACT: each bin is the correctly rounded f32 of the exact sum of every finite va
 floor or cap, bitwise the same in any order, on both backends, in every AD mode (its tangents are exact too: a
 tangent far below its primal is not rounded away). It costs 44 bytes of device memory per bin (the xla backend
 needs `jax_enable_x64`; it raises without it). A non-finite emit makes its bin NaN and is counted in
-`stats['fixed_point_overflow']`. The exactness has one stated condition, fewer than 2^64 adds into one bin, and one
-counted one (docs/float_semantics.md, item 4). For other dtypes `fixed_point=True` is int64 fixed point (each value
+`stats['fixed_point_overflow']`. A bin is exact or NaN, never silently wrong (docs/float_semantics.md, item 4). For
+other dtypes `fixed_point=True` is int64 fixed point (each value
 rounded to a multiple of `1/scale`): bitwise order-independent, identical across backends and schedules (the xla
 backend needs `jax_enable_x64` for it). Unrepresentable values
 are dropped and counted in `stats['fixed_point_overflow']`, and the bin they were emitted to is NaN. A bin's total

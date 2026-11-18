@@ -23,15 +23,19 @@ math modes, schedules and JAX versions.
      On the kernel backend a bin keeps that integer in five signed int64 words, word j of weight 2^(63 j): an
      emit adds its (at most two) signed pieces below 2^63 with atomic adds, and a word whose add overflows int64
      (read from the atomic's old value) adds +-2 into the next word (2^64 = 2 x 2^63).  A carry is needed only
-     when a word drifts by 2^63, never because the total changes sign.  44 bytes per bin with the output.  The
-     top word cannot overflow while the sum of |v| over a bin stays below 2^165: guaranteed while a bin receives
-     fewer than 2^64 adds (stated, not checked: centuries of atomics into one address) and the call makes fewer
-     than 2^31 emits of magnitude >= 2^96 into that output (counted: past it every bin of the output is NaN,
-     counted in `stats['fixed_point_overflow']`; a carry out of a top word would do the same, never silently).
-     The xla backend keeps the same integer as 32-bit digits in nine int64 words
-     (scatter-adds cannot carry) and rounds it the same way, so the two backends agree bitwise; it needs
-     `jax_enable_x64` and raises without it.  A non-finite emit makes its bin NaN, and a total beyond f32's range
-     makes its bin NaN; both are counted in `stats['fixed_point_overflow']`.
+     when a word drifts by 2^63, never because the total changes sign.  44 bytes per bin with the output.  A
+     carry out of the top word (weight 2^252: a running sum past about 2^166, i.e. 2^38 emits near f32's maximum)
+     is detected the same way and makes the bin NaN, so a bin is exact or NaN, never silently wrong (only in that
+     regime can whether it is NaN depend on the order: a running sum that passes 2^166 and comes back).
+     The xla backend keeps the same integer as 32-bit digits in nine int64 words (scatter-adds cannot carry; the
+     words are carry-normalised before 2^29 pieces can have reached one, and a top word past 2^62 makes its bin NaN
+     in the same way) and rounds it the same way, so the two backends agree bitwise.  A non-finite emit makes its
+     bin NaN, and a total beyond f32's range makes its bin NaN; all of these are counted in
+     `stats['fixed_point_overflow']`.
+     **The x64 rule (one rule, one exception).**  The xla backend needs `jax_enable_x64` for an exact sum: an
+     exact `Sum` or its tangent raises without it.  The one exception is the reverse-mode cotangents of f32
+     broadcast operands below, which tallymap makes itself: without x64 the xla backend adds them in f32 (as all
+     its cotangents were before), with x64 they are exact.  The kernel backend is always exact.
    - **other dtypes: fixed point.**  Each value is rounded to int64 fixed point (`round(v * scale)`) before an
      integer add: bitwise results across schedules, `vmap`, and the two backends.  On the xla backend it needs
      `jax_enable_x64`.  Unrepresentable values are dropped and counted (`stats['fixed_point_overflow']`), and the
@@ -44,9 +48,10 @@ math modes, schedules and JAX versions.
    **Reverse-mode cotangents of broadcast operands are exact.**  An f32 broadcast operand's cotangent (a
    parameter's or a table's gradient under `jax.grad`) is a sum of one contribution per item, or per table read,
    into a few bins.  It is accumulated as the exact sum above, so it is exact and order-independent for every finite
-   f32 contribution, then rounded once to f32.  The kernel backend always does this; the xla backend does it with
-   `jax_enable_x64` (the same bits), and without x64 adds in f32.  A non-finite contribution makes that gradient
-   entry NaN.  Cotangents of other dtypes (f64, f16, bf16) are added in their own dtype.
+   f32 contribution, then rounded once to f32: always on the kernel backend; on the xla backend with
+   `jax_enable_x64` (the same bits), and in f32 without it (the exception to the x64 rule above).  A non-finite
+   contribution makes that gradient entry NaN.  Cotangents of other dtypes (f64, f16, bf16) are added in their own
+   dtype.
 5. **Forward, tangent and adjoint share one item program.**  The adjoint replays the same jaxpr with the same options
    (same math), so a replay is bit-exact on the same backend (gated in tests/reverse.py, "REPLAY GATE").
 

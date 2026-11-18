@@ -18,15 +18,16 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   the result is bitwise the same in any order, run to run, in every AD mode and on both backends (the xla backend
   keeps the same integer in nine int64 words and needs `jax_enable_x64`; without it it raises instead of summing
   in float). Device memory: 44 B per bin with the output (2^32 fixed point: 20 B). A non-finite emit makes its bin
-  NaN and is counted in `stats['fixed_point_overflow']`; exactness holds while a bin receives fewer than 2^64 adds
-  (stated) and an output fewer than 2^31 emits of magnitude >= 2^96 (counted: past it the output is NaN).
+  NaN and is counted in `stats['fixed_point_overflow']`; so is a bin whose running sum passes the accumulator's
+  top word (about 2^166): a bin is exact or NaN, never silently wrong.
   Measured on a 2080 Ti: lumen SK forward 1.01x and jvp 1.03x the time of 2^32 fixed point, SK jvp at 16 charge
   replicas 6.4 GB peak. `docs/float_semantics.md` item 4; tests/edge.py "exact".
 - Reverse mode: the cotangent of an f32 broadcast operand (a parameter's or a table's `jax.grad`) was added in f32
   atomics, one contribution per item into a few bins, so every add lost its part below the bin's ulp, always in
   the same direction and in a different order each run (lumen's WCTE gradient at 524288 photons was 1.1e-3 low
   against jvp and not repeatable). These sums are now the exact sum above: bitwise repeatable, the same on both
-  backends. The xla backend needs `jax_enable_x64` for this and otherwise adds them in f32 as before.
+  backends. The xla backend needs `jax_enable_x64` for this and otherwise adds them in f32 as before (the one
+  documented exception to its x64 rule: an exact Sum raises there without x64).
   tests/reverse.py "broadcast cotangents".
 - Kernel backend: a `lax.cond` whose operand array filled two operand slots could write two outputs of that
   array's shape into its one storage, the second overwriting the first (the in-place destination rule tracked
