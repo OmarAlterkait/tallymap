@@ -1447,20 +1447,20 @@ def _(b):
     xs = (jnp.arange(N) % 7 * 0.125).astype(F)
 
     def run(bk, off=False, inplace=True):
-        saved = (OT._cond_dest, OT._init_alias, CG.Emitter.elementwise_self)
+        saved = (OT._may_overwrite, CG.Emitter.elementwise_self)
         CB._KERNELS.clear()
         _P._EAGER.clear()
         CG.INPLACE = inplace
-        if off:
-            OT._cond_dest = lambda em, eqn, ops, bodies: [None] * len(eqn.outvars)
-            OT._init_alias = lambda em, inits, ivars, pt, others: [None] * len(inits)
+        if off:     # the one aliasing rule answers only dus / scatter (in place stays on); loop / cond: never
+            OT._may_overwrite = lambda em, X, paths: (sys._getframe(1).f_code.co_name in ("_dus", "_scatter")
+                                                      and saved[0](em, X, paths))
             CG.Emitter.elementwise_self = lambda self, dst, x: False
         try:
             tm.diagnostics(reset=True)
             r = tm.vmap(item, outputs=out, backend=bk)(xs, keys)
             ks = tm.diagnostics()["kernels"]
         finally:
-            OT._cond_dest, OT._init_alias, CG.Emitter.elementwise_self = saved
+            OT._may_overwrite, CG.Emitter.elementwise_self = saved
             CG.INPLACE = True
             CB._KERNELS.clear()
             _P._EAGER.clear()
@@ -2140,6 +2140,159 @@ def _(b):
             raise Fail(f"{what}: frame_bytes {C.frame_bytes(cub)}")
         raises(RuntimeError, lambda cub=cub: C.check_frame(cub), "frame size")
     return "no record -> RuntimeError"
+
+# ------------------------------------------------------------------ destination aliasing (op_table._may_overwrite)
+# Every in-place write of the kernel backend (dus / scatter into the operand, a while carry in its initial value's
+# storage, a cond output in an operand's storage) asks one rule: a storage may be overwritten only if no read of
+# its old contents remains, on any path.  Each case builds one hazard of that rule around a per-item array and
+# checks, on the kernel backend: the in-place kernel compiles to a different program than the copying one
+# (codegen.INPLACE = False; else the comparison is void) and equals it and xla forward; and the jvp, jax.vmap of a
+# jvp over ONE tangent (the lane program that hid the cond slot bug) and over two, and the grad (the adjoint's
+# replays) equal xla's.
+def _alias_arms(item):
+    from tallymap.backends.kernel import codegen as CG
+    xs = jnp.linspace(0.1, 1.0, N).astype(F)
+    th = jnp.array([0.9, 1.3], F)
+    tv = jnp.array([0.7, -0.4], F)
+    wq = 1.0 + 0.25 * jnp.arange(8, dtype=F)
+    out = {"Q": tm.Sum((8,), F)}
+    f = {bk: tm.vmap(item, outputs=out, in_axes=(0, None), backend=bk) for bk in ("auto", "xla")}
+    assert_arms_differ(f["auto"], f["auto"], xs, th, patch_b=(CG, {"INPLACE": False}))
+    val = lambda r: [r.outputs["Q"], r.per_item]
+    ra = val(f["auto"](xs, th))
+    with patched(CG, INPLACE=False):
+        rc = val(f["auto"](xs, th))
+    rx = val(f["xla"](xs, th))
+    close(ra, rc, 1e-5, 1e-6, "in-place vs copying kernel")
+    close(ra, rx, 1e-4, 1e-5, "kernel vs xla")
+
+    def L(bk):
+        def g(th):
+            r = f[bk](xs, th)
+            return jnp.sum(r.outputs["Q"] * wq) + jnp.sum(r.per_item)
+        return g
+    d = {}
+    for bk in ("auto", "xla"):
+        g = L(bk)
+        d[bk] = dict(jvp=jax.jvp(g, (th,), (tv,))[1],
+                     vmap1=jax.vmap(lambda t: jax.jvp(g, (th,), (t,))[1])(tv[None])[0],
+                     vmap2=jax.vmap(lambda t: jax.jvp(g, (th,), (t,))[1])(jnp.stack([tv, -0.5 * tv])),
+                     grad=jax.jit(jax.grad(g))(th))
+    close(d["auto"]["vmap1"], d["auto"]["jvp"], 1e-4, 1e-5, "kernel: vmap of one tangent vs the plain jvp")
+    for k in d["auto"]:
+        close(d["auto"][k], d["xla"][k], 1e-4, 1e-5, f"kernel vs xla {k}")
+    return "in-place == copying == xla; jvp, vmap of 1 / 2 tangents, grad == xla"
+
+
+def _arr(x, th):
+    """a per-item array in a Local of its own (a scatter into a lazy value is a copy)"""
+    return jnp.sin(x * th[0] * jnp.arange(1, 9, dtype=F)).at[0].set(x * th[1])
+
+
+@case("alias: cond with one array in two operand slots and two outputs of its shape", ["auto"])
+def _(b):
+    """one dead array fills both operand slots; both outputs have its shape.  At most one output may be written
+    into its storage (0a784c6: the rule counted slots, so both were, and the second overwrote the first)."""
+    def item(t, x, th):
+        a = _arr(x, th)
+        o1, o2 = lax.cond(x > 0.5, lambda u, v: (u * 2.0, v + th[0]), lambda u, v: (v - th[1], u * th[0]), a, a)
+        return t.add("Q", jnp.arange(8), o1 + 3.0 * o2), jnp.sum(o1 * o2)
+    return _alias_arms(item)
+
+
+@case("alias: cond swapping two dead operands (parallel destination writes)", ["auto"])
+def _(b):
+    """(a, c) -> (c, a) in one branch, element-wise updates in the other: each output's own operand is a valid
+    destination alone, but in the swapping branch each result reads the other's destination."""
+    def item(t, x, th):
+        a, c = _arr(x, th), _arr(0.5 * x + 0.1, th)
+        o1, o2 = lax.cond(x > 0.4, lambda u, v: (v, u), lambda u, v: (u * th[0], v * th[1]), a, c)
+        return t.add("Q", jnp.arange(8), o1 - 2.0 * o2), jnp.sum(o1 * jnp.arange(8, dtype=F)) + jnp.sum(o2)
+    return _alias_arms(item)
+
+
+@case("alias: while with one array as two initial carries and a body constant", ["auto"])
+def _(b):
+    """v starts two carries and is read by the body every iteration (the single-loop adjoint's restart from its
+    initial state has this shape, 2e83400): v may be neither carry's storage.  Nested in a loop (an item's single
+    top-level while runs as step functions, where nothing is aliased)."""
+    def item(t, x, th):
+        v = _arr(x, th)
+
+        def outer(c):
+            m, acc = c
+
+            def body(c):
+                k, p, q = c
+                return k + 1, 0.5 * p + v[::-1] * th[0], q * th[1] - 0.25 * p
+            _, p, q = lax.while_loop(lambda c: c[0] < 4, body, (jnp.int32(0), v, v))
+            return m + 1, acc + p - q
+        acc = lax.while_loop(lambda c: c[0] < 2, outer, (jnp.int32(0), jnp.zeros(8, F)))[1]
+        return t.add("Q", jnp.arange(8), acc), jnp.sum(acc * acc)
+    return _alias_arms(item)
+
+
+@case("alias: loop constant that is a lazy view of a per-item array (frozen by storage)", ["auto"])
+def _(b):
+    """a scan (and a while nested in a while) re-reads its constant w, an identity view of the uint32 array U
+    (random_key_data of random_wrap: it reads U at its own index), every step; a loop nested in the body starts
+    from w.  U's storage must not become that loop's carry: freezing w freezes the storage it reads.  (7562c37:
+    frozen frames held Local NAMES only, the lazy-init rule made U the carry, and the next step read the updated U:
+    the in-place kernel was 59% / 76% off.)"""
+    def nested(w):
+        return lax.while_loop(lambda d: d[0] < 3, lambda d: (d[0] + 1, d[1] * jnp.uint32(3) + jnp.uint32(1)),
+                              (0, w))[1]
+
+    def item(t, x, th):
+        U = (jnp.arange(16, dtype=jnp.uint32).reshape(8, 2) * (x * 100).astype(jnp.uint32)).at[0, 0].set(7)
+        w = jax.random.key_data(jax.random.wrap_key_data(U))
+        h = lambda: (nested(w) % jnp.uint32(1000)).astype(F)[:, 0]
+
+        def body(acc, _):
+            return (acc + h() * th[0]).at[0].add(th[1]), None
+        acc, _ = lax.scan(body, jnp.zeros(8, F), None, length=3)
+
+        def outer(c):
+            m, a = c
+            return m + 1, a + lax.while_loop(lambda c: c[0] < 3, lambda c: (c[0] + 1, c[1] + h() * th[1]),
+                                             (0, jnp.zeros(8, F)))[1]
+        acc2 = lax.while_loop(lambda c: c[0] < 2, outer, (jnp.int32(0), jnp.zeros(8, F)))[1]
+        return t.add("Q", jnp.arange(8), acc + acc2), jnp.sum(acc * acc2)
+    return _alias_arms(item)
+
+
+@case("alias: in-place updates whose operand is read during or after them (dus, scatter, captured reads)", ["auto"])
+def _(b):
+    """in a loop: a scatter whose update reads another element of its operand, a dynamic_update_slice whose update
+    is a slice of its own operand (both must copy), and an element read before an update and used after it (read
+    captured, the update in place)."""
+    def item(t, x, th):
+        def body(i, a):
+            j = (i * 3) % 8
+            y = a[j]
+            a = a.at[j].set(a[(j + 1) % 8] * th[0] + 0.5)
+            a = lax.dynamic_update_slice(a, a[1:4] * th[1], (i % 5,))
+            return a * 0.9 + 0.01 * y
+        a = lax.fori_loop(0, (x * 6).astype(jnp.int32) + 2, body, _arr(x, th))
+        return t.add("Q", jnp.arange(8), a), jnp.sum(a)
+    return _alias_arms(item)
+
+
+@case("alias: cond in a while body writing the carry, the initial array a body constant (reverse mode)", ["auto"])
+def _(b):
+    """the cond's destination is the loop carry, updated in place in one branch and element-wise in the other;
+    the initial array is also read by the body (as the adjoint's restart reads it)."""
+    def item(t, x, th):
+        a0 = _arr(x, th)
+
+        def body(c):
+            k, a = c
+            a = lax.cond(k % 2 == 0, lambda u: u.at[k % 8].add(th[0]), lambda u: jnp.where(u > 0, u * th[1], u), a)
+            return k + 1, a + 0.01 * a0
+        a = lax.while_loop(lambda c: c[0] < (x * 5).astype(jnp.int32) + 2, body, (jnp.int32(0), a0))[1]
+        return t.add("Q", jnp.arange(8), a), jnp.sum(a * a0)
+    return _alias_arms(item)
+
 
 print("\n================ SUMMARY", jax.__version__, "x64" if jax.config.jax_enable_x64 else "",
       jax.devices()[0].device_kind)

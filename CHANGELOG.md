@@ -22,8 +22,20 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   takes only its own file. tests/edge.py.
 - Cuda target: a cubin from which no frame size could be read passed the per-thread local-memory check. NVRTC
   writes a record for every function (a 0-byte frame included), so this is now an error. tests/edge.py.
+- Kernel backend: a loop constant that is a lazy view of a per-item array (e.g. `jax.random.key_data` of a key
+  array, read at its own index) did not protect that array from in-place reuse: a loop nested in the body could
+  start from it and take its storage as its carry, and the next iteration read the overwritten array (59% / 76%
+  off in a scan / a nested while). Loop constants now freeze every storage they read, not only their own.
+  tests/edge.py, "alias: loop constant that is a lazy view ...".
 
 ### Changed
+
+- Kernel backend: one destination-aliasing rule (`op_table._may_overwrite`) replaces the four separate analyses
+  (dynamic_update_slice / scatter in place, while initial-carry alias, lazy initial carry, cond destinations): a
+  storage may be overwritten only if no read of its old contents remains on any path, the equation's own reads
+  counted per value (one array in two operand slots is two reads), not per slot. Every kernel source of the test
+  suite is byte-identical to before except the case above. tests/edge.py, six "alias:" hazard cases (in place ==
+  copying == xla; jvp, vmap of one / two tangents, grad == xla).
 
 - Kernel backend: no whole-array copies around in-place updates. A live read of an array element (`x = a[j]`
   used after `a = a.at[k].set(...)`) is captured before the update, which is then done in place, instead of the

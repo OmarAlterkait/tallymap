@@ -831,8 +831,8 @@ def _(b):
     array state is the case lumen and DTRAX have).  K in [6, 18]: K > C^2 at C = 2, K > C at C = 5, K <= C at
     C = 16 (head only, no replay), so every C below 16 replays from checkpoints.  Regression: on 0.6.0-0.7.0 the
     single-loop adjoint's restart from the initial state read the CURRENT state on the kernel backend (the
-    initial-carry alias, op_table._init_alias, ignored that the same array was a loop constant): every item of
-    K > C was differentiated along a wrong trajectory, while K <= C was exact."""
+    initial-carry alias, then op_table._init_alias, now op_table._may_overwrite, ignored that the same array was a
+    loop constant): every item of K > C was differentiated along a wrong trajectory, while K <= C was exact."""
     NB, K = 8, 12
     KMAX = K // 2 + K + 1
     xs, keys, _, th, wq = inputs(NB)

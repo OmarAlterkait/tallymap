@@ -525,8 +525,24 @@ class Emitter:
 
     # ------------------------------------------------------------ jaxpr evaluation
     def freeze(self, vals):
-        """push a frame of never-mutable Local arrays (loop consts / pass-through carries / function params)."""
-        self._frozen.append({v.name for v in vals if isinstance(v, Local) and v.shape != ()})
+        """push a frame of never-mutable storages (loop consts / pass-through carries / function params): every
+        Local array a value of `vals` reads -- the value itself, or, for a lazy value, the storages its elements read
+        (a loop constant that is a View of a per-item array is re-read every iteration: so is that array).  Kept as
+        the C text each value reads ("*": unrenderable, everything is frozen)."""
+        frame = []
+        for v in vals:
+            if isinstance(v, Local):
+                frame.append(v.name)
+            elif not isinstance(v, (Table, VTally)) and v is not None:
+                saved = (self.lines, self.ind, self.uid)
+                try:
+                    self.lines = []
+                    frame.append(elem(v, [f"_q{k}" for k in range(len(v.shape))]))
+                except Exception:
+                    frame.append("*")
+                finally:
+                    self.lines, self.ind, self.uid = saved
+        self._frozen.append(frame)
 
     def unfreeze(self):
         self._frozen.pop()
@@ -539,13 +555,13 @@ class Emitter:
         if not self.inplace or not self._scopes or not isinstance(val, Local) or val.shape == () or \
                 isinstance(var, Literal):
             return False
-        if any(val.name in f for f in self._frozen):
-            return False
         env, rem = self._scopes[-1]
         if rem.get(var, 0) != 0:
             return False
         import re
         pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(val.name) + r"(?![A-Za-z0-9_])")
+        if any(t == "*" or pat.search(t) for f in self._frozen for t in f):
+            return False
         readers = []                       # live lazy values of THIS scope whose elements read val's storage
         for depth, (env_, rem_) in enumerate(self._scopes):
             for v, x in env_.items():

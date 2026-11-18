@@ -649,20 +649,14 @@ def _dynamic_slice(em, eqn, ins, slice_sizes):
     return View(src, pshape, lambda idx: [ia(s, i) for s, i in zip(st, idx)])
 
 
-def _in_place(em, op, readers):
-    """may a dynamic_update_slice / scatter write straight into its operand's storage (no copy)?  Only when the
-    operand is dead after this equation (Emitter.can_mutate) and no other input of the equation -- the update,
-    the indices -- reads that storage: the update is written element by element, so such an input would see
-    elements this same equation already overwrote (x = dus(x, x[k-1:k+2], k))."""
-    return em.can_mutate(em.cur_invars[0], op) and not any(_refs(em, r, op.name) for r in readers)
-
-
 @rule("dynamic_update_slice")
 def _dus(em, eqn, ins, **p):
     src, upd, starts = ins[0], ins[1], ins[2:]
     st = [_clamp_start(em, s, src.shape[d] - upd.shape[d]) for d, s in enumerate(starts)]
     st += [0] * (len(src.shape) - len(st))
-    out = src if _in_place(em, src, [upd] + list(starts)) else em.mat_copy(src)
+    # in place when the operand's storage may be overwritten: the update and the indices are read while the
+    # update is written element by element (x = dus(x, x[k-1:k+2], k) must copy)
+    out = src if _may_overwrite(em, src, [(src, ins)]) else em.mat_copy(src)
 
     def body(idx):
         em.line(f"{out.name}[{ravel([ia(s, i) for s, i in zip(st, idx)], src.shape)}] = {elem(upd, idx)};")
@@ -1123,7 +1117,7 @@ def _scatter(em, eqn, ins, dimension_numbers, mode=None, **p):
     # in place when the operand is dead (the dynamic_update_slice rule).  x.at[i].set(v) with a traced i is a
     # scatter, not a dynamic_update_slice; copying it every time cost DTRAX's g0102 item 17 copies of its
     # float64[34,23] step carry (106 KB of its 178 KB frame; the private engine line has done this since 6f5d0cf)
-    out = op if _in_place(em, op, [ind, upd]) else em.mat_copy(op)
+    out = op if _may_overwrite(em, op, [(op, ins)]) else em.mat_copy(op)
     t = ctype(op.dtype)
     usd = [d for d in range(len(upd.shape)) if d not in uwd]
     wdims = [d for d in range(len(op.shape)) if d not in iwd]
@@ -1176,10 +1170,10 @@ TALLY_AWARE = {"while", "cond", "scan", "pjit", "jit", "closed_call", "core_call
 
 # ------------------------------------------------------------------ buffer assignment at loop / cond boundaries
 # (wavefront-state 82d6ee2 "v3" + fbf2c5b "v5", one fixed rule; DTRAX on an L40S runs 1.59x slower without both.)
-# v3: a while loop's initial carry array that is dead after the loop (the in-place liveness rule, Emitter.can_mutate)
-#     and that no other operand of the loop reads IS the carry storage (no init copy); a cond output array is written
-#     into the storage of a dead operand of the same shape and dtype (destination passing: no fresh array, and a
-#     branch that passes the operand through or updates it in place copies nothing).
+# v3: a while loop's initial carry array that may be overwritten (_may_overwrite, the one aliasing rule) IS the carry
+#     storage (no init copy); a cond output array is written into the storage of an operand that may be overwritten
+#     (destination passing: no fresh array, and a branch that passes the operand through or updates it in place
+#     copies nothing).
 # v5: the same when the value is LAZY and reads that storage only at its own index (Emitter.elementwise_self, e.g. a
 #     whole-array jnp.where(p, a, x)): it is evaluated into the storage, element by element; and a loop body result of
 #     that kind is written straight back into its carry.  Placement only: every element's expression is unchanged.
@@ -1216,43 +1210,32 @@ def _src_locals(x, out=None, d=0):
     return out
 
 
-def _lazy_dest(em, v, others, used):
-    """(v5) a dead Local the lazy initial carry v reads only at its own index, and nothing else live or another
-    operand of the loop (`others`: every operand but v's own slot) reads: v is evaluated INTO it.  -> that Local or
-    None."""
-    for X in _src_locals(v).values():
-        if X.name in used or tuple(X.shape) != tuple(v.shape) or X.dtype != v.dtype:
-            continue
-        if not em.elementwise_self(X, v) or not em.can_mutate(None, X):
-            continue
-        if any(_refs(em, o, X.name) for o in others):
-            continue
-        return X
-    return None
+def _may_overwrite(em, X, paths):
+    """THE destination-aliasing rule: every in-place write of this backend (dynamic_update_slice and scatter into
+    their operand, a while carry in its initial value's storage, a cond output in an operand's storage) asks it.
 
-
-def _init_alias(em, inits, ivars, pt, others):
-    """(v3, v5) per initial carry of a while loop: None (copy it into a fresh carry), or the Local that IS the carry
-    storage (the init itself, dead after the loop; or for a lazy init, the dead storage it is evaluated into).
-    others = the loop's operands, inits last.  The conflict check excludes the init's own SLOT, not every operand
-    that is the same value: one value can be an initial carry AND a loop constant or another carry (the single-loop
-    adjoint restarts from its initial state), and the body must then read it unchanged."""
-    dest, used = [], set()
-    n0 = len(others) - len(inits)
-    for k, (v, ivar, p_) in enumerate(zip(inits, ivars, pt)):
-        X = None
-        rest = others[:n0 + k] + others[n0 + k + 1:]
-        if not p_ and not isinstance(v, VTally) and v.shape != ():
-            if isinstance(v, Local):
-                if (v.name not in used and em.can_mutate(ivar, v)
-                        and not any(_refs(em, x, v.name) for x in rest)):
-                    X = v
-            elif not isinstance(v, Table):
-                X = _lazy_dest(em, v, rest, used)
-        if X is not None:
-            used.add(X.name)
-        dest.append(X)
-    return dest
+    May the per-item array X be overwritten with a value here?  paths = [(src, reads)], one per control path through
+    the equation (one; or one per cond branch): `src` is the value written into X on that path, `reads` every value
+    the equation still reads on it once the write has begun, src included once.  Yes iff no read of X's old contents
+    remains after the write begins, on every path:
+      (a) in the equation: the only value of `reads` that reads X is src, and src reads it at most at the element
+          being written (src IS X, or Emitter.elementwise_self).  Values are counted, not storage names or operand
+          slots: one array passed in two slots is two reads, and a value already placed in X (an earlier output of
+          the equation, live after it) is a read;
+      (b) after it: X is not frozen (a value a loop re-reads every iteration, a predicate input, a function
+          parameter, or any storage such a value reads) and no live value of any active scope reads it
+          (Emitter.can_mutate).  Checked last, as it may emit the capture of a small live reader."""
+    if not isinstance(X, Local) or X.shape == ():
+        return False
+    for src, reads in paths:
+        if tuple(src.shape) != tuple(X.shape) or np.dtype(src.dtype) != np.dtype(X.dtype):
+            return False
+        own = _refs(em, src, X.name)
+        if own and not ((isinstance(src, Local) and src.name == X.name) or em.elementwise_self(X, src)):
+            return False
+        if sum(_refs(em, r, X.name) for r in reads) > own:
+            return False
+    return em.can_mutate(None, X)
 
 
 def _carry_vars(em, inits, pass_through, dest=None):
@@ -1376,7 +1359,11 @@ def _while(em, eqn, ins, **p):
     bc = list(ins[w.nc:w.nc + w.nb])
     init = list(ins[w.nc + w.nb:])
     pt = _pass_through(w.body.jaxpr, w.nb, len(init))
-    dest = _init_alias(em, init, list(em.cur_invars)[w.nc + w.nb:], pt, cc + bc + init)
+    # (v3, v5) an initial carry's own storage, or for a lazy one a storage it is built from, may BE the carry (no
+    # init copy) when it may be overwritten: every operand of the loop is read again by the loop
+    dest = [None if p_ or isinstance(v, VTally) or v.shape == () else
+            next((X for X in _src_locals(v).values() if _may_overwrite(em, X, [(v, ins)])), None)
+            for v, p_ in zip(init, pt)]
     cars = _carry_vars(em, init, pt, dest)
     vals = [_carry_val(c) if not p_ else c for c, p_ in zip(cars, pt)]
     em.freeze(cc + bc + [c for c, p_ in zip(cars, pt) if p_])     # re-read every iteration: never in place
@@ -1461,7 +1448,30 @@ def _cond(em, eqn, ins, **p):
     iv = em.fresh("bi")
     em.line(f"const int {iv} = (int)({ie});")
     bodies = [_branch(em, br, ops) for br in branches]
-    dest = _cond_dest(em, eqn, ops, bodies)
+    # (v3, v5) destination passing: output j is written into an operand's storage when it may be overwritten with
+    # the branch results (the operand itself first).  Exactly one branch runs, its lines are emitted already, and
+    # in it the other outputs are assigned first, so on its path the only later reads are the destination outputs:
+    # those placed so far are reads of their storages (one storage, one output), and the parallel writes below.
+    nout = len(eqn.outvars)
+    dest = [None] * nout
+    for j in range(nout):
+        rj = [bd[1][j] for bd in bodies]
+        if any(isinstance(r, VTally) for r in rj):
+            continue
+        placed = [d for d in dest if d is not None]
+        dest[j] = next((op for op in ([ops[j]] if j < len(ops) else []) + [o for k, o in enumerate(ops) if k != j]
+                        if _may_overwrite(em, op, [(r, [r] + placed) for r in rj])), None)
+    changed = True
+    while changed:              # parallel writes: a destination whose result reads ANOTHER written one is dropped
+        changed = False         # (assigned first, into a fresh array)
+        for j in range(nout):
+            if dest[j] is not None and any(
+                    not (isinstance(r[j], Local) and r[j].name == dest[j].name) and
+                    any(dest[m] is not None and m != j and not (isinstance(r[m], Local) and r[m].name == dest[m].name)
+                        and _refs(em, r[j], dest[m].name) for m in range(nout))
+                    for r in (bd[1] for bd in bodies)):
+                dest[j] = None
+                changed = True
     outs = []
     for j, v in enumerate(eqn.outvars):
         if dest[j] is not None:
@@ -1494,52 +1504,6 @@ def _cond(em, eqn, ins, **p):
                 em.assign(o[1], r)
     em.close()
     return [o[1] if isinstance(o, tuple) else (o if isinstance(o, VTally) else _carry_val(o)) for o in outs]
-
-
-def _cond_dest(em, eqn, ops, bodies):
-    """(v3, v5) per cond output: the dead operand Local it is written into, or None (a fresh array).  Exactly one
-    branch runs; in it the other outputs are assigned first, so only another DESTINATION reading this storage could
-    see it overwritten, which the second loop excludes.  A storage is the destination of at most one output: `used`
-    holds storage NAMES, not operand slots, since one array can fill several slots (the same value passed twice)."""
-    civ = list(eqn.invars[1:])
-    n = len(eqn.outvars)
-    dest, used = [None] * n, set()
-    for j, v in enumerate(eqn.outvars):
-        if any(isinstance(bd[1][j], VTally) for bd in bodies):
-            continue
-        shape, dt, _ = phys(v.aval)
-        if shape == ():
-            continue
-        for k in ([j] if j < len(ops) else []) + [k for k in range(len(ops)) if k != j]:
-            op = ops[k]
-            if not isinstance(op, Local) or op.name in used or op.shape != tuple(shape) or op.dtype != dt:
-                continue
-            if not em.can_mutate(civ[k], op):
-                continue
-            # every branch result is this storage (passed through / updated in place: nothing to write), another
-            # array, or a lazy value that reads this storage only at its own index (v5)
-            if all((isinstance(r, Local) and r.name == op.name) or not _refs(em, r, op.name)
-                   or em.elementwise_self(op, r) for r in (bd[1][j] for bd in bodies)):
-                dest[j] = op
-                used.add(op.name)
-                break
-    changed = True
-    while changed:                     # a destination whose branch result reads ANOTHER written destination: drop it
-        changed = False
-        for j in range(n):
-            if dest[j] is None:
-                continue
-            for bd in bodies:
-                r = bd[1][j]
-                if isinstance(r, Local) and r.name == dest[j].name:
-                    continue
-                if any(dest[m] is not None and m != j and not (isinstance(bd[1][m], Local) and
-                                                               bd[1][m].name == dest[m].name)
-                       and _refs(em, r, dest[m].name) for m in range(n)):
-                    dest[j] = None
-                    changed = True
-                    break
-    return dest
 
 
 @rule("scan")
