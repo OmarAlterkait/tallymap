@@ -77,6 +77,22 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   The replay check compares child counts (`replay_mismatch`); the value fingerprint and its `fwd_mismatch` entry in
   `tm.diagnostics()['reverse']['tree']` are gone. Works under `jax.checkpoint` (tests/reverse_spawn.py 2b).
   `docs/design_notes.md` section 4.
+- Simplifications, no change in results (the structure review's verified list). Dead code removed: unused kernel
+  helpers (`sj_atomic_max_f32`, `sj_maximum` / `sj_minimum`, the host atomicMax / Min family and max / min
+  templates), the cuda shim's `grid` attribute, `tallymap_host_threads`, never-read attributes, `emit_p_bind`,
+  `_tally._isfloat`, call-like primitive names that exist on no tested JAX. One copy of each layout:
+  `ItemProgram.out_tallies` / `float_outs` / `float_ys`, named stats slots (`_api.STATS`), the kernel's result
+  buffers written once (`Layout.res`). The two loop adjoints share their common code (the single-loop adjoint still
+  builds tally cotangents inside its micro-step). `_rewrite` no longer imports `_reverse` (the re-tracer reaches
+  reverse mode through `RevOpts`), and in-function imports are at module level except the ten that would close an
+  import cycle. The reverse-mode negative controls live in the tests, which patch one function each; the
+  instrumentation is one store, `_diagnostics.REVERSE`. On the CPU target the NVVM multiply-chain cut is the
+  identity. Generated kernel sources change only by the deleted prelude lines (and, on the CPU, by the cut).
+
+### Added
+
+- `tm.history()`: the last programs' `closed_over_floats` and the kernel records (tag, target, schedule, hash,
+  source) without `tm.diagnostics()`'s cost (no jaxpr rendered, nothing probed). tests/edge.py.
 
 ## 0.7.1 - 2026-11-12
 
