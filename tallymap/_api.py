@@ -24,9 +24,8 @@ from jax.extend.core import ClosedJaxpr, jaxpr_as_fun
 
 from . import _errors
 from ._rewrite import check_tallies, isfloat, retrace
-from ._tally import Tally
+from ._tally import Tally, emit_p
 
-FLOAT0 = jax.dtypes.float0
 MAX_ITEMS = 2 ** 31 - 1
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SKIP = []
@@ -238,9 +237,8 @@ def _poison_tally(t, bad):
     no forward launch); the tangent sums are poisoned here, inside the tangent / fused / dual-lane kernel, by the
     items that were truncated (per item).  A fixed-point sum flags the
     NaN emits as overflows (stats['fixed_point_overflow'] then counts them too)."""
-    from ._rewrite import emit_p_bind
     nan = jnp.full(t.shape[:-1], np.nan, t.dtype)
-    return lax.cond(bad, lambda t: lax.fori_loop(0, t.shape[-1], lambda i, t: emit_p_bind(t, i, nan), t),
+    return lax.cond(bad, lambda t: lax.fori_loop(0, t.shape[-1], lambda i, t: emit_p.bind(t, i, nan), t),
                     lambda t: t, t)
 
 

@@ -47,7 +47,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 
-from ._rewrite import emit_p_bind, isfloat, retrace
+from ._rewrite import isfloat, retrace
+from ._tally import emit_p
 
 LAST = []            # host-side stats of executed tree adjoints (appended by a debug callback)
 MIN_BUCKET = 256
@@ -135,7 +136,7 @@ def build_rec(p, Cg, neg=""):
             for j, i in enumerate(fl):
                 L = ls[i]
                 idx = jnp.where(w, q * L + jnp.arange(L, dtype=jnp.int32), -1)
-                spf2.append(emit_p_bind(spf[j], idx, jnp.reshape(child[i], (L,)).astype(spf[j].dtype)))
+                spf2.append(emit_p.bind(spf[j], idx, jnp.reshape(child[i], (L,)).astype(spf[j].dtype)))
             return q + w.astype(jnp.int32), tuple(spf2)
 
         targs = [None] * nT
@@ -146,7 +147,7 @@ def build_rec(p, Cg, neg=""):
         tv, y = outs[:nT], outs[nT:]
         q, spf = tv[ks]
         n = (q - off).astype(jnp.int32)
-        fp = emit_p_bind(tfp[0], jnp.int32(0), z * (n != cnt).astype(z.dtype))
+        fp = emit_p.bind(tfp[0], jnp.int32(0), z * (n != cnt).astype(z.dtype))
         return [tv[kk] for kk in us] + list(spf) + [fp] + list(y) + [n]
 
     avals = ([_sds(tav[k]) for k in us]

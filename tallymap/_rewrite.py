@@ -248,11 +248,6 @@ SELECT = ("gather", "dynamic_slice", "slice")          # reads that can get a sp
 _CUSTOM = ("custom_jvp_call", "custom_vjp_call")
 
 
-def emit_p_bind(t, i, v):
-    from ._tally import emit_p
-    return emit_p.bind(t, i, v)
-
-
 def retrace(cj, *, cap=None, rev=False, n_tally=0, tables=None, report=None, spawn=None):
     """-> python function f(*invars) evaluating cj with (cap) every top-level while loop capped at `cap`
     iterations (f returns its outputs + [truncated:bool]), or (rev: True or _reverse.RevOpts) every while loop replaced
@@ -331,7 +326,7 @@ def _interp(jaxpr, consts, args, flags, ctx, cap, rev, top, tags=None):
                 if tagged:                     # any other use of a sparse table: it needs a dense cotangent too
                     ctx["dense"].update(t for t in itags if t is not None)
                 force = any(isinstance(x, tuple) for x in ins)   # a hooked (tuple-valued) tally flows in: interpret
-                if name == "while" and (force or rev or (top and (cap is not None or ctx.get("fp") is not None))
+                if name == "while" and (force or rev or (top and cap is not None)
                                         or any(_needs(s.jaxpr, rev, top, cap, ctx) for s in subs)):
                     outs, oflags = _while(eqn, ins, fin, ctx, cap, rev, top)
                 elif name == "tallymap_spawn" and ctx.get("spawn") is not None:
@@ -442,7 +437,7 @@ def _with_toks(ctx, tids, fn, n):
     return g
 
 
-def _tids(ctx, tags, subs=()):
+def _tids(ctx, tags):
     """the threaded tokens a sub-computation needs: the table tokens of the tables it reads."""
     return sorted({t for t in tags if t is not None}) if ctx.get("tread") else []
 
@@ -480,7 +475,7 @@ def _while(eqn, ins, fin, ctx, cap, rev, top, itags=None):
     if top and getattr(ropt, "single", False):      # T3: the (fold_post) item's one top-level loop
         checkpointed_while = checkpointed_while_single
     cfn = _notread(ctx, cfn)
-    tids = _tids(ctx, btags, [w.body])
+    tids = _tids(ctx, btags)
     bfl = list(fin[nc:nc + nb])
     live = _live_carries(w, nc, nb, len(init))
     from ._reverse import T3_MIN_EQNS, _n_eqns
@@ -521,7 +516,7 @@ def _cond(eqn, ins, fin, ctx, cap, rev, top, itags=None):
     otags = (itags or [None] * len(ins))[1:]
     track = cap is not None
     fns = [_sub_fn(b, fin[1:], ctx, cap, rev, top, track_trunc=track, tags=otags) for b in brs]
-    tids = _tids(ctx, otags, brs)
+    tids = _tids(ctx, otags)
     nops = len(ops)
 
     def wrap(f):
@@ -550,7 +545,7 @@ def _scan(eqn, ins, fin, ctx, cap, rev, itags=None):
     itags = itags or [None] * len(ins)
     ctx["dense"].update(t for t in itags[nc:] if t is not None)  # a table as a scan carry / scanned input: dense
     body = _sub_fn(sc.body, fin, ctx, cap, rev, False, tags=itags[:nc] + [None] * (len(ins) - nc))
-    tids = _tids(ctx, itags[:nc], [sc.body])
+    tids = _tids(ctx, itags[:nc])
 
     def f(carry, x):
         c, tk = carry

@@ -17,16 +17,11 @@ from jax.extend.core import Primitive
 from jax.interpreters import ad, mlir
 
 from ._compat import register_batcher
-
-FLOAT0 = jax.dtypes.float0
-
-
-def _isfloat(dt):
-    return jnp.issubdtype(dt, jnp.inexact)
+from ._rewrite import isfloat
 
 
 def _zero_like(x):
-    return ad.Zero(jax.typeof(x).to_tangent_aval())     # (= Zero.from_primal_value on 0.5.3; that is gone on 0.11)
+    return ad.Zero(jax.typeof(x).to_tangent_aval())
 
 
 # ----------------------------------------------------------------------------------------------- emit_p
@@ -65,7 +60,7 @@ def _emit_jvp(primals, tangents):
     t, idx, val = primals
     dt, _, dv = tangents
     out = emit_p.bind(t, idx, val)
-    if not _isfloat(t.dtype) or (type(dt) is ad.Zero and type(dv) is ad.Zero):
+    if not isfloat(t.dtype) or (type(dt) is ad.Zero and type(dv) is ad.Zero):
         return out, _zero_like(out)
     dt = ad.instantiate_zeros(dt)
     if type(dv) is ad.Zero:
@@ -125,7 +120,7 @@ mlir.register_lowering(spawn_p, lambda ctx, *a, **k: _spawn_impl())
 
 def _spawn_jvp(primals, tangents):
     q, when, *c = primals
-    ct = [ad.instantiate_zeros(t) for x, t in zip(c, tangents[2:]) if _isfloat(x.dtype)]
+    ct = [ad.instantiate_zeros(t) for x, t in zip(c, tangents[2:]) if isfloat(x.dtype)]
     out = spawn_p.bind(q, when, *c, *ct)       # child = (primal leaves, tangent leaves of the float leaves)
     return out, _zero_like(out)
 

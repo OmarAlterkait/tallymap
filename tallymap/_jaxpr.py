@@ -19,10 +19,10 @@ from jax.tree_util import tree_leaves, tree_unflatten
 # frames inside tallymap are not "user" frames: source summaries of item equations point at the user's code
 _siu.register_exclusion(os.path.dirname(os.path.abspath(__file__)) + os.sep)
 
-# call-like primitives: ONE sub-jaxpr whose invars / outvars map 1:1 onto the equation's
-CALL_PARAM = {"pjit": "jaxpr", "jit": "jaxpr", "closed_call": "call_jaxpr", "core_call": "call_jaxpr",
-              "custom_jvp_call": "call_jaxpr", "custom_vjp_call": "call_jaxpr",
-              "checkpoint": "jaxpr", "remat": "jaxpr", "remat2": "jaxpr"}
+# call-like primitives: ONE sub-jaxpr whose invars / outvars map 1:1 onto the equation's.  Every key is a primitive
+# name on some TESTED_JAX version (pjit: 0.6.2; jit: from 0.7; closed_call: up to 0.10; checked by tracing on each)
+CALL_PARAM = {"pjit": "jaxpr", "jit": "jaxpr", "closed_call": "call_jaxpr",
+              "custom_jvp_call": "call_jaxpr", "custom_vjp_call": "call_jaxpr", "remat2": "jaxpr"}
 
 
 def closed(j):
@@ -134,7 +134,7 @@ def is_dropvar(v):
 
 
 def lit(v):
-    """value of a jaxpr Literal as a typed numpy scalar (0.5.3 stores raw python scalars)."""
+    """value of a jaxpr Literal as a typed numpy scalar."""
     return np.asarray(v.val, dtype=v.aval.dtype)
 
 
