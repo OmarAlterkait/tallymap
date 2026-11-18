@@ -170,9 +170,11 @@ static inline unsigned atomicOr(unsigned* a, unsigned v) { return __atomic_fetch
 static inline int atomicExch(int* a, int v) { return __atomic_exchange_n(a, v, __ATOMIC_SEQ_CST); }
 """
 
-# kernel.BRK with portable constraints ("+g": any register or memory the compiler picks; the cut is still opaque)
+# kernel.BRK on the host: the identity.  The cut works around NVVM's exponential compile time on wide-multiply chains
+# (codegen.MULCHAIN_K), a CUDA-only problem: the CPU target compiles the plain chain (tests/mulchain.py: compile time
+# and bitwise results on either target).
 HOST_BRK = r"""
-template <class T> static inline T sj_brk(T x) { asm("" : "+g"(x)); return x; }
+#define sj_brk(x) (x)
 """
 
 ENTRY = r"""

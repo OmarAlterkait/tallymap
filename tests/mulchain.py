@@ -1,5 +1,5 @@
 """Wide-multiply chains in the kernel backend.  python tests/mulchain.py   (enables jax_enable_x64 itself; runs the
-target JAX places it on: cuda on a GPU, the CPU target elsewhere, where the cuts are the portable host.HOST_BRK)
+target JAX places it on: cuda on a GPU, the CPU target elsewhere, where a cut is the identity: host.HOST_BRK)
 
 NVVM is exponential in the depth of a serial chain of 64-bit integer multiplies inside one function (127 s at depth
 16, > 300 s at 20), so the cuda emitter cuts such a chain every codegen.MULCHAIN_K links with a zero-instruction
