@@ -256,7 +256,7 @@ def _out_tallies(p):
 
 
 # ------------------------------------------------------------------------------------------- vmap
-_OPTS = {                  # the public options; measurement switches and negative controls are module constants
+_OPTS = {                  # the public options; measurement switches are test-only module constants
     "cuda_math": "kernel backend on a CUDA GPU, f32 div/sqrt: 'approx' (default) | 'ieee' (the CPU is always IEEE)",
     "schedule": "kernel backend: 'item' (default: a thread runs whole items) | 'step' (refill per loop step)",
     "xla_batch_size": "xla backend: items per batch",
@@ -297,8 +297,8 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                rev_stats          reverse through spawn: report the tree adjoint's stats to the host
                                   (tallymap.diagnostics()['reverse']).  Off by default: a host callback takes jax.jit
                                   off its C++ fast path.  A failed check makes the gradient NaN either way.
-               Any other name raises (there are no private options: measurement switches and negative
-               controls are test-only module constants, e.g. codegen.FILL, _primitive.LANES).
+               Any other name raises (there are no private options: measurement switches are test-only module
+               constants, e.g. codegen.FILL, _primitive.LANES; negative controls live in the tests).
     The returned function takes the mapped/broadcast args, plus optionally n_active=<traced int>: only items
     i < n_active run (fixed capacity N, varying active count: no retrace / recompile).  n_active is the launch's
     item count, not part of the item program: items i >= n_active do not run, so they emit nothing, never count

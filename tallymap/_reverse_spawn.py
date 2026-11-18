@@ -34,10 +34,10 @@ capacity (stats 'generation_overflow') or a replay mismatch poisons too.  Never 
 
 Capacities are derived from the Queue capacity Q (the user sets nothing): the tree holds up to Q children, a
 generation up to Q.  Generation launches use capacity buckets Cg, Cg/2, Cg/4, ... (>= 256) so a small generation
-does not pay for Cg idle items, nor for Cg-sized XLA work around the launch.  The test-only module constants
-GEN_CAPACITY and TREE_NEG (below) lower the generation capacity and select the negative controls.
+does not pay for Cg idle items, nor for Cg-sized XLA work around the launch.  tests/reverse_spawn.py patches
+_gen_capacity (a smaller generation capacity), _children and _replay_inputs (its negative controls).
 Stats of the last tree adjoint (host side, via jax.debug.callback, OPT-IN: rev_stats=True -- a host callback takes
-jax.jit off its C++ dispatch path): tallymap.diagnostics()['reverse']['tree'] (= _reverse_spawn.LAST[-1]).
+jax.jit off its C++ dispatch path): tallymap.diagnostics()['reverse']['tree'] (_diagnostics.record_reverse).
 Second order through this adjoint raises (the recorded payloads carry no tangent).
 """
 import dataclasses
@@ -47,15 +47,28 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 
+from ._diagnostics import record_reverse
 from ._rewrite import isfloat, retrace
 from ._tally import emit_p
 
-LAST = []            # host-side stats of executed tree adjoints (appended by a debug callback)
 MIN_BUCKET = 256
-# TEST-ONLY (tests/reverse_spawn.py patches them, like codegen.FILL; never set by the library):
-GEN_CAPACITY = None  # largest generation the tree adjoint takes (None: the Queue capacity); smaller -> overflow
-TREE_NEG = ""        # NEGATIVE CONTROLS: 'detach' (children's cotangents not injected) | 'replay' (the adjoint
-                     # replays a perturbed item, whose child counts the replay check must catch)
+
+
+def _gen_capacity(Q):
+    """the largest generation the tree adjoint takes: the Queue capacity Q (a larger generation overflows: NaN)."""
+    return Q
+
+
+def _children(dx):
+    """the cotangents of a generation's children's initial states, as injected into their parents' replay (NEGATIVE
+    CONTROL in tests/reverse_spawn.py: zeros, i.e. detached children)."""
+    return dx
+
+
+def _replay_inputs(pi, fl):
+    """the per-item operands the adjoint's replay of an item starts from (NEGATIVE CONTROL in tests/reverse_spawn.py:
+    a perturbed item, whose child counts the replay check must catch).  Part of the rec program's cache key."""
+    return pi
 
 
 def _spawn_slot(p):
@@ -96,7 +109,7 @@ def rec_primal(p):
 # ------------------------------------------------------------------------------------------- the adjoint program
 @dataclasses.dataclass(frozen=True, eq=False)
 class Rec:
-    cj: object           # rec item jaxpr (differs from the base only under the negative control TREE_NEG='replay')
+    cj: object           # rec item jaxpr
     us: tuple            # user tally slots of the base prog
     fl: tuple            # float per-item leaves
     ls: tuple            # elements per leaf
@@ -106,7 +119,7 @@ def _size(shape):
     return int(np.prod(shape, dtype=np.int64))
 
 
-def build_rec(p, Cg, neg=""):
+def build_rec(p, Cg):
     """the rewritten item program of base ItemProgram p (see module docstring).
     invars : [user tallies][SPf_l (float leaves)][FP] + [pi][off, cnt, z] + [bc][nact]
     outvars: same tallies + [user per-item results][n]"""
@@ -126,8 +139,7 @@ def build_rec(p, Cg, neg=""):
         cuts = np.cumsum((0, nU, nF, 1, nP, 3, nB, 1))
         tu, tf_, tfp, pi, scal, bc, _ = (list(a[i:j]) for i, j in zip(cuts[:-1], cuts[1:]))
         off, cnt, z = scal            # (the last operand, nact, is the launch's n_active: the item does not read it)
-        if neg == "replay":           # NEGATIVE CONTROL ONLY: the adjoint replays a different item
-            pi[fl[0]] = pi[fl[0]] * 1.5
+        pi = list(_replay_inputs(pi, fl))
 
         def sp(tok, when, *child):
             q, spf = tok
@@ -164,10 +176,10 @@ def _progs(p, Cg, U_bc, o):
     from ._api import ItemProgram, TSpec
     from ._reverse import check_slots, vjp_prog
     cache = p.__dict__.setdefault("_tree_cache", {})
-    key = (Cg, tuple(U_bc), tuple(sorted(o.items())), TREE_NEG)
+    key = (Cg, tuple(U_bc), tuple(sorted(o.items())), _replay_inputs)
     if key in cache:
         return cache[key]
-    R = build_rec(p, Cg, TREE_NEG)
+    R = build_rec(p, Cg)
     if any(p.tallies[k].kind not in ("sum", "discard") for k in R.us):
         raise NotImplementedError("tallymap tree adjoint: unsupported tally kinds "
                                   + str([p.tallies[k].kind for k in R.us]))
@@ -227,7 +239,7 @@ def tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N, ring):
     from ._primitive import _float_slots, _inst, bind_call
     o = dict(node.opts)
     Q = int(base.spawn.capacity)
-    Cg = min(int(GEN_CAPACITY or Q), Q)
+    Cg = min(int(_gen_capacity(Q)), Q)
     R, adj, T, pert_pi, pert_bc = _progs(base, Cg, U_bc, o)
     nP, nB = base.nP, base.nB
     av = base.in_avals()
@@ -278,8 +290,7 @@ def tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N, ring):
 
     def adj_gen(X, cnt, b, nact, dx, cy):
         """the adjoint launch of a generation; dx: its children's initial-state cotangents (its SPf cotangent)"""
-        if TREE_NEG == "detach":     # NEGATIVE CONTROL ONLY: children's cotangents are not injected
-            dx = [jnp.zeros_like(d) for d in dx]
+        dx = _children(dx)
         ct = ct_user + [d.reshape(-1) for d in dx] + [jnp.ones((1,), jnp.float32)]
         outs = bind_call(*X, _excl_cumsum(cnt), cnt, jnp.zeros((b,), jnp.float32), *cy, *bc, nact, *ct, node=t_node)
         dp = list(outs[len(ib) + 1:])
@@ -324,5 +335,5 @@ def tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N, ring):
         st_ = dict(generations=G, children=total, max_generation=jnp.max(ng[1:Q + 1]),
                    generation_overflow=ovf, drop_risk=drop_risk, replay_mismatch=mm.astype(jnp.int32),
                    n_roots=jnp.int32(N), launches=G + 2)   # the recording primal + one adjoint per generation
-        jax.debug.callback(lambda d: LAST.append({k: np.asarray(v) for k, v in d.items()}), st_)
+        jax.debug.callback(lambda d: record_reverse("tree", {k: np.asarray(v) for k, v in d.items()}), st_)
     return _no_second_order((g_pi, g_bc))

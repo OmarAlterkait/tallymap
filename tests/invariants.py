@@ -21,7 +21,7 @@ Sections (cell name prefixes):
            gradient does not depend on rev_checkpoints.
   [trunc]  truncation (max_steps): flags, n_truncated, partial integer tallies, poisoned float tallies and per-item
            results agree between cuda, xla and the dense reference, with n_active and across cuda schedules.
-  (Replay: gated by tests/reverse.py, cell "REPLAY GATE" with its NEGATIVE CONTROL (_reverse.REPLAY_SHIFT).  Not
+  (Replay: gated by tests/reverse.py, cell "REPLAY GATE" with its NEGATIVE CONTROL (_reverse._shifted patched).  Not
   duplicated here.)
 
 Each cell prints one line: PASS | RAISES-OK (an expected, clear error) | FAIL <why> | RAISE <exception> |

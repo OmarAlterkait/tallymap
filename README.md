@@ -467,8 +467,8 @@ the gain there is the gradient. All rows and the method: `docs/performance.md`.
 | `rev_checkpoints` | `'auto'` | reverse mode: checkpoint buffer size C. `'auto'`: 16 for a loop step of fewer than 1000 equations, else the largest of 4 ... 64 whose 3C+1 states (single-loop adjoint: 2C+1) fit 64 KiB. A loop of K <= C steps is not replayed; O(K) work for K <= C^2. |
 | `rev_stats` | `False` | reverse through spawn: report the tree adjoint's counts to the host. Off by default because a host callback takes `jax.jit` off its C++ fast path, which can cost an order of magnitude. |
 
-Any other option name raises, and there are no private options: the measurement switches and negative controls
-are test-only module constants. tallymap's one environment variable is `TALLYMAP_CACHE`, the kernel cache
+Any other option name raises, and there are no private options: the measurement switches are test-only module
+constants, and the negative controls live in the tests. tallymap's one environment variable is `TALLYMAP_CACHE`, the kernel cache
 directory (default `~/.cache/tallymap`). On the CPU the standard OpenMP and compiler variables apply:
 `OMP_NUM_THREADS` (default: the CPUs the process may use), `OMP_STACKSIZE` (the worker threads' stack, where per-item
 arrays live; tallymap sets it to 16M if it is unset, and a kernel needing more than half of it raises before it runs)

@@ -42,6 +42,10 @@ HISTORY = 16
 PROGRAMS = collections.deque(maxlen=HISTORY)       # (tag, jaxpr object) of item programs bound by tm.vmap
 KERNELS = collections.deque(maxlen=HISTORY)        # dicts recorded by backends/kernel.kernel()
 _CAPTURE = []                                      # active diagnostics(f, ...) captures: dict(programs=, kernels=)
+# reverse-mode instrumentation (record_reverse): build = what the last vjp_prog built (its sparse / dense tables,
+# its checkpointed loops: tests and benchmarks read it), single = its single-loop decision, tree = the stats of the
+# tree adjoints run with rev_stats=True
+REVERSE = dict(build={}, single={}, tree=[])
 
 
 def record_program(prog):
@@ -70,6 +74,18 @@ def float_consts(consts):
             sh = tuple(np.shape(c))
             out.append((sh, str(dt), int(np.prod(sh, dtype=np.int64))))
     return out
+
+
+def record_reverse(kind, rec):
+    """kind 'build' / 'single': replace that record; 'loop': append a checkpointed loop to build['loops']; 'tree':
+    append a tree adjoint's stats."""
+    if kind == "loop":
+        REVERSE["build"].setdefault("loops", []).append(rec)
+    elif kind == "tree":
+        REVERSE["tree"].append(rec)
+    else:
+        REVERSE[kind].clear()
+        REVERSE[kind].update(rec)
 
 
 def record_kernel(rec):
@@ -147,9 +163,8 @@ def _host():
 
 
 def _reverse():
-    from . import _reverse as R
-    from . import _reverse_spawn as RS
-    return dict(single=dict(R.LAST_SINGLE), tree=RS.LAST[-1] if RS.LAST else None)
+    t = REVERSE["tree"]
+    return dict(single=dict(REVERSE["single"]), tree=t[-1] if t else None)
 
 
 def diagnostics(fn=None, *args, reset=False, **kwargs):
@@ -168,10 +183,8 @@ def diagnostics(fn=None, *args, reset=False, **kwargs):
         d.update(programs=[_render(r) for r in PROGRAMS], kernels=list(KERNELS))
     d["kernels"] = [_with_resources(k) for k in d["kernels"]]
     if reset:
-        from . import _reverse as R
-        from . import _reverse_spawn as RS
-        R.LAST_SINGLE.clear()
-        RS.LAST.clear()
+        for r in REVERSE.values():
+            r.clear()
         PROGRAMS.clear()
         KERNELS.clear()
     return d

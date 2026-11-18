@@ -372,8 +372,8 @@ error) turn every affected cell into a failure, which is how the matrix is known
   outside its negative control, and cost a forward launch per gradient (~1x the value call on lumen). Its failure
   class is gated in `tests/reverse.py` ("REPLAY GATE"): on an item whose step count hangs on f32 div / sqrt bits,
   every item's reverse derivative must equal its forward-mode derivative (the fused jvp kernel runs the forward's
-  own trajectory), for the nested and the single-loop adjoint; the negative control (test-only
-  `_reverse.REPLAY_SHIFT = 1`: the adjoint replays and sweeps K-1 steps) must fail the gate on exactly the items of
+  own trajectory), for the nested and the single-loop adjoint; the negative control (the test patches
+  `_reverse._shifted`: the adjoint replays and sweeps K-1 steps) must fail the gate on exactly the items of
   K >= 2, with a different adjoint kernel. (An earlier control, the adjoint in `approx` math against an `ieee`
   forward, changed no step count on two attempts and was replaced: a negative control must perturb by
   construction.) Applications validate gradients against `jacfwd` / finite differences (lumen does, on 6 detectors).
@@ -440,13 +440,17 @@ emitted value AT THE SPAWN STEP, inside the parent's ordinary replay adjoint. No
 ## 5. Fewer knobs
 
 Unknown option names raise. The public options are the six in the README, and there are no private options.
-Every measurement switch and negative control is a TEST-ONLY module constant that the library never sets, patched
-by the tests (`tests/ab_rule.patched`): `codegen.FILL` and `codegen.INPLACE` (both in the cuda kernel key),
-`_primitive.FUSE_JVP` and `LANES`, `_reverse.SINGLE`, `REPLAY_SHIFT`, `SPARSE_MIN` and `NODENSE`, and
-`_reverse_spawn.GEN_CAPACITY` and `TREE_NEG`. They were private options (`_cuda_inplace`, `_lanes`, `_fold`,
-`_rev_sparse_min`, `_rev_nodense`, `_rev_gen_capacity`, `_tree_neg`) carried in every node and cache key; as
-constants they are read when a program is traced or lowered, and the eager-call cache does not see them (the
-test helper clears it).
+Every measurement switch is a TEST-ONLY module constant that the library never sets, patched by the tests
+(`tests/ab_rule.patched`): `codegen.FILL` and `codegen.INPLACE` (both in the cuda kernel key), `_primitive.FUSE_JVP`
+and `LANES`, `_reverse.SINGLE` and `SPARSE_MIN`. The library holds no deliberately wrong path: each negative control
+lives in its test, which patches the one function it perturbs (`_reverse._shifted`: the adjoint replays K - 1
+steps; `_reverse._mixed_use_tables`: no dense detection; `_reverse_spawn._children` / `_replay_inputs`: detached
+children, a perturbed replay; `_reverse_spawn._gen_capacity`: a smaller generation). They were private options
+(`_cuda_inplace`, `_lanes`, `_fold`, `_rev_sparse_min`, `_rev_nodense`, `_rev_gen_capacity`, `_tree_neg`) carried
+in every node and cache key, then module constants; they are read when a program is traced or lowered, and the
+eager-call cache does not see them (the test helper clears it). Reverse-mode instrumentation (what the last adjoint
+built, its single-loop decision, the tree adjoint's stats) is recorded in `_diagnostics.REVERSE`, the one history
+`tm.diagnostics()` reads.
 
 Removed, with their measurements: 20 environment switches; the replay-from-start reverse scheme (3.4 to 13 times
 slower wherever it was measured); turning activity analysis off; the CUDA block size, shared-memory budget and

@@ -47,13 +47,12 @@ from jax.interpreters import ad as _jad
 from jax.interpreters import batching as _batching
 from jax.interpreters import mlir as _mlir
 
+from ._diagnostics import record_reverse
 from ._rewrite import isfloat
 from ._tally import emit_p
 
 FLOAT0 = jax.dtypes.float0
-LAST = {}          # what the last vjp_prog / checkpointed_while built (instrument checks in tests and benchmarks)
 SPARSE_MIN = 32    # tables of >= this many elements get sparse (emitted) cotangents (tests patch it, like codegen.FILL)
-NODENSE = False    # TEST-ONLY NEGATIVE CONTROL: drop the dense detection of mixed-use tables (a wrong gradient)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -230,15 +229,11 @@ def _active(bfn, bc, init, pb, pc, cand, w_idx):
         act |= nz
 
 
-# TEST-ONLY negative control of tests/reverse.py's REPLAY GATE (patched like codegen.FILL; never set by the library):
-# the adjoint replays and sweeps K - REPLAY_SHIFT steps of a K-step loop (at least 1), i.e. it differentiates a
-# trajectory the forward did not run, for every item of K >= 2.  Read when the adjoint program is traced, so the
-# perturbed adjoint is a different program (and kernel); the forward is untouched.
-REPLAY_SHIFT = 0
-
-
 def _shifted(K):
-    return jnp.maximum(K - REPLAY_SHIFT, jnp.minimum(K, 1)) if REPLAY_SHIFT else K
+    """the number of steps the adjoint replays and sweeps for a loop the forward ran K steps: K.  (tests/reverse.py's
+    REPLAY GATE patches it to K - 1 as its negative control: the adjoint then differentiates a trajectory the forward
+    did not run.  Called when the adjoint program is traced, so the patched adjoint is a different program.)"""
+    return K
 
 
 # ------------------------------------------------------------------------------------------- checkpointed_while
@@ -279,9 +274,9 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None, li
         k, out, head = lax.while_loop(lambda s: cfn(cc, s[1]), b_,
                                       (jnp.int32(0), init, _buf_new(C + 1, [init[j] for j in l_idx])))
         act = tuple(_active(bfn, bc, init, pb, pc, f_idx, w_idx))
-        LAST.setdefault("loops", []).append(dict(checkpoints=C, auto=not o.checkpoints, n_state=len(s_idx),
-                                                 n_live=len(l_idx), n_float=len(f_idx), n_active=len(act),
-                                                 n_tok=len(w_idx), state_bytes=sb, ckpt_bytes=(3 * C + 1) * sb))
+        record_reverse("loop", dict(checkpoints=C, auto=not o.checkpoints, n_state=len(s_idx), n_live=len(l_idx),
+                                    n_float=len(f_idx), n_active=len(act), n_tok=len(w_idx), state_bytes=sb,
+                                    ckpt_bytes=(3 * C + 1) * sb))
         return out, (cc, bc, init, k, head, _Static((pb, pc, act)))
 
     def bwd(res, ct):
@@ -429,7 +424,6 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None, li
 COUNT, CKPT, ADV, FILL, SWEEP, DONE = range(6)
 T3_MIN_EQNS = 1000
 SINGLE = "auto"                  # 'auto' (by single_blocker) | 'force' (whenever the shape allows) | 'off' (tests)
-LAST_SINGLE = {}                 # what the last vjp_prog decided: used, why not (diagnostics()['reverse']['single'])
 
 
 def _n_eqns(jaxpr):
@@ -600,10 +594,9 @@ def checkpointed_while_single(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=N
         pc = tuple(bool(x.perturbed) for x in init)
         cc, bc, init = [x.value for x in cc], [x.value for x in bc], [x.value for x in init]
         act = tuple(j for j in _active(bfn, bc, init, pb, pc, f_idx, w_idx) if j != pidx)
-        LAST.setdefault("loops", []).append(dict(checkpoints=C, auto=not o.checkpoints, n_state=len(s_idx),
-                                                 n_live=len(l_idx), n_float=len(f_idx), n_active=len(act),
-                                                 n_tok=len(w_idx), state_bytes=sb, ckpt_bytes=(2 * C + 1) * sb,
-                                                 single=True))
+        record_reverse("loop", dict(checkpoints=C, auto=not o.checkpoints, n_state=len(s_idx), n_live=len(l_idx),
+                                    n_float=len(f_idx), n_active=len(act), n_tok=len(w_idx), state_bytes=sb,
+                                    ckpt_bytes=(2 * C + 1) * sb, single=True))
         return list(init), (cc, bc, init, _Static((pb, pc, act)))   # (dead outputs: see the docstring)
 
     def bwd(res, ct):
@@ -873,8 +866,7 @@ def vjp_prog(p, pert_pi, pert_bc, opts=None):
     r = fold_post(p) if why is None else None
     if why is None and r is None:
         why = "a loop in the pre / post code, or key-typed results"
-    LAST_SINGLE.clear()
-    LAST_SINGLE.update(used=r is not None, why=why)
+    record_reverse("single", dict(used=r is not None, why=why))      # (diagnostics()['reverse']['single'])
     pc_ = p
     if r is not None:                # T3: the adjoint retraces the folded program
         pc_, meta = r
@@ -894,19 +886,16 @@ def vjp_prog(p, pert_pi, pert_bc, opts=None):
     tables = {nT + nP + sh + i: k for k, i in enumerate(big)}
     dense = set()
     if big:                                   # trace-time pass: which tables have non-read (dense) uses
-        rep = {}
-        jax.make_jaxpr(retrace(pc_.cj, rev=o, n_tally=nT, tables=tables, report=rep))(
-            *[_sds(a) for a in pc_.in_avals()], *[flat_aval(i) for i in big])
-        dense = {big[k] for k in rep["dense"]}
-        if NODENSE:                                            # NEGATIVE CONTROL ONLY: drop the dense uses
-            dense = set()
+        dense = {big[k] for k in _mixed_use_tables(pc_.cj, o, nT, tables,
+                                                   [_sds(a) for a in pc_.in_avals()] + [flat_aval(i) for i in big])}
     big = [i for i in big if i not in dense]  # a table with any other use is differentiated densely for ALL uses
     tables = {nT + nP + sh + i: k for k, i in enumerate(big)}
     dib = [i for i in ib if i not in big]
     fr = retrace(pc_.cj, rev=o, n_tally=nT, tables=tables)
-    LAST.clear()
-    LAST.update(opts=o, sparse=[(i, size(i)) for i in big], dense=[(i, size(i)) for i in dib],
-                loops=[])
+    # what this adjoint is built from (tests and benchmarks read it: _diagnostics.REVERSE["build"]); its loops are
+    # appended as the retrace below builds them
+    record_reverse("build", dict(opts=o, sparse=[(i, size(i)) for i in big], dense=[(i, size(i)) for i in dib],
+                                 loops=[]))
 
     def V(*a):
         t = list(a[:nT])
@@ -965,6 +954,16 @@ def vjp_prog(p, pert_pi, pert_bc, opts=None):
     check_slots(cj, tl, p.tag + "+vjp")             # the cotangent tallies are threaded linearly (or raise)
     return ItemProgram(cj, tl, nP + len(yf), nB + len(tf), len(ip) if p.trunc is not None else None, None,
                        p.tag + ("+fold" if sh else "") + "+vjp", where=p.where, nact=p.nact)
+
+
+def _mixed_use_tables(cj, o, nT, tables, avals):
+    """the trace-time pass of vjp_prog: the token indices (of `tables`) of the tables that also have uses other than
+    reads, which need the dense cotangent for every use.  (tests/reverse.py patches it to return nothing as a
+    NEGATIVE CONTROL: the mixed table's gradient must then be wrong.)"""
+    from ._rewrite import retrace
+    rep = {}
+    jax.make_jaxpr(retrace(cj, rev=o, n_tally=nT, tables=tables, report=rep))(*avals)
+    return rep["dense"]
 
 
 def check_slots(cj, tl, tag):

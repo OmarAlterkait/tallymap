@@ -5,7 +5,8 @@ Comparing two identical programs measures noise.  Measurement hygiene for the li
     from ab_rule import assert_arms_differ, patched
     (ka, ha), (kb, hb) = assert_arms_differ(f_a, f_b, *args)
     with patched(codegen, INPLACE=False):     # an arm that is a TEST-ONLY module constant (codegen.FILL / INPLACE,
-        ...                                   # _primitive.LANES, _reverse.SPARSE_MIN / NODENSE, ...)
+        ...                                   # _primitive.LANES, _reverse.SPARSE_MIN, ...) or a patched function
+                                              # (_reverse._shifted, _reverse._mixed_use_tables)
 """
 import contextlib
 

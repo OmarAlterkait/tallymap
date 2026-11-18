@@ -4,8 +4,8 @@ env: BACKENDS=xla,cuda  TEST_X64=1  ONLY=substr  KS=1,10,100,1000
 Every gradient is compared, as full VECTORS, against jax.grad of a PADDED-SCAN version of the same item (dense
 per-item tallies, jax.vmap + sum: tallymap.reference), and where cheap against jacfwd / jvp of
 tallymap's forward mode.  The evaluation point is always a jit ARGUMENT (F3 rule).  Instrument checks: the
-sparse/dense table path and the scheme actually built are read back from tallymap._reverse.LAST and asserted before a
-result is accepted.
+sparse/dense table path and the scheme actually built are read back from
+tallymap._diagnostics.REVERSE["build"] and asserted before a result is accepted.
 """
 import os
 import sys
@@ -23,6 +23,7 @@ from ab_rule import patched
 from jax import lax
 
 import tallymap as tm
+from tallymap import _diagnostics as _D
 from tallymap import _reverse
 
 if os.environ.get("TX_UNFUSED") == "1":                 # run_all --unfused: the two-node jvp design
@@ -166,7 +167,7 @@ def walk_case(b, NB, K, **ro):
     f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, in_axes=AX, backend=b, **ro)
     r = reference(padded, outputs={"Q": tm.Sum((NB,), F)}, in_axes=AX)
     g = grads(loss_of(f, wq), (xs, keys, tab, th))
-    info = dict(_reverse.LAST)
+    info = dict(_D.REVERSE['build'])
     gr = grads(loss_of(r, wq), (xs, keys, tab, th))
     return g, gr, info, (f, xs, keys, tab, th, wq, AX, item)
 
@@ -349,7 +350,7 @@ for NB in (8, 512):
         f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, in_axes=AX, backend=b)
         r = reference(padded, outputs={"Q": tm.Sum((NB,), F)}, in_axes=AX)
         g = grads(loss_of(f, wq), (xs, keys, tab, th))
-        info = dict(_reverse.LAST)
+        info = dict(_D.REVERSE['build'])
         if (NB >= 32) != bool(info["sparse"]):
             raise Fail(f"instrument: {info}")
         return close(g, grads(loss_of(r, wq), (xs, keys, tab, th)), "nested") + f" loops {len(info['loops'])}"
@@ -400,7 +401,7 @@ def branchy_case(b, NB, mixed=False, use_scan=False, **ro):
     f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, in_axes=AX, backend=b, **ro)
     r = reference(padded, outputs={"Q": tm.Sum((NB,), F)}, in_axes=AX)
     g = grads(loss_of(f, wq), (xs, keys, tab, th))
-    info = dict(_reverse.LAST)
+    info = dict(_D.REVERSE['build'])
     return g, grads(loss_of(r, wq), (xs, keys, tab, th)), info
 
 
@@ -431,7 +432,7 @@ def _(b):
 @case("NEGATIVE CONTROL: mixed use with dense detection disabled MUST differ", ["xla"])
 def _(b):
     g, gr, _ = branchy_case(b, 256, mixed=True)
-    with patched(_reverse, NODENSE=True):
+    with patched(_reverse, _mixed_use_tables=lambda *a: set()):
         gb, _, info = branchy_case(b, 256, mixed=True)
     if any(s == 256 for _, s in info["dense"]):
         raise Fail(f"instrument: the defect was not applied {info}")
@@ -457,8 +458,8 @@ def _(b):
             return jnp.sum(q * wq) + 0.1 * jnp.sum(q * q) / NB
         return g
     jax.grad(L(f))(P)
-    if not _reverse.LAST.get("sparse"):
-        raise Fail(f"instrument: the 64-entry table must be on the sparse path: {_reverse.LAST}")
+    if not _D.REVERSE['build'].get("sparse"):
+        raise Fail(f"instrument: the 64-entry table must be on the sparse path: {_D.REVERSE['build']}")
     H = jax.jacfwd(jax.jacfwd(L(r)))(P)
     v = jnp.linspace(-1.0, 1.0, P.size).astype(F)
     got = dict(hessian=jax.jit(jax.hessian(L(f)))(P), jacrev2=jax.jit(jax.jacrev(jax.jacrev(L(f))))(P),
@@ -531,7 +532,7 @@ for which in ("while-in-cond-in-scan", "cond-in-while", "scan-in-cond-in-while",
         f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, in_axes=AX, backend=b)
         r = reference(padded, outputs={"Q": tm.Sum((NB,), F)}, in_axes=AX)
         g = grads(loss_of(f, wq), (xs, keys, tab, th))
-        info = dict(_reverse.LAST)
+        info = dict(_D.REVERSE['build'])
         dense = which.endswith("(dense)")
         on_sparse = any(s == NB for _, s in info["sparse"])
         if on_sparse == dense:
@@ -647,7 +648,7 @@ def _(b):
     r = reference(padded, outputs={"Q": tm.Sum((NB,), F)}, in_axes=(0, 0, None))
     th = F(0.95)
     g = jax.jit(jax.grad(lambda t: jnp.sum(f(xs, keys, t).outputs["Q"] * wq)))(th)
-    lp = _reverse.LAST["loops"][0]
+    lp = _D.REVERSE['build']["loops"][0]
     gr = jax.jit(jax.grad(lambda t: jnp.sum(r(xs, keys, t).outputs["Q"] * wq)))(th)
     if lp["n_active"] != 1:
         raise Fail(f"activity: expected 1 active carry (w), got {lp}")
@@ -731,9 +732,9 @@ def _replay_item(NB):
 def _(b):
     """the adjoint differentiates the trajectory the forward kernel ran (what the removed runtime replay check
     compared): every item's reverse derivative must equal its forward-mode derivative (the jvp kernel runs the
-    forward's own trajectory), item by item.  NEGATIVE CONTROL, deterministic: _reverse.REPLAY_SHIFT = 1 makes the
-    adjoint replay and sweep K-1 steps of each K-step loop (test-only, like codegen.FILL), which must be flagged on
-    EXACTLY the items of K >= 2; the control's adjoint kernel must differ from the clean one (cuda)."""
+    forward's own trajectory), item by item.  NEGATIVE CONTROL, deterministic: _reverse._shifted patched to
+    K - 1 makes the adjoint replay and sweep K-1 steps of each K-step loop, which must be flagged on EXACTLY the
+    items of K >= 2; the control's adjoint kernel must differ from the clean one (cuda)."""
     from tallymap import _diagnostics as D
     NB, n = 64, 4096
     item = _replay_item(NB)
@@ -742,19 +743,20 @@ def _(b):
     want = np.asarray(f(xs).per_item[0]) >= 2                       # the items the control must flag
     gf = jax.jit(lambda x: jax.jvp(lambda x_: f(x_).per_item[1], (x,), (jnp.ones_like(x),))[1])(xs)
     gf = np.asarray(gf)
-    s0, r0, bad, hashes = _reverse.SINGLE, _reverse.REPLAY_SHIFT, {}, {}
+    s0, sh0, bad, hashes = _reverse.SINGLE, _reverse._shifted, {}, {}
+    short = lambda K: jnp.maximum(K - 1, jnp.minimum(K, 1))        # the control: K - 1 steps (at least 1)
     try:
         for single in ("off", "force"):
             for shift in (0, 1):
-                _reverse.SINGLE, _reverse.REPLAY_SHIFT = single, shift
+                _reverse.SINGLE, _reverse._shifted = single, (short if shift else sh0)
                 D.KERNELS.clear()
                 gr = np.asarray(jax.jit(jax.grad(lambda x: jnp.sum(f(x).per_item[1])))(xs))
                 hashes[single, shift] = {k["hash"] for k in D.KERNELS if "vjp" in k["tag"]}
-                if _reverse.LAST_SINGLE.get("used") != (single == "force"):
-                    raise Fail(f"instrument: SINGLE={single}: {_reverse.LAST_SINGLE}")
+                if _D.REVERSE['single'].get("used") != (single == "force"):
+                    raise Fail(f"instrument: SINGLE={single}: {_D.REVERSE['single']}")
                 bad[single, shift] = ~(np.abs(gr - gf) <= 2e-4 * np.abs(gf) + 1e-6)
     finally:
-        _reverse.SINGLE, _reverse.REPLAY_SHIFT = s0, r0
+        _reverse.SINGLE, _reverse._shifted = s0, sh0
     counts = {k: int(v.sum()) for k, v in bad.items()}
     print(f"    REPLAY GATE counts {b}: K>=2 {int(want.sum())}/{n}; flagged {counts}", flush=True)
     for single in ("off", "force"):
@@ -885,10 +887,10 @@ def _(b):
                 _reverse.SINGLE = single
                 for C in (2, 5, 16):
                     g = G(tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, in_axes=AX, backend=b, rev_checkpoints=C))
-                    if _reverse.LAST_SINGLE.get("used") != (single == "force"):
-                        raise Fail(f"instrument: SINGLE={single}: {_reverse.LAST_SINGLE}")
-                    if _reverse.LAST["loops"][0]["checkpoints"] != C:
-                        raise Fail(f"instrument: slots {_reverse.LAST['loops']}")
+                    if _D.REVERSE['single'].get("used") != (single == "force"):
+                        raise Fail(f"instrument: SINGLE={single}: {_D.REVERSE['single']}")
+                    if _D.REVERSE['build']["loops"][0]["checkpoints"] != C:
+                        raise Fail(f"instrument: slots {_D.REVERSE['build']['loops']}")
                     close(g, gr, f"S={S} {'T3' if single == 'force' else 'nested'} C={C}")
                 out.append(f"S={S} {single}")
     finally:
@@ -933,7 +935,7 @@ def _(b):
     f = tm.vmap(item, outputs={"Q": tm.Sum((NB,), F)}, in_axes=AX, backend=b)
     r = reference(padded, outputs={"Q": tm.Sum((NB,), F)}, in_axes=AX)
     g = grads(loss_of(f, wq), (xs, keys, tab, th))
-    lp = _reverse.LAST["loops"][0]
+    lp = _D.REVERSE['build']["loops"][0]
     gr = grads(loss_of(r, wq), (xs, keys, tab, th))
     if not lp["n_live"] < lp["n_state"]:
         raise Fail(f"instrument: every state carry stored ({lp})")
@@ -997,8 +999,8 @@ def _(b):
         gs = []
         for mode in ("off", "force"):
             gs.append(_with_single(mode, lambda: grads(loss_of(f, wq), (xs, keys, tab, th))))
-            if _reverse.LAST_SINGLE.get("used") != (mode == "force"):
-                raise Fail(f"{nm}: SINGLE={mode} but {_reverse.LAST_SINGLE}")
+            if _D.REVERSE['single'].get("used") != (mode == "force"):
+                raise Fail(f"{nm}: SINGLE={mode} but {_D.REVERSE['single']}")
         nx = int((np.asarray(gs[0]["x"]) != np.asarray(gs[1]["x"])).sum())
         if nx:
             raise Fail(f"{nm}: {nx} per-item cotangents differ between T3 and the nested-loop adjoint")
@@ -1012,7 +1014,7 @@ def _(b):
     xs, keys, tab, th, wq = inputs(64)
     f = tm.vmap(item, outputs={"Q": tm.Sum((64,), F)}, in_axes=(0, 0, None, None), backend=b)
     _with_single("auto", lambda: grads(loss_of(f, wq), (xs, keys, tab, th)))
-    w = dict(_reverse.LAST_SINGLE)
+    w = dict(_D.REVERSE['single'])
     if w.get("used") or "T3_MIN_EQNS" not in str(w.get("why")):
         raise Fail(f"auto on a ~30-equation step: {w}")
     return f"small step: {w['why']}"
@@ -1039,8 +1041,8 @@ def _(b):
                 if nl != 1:
                     raise Fail(f"{mode}: jax.grad of a linear loss runs {nl} kernels, want 1 (the adjoint)")
             gq = float(_with_single(mode, lambda: gq_f(th)))
-            if _reverse.LAST_SINGLE.get("used") != (mode == "force"):
-                raise Fail(f"SINGLE={mode} but {_reverse.LAST_SINGLE}")
+            if _D.REVERSE['single'].get("used") != (mode == "force"):
+                raise Fail(f"SINGLE={mode} but {_D.REVERSE['single']}")
             gy = _with_single(mode, lambda: jax.jit(jax.grad(lambda t_: jnp.sum(f(xs, t_).per_item ** 2)))(th))
             r = tm.reference(item, outputs={"Q": tm.Sum((4,), F)}, in_axes=(0, None), max_steps=cap)
             close(dict(g=gy), dict(g=jax.jacfwd(lambda t_: jnp.sum(r(xs, t_).per_item ** 2))(th)), "per-item grad")

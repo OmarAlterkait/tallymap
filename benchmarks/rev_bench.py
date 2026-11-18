@@ -3,7 +3,7 @@ parameter count P and backend.  python benchmarks/rev_bench.py
 env: RB_N (65536)  RB_KS (10,30,100,300,1000)  RB_PS (1,10,tab)  RB_BACKENDS (cuda,xla)  RB_MATH (ieee,approx)
      RB_MODES (fwd,jvp,jacfwd,ckpt,dense)  RB_REPS (5)  RB_TAB (11096)  RB_SLOTS (16: rev_checkpoints, comma list)
 Rows: 'ROW {json}'.  Instrument: every arm records the kernel hash(es) it built (cuda) and the vjp program summary
-(tallymap._reverse.LAST); arms that must differ are asserted to have different kernels.
+(tallymap._diagnostics.REVERSE["build"]); arms that must differ are asserted to have different kernels.
 """
 import json
 import os
@@ -19,7 +19,7 @@ import numpy as np
 from jax import lax
 
 import tallymap as tm
-from tallymap import _reverse
+from tallymap import _diagnostics, _reverse
 
 jax.config.update("jax_default_matmul_precision", "highest")
 GPU = jax.default_backend() == "gpu"
@@ -162,8 +162,8 @@ def run_arm(backend, math, K, P, mode):
         row["regs"] = [r[0] for r in rs]
         row["stack"] = [r[1] for r in rs]
     if mode.startswith(("ckpt", "dense")):
-        row["vjp"] = dict(sparse=_reverse.LAST.get("sparse"), dense=_reverse.LAST.get("dense"),
-                          loops=_reverse.LAST.get("loops"))
+        b_ = _diagnostics.REVERSE["build"]
+        row["vjp"] = dict(sparse=b_.get("sparse"), dense=b_.get("dense"), loops=b_.get("loops"))
         row["g"] = np.asarray(o, np.float64).ravel()[:4].tolist()
         row["gnorm"] = float(np.linalg.norm(np.asarray(o, np.float64)))
         row["_g"] = np.asarray(o, np.float64)

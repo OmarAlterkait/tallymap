@@ -88,7 +88,7 @@ JAX primitive without side effects and is slow by design, at about plain-JAX spe
 
 ## Fewer knobs (notes section 5)
 
-Six public options; unknown names raise; measurement switches and negative controls are test-only module
-constants. Removed with their measurements (notes section 5-6): 20 environment switches, event scheduling, the
+Six public options; unknown names raise; measurement switches are test-only module constants and negative
+controls live in the tests. Removed with their measurements (notes section 5-6): 20 environment switches, event scheduling, the
 batch fold, step segmentation, `cuda_min_blocks`, block-size and shared-memory options, constant folding, the
 replay fingerprint, and the forward-stores-checkpoints and one-kernel-per-phase adjoints.

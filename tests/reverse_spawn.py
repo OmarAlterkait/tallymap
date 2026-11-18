@@ -163,7 +163,8 @@ def reference(th, X0, depth=DEPTH + 1, cap=CG):
 
 
 # ------------------------------------------------------------------------------------------- tallymap
-RS.GEN_CAPACITY = CG          # the test-only generation capacity (TREE_CG); the overflow cell lowers it
+_CHILDREN0, _REPLAY0 = RS._children, RS._replay_inputs
+RS._gen_capacity = lambda Q: min(CG, Q)     # the test's generation capacity (TREE_CG); the overflow cell lowers it
 
 
 def tallymap_fn(cap_q=QCAP, backend=BK):
@@ -285,18 +286,18 @@ c = cmp(a, b)
 report("reverse(tree) == jacfwd/jvp through spawn", c["max_rel"] < (1e-10 if X64 else 1e-4), **c)
 
 # 4. the tree matters: detached children (cotangents of children not injected) must differ -- NEGATIVE CONTROL
-RS.TREE_NEG = "detach"
+RS._children = lambda dx: [jnp.zeros_like(d) for d in dx]
 _, g_d = grad_tallymap(TH, X0, tallymap_fn())
-RS.TREE_NEG = ""
+RS._children = _CHILDREN0
 c = cmp(g_d, g_r)
 report("NEG detach: detached-children gradient differs from the reference", c["max_rel"] > 1e-3, **c)
 
 # 5. replay check: the adjoint replays a perturbed item (other child counts) -> mismatches counted, gradient NaN
 #    (NEGATIVE CONTROL)
 tm.diagnostics(reset=True)
-RS.TREE_NEG = "replay"
+RS._replay_inputs = lambda pi, fl: [x * 1.5 if i == fl[0] else x for i, x in enumerate(pi)]
 _, g_p = grad_tallymap(TH, X0, tallymap_fn())
-RS.TREE_NEG = ""
+RS._replay_inputs = _REPLAY0
 jax.block_until_ready(g_p)
 st = tm.diagnostics()["reverse"]["tree"]
 report("NEG replay: the replay check detects a replay whose child counts differ from the forward",
@@ -304,12 +305,12 @@ report("NEG replay: the replay check detects a replay whose child counts differ 
 
 # 6. overflow: generation capacity too small -> NaN + overflow flag (never silently wrong)
 tm.diagnostics(reset=True)
-RS.GEN_CAPACITY = max(8, max(sizes) // 2)
+RS._gen_capacity = lambda Q: min(max(8, max(sizes) // 2), Q)
 _, g_o = grad_tallymap(TH, X0, tallymap_fn())
-RS.GEN_CAPACITY = CG
+RS._gen_capacity = lambda Q: min(CG, Q)
 jax.block_until_ready(g_o)
 st = tm.diagnostics()["reverse"]["tree"]
-report("overflow (GEN_CAPACITY < largest generation) -> NaN",
+report("overflow (generation capacity < largest generation) -> NaN",
        bool(st["generation_overflow"]) and np.isnan(flat(g_o)).all(),
        generation_overflow=bool(st["generation_overflow"]))
 
