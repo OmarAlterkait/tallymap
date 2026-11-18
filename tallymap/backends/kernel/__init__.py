@@ -71,14 +71,12 @@ class Kernel:
             self.src = host.source(self.src, self.L)
             so, self.info = host.compile_so(self.src, p.where, note)   # run-or-raise on the stack bound
             self.kid = host.register(so, self.info)
-            self.ext = ".cc"
             return
         if math not in MATH_OPTS:
             raise ValueError("tallymap: cuda_math must be 'ieee' or 'approx'")
         cubin, self.info = C.compile_cubin(self.src, C.device_arch(), MATH_OPTS[math])
         C.check_frame(cubin, p.where, note)      # run-or-raise: over CUDA's per-thread local limit never launches
         self.kid = C.register_kernel(cubin, note)
-        self.ext = ".cu"
 
 
 def schedule_note(L):
@@ -150,7 +148,7 @@ def run(p, pi, bc, target="cuda", cuda_math="approx", schedule="item", ndev=1, *
     else:
         call = jax.ffi.ffi_call(C.TARGET, rs, has_side_effect=False)
         res = call(*args, kernel_id=np.int64(kern.kid), block=np.int32(kern.block), n_zero=np.int32(L.n_zero),
-                   flags=np.int32(L.flags), grid=np.int32(0), n_items=np.int64(N))
+                   flags=np.int32(L.flags), n_items=np.int64(N))
     at = lambda r: res[r - L.n_in]                     # buffer r of the kernel (Layout.r_*) among the results
     ys = [at(r) for r in L.r_ys]
     yav = [v.aval for v in p.cj.jaxpr.outvars[p.nT:]]

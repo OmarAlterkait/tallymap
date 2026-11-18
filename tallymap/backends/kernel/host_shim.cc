@@ -80,8 +80,6 @@ extern "C" int tallymap_host_register(int64_t id, void* fn) {
   return 1;
 }
 
-extern "C" int tallymap_host_threads() { return default_threads(); }
-
 static ffi::Error HostLaunchImpl(ffi::RemainingArgs args, ffi::RemainingRets rets, int64_t kernel_id, int32_t n_zero,
                                  int32_t flags, int64_t n_items, int64_t stack, int32_t n_dev) {
   SjHostRun run = nullptr;

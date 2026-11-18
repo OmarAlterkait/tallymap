@@ -98,8 +98,6 @@ __device__ __forceinline__ i32 sj_tkey_f(float x) { i32 i = __float_as_int(x); r
 __device__ __forceinline__ i64 sj_tkey_d(double x) { i64 i = __double_as_longlong(x); return i ^ ((i >> 63) & 0x7fffffffffffffffll); }
 __device__ __forceinline__ i64 sj_clampi(i64 x, i64 hi) { return x < 0 ? 0 : (x > hi ? hi : x); }
 __device__ __forceinline__ bool sj_inb(i64 x, i64 hi) { return x >= 0 && x <= hi; }
-__device__ __forceinline__ float sj_maximum(float a, float b) { return (a != a || b != b) ? __int_as_float(0x7fc00000) : (a > b ? a : (b > a ? b : (signbit(a) ? b : a))); }
-__device__ __forceinline__ float sj_minimum(float a, float b) { return (a != a || b != b) ? __int_as_float(0x7fc00000) : (a < b ? a : (b < a ? b : (signbit(a) ? a : b))); }
 
 // threefry2x32 (20 rounds), bitwise identical to jax.random's threefry2x32_p
 __device__ __forceinline__ u32 sj_rotl(u32 x, int d) { return (x << d) | (x >> (32 - d)); }
@@ -151,10 +149,6 @@ __device__ __forceinline__ sj_c128 sj_cexp(sj_c128 z) { const double e = exp(z.r
 __device__ __forceinline__ sj_c64 sj_clog(sj_c64 z) { return sj_mkc64(logf(sj_cabs(z)), atan2f(z.im, z.re)); }
 __device__ __forceinline__ sj_c128 sj_clog(sj_c128 z) { return sj_mkc128(log(sj_cabs(z)), atan2(z.im, z.re)); }
 
-// float min/max atomics
-__device__ __forceinline__ void sj_atomic_max_f32(float* a, float v) {
-  if (v != v) { atomicExch((u32*)a, __float_as_uint(v)); return; }
-  if (v >= 0.0f) atomicMax((i32*)a, __float_as_int(v)); else atomicMin((u32*)a, __float_as_uint(v)); }
 #define SJ_LDV(p) (*((volatile u32*)(p)))
 """
 
@@ -314,7 +308,6 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
         return f"((const {'u8' if np.dtype(dt) == np.bool_ else ctype(dt)}*)P.p[{i}])"
 
     outs = p.out_tallies
-    L.n_out = len(outs)
     base_in, base_par, base_arg = [], ["const SjParams& P", "const i64 item"], ["P", "item"]
     base_par += [f"{_acc_t(p.tallies[k])}* const sj_acc{k}" for k in outs]
     base_arg += [f"sj_acc{k}" for k in outs]
@@ -338,9 +331,9 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
     L.cjs = {}
     fdefs = []
 
-    def function(name, cj, ins, out_names=None, inplace_out=None):
+    def function(name, cj, ins, inplace_out=None):
         """emit `cj` as a device function taking the base params + (decl, Val) inputs; non-tally results are
-        written to reference params o<j> (or the given names).  inplace_out {j: name}: result j may be the mutable
+        written to reference params o<j>.  inplace_out {j: name}: result j may be the mutable
         reference parameter `name` itself, updated in place (then it has no o<j>, and its spec is "inplace").
         -> (results, out (shape, dtype, impl) | None | "inplace")"""
         L.cjs[name] = cj

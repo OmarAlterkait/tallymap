@@ -1333,7 +1333,6 @@ def _while(em, eqn, ins, **p):
     em.freeze(cc + bc + [c for c, p_ in zip(cars, pt) if p_])     # re-read every iteration: never in place
     start = len(em.lines)
     em.open("while (true)")
-    em.cf_depth += 1
     em.freeze(vals)                                                 # the predicate must not consume a carry
     pred = em.run_closed(w.cond, cc + vals)[0]
     em.unfreeze()
@@ -1343,7 +1342,6 @@ def _while(em, eqn, ins, **p):
     else:
         outs = _batched_body(em, w, pred, bc, cars, vals, pt)
     pp = _update_carries(em, cars, outs, pt, start)
-    em.cf_depth -= 1
     em.close()
     em.unfreeze()
     _pingpong_exit(em, pp)
@@ -1391,9 +1389,7 @@ def _branch(em, br, ops):
     saved, ind = em.lines, em.ind
     em.lines = []
     em.ind = ind + 1
-    em.cf_depth += 1
     res = em.run_closed(br, ops)
-    em.cf_depth -= 1
     lines = em.lines
     em.lines, em.ind = saved, ind
     return lines, res
@@ -1505,11 +1501,9 @@ def _scan(em, eqn, ins, **p):
         else:
             v = View(x, x.shape[1:], lambda idx, ti=ti: [ti] + list(idx))
             xs_t.append(v)
-    em.cf_depth += 1
     em.freeze(consts + xs + [c for c, p_ in zip(cars, pt) if p_])
     outs = em.run_closed(jaxpr, consts + vals + xs_t)
     em.unfreeze()
-    em.cf_depth -= 1
     for j, (y, yv) in enumerate(zip(ys, outs[num_carry:])):
         if y is None or isinstance(yv, VTally):
             if not (y is None and isinstance(yv, VTally)):

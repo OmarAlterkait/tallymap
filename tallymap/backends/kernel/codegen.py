@@ -330,7 +330,6 @@ class Emitter:
         self.consts = []          # hoisted non-scalar constants (numpy arrays)
         self._const_ids = {}
         self.prims = set()        # primitive names seen (for the report)
-        self.cf_depth = 0         # control-flow nesting depth (while/cond/scan bodies)
         self.hooks = {}           # tallymap primitive name -> rule (set by the kernel builder)
         self._scopes = []         # active run_jaxpr scopes: (env, remaining uses) -- liveness for in-place updates
         self._frozen = [set()]    # names of Local arrays that must never be mutated (loop consts, function params)
@@ -670,7 +669,6 @@ class Emitter:
                 for a in eqn.invars:
                     if not isinstance(a, Literal):
                         rem[a] -= 1
-                self.cur_invars = eqn.invars
                 # jaxpr-local use counts of this equation's results (rules may fuse one-use values lazily;
                 # 0 = only a nested-call result, consumers unknown here)
                 self.out_uses = [uses.get(v, 0) if not is_dropvar(v) else 0 for v in eqn.outvars]

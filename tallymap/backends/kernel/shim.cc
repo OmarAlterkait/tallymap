@@ -3,7 +3,7 @@
 // Python compiles a kernel module (CUBIN) per program and registers its image here under a 64-bit id
 // (tallymap_register).  At execution the handler lazily loads the module into the CURRENT CUDA context
 // (the one XLA runs the stream in), memsets the first n_zero result buffers, and launches
-//   sj_prep  (optional, flags & 1)  identity init of min/max accumulators
+//   sj_prep  (optional, flags & 1)  spawn queue: sequence numbers init
 //   sj_main                         persistent threads, occupancy-sized grid
 //   sj_post  (optional, flags & 2)  scratch accumulator -> output conversion
 // on XLA's stream.  Every kernel takes (by-value struct of all buffer pointers: args first, then results; i64 n_items).
@@ -155,7 +155,7 @@ extern "C" int tallymap_kernel_info(int64_t id, long long* out) {
 }
 
 static ffi::Error SjLaunchImpl(cudaStream_t stream, ffi::RemainingArgs args, ffi::RemainingRets rets,
-                               int64_t kernel_id, int32_t block, int32_t n_zero, int32_t flags, int32_t grid,
+                               int64_t kernel_id, int32_t block, int32_t n_zero, int32_t flags,
                                int64_t n_items) {
   Drv& d = drv();
   if (!d.ok) return ffi::Error(ffi::ErrorCode::kInternal, "tallymap: " + d.err);
@@ -225,7 +225,7 @@ static ffi::Error SjLaunchImpl(cudaStream_t stream, ffi::RemainingArgs args, ffi
     r = d.LaunchKernel(L.prep, aux_grid, 1, 1, 256, 1, 1, 0, stream, kp, nullptr);
     if (r) return ffi::Error(ffi::ErrorCode::kInternal, launch_err("sj_prep", r, L.prep, L.sms, note));
   }
-  long long g = grid > 0 ? grid : (long long)L.sms * (grid < 0 && -grid < L.occ ? -grid : L.occ);   // grid < 0: cap blocks/SM (instrument)
+  long long g = (long long)L.sms * L.occ;
   long long need = (n_items + block - 1) / block;
   if (g > need && !(flags & 4)) g = need;
   if (g < 1) g = 1;
@@ -247,5 +247,4 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(TallymapLaunch, SjLaunchImpl,
                                   .Attr<int32_t>("block")
                                   .Attr<int32_t>("n_zero")
                                   .Attr<int32_t>("flags")
-                                  .Attr<int32_t>("grid")
                                   .Attr<int64_t>("n_items"));

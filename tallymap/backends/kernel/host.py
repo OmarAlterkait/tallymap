@@ -152,8 +152,6 @@ template <class T, class F> static inline T sj_f2i(F x) {   // CUDA's _rz conver
 #define __uint2double_rn(x) ((double)(x))
 #define __ll2double_rn(x) ((double)(x))
 #define __ull2double_rn(x) ((double)(x))
-template <class T> static inline T max(T a, T b) { return a > b ? a : b; }
-template <class T> static inline T min(T a, T b) { return a < b ? a : b; }
 static inline int atomicAdd(int* a, int v) { return __atomic_fetch_add(a, v, __ATOMIC_RELAXED); }
 static inline unsigned atomicAdd(unsigned* a, unsigned v) { return __atomic_fetch_add(a, v, __ATOMIC_RELAXED); }
 static inline unsigned long long atomicAdd(unsigned long long* a, unsigned long long v) { return __atomic_fetch_add(a, v, __ATOMIC_RELAXED); }
@@ -170,16 +168,6 @@ static inline unsigned atomicSub(unsigned* a, unsigned v) { return __atomic_fetc
 static inline unsigned atomicExch(unsigned* a, unsigned v) { return __atomic_exchange_n(a, v, __ATOMIC_SEQ_CST); }
 static inline unsigned atomicOr(unsigned* a, unsigned v) { return __atomic_fetch_or(a, v, __ATOMIC_RELAXED); }
 static inline int atomicExch(int* a, int v) { return __atomic_exchange_n(a, v, __ATOMIC_SEQ_CST); }
-template <class T> static inline T sj_amax(T* a, T v) { T o = __atomic_load_n(a, __ATOMIC_RELAXED); while (o < v && !__atomic_compare_exchange_n(a, &o, v, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {} return o; }
-template <class T> static inline T sj_amin(T* a, T v) { T o = __atomic_load_n(a, __ATOMIC_RELAXED); while (o > v && !__atomic_compare_exchange_n(a, &o, v, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {} return o; }
-static inline int atomicMax(int* a, int v) { return sj_amax(a, v); }
-static inline unsigned atomicMax(unsigned* a, unsigned v) { return sj_amax(a, v); }
-static inline long long atomicMax(long long* a, long long v) { return sj_amax(a, v); }
-static inline unsigned long long atomicMax(unsigned long long* a, unsigned long long v) { return sj_amax(a, v); }
-static inline int atomicMin(int* a, int v) { return sj_amin(a, v); }
-static inline unsigned atomicMin(unsigned* a, unsigned v) { return sj_amin(a, v); }
-static inline long long atomicMin(long long* a, long long v) { return sj_amin(a, v); }
-static inline unsigned long long atomicMin(unsigned long long* a, unsigned long long v) { return sj_amin(a, v); }
 """
 
 # kernel.BRK with portable constraints ("+g": any register or memory the compiler picks; the cut is still opaque)
@@ -373,7 +361,6 @@ def shim():
                 shutil.rmtree(tmp, ignore_errors=True)
         lib = ctypes.CDLL(so)
         lib.tallymap_host_register.argtypes = [ctypes.c_int64, ctypes.c_void_p]
-        lib.tallymap_host_threads.restype = ctypes.c_int
         jax.ffi.register_ffi_target(TARGET, jax.ffi.pycapsule(lib.TallymapHostLaunch), platform="cpu")
         _SHIM.append(lib)
         return lib
