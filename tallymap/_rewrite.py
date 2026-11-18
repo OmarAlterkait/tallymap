@@ -3,7 +3,7 @@
   (jaxpr structure -- while / cond / scan / call-like params -- is read through tallymap/_jaxpr.py)
   check_tallies(cj, kinds)                 tallies are write-only and used LINEARLY (virtual == dense meaning)
   retrace(cj, cap=, rev=)                  re-trace an item jaxpr: cap top-level while loops at max_steps (adds a
-                                           `truncated` output), or (rev=True) replace every while loop by a
+                                           `truncated` output), or (rev=RevOpts) replace every while loop by a
                                            reverse-differentiable replay loop (_reverse.checkpointed_while)
 """
 import jax.numpy as jnp
@@ -250,9 +250,10 @@ _CUSTOM = ("custom_jvp_call", "custom_vjp_call")
 
 def retrace(cj, *, cap=None, rev=False, n_tally=0, tables=None, report=None, spawn=None):
     """-> python function f(*invars) evaluating cj with (cap) every top-level while loop capped at `cap`
-    iterations (f returns its outputs + [truncated:bool]), or (rev: True or _reverse.RevOpts) every while loop replaced
-    by a reverse-differentiable loop (_reverse.checkpointed_while).  The first n_tally invars are tallies (rev: their
-    carries get a pass-through cotangent instead of a dense one).
+    iterations (f returns its outputs + [truncated:bool]), or (rev: a _reverse.RevOpts) every while loop replaced
+    by a reverse-differentiable loop (_reverse.checkpointed_while, through the RevOpts hooks: this module never
+    imports _reverse).  The first n_tally invars are tallies (rev: their carries get a pass-through cotangent instead
+    of a dense one).
     spawn: f(token, when, *child) -> token' replaces every spawn (the tree adjoint, _reverse_spawn.py).  With the hook
     the spawn token may be a python TUPLE (e.g. (token, count)): equations it flows into are interpreted (never bound),
     and lax control flow carries it as a pytree.  Only for rev=False (the hooked program is re-traced to a flat jaxpr).
@@ -310,8 +311,7 @@ def _interp(jaxpr, consts, args, flags, ctx, cap, rev, top, tags=None):
             itags = [None if isinstance(v, Literal) else tg.get(v) for v in eqn.invars]
             tagged = bool(ctx.get("tread")) and any(t is not None for t in itags)
             if tagged and name in SELECT and itags[0] is not None and all(t is None for t in itags[1:]):
-                from ._reverse import tread
-                outs, tok = tread(eqn, ctx["toks"][itags[0]], ins)
+                outs, tok = rev.tread(eqn, ctx["toks"][itags[0]], ins)
                 _set_tok(ctx, itags[0], tok)
             elif tagged and name == "while":
                 outs, oflags = _while(eqn, ins, fin, ctx, cap, rev, top, itags)
@@ -470,23 +470,18 @@ def _while(eqn, ins, fin, ctx, cap, rev, top, itags=None):
         return list(out), tflags
     if not rev:
         return lax.while_loop(lambda c: cfn(cc, c), lambda c: bfn(bc, c), list(init)), tflags
-    from ._reverse import checkpointed_while, checkpointed_while_single
-    ropt = None if rev is True else rev
-    if top and getattr(ropt, "single", False):      # T3: the (fold_post) item's one top-level loop
-        checkpointed_while = checkpointed_while_single
+    loop = rev.loop(top)              # checkpointed_while, or (T3: the fold_post item's top-level loop) the single one
     cfn = _notread(ctx, cfn)
     tids = _tids(ctx, btags)
     bfl = list(fin[nc:nc + nb])
     live = _live_carries(w, nc, nb, len(init))
-    from ._reverse import T3_MIN_EQNS, _n_eqns
-    big = _n_eqns(w.body.jaxpr) >= T3_MIN_EQNS            # (auto_checkpoints)
+    big = rev.big(w.body.jaxpr)
     if not tids:
-        return checkpointed_while(cfn, bfn, list(cc), list(bc), list(init), tflags, ropt, bfl, live=live,
-                                  big=big), tflags
+        return loop(cfn, bfn, list(cc), list(bc), list(init), tflags, rev, bfl, live=live, big=big), tflags
     n = len(init)
-    out = checkpointed_while(lambda cc_, c2: cfn(cc_, c2[:n]), _with_toks(ctx, tids, bfn, n), list(cc), list(bc),
-                    list(init) + [ctx["toks"][t] for t in tids], list(tflags) + ["w"] * len(tids),
-                    ropt, bfl, live=live + [False] * len(tids), big=big)
+    out = loop(lambda cc_, c2: cfn(cc_, c2[:n]), _with_toks(ctx, tids, bfn, n), list(cc), list(bc),
+               list(init) + [ctx["toks"][t] for t in tids], list(tflags) + ["w"] * len(tids),
+               rev, bfl, live=live + [False] * len(tids), big=big)
     for t, v in zip(tids, out[n:]):
         _set_tok(ctx, t, v)
     return list(out[:n]), tflags

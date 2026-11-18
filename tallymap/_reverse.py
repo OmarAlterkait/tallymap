@@ -62,6 +62,19 @@ class RevOpts:
                                # by vjp_prog only for a program it folded (fold_post)
     probe: tuple = None        # T3: (probe carry, truncation carry) of the folded loop (fold_post)
 
+    # the re-tracer's hooks into reverse mode (_rewrite.retrace(rev=this)): _rewrite never imports this module
+    def loop(self, top):
+        """the reverse-differentiable loop builder for a while loop (top: the item's top-level loop)."""
+        return checkpointed_while_single if top and self.single else checkpointed_while
+
+    def big(self, body):
+        """does a loop with this body jaxpr have a step of >= T3_MIN_EQNS equations (auto_checkpoints)?"""
+        return _n_eqns(body) >= T3_MIN_EQNS
+
+    def tread(self, eqn, tok, ins):
+        """a sparse table read (see tread)."""
+        return tread(eqn, tok, ins)
+
 
 def rev_opts(opts=None):
     """RevOpts from the tallymap.vmap option rev_checkpoints (an int >= 1, or 'auto' / None)."""
