@@ -229,36 +229,6 @@ def b_rsqrt(em, a, ts, t, p, vals):
     return f"rsqrt({a[0]})"
 
 
-def b_erf(em, a, ts, t, p, vals):
-    if t == "float":
-        return f"erff({a[0]})"
-    return f"erf({a[0]})"
-
-
-def b_erfinv(em, a, ts, t, p, vals):
-    if t == "float":
-        return f"erfinvf({a[0]})"
-    return f"erfinv({a[0]})"
-
-
-def b_asin(em, a, ts, t, p, vals):
-    return f"{'asinf' if t == 'float' else 'asin'}({a[0]})"
-
-
-def b_atan(em, a, ts, t, p, vals):
-    return f"{'atanf' if t == 'float' else 'atan'}({a[0]})"
-
-
-def b_exp2(em, a, ts, t, p, vals):
-    return f"{'exp2f' if t == 'float' else 'exp2'}({a[0]})"
-
-
-def b_tanh(em, a, ts, t, p, vals):
-    if t == "float":
-        return f"tanhf({a[0]})"
-    return f"tanh({a[0]})"
-
-
 def b_and(em, a, ts, t, p, vals):
     return f"({a[0]} && {a[1]})" if t == "bool" else f"(({t})(({a[0]}) & ({a[1]})))"
 
@@ -279,10 +249,6 @@ def _cmp(op):
     def b(em, a, ts, t, p, vals):
         return f"(({a[0]}) {op} ({a[1]}))"
     return b
-
-
-def b_log2(em, a, ts, t, p, vals):
-    return f"{'log2f' if t == 'float' else 'log2'}({a[0]})"
 
 
 def b_mulhi(em, a, ts, t, p, vals):
@@ -348,10 +314,6 @@ def b_select_n(em, a, ts, t, p, vals):
     for i in range(len(cases) - 2, -1, -1):
         e = f"(({w}) == {i} ? ({cases[i]}) : {e})"
     return e
-
-
-def b_nextafter(em, a, ts, t, p, vals):
-    return f"{'nextafterf' if t == 'float' else 'nextafter'}({a[0]}, {a[1]})"
 
 
 def b_pow(em, a, ts, t, p, vals):
@@ -423,16 +385,16 @@ EW = {
     "sub": b_sub, "mul": b_mul, "div": b_div, "rem": b_rem,
     "max": b_max, "min": b_min, "neg": b_neg, "abs": b_abs, "sign": b_sign,
     "floor": _f1("floorf"), "ceil": _f1("ceilf"), "round": b_round, "is_finite": b_isfinite,
-    "exp": _f1("expf"), "exp2": b_exp2, "log": _f1("logf"), "log1p": _f1("log1pf"),
+    "exp": _f1("expf"), "exp2": _f1("exp2f"), "log": _f1("logf"), "log1p": _f1("log1pf"),
     "expm1": _f1("expm1f"), "sqrt": b_sqrt, "rsqrt": b_rsqrt, "cbrt": _f1("cbrtf"),
-    "sin": _f1("sinf"), "cos": _f1("cosf"), "tan": _f1("tanf"), "asin": b_asin,
-    "acos": _f1("acosf"), "atan": b_atan, "sinh": _f1("sinhf"), "cosh": _f1("coshf"),
-    "tanh": b_tanh, "asinh": _f1("asinhf"), "acosh": _f1("acoshf"), "atanh": _f1("atanhf"),
-    "atan2": _f2("atan2f"), "logistic": b_logistic, "pow": b_pow, "nextafter": b_nextafter,
-    "erf": b_erf, "erfc": _f1("erfcf"), "erf_inv": b_erfinv, "lgamma": _f1("lgammaf"),
+    "sin": _f1("sinf"), "cos": _f1("cosf"), "tan": _f1("tanf"), "asin": _f1("asinf"),
+    "acos": _f1("acosf"), "atan": _f1("atanf"), "sinh": _f1("sinhf"), "cosh": _f1("coshf"),
+    "tanh": _f1("tanhf"), "asinh": _f1("asinhf"), "acosh": _f1("acoshf"), "atanh": _f1("atanhf"),
+    "atan2": _f2("atan2f"), "logistic": b_logistic, "pow": b_pow, "nextafter": _f2("nextafterf"),
+    "erf": _f1("erff"), "erfc": _f1("erfcf"), "erf_inv": _f1("erfinvf"), "lgamma": _f1("lgammaf"),
     "and": b_and, "or": b_or, "xor": b_xor, "not": b_not,
     "eq": _cmp("=="), "ne": _cmp("!="), "lt": _cmp("<"), "le": _cmp("<="), "gt": _cmp(">"),
-    "ge": _cmp(">="), "log2": b_log2,
+    "ge": _cmp(">="), "log2": _f1("log2f"),
     "real": b_real, "imag": b_imag, "complex": b_complex, "conj": b_conj, "mulhi": b_mulhi, "shift_left": b_shl,
     "shift_right_logical": b_shrl,
     "shift_right_arithmetic": b_shra, "population_count": b_popc, "clz": b_clz,
