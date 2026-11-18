@@ -547,21 +547,18 @@ class Emitter:
     def unfreeze(self):
         self._frozen.pop()
 
-    def can_mutate(self, var, val):
-        """May the array `val` (bound to jaxpr var `var` of the CURRENT scope) be updated in place?  Only if it is
-        a mutable per-item Local (not a loop const / function parameter), `var` has no
-        remaining use in this scope, and no LIVE value of any active scope reads its storage (checked on the C
-        text every live value would read: Views and Lazy expressions included)."""
-        if not self.inplace or not self._scopes or not isinstance(val, Local) or val.shape == () or \
-                isinstance(var, Literal):
-            return False
-        env, rem = self._scopes[-1]
-        if rem.get(var, 0) != 0:
+    def can_mutate(self, val):
+        """May the array `val` be updated in place?  Only if it is a mutable per-item Local (not a loop const /
+        function parameter) and no LIVE value of any active scope reads its storage (checked on the C text every
+        live value would read: Views and Lazy expressions included).  The equation's own reads of it are the
+        caller's (op_table._may_overwrite)."""
+        if not self.inplace or not self._scopes or not isinstance(val, Local) or val.shape == ():
             return False
         import re
         pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(val.name) + r"(?![A-Za-z0-9_])")
         if any(t == "*" or pat.search(t) for f in self._frozen for t in f):
             return False
+        env = self._scopes[-1][0]          # the current scope's bindings (a captured reader is rebound there)
         readers = []                       # live lazy values of THIS scope whose elements read val's storage
         for depth, (env_, rem_) in enumerate(self._scopes):
             for v, x in env_.items():

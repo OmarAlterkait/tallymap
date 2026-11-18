@@ -1235,7 +1235,7 @@ def _may_overwrite(em, X, paths):
             return False
         if sum(_refs(em, r, X.name) for r in reads) > own:
             return False
-    return em.can_mutate(None, X)
+    return em.can_mutate(X)
 
 
 def _carry_vars(em, inits, pass_through, dest=None):
