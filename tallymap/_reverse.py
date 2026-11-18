@@ -244,6 +244,75 @@ def _active(bfn, bc, init, pb, pc, cand, w_idx):
         act |= nz
 
 
+# ------------------------------------------------------------------------------------------- the two loop adjoints'
+# shared parts (checkpointed_while, checkpointed_while_single): plain python around the same JAX calls, so each traces
+# what it wrote inline.  What they do NOT share stays in each: the forward store, the sweep driver, the step VJP's form
+# (T3: has_aux, the next state) and where the tally cotangents are built (T3: inside its micro-step).
+def _carry_sets(kinds, init, live):
+    """-> (s_idx state carries, f_idx float state carries, o_idx float output tallies, w_idx table tokens, l_idx the
+    stored state: the state carries the step or the predicate reads)."""
+    kinds = ["o" if k is True else (k or None) for k in kinds]
+    n = len(init)
+    s_idx = [j for j in range(n) if kinds[j] is None]
+    f_idx = [j for j in s_idx if isfloat(_dt(init[j]))]
+    o_idx = [j for j in range(n) if kinds[j] == "o" and isfloat(_dt(init[j]))]
+    w_idx = [j for j in range(n) if kinds[j] == "w"]
+    l_idx = [j for j in s_idx if live is None or live[j]]
+    return s_idx, f_idx, o_idx, w_idx, l_idx
+
+
+def _fwd_operands(cc, bc, init, btal):
+    """a custom_vjp forward's operands (symbolic_zeros=True) -> (pb: perturbed non-tally body consts, pc: perturbed
+    carries, cc, bc, init as values)."""
+    pb = tuple(bool(x.perturbed) and not t for x, t in zip(bc, btal))
+    pc = tuple(bool(x.perturbed) for x in init)
+    return pb, pc, [x.value for x in cc], [x.value for x in bc], [x.value for x in init]
+
+
+def _inst(c, x):
+    """cotangent c, or a zero like x when it is a symbolic zero / None."""
+    return jnp.zeros(jnp.shape(x), _dt(x)) if c is None or isinstance(c, SymbolicZero) else c
+
+
+def _restore(init, l_idx, vals):
+    """the carry: the stored state `vals` in the slots l_idx, the initial carry elsewhere."""
+    c = list(init)
+    for j, v in zip(l_idx, vals):
+        c[j] = v
+    return c
+
+
+def _step_args(c, bc, act, o_idx, w_idx, fb, dv, bv, ov, wv):
+    """(carry, body consts) of one step at c with the differentiated slots replaced by dv, bv, ov, wv."""
+    cf, b = list(c), list(bc)
+    for j, v in zip(act, dv):
+        cf[j] = v
+    for j, v in zip(o_idx, ov):
+        cf[j] = v
+    for j, v in zip(w_idx, wv):
+        cf[j] = v
+    for i, v in zip(fb, bv):
+        b[i] = v
+    return cf, b
+
+
+def _grads(cc, bc, init, pc, fb, act, o_idx, w_idx, ctb, ctd, ct_o, ctw):
+    """the loop's cotangents (of cc, bc, init) from the sweep's accumulators."""
+    g_bc = [None] * len(bc)
+    for i, v in zip(fb, ctb):
+        g_bc[i] = v
+    g_init = [None] * len(init)
+    for j, v in zip(act, ctd):
+        if pc[j]:
+            g_init[j] = v
+    for j, v in zip(o_idx, ct_o):
+        if pc[j]:
+            g_init[j] = v
+    for j, v in zip(w_idx, ctw):
+        g_init[j] = v
+    return [None] * len(cc), g_bc, g_init
+
+
 def _shifted(K):
     """the number of steps the adjoint replays and sweeps for a loop the forward ran K steps: K.  (tests/reverse.py's
     REPLAY GATE patches it to K - 1 as its negative control: the adjoint then differentiates a trajectory the forward
@@ -262,25 +331,17 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None, li
     equations (auto_checkpoints)."""
     o = rev_opts(opts)
     btal = list(bflags) if bflags is not None else [False] * len(bc)
-    kinds = ["o" if k is True else (k or None) for k in kinds]
-    n = len(init)
-    s_idx = [j for j in range(n) if kinds[j] is None]
-    f_idx = [j for j in s_idx if isfloat(_dt(init[j]))]
-    o_idx = [j for j in range(n) if kinds[j] == "o" and isfloat(_dt(init[j]))]
-    w_idx = [j for j in range(n) if kinds[j] == "w"]
+    s_idx, f_idx, o_idx, w_idx, l_idx = _carry_sets(kinds, init, live)
 
     @jax.custom_vjp
     def loop(cc, bc, init):
         return lax.while_loop(lambda c: cfn(cc, c), lambda c: bfn(bc, c), init)
 
-    l_idx = [j for j in s_idx if live is None or live[j]]       # the stored state: the carries the step reads
     sb = state_bytes([init[j] for j in l_idx])
     C = int(o.checkpoints) if o.checkpoints else auto_checkpoints(sb, big)
 
     def fwd(cc, bc, init):
-        pb = tuple(bool(x.perturbed) and not t for x, t in zip(bc, btal))
-        pc = tuple(bool(x.perturbed) for x in init)
-        cc, bc, init = [x.value for x in cc], [x.value for x in bc], [x.value for x in init]
+        pb, pc, cc, bc, init = _fwd_operands(cc, bc, init, btal)
         # the forward counts the steps and stores the states before steps 0..C-1 in the HEAD (slot C: a scratch
         # sink, so the store is unconditional and in place): an item of K <= C steps then needs no replay at all
         def b_(s):
@@ -300,27 +361,16 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None, li
         pb, pc, act = st.v
         act = list(act)
         fb = [i for i, x in enumerate(bc) if pb[i] and isfloat(_dt(x))]
-
-        def inst(c, x):
-            return jnp.zeros(jnp.shape(x), _dt(x)) if c is None or isinstance(c, SymbolicZero) else c
         ct = list(ct)
-        ct_o = [inst(ct[j], init[j]) for j in o_idx]
-        acc0 = ([inst(ct[j], init[j]) for j in act], [inst(ct[j], init[j]) for j in w_idx],
+        ct_o = [_inst(ct[j], init[j]) for j in o_idx]
+        acc0 = ([_inst(ct[j], init[j]) for j in act], [_inst(ct[j], init[j]) for j in w_idx],
                 [jnp.zeros_like(bc[i]) for i in fb])
 
         def vjp_step(c, acc):
             ctd, ctw, ctb = acc
 
             def f(dv, bv, ov, wv):
-                cf, b = list(c), list(bc)
-                for j, v in zip(act, dv):
-                    cf[j] = v
-                for j, v in zip(o_idx, ov):
-                    cf[j] = v
-                for j, v in zip(w_idx, wv):
-                    cf[j] = v
-                for i, v in zip(fb, bv):
-                    b[i] = v
+                cf, b = _step_args(c, bc, act, o_idx, w_idx, fb, dv, bv, ov, wv)
                 out = bfn(b, cf)
                 return [out[j] for j in act], [out[j] for j in o_idx], [out[j] for j in w_idx]
             _, vjp = jax.vjp(f, [c[j] for j in act], [bc[i] for i in fb], [c[j] for j in o_idx],
@@ -338,10 +388,7 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None, li
             return [c[j] for j in l_idx]
 
         def restore(vals):
-            c = list(init)
-            for j, v in zip(l_idx, vals):
-                c[j] = v
-            return c
+            return _restore(init, l_idx, vals)
         # Checkpoint stride.  C, not ceil(K/C): a SEGMENT TAPE of C slots is allocated once per segment, and
         # allocating it costs C stores whatever the segment's length is, so the sweep's local-memory traffic is
         # ns * C states, not K.  ceil(K/C) makes ns = K for K <= C (one state per segment, C-1 slots wasted):
@@ -390,21 +437,8 @@ def checkpointed_while(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=None, li
                     return vjp_step(restore([_unphys(v, l) for v, l in zip(raw, likes)]), acc)
                 return lax.fori_loop(0, LL, rv, acc)
             return lax.fori_loop(0, nsub, sub, acc)
-        acc = lax.fori_loop(0, ns, seg, acc0)
-        ctd, ctw, ctb = acc
-        g_bc = [None] * len(bc)
-        for i, v in zip(fb, ctb):
-            g_bc[i] = v
-        g_init = [None] * n
-        for j, v in zip(act, ctd):
-            if pc[j]:
-                g_init[j] = v
-        for j, v in zip(o_idx, ct_o):
-            if pc[j]:
-                g_init[j] = v
-        for j, v in zip(w_idx, ctw):
-            g_init[j] = v
-        return [None] * len(cc), g_bc, g_init
+        ctd, ctw, ctb = lax.fori_loop(0, ns, seg, acc0)
+        return _grads(cc, bc, init, pc, fb, act, o_idx, w_idx, ctb, ctd, ct_o, ctw)
 
     loop.defvjp(fwd, bwd, symbolic_zeros=True)
     return loop(list(cc), list(bc), list(init))
@@ -580,13 +614,7 @@ def checkpointed_while_single(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=N
     whose primal outputs nothing reads."""
     o = rev_opts(opts)
     btal = list(bflags) if bflags is not None else [False] * len(bc)
-    kinds = ["o" if k is True else (k or None) for k in kinds]
-    n = len(init)
-    s_idx = [j for j in range(n) if kinds[j] is None]
-    f_idx = [j for j in s_idx if isfloat(_dt(init[j]))]
-    o_idx = [j for j in range(n) if kinds[j] == "o" and isfloat(_dt(init[j]))]
-    w_idx = [j for j in range(n) if kinds[j] == "w"]
-    l_idx = [j for j in s_idx if live is None or live[j]]
+    s_idx, f_idx, o_idx, w_idx, l_idx = _carry_sets(kinds, init, live)
     pidx, tr_c = o.probe
     if tr_c >= 0 and tr_c not in l_idx:
         raise ValueError("tallymap: the single-loop adjoint cannot see the truncation carry (internal error)")
@@ -599,9 +627,7 @@ def checkpointed_while_single(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=N
         return lax.while_loop(lambda c: cfn(cc, c), lambda c: bfn(bc, c), init)
 
     def fwd(cc, bc, init):
-        pb = tuple(bool(x.perturbed) and not t for x, t in zip(bc, btal))
-        pc = tuple(bool(x.perturbed) for x in init)
-        cc, bc, init = [x.value for x in cc], [x.value for x in bc], [x.value for x in init]
+        pb, pc, cc, bc, init = _fwd_operands(cc, bc, init, btal)
         act = tuple(j for j in _active(bfn, bc, init, pb, pc, f_idx, w_idx) if j != pidx)
         record_reverse("loop", dict(checkpoints=C, auto=not o.checkpoints, n_state=len(s_idx), n_live=len(l_idx),
                                     n_float=len(f_idx), n_active=len(act), n_tok=len(w_idx), state_bytes=sb,
@@ -613,38 +639,24 @@ def checkpointed_while_single(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=N
         pb, pc, act = st.v
         act = list(act)
         fb = [i for i, x in enumerate(bc) if pb[i] and isfloat(_dt(x))]
-
-        def inst(c, x):
-            return jnp.zeros(jnp.shape(x), _dt(x)) if c is None or isinstance(c, SymbolicZero) else c
         ct = list(ct)
         # the tally cotangents are built INSIDE the micro-step: a value computed before the machine loop and read in
         # it is per-thread state of the step schedule, so a symbolic-zero tally cotangent instantiated here would be a
         # tally-sized local array per lane (lumen SK: (88768,), "too large")
-        ct_o_of = lambda: [inst(ct[j], init[j]) for j in o_idx]
-        acc0 = ([inst(ct[j], init[j]) for j in act], [inst(ct[j], init[j]) for j in w_idx],
+        ct_o_of = lambda: [_inst(ct[j], init[j]) for j in o_idx]
+        acc0 = ([_inst(ct[j], init[j]) for j in act], [_inst(ct[j], init[j]) for j in w_idx],
                 [jnp.zeros_like(bc[i]) for i in fb])
         likes = [init[j] for j in l_idx]
 
         def restore(vals):
-            c = list(init)
-            for j, v in zip(l_idx, vals):
-                c[j] = v
-            return c
+            return _restore(init, l_idx, vals)
 
         def lin_step(x):
             """the linearized step at state x: (next state, vjp of the differentiated outputs)"""
             c = restore(x)
 
             def f(dv, bv, ov, wv):
-                cf, b = list(c), list(bc)
-                for j, v in zip(act, dv):
-                    cf[j] = v
-                for j, v in zip(o_idx, ov):
-                    cf[j] = v
-                for j, v in zip(w_idx, wv):
-                    cf[j] = v
-                for i, v in zip(fb, bv):
-                    b[i] = v
+                cf, b = _step_args(c, bc, act, o_idx, w_idx, fb, dv, bv, ov, wv)
                 out = bfn(b, cf)
                 return ([out[j] for j in act], [out[j] for j in o_idx], [out[j] for j in w_idx]), \
                     [out[j] for j in l_idx]
@@ -720,20 +732,9 @@ def checkpointed_while_single(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=N
                _buf_new(2 * C + 1, likes), acc0, jnp.zeros((1,), jnp.float32))
         out = lax.while_loop(lambda st_: st_[0] != DONE, body, st0)
         ctd, ctw, ctb = out[-2]
-        g_bc = [None] * len(bc)
-        for i, v in zip(fb, ctb):
-            g_bc[i] = v
-        g_init = [None] * n
-        for j, v in zip(act, ctd):
-            if pc[j]:
-                g_init[j] = v
-        for j, v in zip(o_idx, ct_o_of()):
-            if pc[j]:
-                g_init[j] = v
-        for j, v in zip(w_idx, ctw):
-            g_init[j] = v
+        g_cc, g_bc, g_init = _grads(cc, bc, init, pc, fb, act, o_idx, w_idx, ctb, ctd, ct_o_of(), ctw)
         g_init[pidx] = out[-1]          # the probe: what COUNT saw (fold_post)
-        return [None] * len(cc), g_bc, g_init
+        return g_cc, g_bc, g_init
 
     loop.defvjp(fwd, bwd, symbolic_zeros=True)
     return loop(list(cc), list(bc), list(init))
