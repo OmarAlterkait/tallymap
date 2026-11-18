@@ -21,13 +21,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ..._api import DENSE_WORDS, UnsupportedError
+from ..._api import UnsupportedError
 from ..._compat import key_impl
 from ..._jaxpr import digest
 from . import codegen
 from . import compile as C
 from .codegen import CodegenError, is_key_dtype
-from .kernel import BLOCK, QCTL_STRIDE, build_source
+from .kernel import BLOCK, build_source
 
 _KERNELS = {}
 
@@ -140,29 +140,7 @@ def run(p, pi, bc, target="cuda", cuda_math="approx", schedule="item", ndev=1, *
             _, fn, k, shape, dt = c
             consts.append(jnp.asarray(L.cjs[fn].consts[k]).astype(dt).reshape(shape))
     args = [_phys_in(jnp.asarray(x)) for x in pi] + [_phys_in(jnp.asarray(x)) for x in bc] + consts
-    rs = []
-    outs = [k for k, s in enumerate(p.tallies) if s.kind == "sum"]
-    for k in outs:
-        s = p.tallies[k]
-        rs.append(jax.ShapeDtypeStruct(tuple(s.lead) + (s.S,), s.dtype))
-    for k in outs:
-        if k in L.r_scr:
-            s = p.tallies[k]
-            n = int(np.prod(s.lead, dtype=np.int64)) * s.S
-            # u32 words: fixed point: per bin a u64 low word, an i32 carry word and a u32 flag; exact: per bin
-            # DENSE_WORDS int64 words, then one flag bit per bin (kernel.DENSE)
-            w = 2 * DENSE_WORDS * n + (n + 31) // 32 if s.exact else 4 * n
-            rs.append(jax.ShapeDtypeStruct((w,), jnp.uint32))
-    rs.append(jax.ShapeDtypeStruct((2,), jnp.uint32))          # claim counter (u64)
-    rs.append(jax.ShapeDtypeStruct((5,), jnp.int32))           # stats
-    if p.spawn is not None:
-        Q = int(p.spawn.capacity)
-        for sh, dt, _ in L.pav:
-            rs.append(jax.ShapeDtypeStruct((Q * max(1, int(np.prod(sh, dtype=np.int64))),), dt))
-        rs.append(jax.ShapeDtypeStruct((Q,), jnp.uint32))
-        rs.append(jax.ShapeDtypeStruct((8 * QCTL_STRIDE,), jnp.uint32))   # control words, one line each
-    for sh, dt, _ in L.yav:
-        rs.append(jax.ShapeDtypeStruct((N,) + tuple(sh), dt))
+    rs = [jax.ShapeDtypeStruct(((N,) if per_item else ()) + sh, dt) for sh, dt, per_item in L.res]   # (build_source)
     if target == "cpu":
         from . import host
         call = jax.ffi.ffi_call(host.TARGET, rs, has_side_effect=False)
@@ -173,15 +151,12 @@ def run(p, pi, bc, target="cuda", cuda_math="approx", schedule="item", ndev=1, *
         call = jax.ffi.ffi_call(C.TARGET, rs, has_side_effect=False)
         res = call(*args, kernel_id=np.int64(kern.kid), block=np.int32(kern.block), n_zero=np.int32(L.n_zero),
                    flags=np.int32(L.flags), grid=np.int32(0), n_items=np.int64(N))
-    nO = len(outs)
-    nscr = len(L.r_scr)
-    stats = res[nO + nscr + 1]
-    ys = list(res[len(res) - len(L.yav):]) if L.yav else []
+    at = lambda r: res[r - L.n_in]                     # buffer r of the kernel (Layout.r_*) among the results
+    ys = [at(r) for r in L.r_ys]
     yav = [v.aval for v in p.cj.jaxpr.outvars[p.nT:]]
     ys = [jax.random.wrap_key_data(y, impl=key_impl(a.dtype).name) if is_key_dtype(a.dtype) else y
           for y, a in zip(ys, yav)]
     ring = []
     if p.rec is not None:               # the queue leaves (_reverse_spawn.rec_primal)
-        r0 = nO + nscr + 2
-        ring = [res[r0 + i].reshape((int(p.spawn.capacity),) + tuple(sh)) for i, (sh, _, _) in enumerate(L.pav)]
-    return list(res[:nO]) + [stats] + ys + ring
+        ring = [at(r).reshape((int(p.spawn.capacity),) + tuple(sh)) for r, (sh, _, _) in zip(L.r_q, L.pav)]
+    return [at(L.r_out[k]) for k in p.out_tallies] + [at(L.r_stats)] + ys + ring

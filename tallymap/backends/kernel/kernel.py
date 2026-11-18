@@ -11,7 +11,7 @@ N (the item count) is a kernel ARGUMENT: one cubin serves every N.
 """
 import numpy as np
 
-from ..._api import DENSE_WORDS
+from ..._api import DENSE_WORDS, STATS
 from .codegen import CodegenError, Emitter, Local, Scalar, Table, VTally, _size, ctype, elem, fill_decl, unravel
 from .op_table import phys
 
@@ -313,7 +313,7 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
     def tptr(i, dt):
         return f"((const {'u8' if np.dtype(dt) == np.bool_ else ctype(dt)}*)P.p[{i}])"
 
-    outs = [k for k, s in enumerate(p.tallies) if s.kind == "sum"]
+    outs = p.out_tallies
     L.n_out = len(outs)
     base_in, base_par, base_arg = [], ["const SjParams& P", "const i64 item"], ["P", "item"]
     base_par += [f"{_acc_t(p.tallies[k])}* const sj_acc{k}" for k in outs]
@@ -460,32 +460,31 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
     base_const = nP + nB
     nin = base_const + len(L.consts)
     L.n_in = nin
-    r = nin
-    L.r_out = {}
-    for k in outs:
-        L.r_out[k] = r
-        r += 1
-    L.r_scr = {}
-    for k in outs:
-        if _scratch(p.tallies[k]) is not None:
-            L.r_scr[k] = r
-            r += 1
-    L.r_ctr, L.r_stats = r, r + 1
-    r += 2
+    # the result buffers, written once: L.res[i] = (shape, dtype, per_item) of buffer nin + i (run() builds the FFI
+    # results from it, the item axis prepended where per_item), and each L.r_* is a buffer's index in P.p[]
+    L.res = []
+
+    def result(shape, dt, per_item=False):
+        L.res.append((tuple(shape), np.dtype(dt), per_item))
+        return nin + len(L.res) - 1
+    L.r_out = {k: result(tuple(p.tallies[k].lead) + (p.tallies[k].S,), p.tallies[k].dtype) for k in outs}
+    L.r_scr = {k: result((_scratch_words(p.tallies[k]),), np.uint32) for k in outs if _scratch(p.tallies[k]) is not None}
+    L.r_ctr = result((2,), np.uint32)                       # the claim counter (u64)
+    L.r_stats = result((len(STATS),), np.int32)
     if spawn is not None:
-        L.r_q = list(range(r, r + nP))
-        r += nP
-        L.r_seq, L.r_qctl = r, r + 1
-        r += 2
-    L.n_zero = r - nin
-    L.r_ys = list(range(r, r + len(yav)))
-    r += len(yav)
-    L.n_buf = r
+        L.r_q = [result((int(spawn.capacity) * max(1, _size(sh)),), dt) for sh, dt, _ in pav]
+        L.r_seq = result((int(spawn.capacity),), np.uint32)
+        L.r_qctl = result((8 * QCTL_STRIDE,), np.uint32)   # the queue's control words, one line each
+    L.n_zero = len(L.res)                                   # (the shim zeroes these before the launch)
+    L.r_ys = [result(sh, dt, per_item=True) for sh, dt, _ in yav]
+    r = nin + len(L.res)
     if r > SJ_MAXP:
         raise CodegenError(f"too many buffers ({r} > {SJ_MAXP}: the kernel parameter struct would exceed the "
                            "driver's 32,764-byte limit)")
     L.pav, L.yav = pav, yav
 
+    # SJ_STATS[i] is slot i of _api.STATS: 0 spawned, 1 children_dropped, 2 children_truncated, 3 fixed_point_overflow,
+    # 4 dropped_emits
     src = [PRELUDE, f"struct SjParams {{ void* p[{r}]; }};",
            f"#define SJ_CONST(j) (P.p[{base_const} + (j)])", f"#define SJ_STATS ((i32*)P.p[{L.r_stats}])"]
     if spawn is not None:
@@ -822,6 +821,13 @@ _IRANGE = {"i8": ("-128.0", "128.0"), "u8": ("0.0", "256.0"), "i16": ("-32768.0"
 
 def _scratch(s):
     return np.int64 if s.fixed_point or s.exact else None
+
+
+def _scratch_words(s):
+    """u32 words of a sum's scratch buffer: exact: per bin DENSE_WORDS int64 words, then one flag bit per bin (DENSE);
+    fixed point: per bin a u64 low word, an i32 carry word and a u32 flag (WIDE)."""
+    n = int(np.prod(s.lead, dtype=np.int64)) * s.S
+    return 2 * DENSE_WORDS * n + (n + 31) // 32 if s.exact else 4 * n
 
 
 def _acc_t(s):

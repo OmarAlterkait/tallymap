@@ -880,8 +880,8 @@ def vjp_prog(p, pert_pi, pert_bc, opts=None):
     sh = int(r is not None)          # (the folded program's probe operand follows the per-item operands)
     nT, nP, nB = p.nT, p.nP, p.nB
     ya = p.y_avals()
-    tf = [i for i, s in enumerate(p.tallies) if s.kind == "sum" and isfloat(s.dtype)]
-    yf = [j for j, a in enumerate(ya) if isfloat(a.dtype)]
+    tf = [p.out_tallies[j] for j in p.float_outs]        # (tally indices of the float sums)
+    yf = p.float_ys
     ip = [i for i in range(nP) if pert_pi[i]]
     ib = [i for i in range(nB) if pert_bc[i]]
     av = p.in_avals()

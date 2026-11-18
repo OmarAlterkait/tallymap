@@ -102,6 +102,12 @@ class Result(NamedTuple):
                          # children_dropped / children_truncated
 
 
+# the stats output of every backend call (int32[len(STATS)]), slot by slot: ST[name] is its index.  The kernel
+# backend's C writes the same slots by number (SJ_STATS[i], backends/kernel/kernel.py).
+STATS = ("spawned", "children_dropped", "children_truncated", "fixed_point_overflow", "dropped_emits")
+ST = {n: i for i, n in enumerate(STATS)}
+
+
 class UnsupportedError(NotImplementedError):
     """A backend cannot run this program.  backend='auto' raises it too (the kernel backend never falls back to the
     xla backend: pass backend='xla' for that)."""
@@ -167,6 +173,22 @@ class ItemProgram:
     def in_avals(self):
         return [v.aval for v in self.cj.jaxpr.invars]
 
+    # the backend outputs of a program: [out_tallies (the sums)] + [stats int32[len(STATS)]] + [per-item results]
+    @property
+    def out_tallies(self):
+        """indices of the tallies a backend returns, in output order: the sums."""
+        return [k for k, s in enumerate(self.tallies) if s.kind == "sum"]
+
+    @property
+    def float_outs(self):
+        """positions among out_tallies of the float ones (the outputs that have tangents and cotangents)."""
+        return [j for j, k in enumerate(self.out_tallies) if isfloat(self.tallies[k].dtype)]
+
+    @property
+    def float_ys(self):
+        """indices of the float per-item results."""
+        return [j for j, a in enumerate(self.y_avals()) if isfloat(a.dtype)]
+
 
 def _sds(a):
     return jax.ShapeDtypeStruct(a.shape, a.dtype)
@@ -195,8 +217,7 @@ def jvp_prog(p, pert_pi, pert_bc):
     # discarded float tallies get (discarded) tangent tallies too: the jvp of an emit into them is an emit, and it
     # must land in a tally slot (derived programs -- lin / T -- discard their primal tallies)
     tf = [i for i, s in enumerate(p.tallies) if s.kind in ("sum", "discard") and isfloat(s.dtype)]
-    ya = p.y_avals()
-    yf = [j for j, a in enumerate(ya) if isfloat(a.dtype)]
+    yf = p.float_ys
     ip = [i for i in range(nP) if pert_pi[i]]
     ib = [i for i in range(nB) if pert_bc[i]]
 
@@ -248,12 +269,6 @@ def _poison_tally(t, bad):
 
 # ------------------------------------------------------------------------------------------- dispatch
 _WARNED = set()
-
-
-def _out_tallies(p):
-    """backend outputs: [these sum tallies] + [stats int32[5]: spawned, children_dropped, children_truncated,
-    fixed_point_overflow, dropped_emits] + [per-item results]."""
-    return [i for i, s in enumerate(p.tallies) if s.kind == "sum"]
 
 
 # ------------------------------------------------------------------------------------------- vmap
@@ -423,12 +438,12 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
         _diagnostics.record_program(prog)
         from ._primitive import bind_call, make_node       # (here: _primitive imports this module)
         flat = bind_call(*pi, *bc_all, node=make_node(prog, backend, opts, _call_site(decl)))
-        nt = len(_out_tallies(prog))
+        nt = len(prog.out_tallies)
         tvals, st, ys = flat[:nt], flat[nt], flat[nt + 1:]
         res_out = {n: tvals[i].reshape(shapes[n]) for i, n in enumerate(names)}
-        stats = {"fixed_point_overflow": st[3], "dropped_emits": st[4]}
+        stats = {n: st[ST[n]] for n in ("fixed_point_overflow", "dropped_emits")}
         if spawn is not None:
-            stats.update(spawned=st[0], children_dropped=st[1], children_truncated=st[2])
+            stats.update((n, st[ST[n]]) for n in ("spawned", "children_dropped", "children_truncated"))
         if max_steps is not None:
             trunc = ys[-1]
             ys = ys[:-1]
@@ -449,11 +464,11 @@ def _limits(stats, st, spawn, max_steps):
     for a child, or an item (or a spawned child) hit max_steps."""
     flags = []
     if spawn is not None:
-        flags.append(st[1] > 0)                            # a child that did not fit the Queue
+        flags.append(st[ST["children_dropped"]] > 0)       # a child that did not fit the Queue
     if max_steps is not None:
         flags.append(stats["n_truncated"] > 0)             # an item hit max_steps
         if spawn is not None:
-            flags.append(st[2] > 0)                        # a spawned child hit max_steps
+            flags.append(st[ST["children_truncated"]] > 0)  # a spawned child hit max_steps
     if not flags:
         return None
     bad = flags[0]

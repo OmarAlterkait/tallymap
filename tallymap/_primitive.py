@@ -48,7 +48,7 @@ from jax.interpreters import ad, mlir
 from jax.interpreters import partial_eval as _pe
 
 from . import _errors
-from ._api import _WARNED, ItemProgram, UnsupportedError, _mk, _sds, jvp_prog
+from ._api import _WARNED, ST, STATS, ItemProgram, UnsupportedError, _mk, _sds, jvp_prog
 from ._compat import NM, convert_constvars_jaxpr, drop_var, register_batcher, requires_devices
 from ._jaxpr import call_jaxpr, cond_branches, digest, host_callbacks, scan_parts, subjaxprs, while_parts
 from ._reverse import LEAN_C, vjp_prog
@@ -126,10 +126,6 @@ def _split(node, args):
     return list(args[:n]), list(args[n:])
 
 
-def _out_specs(p):
-    return [k for k, s in enumerate(p.tallies) if s.kind == "sum"]
-
-
 _aval = jax.typeof
 
 
@@ -147,8 +143,8 @@ def _abstract(*args, node):
     if p.nP and len(args[0].shape) == 0:
         raise TypeError("tallymap_call: per-item operands need a leading item axis")
     N = args[0].shape[0]
-    outs = [ShapedArray(tuple(p.tallies[k].lead) + (p.tallies[k].S,), p.tallies[k].dtype) for k in _out_specs(p)]
-    outs.append(ShapedArray((5,), jnp.int32))
+    outs = [ShapedArray(tuple(p.tallies[k].lead) + (p.tallies[k].S,), p.tallies[k].dtype) for k in p.out_tallies]
+    outs.append(ShapedArray((len(STATS),), jnp.int32))
     outs += [ShapedArray((N,) + tuple(a.shape), a.dtype) for a in p.y_avals()]
     if p.rec is not None:               # the queue ring (_reverse_spawn.rec_primal)
         outs += [ShapedArray((p.spawn.capacity,) + tuple(a.shape), a.dtype) for a in p.in_avals()[p.nT:p.nT + p.nP]]
@@ -259,7 +255,7 @@ def _global_ring(p, ring, stats, axes, n):
     """the record (queue leaves) of this device's items -> the call's: the devices' children packed in device order,
     parents renumbered (a child slot -> its global slot, a root -> -1 - its global index; n roots per device)"""
     d = lax.axis_index(axes)
-    cnt = lax.all_gather(stats[0], axes)
+    cnt = lax.all_gather(stats[ST["spawned"]], axes)
     off = jnp.cumsum(cnt) - cnt
     par = ring[p.rec + 1]
     ring = list(ring)
@@ -461,7 +457,7 @@ def _jvp(primals, tangents, *, node):
         prim_idx, tan_idx = _fused_layout(p)
         outs = [o[j] for j in prim_idx]
         touts = [o[j] for j in tan_idx]
-        return outs, _tangents_out(p, outs, touts[:_ntf(p)] + [None] + touts[_ntf(p):])
+        return outs, _tangents_out(p, outs, touts[:len(p.float_outs)] + [None] + touts[len(p.float_outs):])
     if p.spawn is not None and node.kind == "primal":      # (the tree adjoint's record: _ring_node)
         outs, ring = _bind_recorded(node, pi, bc)
         touts = bind_call(*pi, *dl, *bc, *db, *ring, node=_ring_node(node, pp, pb))
@@ -484,8 +480,8 @@ def _ring_node(node, pp, pb):
     [stats] + [queue leaves] of the recording primal (_reverse_spawn.rec_primal; _bind_recorded)"""
     r = rec_primal(node.prog)
     Q = r.spawn.capacity
-    ring = [jax.ShapeDtypeStruct((5,), jnp.int32)] + [jax.ShapeDtypeStruct((Q,) + tuple(a.shape), a.dtype)
-                                                      for a in r.in_avals()[r.nT:r.nT + r.nP]]
+    ring = [jax.ShapeDtypeStruct((len(STATS),), jnp.int32)] + [
+        jax.ShapeDtypeStruct((Q,) + tuple(a.shape), a.dtype) for a in r.in_avals()[r.nT:r.nT + r.nP]]
     return _tangent_node(node, pp, pb, ring)
 
 
@@ -493,22 +489,17 @@ def _bind_recorded(node, pi, bc):
     """-> (the primal outputs, the record) of a spawning call run as its recording primal"""
     N = pi[0].shape[0]
     o = bind_call(*pi, *[jnp.zeros((N,), jnp.int32)] * 4, *bc, node=node.derived(rec_primal(node.prog), "primal"))
-    nt, nY = len(_out_specs(node.prog)), node.prog.nY
+    nt, nY = len(node.prog.out_tallies), node.prog.nY
     return o[:nt + 1 + nY], [o[nt]] + o[nt + 1 + nY:]
 
 
 def _tangents_out(p, outs, touts):
     """map a tangent node's outputs ([float sum tallies'] + [stats] + [float results']) onto the primal outputs."""
-    ot = _out_specs(p)
-    nt = len(ot)
-    ntf = sum(1 for k in ot if isfloat(p.tallies[k].dtype))
-    dt_it, dy_it = iter(touts[:ntf]), iter(touts[ntf + 1:])
-    res = []
-    for j, k in enumerate(ot):
-        res.append(next(dt_it) if isfloat(p.tallies[k].dtype) else _zero(_aval(outs[j])))
+    nt, tf, yf = len(p.out_tallies), p.float_outs, p.float_ys
+    dt_it, dy_it = iter(touts[:len(tf)]), iter(touts[len(tf) + 1:])
+    res = [next(dt_it) if j in tf else _zero(_aval(outs[j])) for j in range(nt)]
     res.append(_zero(_aval(outs[nt])))
-    for o, a in zip(outs[nt + 1:], p.y_avals()):
-        res.append(next(dy_it) if isfloat(a.dtype) else _zero(_aval(o)))
+    res += [next(dy_it) if j in yf else _zero(_aval(o)) for j, o in enumerate(outs[nt + 1:nt + 1 + p.nY])]
     return res
 
 
@@ -520,13 +511,6 @@ def _inst(c, shape, dtype):
     return jnp.zeros(shape, dtype) if _is_zero(c) else c
 
 
-def _float_slots(p):
-    ot = _out_specs(p)
-    tf = [j for j, k in enumerate(ot) if isfloat(p.tallies[k].dtype)]       # positions among the tally outputs
-    yf = [j for j, a in enumerate(p.y_avals()) if isfloat(a.dtype)]
-    return ot, tf, yf
-
-
 def _vjp_call(node, base, pi, bc, U_pi, U_bc, cts, N, ring=()):
     """cotangents of base's operands flagged U_pi / U_bc, given cotangents `cts` of ALL base outputs.  ring: the
     tree adjoint's record (a spawning base, _ring_node)."""
@@ -535,7 +519,7 @@ def _vjp_call(node, base, pi, bc, U_pi, U_bc, cts, N, ring=()):
             raise NotImplementedError("tallymap: reverse mode through spawn is supported for a spawning call's own "
                                       "first-order jvp only (no second order)")
         return tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N, ring)
-    ot, tf, yf = _float_slots(base)
+    ot, tf, yf = base.out_tallies, base.float_outs, base.float_ys
     nt = len(ot)
     ya = base.y_avals()
     ct_t = []
@@ -588,7 +572,7 @@ def _transpose(cts, *args, node):
         for k, i in enumerate(ib):
             U_bc[i] = ad.is_undefined_primal(bc[nBb + k])
         # tangent outputs = [float tallies'] + [stats] + [float results']: re-expand to all base outputs
-        ot, tf, yf = _float_slots(base)
+        ot, tf, yf = base.out_tallies, base.float_outs, base.float_ys
         full = [None] * len(ot) + [None] + [None] * base.nY
         for c, j in zip(cts[:len(tf)], tf):
             full[j] = c
@@ -617,7 +601,7 @@ def _transpose(cts, *args, node):
         ln = node.derived(q, "tangent", base=base, pp=node.pp, pb=node.pb,
                           lin_pi=(False,) * nPb + (True,) * len(ip), lin_bc=(False,) * nBb + (True,) * nib)
         touts = bind_call(*pi[:nPb], *dpi, *bc[:nBb], *dbc, node=ln)
-        ot, tf, yf = _float_slots(base)
+        tf = base.float_outs
         g_ct = list(touts[:len(tf)])                      # -> cotangents of the adjoint node's tally-ct operands
         g_cy = list(touts[len(tf) + 1:])                  # -> cotangents of its per-item cy operands
         res_pi = [None] * nPb + [g if ad.is_undefined_primal(x) else None for g, x in zip(g_cy, pi[nPb:])]
@@ -709,7 +693,7 @@ def _dual_lanes(args, dims, node, fused):
     a2 = [lanes_of(jnp.moveaxis(x, d, 1), 1) if b and k < nP else lanes_of(jnp.moveaxis(x, d, 0), 0) if b else
           (jnp.broadcast_to(jnp.expand_dims(x, 1), (x.shape[0], T) + tuple(x.shape[1:])) if k < nP and bpi[k] else x)
           for k, (x, d, b) in enumerate(zip(args, dims, bat))]
-    ot = _out_specs(p)
+    ot = p.out_tallies
     od = [0 if lt[k] else NM for k in ot] + [NM] + [1 if l else NM for l in ly]
     if nC == 1:
         return bind_call(*a2, node=ln), od
@@ -845,16 +829,11 @@ def _largest_loop_array(jaxpr, in_loop=False):
 FUSE_JVP = True               # (tests may set tallymap._primitive.FUSE_JVP = False to exercise the two-node design)
 
 
-def _ntf(p):
-    return sum(1 for k in _out_specs(p) if isfloat(p.tallies[k].dtype))
-
-
 def _fused_layout(p):
     """fused_jvp outputs = [primal sums (nt)] [tangent sums (ntf)] [stats] [primal results (nY)]
     [tangent results (nyf)];
     -> (indices of the primal outputs, indices of the tangent outputs) in the fused output list."""
-    nt, ntf, nY = len(_out_specs(p)), _ntf(p), p.nY
-    nyf = sum(1 for a in p.y_avals() if isfloat(a.dtype))
+    nt, ntf, nY, nyf = len(p.out_tallies), len(p.float_outs), p.nY, len(p.float_ys)
     prim = list(range(nt)) + [nt + ntf] + list(range(nt + ntf + 1, nt + ntf + 1 + nY))
     tan = list(range(nt, nt + ntf)) + list(range(nt + ntf + 1 + nY, nt + ntf + 1 + nY + nyf))
     return prim, tan
@@ -885,7 +864,7 @@ def _fused_parts(jn):
 
 def _assemble(p, outs, touts):
     prim_idx, tan_idx = _fused_layout(p)
-    ntf = _ntf(p)
+    ntf = len(p.float_outs)
     res = [None] * (len(prim_idx) + len(tan_idx))
     for j, o in zip(prim_idx, outs):
         res[j] = o
@@ -910,7 +889,7 @@ def _fused_batch(args, dims, *, node):
     p = fwd.prog
     pd = [dims[i] for i in pos]
     if all(d is NM for d in pd):
-        outs, od = bind_call(*[args[i] for i in pos], node=fwd), [NM] * (len(_out_specs(p)) + 1 + p.nY)
+        outs, od = bind_call(*[args[i] for i in pos], node=fwd), [NM] * (len(p.out_tallies) + 1 + p.nY)
     else:
         outs, od = (_fused_batch if fwd.kind == "fused_jvp" else _batch)([args[i] for i in pos], pd, node=fwd)
     touts, td = _batch(list(args), list(dims), node=ln)
@@ -957,7 +936,7 @@ def _fused_pe_custom(saveable, unks_in, inst_in, eqn):
     if any(unks_in[i] for i in pos):                 # primal unknown: everything staged
         return None, eqn, [True] * n, [True] * n, res_of(eqn.invars, inst_in)
     prim_idx, tan_idx = _fused_layout(fwd.prog)
-    ntf = _ntf(fwd.prog)
+    ntf = len(fwd.prog.float_outs)
     _, pp, pb, chain = node.base
     if fwd.prog.spawn is not None and fwd.kind == "primal" and not chain:   # the tree adjoint's record (_fused_pe):
         # the known side runs the recording primal (a closed call: its outputs + the record), the record becomes
@@ -974,7 +953,7 @@ def _fused_pe_custom(saveable, unks_in, inst_in, eqn):
         ring = [Var(a) for a in cj.out_avals[len(prim_idx):]]
         known = eqn.replace(primitive=closed_call_p, invars=pin, outvars=[eqn.outvars[j] for j in prim_idx] + ring,
                             params=dict(call_jaxpr=cj))
-        drop = drop_var(eqn.outvars[prim_idx[len(_out_specs(fwd.prog))]].aval)
+        drop = drop_var(eqn.outvars[prim_idx[len(fwd.prog.out_tallies)]].aval)
         tvars = [eqn.outvars[j] for j in tan_idx]
         staged = eqn.replace(primitive=tallymap_call_p, outvars=tvars[:ntf] + [drop] + tvars[ntf:],
                              params=dict(node=rn), invars=list(eqn.invars) + ring)
@@ -985,7 +964,7 @@ def _fused_pe_custom(saveable, unks_in, inst_in, eqn):
     # the tangent node has its own stats output: give it a fresh (dropped) var (reusing the fused node's stats var is
     # wrong),
     # so build its outvars as [tangent sums] + [a dropped var] + [tangent results]
-    drop = drop_var(eqn.outvars[prim_idx[len(_out_specs(fwd.prog))]].aval)
+    drop = drop_var(eqn.outvars[prim_idx[len(fwd.prog.out_tallies)]].aval)
     tvars = [eqn.outvars[j] for j in tan_idx]
     staged = eqn.replace(primitive=tallymap_call_p, outvars=tvars[:ntf] + [drop] + tvars[ntf:], params=dict(node=ln),
                          invars=list(eqn.invars))

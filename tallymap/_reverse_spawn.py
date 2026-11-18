@@ -47,7 +47,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 
-from ._api import ItemProgram, TSpec, _mk, _sds
+from ._api import ST, ItemProgram, TSpec, _mk, _sds
 from ._diagnostics import record_reverse
 from ._reverse import check_slots, vjp_prog
 from ._rewrite import isfloat, retrace
@@ -233,7 +233,7 @@ def tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N, ring):
     """cotangents (g_pi, g_bc) of base's per-item / broadcast operands flagged U_pi / U_bc, given the cotangents
     `cts` of ALL base outputs ([sum tallies] + [stats] + [per-item results]) and the record `ring` = [stats] +
     [queue leaves] of rec_primal(base) (see the module docstring); base spawns."""
-    from ._primitive import _float_slots, _inst, bind_call      # (here: _primitive imports this module)
+    from ._primitive import _inst, bind_call      # (here: _primitive imports this module)
     o = dict(node.opts)
     Q = int(base.spawn.capacity)
     Cg = min(int(_gen_capacity(Q)), Q)
@@ -242,21 +242,21 @@ def tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N, ring):
     av = base.in_avals()
     pav, bav = av[base.nT:base.nT + nP], av[base.nT + nP:]
     ya = base.y_avals()
-    ot, tf, yf = _float_slots(base)
+    ot, yf = base.out_tallies, base.float_ys
     ib = [i for i, f in enumerate(pert_bc) if f]
     t_node = node.derived(T, "adjoint", base=adj, pp=pert_pi, pb=pert_bc,
-                          lin_pi=(False,) * adj.nP + (True,) * sum(1 for a in adj.y_avals() if isfloat(a.dtype)),
-                          lin_bc=(False,) * adj.nB
-                          + (True,) * sum(1 for s in adj.tallies if s.kind == "sum" and isfloat(s.dtype)))
+                          lin_pi=(False,) * adj.nP + (True,) * len(adj.float_ys),
+                          lin_bc=(False,) * adj.nB + (True,) * len(adj.float_outs))
     # output cotangents of the adjoint program's float sum tallies, in tally order: user, SPf, FP
-    ct_user = [_inst(cts[j], tuple(base.tallies[k].lead) + (base.tallies[k].S,), base.tallies[k].dtype)
-               for j, k in enumerate(ot) if isfloat(base.tallies[k].dtype)]
+    ct_user = [_inst(cts[j], tuple(base.tallies[ot[j]].lead) + (base.tallies[ot[j]].S,), base.tallies[ot[j]].dtype)
+               for j in base.float_outs]
 
     # ---- the record
     stats, leaves = ring[0], ring[1:1 + nP]
     par, ordn, gen = ring[2 + nP:5 + nP]
-    total = stats[0]
-    drop_risk = (total > Q) | (stats[1] > 0)         # a slot reused or a child dropped: the record is incomplete
+    total = stats[ST["spawned"]]
+    # a slot reused or a child dropped: the record is incomplete
+    drop_risk = (total > Q) | (stats[ST["children_dropped"]] > 0)
     slot = jnp.arange(Q, dtype=jnp.int32)
     valid = slot < total
     gk = jnp.where(valid, gen, Q + 1)
