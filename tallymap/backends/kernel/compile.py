@@ -12,7 +12,9 @@ import glob
 import hashlib
 import os
 import platform
+import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -31,6 +33,12 @@ def cache_dir():
          or os.path.join(os.path.expanduser("~"), ".cache", "tallymap"))
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def tmp_path(path):
+    """a temporary name beside `path` for a compiler to write and os.replace into place.  The cache directory may be
+    shared by many nodes, where a pid alone is not unique: the name carries the host, the pid and a random token."""
+    return f"{path}.tmp.{socket.gethostname()}.{os.getpid()}.{secrets.token_hex(4)}"
 
 
 def _atomic_write(path, data):
@@ -192,7 +200,7 @@ def shim():
         os.makedirs(d, exist_ok=True)
         so = os.path.join(d, f"libtallymap_cuda_{h}.so")
         if not os.path.exists(so):
-            tmp = so + f".tmp{os.getpid()}"
+            tmp = tmp_path(so)
             cmd = [cxx, "-O2", "-std=c++17", "-shared", "-fPIC", "-w", f"-I{inc}", src, "-o", tmp, "-ldl"]
             r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
             if r.returncode:

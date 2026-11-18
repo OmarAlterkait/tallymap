@@ -12,6 +12,11 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   array's shape into its one storage, the second overwriting the first (the in-place destination rule tracked
   slots, not storages). Seen as `jax.vmap` of a jvp over exactly one tangent being wrong; any cond with that
   pattern was exposed, on CPU and GPU. tests/transforms.py.
+- Kernel cache on a directory shared by several nodes: the host kernel, host shim and cuda shim were compiled to
+  a temporary named only by the pid, so two nodes with the same pid could write the same file. The temporary now
+  names the host, the pid and a random token (still renamed into place atomically). tests/edge.py.
+- CPU target: a host kernel whose `-fstack-usage` file was missing ran without its stack-size check. A cached
+  kernel without that file is now rebuilt, and a build that does not write it is an error. tests/edge.py.
 
 ### Changed
 

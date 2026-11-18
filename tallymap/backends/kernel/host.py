@@ -243,12 +243,13 @@ def compile_so(src, where="", note=""):
     d = os.path.join(C.cache_dir(), "host")
     os.makedirs(d, exist_ok=True)
     so, su = os.path.join(d, f"k_{h}.so"), os.path.join(d, f"k_{h}.su")
-    cached = os.path.exists(so)
+    # the .su is part of the cache entry: a kernel is never run without its stack bound checked
+    cached = os.path.exists(so) and os.path.exists(su)
     t = time.perf_counter()
     if not cached:
         cc = os.path.join(d, f"k_{h}.cc")
         C._atomic_write(cc, src.encode())
-        tmp = so + f".tmp{os.getpid()}"
+        tmp = C.tmp_path(so)
         cmd = [C.host_cxx(), *OPTS, "-fstack-usage", cc, "-o", tmp]
         r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", cwd=d)
         if r.returncode:
@@ -261,7 +262,10 @@ def compile_so(src, where="", note=""):
         os.replace(tmp, so)
     dt = time.perf_counter() - t
     stack = _stack_bytes(su)
-    if stack is not None and stack > stack_limit():
+    if stack is None:
+        raise RuntimeError(f"tallymap: the host compiler wrote no -fstack-usage file ({su}), so the host kernel's "
+                           "stack bound cannot be checked (internal error; backend='xla' runs the program meanwhile)")
+    if stack > stack_limit():
         from ..._api import UnsupportedError
         raise UnsupportedError(
             f"tallymap: the host kernel{' for ' + where if where else ''} may need up to {stack:,} bytes of stack "
@@ -350,7 +354,7 @@ def shim():
         os.makedirs(d, exist_ok=True)
         so = os.path.join(d, f"libtallymap_host_{h}.so")
         if not os.path.exists(so):
-            tmp = so + f".tmp{os.getpid()}"
+            tmp = C.tmp_path(so)
             cmd = [cxx, "-O2", "-std=c++17", "-shared", "-fPIC", "-w", "-fopenmp", f"-I{inc}", src, "-o", tmp]
             r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
             if r.returncode:

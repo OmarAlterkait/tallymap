@@ -2046,6 +2046,74 @@ def _(b):
             os.environ["OMP_NUM_THREADS"] = old
     return "; ".join(out)
 
+
+@case("kernel cache temp names: two nodes with the same pid get different names (the cache dir is shared)",
+      ["xla"])
+def _(b):
+    from tallymap.backends.kernel import compile as C
+    gethost, getpid = C.socket.gethostname, C.os.getpid
+    p = "/cache/host/k_0123.so"
+    try:
+        C.os.getpid = lambda: 4242
+        names = {}
+        for host in ("nodeA", "nodeB"):
+            C.socket.gethostname = lambda host=host: host
+            names[host] = C.tmp_path(p)
+        again = C.tmp_path(p)                                  # nodeB, same pid again
+    finally:
+        C.socket.gethostname, C.os.getpid = gethost, getpid
+    if names["nodeA"] == names["nodeB"] or again == names["nodeB"]:
+        raise Fail(f"temp names collide: {names}, again {again}")
+    for host, n in names.items():
+        if not (n.startswith(p + ".tmp") and host in n and "4242" in n):
+            raise Fail(f"{host}: {n!r} is not <path>.tmp... naming the host and pid")
+    return f"{names['nodeA']} != {names['nodeB']}"
+
+
+@case("host kernel cache: a missing -fstack-usage file is an error, and a cached .so without its .su is rebuilt",
+      ["xla"])
+def _(b):
+    import subprocess
+    import tempfile
+
+    from tallymap.backends.kernel import compile as C
+    from tallymap.backends.kernel import host as H
+    calls, write_su = [], [False]
+
+    def fake_cxx(cmd, **kw):                                   # writes -o <tmp>, and the .su as GCC 11 names it
+        calls.append(cmd)
+        out, cc = cmd[cmd.index("-o") + 1], cmd[-3]
+        open(out, "w").close()
+        if write_su[0]:
+            with open(f"{out}-{os.path.basename(cc)[:-3]}.su", "w") as f:
+                f.write("k.cc:1:6:void sj_main()\t64\tstatic\n")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    saved = (H.compiler_identity, C.host_cxx, H.stack_limit, H.subprocess.run, os.environ.get("TALLYMAP_CACHE"))
+    try:
+        os.environ["TALLYMAP_CACHE"] = tempfile.mkdtemp(prefix="tm_su_", dir=os.environ.get("LSCRATCH") or None)
+        H.compiler_identity, C.host_cxx, H.stack_limit = (lambda: "fake"), (lambda: "fake-c++"), (lambda: 1 << 20)
+        H.subprocess.run = fake_cxx
+        src = "// edge: missing .su\n"
+        raises(RuntimeError, lambda: H.compile_so(src), "-fstack-usage")          # no .su written: not skipped
+        write_su[0] = True
+        n0 = len(calls)
+        _, info = H.compile_so(src)                            # the .so from above is cached, its .su is not
+        if len(calls) != n0 + 1 or info["cached"] or info["stack"] != 64:
+            raise Fail(f"a cached .so without its .su: compiles {len(calls) - n0}, info {info}")
+        _, info2 = H.compile_so(src)
+        if len(calls) != n0 + 1 or not info2["cached"] or info2["stack"] != 64:
+            raise Fail(f"with both files cached: compiles {len(calls) - n0 - 1}, info {info2}")
+        tmp = calls[-1][calls[-1].index("-o") + 1]
+        if C.socket.gethostname() not in tmp:
+            raise Fail(f"the host kernel's temp name {tmp!r} does not name the host")
+    finally:
+        H.compiler_identity, C.host_cxx, H.stack_limit, H.subprocess.run, old = saved
+        if old is None:
+            os.environ.pop("TALLYMAP_CACHE", None)
+        else:
+            os.environ["TALLYMAP_CACHE"] = old
+    return "missing .su raises; .so without .su rebuilt; both cached -> no compile"
+
 print("\n================ SUMMARY", jax.__version__, "x64" if jax.config.jax_enable_x64 else "",
       jax.devices()[0].device_kind)
 for n, b, m in RES:
