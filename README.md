@@ -528,7 +528,10 @@ What is explicitly out of scope, so that you do not have to find out by trying:
 - **The CPU kernel needs Linux and a C++17 compiler (GCC or Clang).** Without one, or on macOS and Windows,
   `backend='auto'` on the CPU raises `tm.UnsupportedError` naming the fix; `backend='xla'` runs there.
 - **CPU results are not bitwise equal to XLA:CPU** on transcendentals (libm vs XLA's own approximations, 1-7 ulps)
-  or on subnormals (XLA:CPU flushes them to zero; the kernel is IEEE). On a GPU the bitwise checks against XLA stand.
+  or on subnormals (XLA:CPU flushes them to zero; the kernel is IEEE). On a GPU the test suite's bitwise checks
+  against XLA stand, but not every transcendental is bitwise: `acos` differs on about 37% of f32 inputs (CUDA's
+  `acosf` within 1 ulp, XLA's own expansion within 3), so a chaotic program such as a photon transport diverges
+  per item and agrees statistically (`docs/float_semantics.md`).
 - **`shard_map` around a call is unsupported**: shard the items with `NamedSharding` and `jax.jit` instead
   (see "Backends"). `jax.pmap` works.
 - **`jax.export` of a kernel program is unsupported.** Its custom call is not on JAX's export allow-list and its
