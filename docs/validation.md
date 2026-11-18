@@ -46,9 +46,9 @@ used to answer a B question.
 ## The `compare` criterion
 
 `compare(f, *args, other=..., floor_fn=...)` in `tests/compare_protocol.py` compares two implementations of the
-same item program, for example `backend='cuda'` against `backend='xla'`, on the same per-item keys. It is a
-test protocol, not library API; `tests/edge.py` runs it on the kernel backend. It is a statistical test, not an
-equality check, because the two backends do not produce bitwise identical f32 sums by design
+same item program, for example the kernel backend (`backend='auto'`) against `backend='xla'`, on the same
+per-item keys. It is a test protocol, not library API; `tests/edge.py` runs it on the kernel backend. It is a
+statistical test, not an equality check, because the two backends do not produce bitwise identical f32 sums by design
 (`docs/float_semantics.md`).
 
 Its three legs, all required, are in `tests/compare_protocol.py::criteria()` and are frozen:
