@@ -461,7 +461,8 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
         L.res.append((tuple(shape), np.dtype(dt), per_item))
         return nin + len(L.res) - 1
     L.r_out = {k: result(tuple(p.tallies[k].lead) + (p.tallies[k].S,), p.tallies[k].dtype) for k in outs}
-    L.r_scr = {k: result((_scratch_words(p.tallies[k]),), np.uint32) for k in outs if _scratch(p.tallies[k]) is not None}
+    L.r_scr = {k: result((_scratch_words(p.tallies[k]),), np.uint32)
+               for k in outs if _scratch(p.tallies[k]) is not None}
     L.r_ctr = result((2,), np.uint32)                       # the claim counter (u64)
     L.r_stats = result((len(STATS),), np.int32)
     if spawn is not None:

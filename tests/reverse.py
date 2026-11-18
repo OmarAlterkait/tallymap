@@ -1102,8 +1102,8 @@ def _(b):
             raise Fail(f"{nm}: grad {rs[0][:4]} != exact f32 {want[:4]} (rel {relerr(rs[0], want):.2g})")
         if not all(np.array_equal(r.view(np.uint32), rs[0].view(np.uint32)) for r in rs[1:]):
             raise Fail(f"{nm}: grad not bitwise repeatable: {[r[:2] for r in rs]}")
-        if [d for d, _ in _reverse.LAST["sparse"]] != ([] if k < _reverse.SPARSE_MIN else [0]):
-            raise Fail(f"{nm}: table path {_reverse.LAST}")
+        if [d for d, _ in _D.REVERSE['build']["sparse"]] != ([] if k < _reverse.SPARSE_MIN else [0]):
+            raise Fail(f"{nm}: table path {_D.REVERSE['build']}")
         out.append(f"{nm}: == exact f32 x3")
     return "; ".join(out)
 
