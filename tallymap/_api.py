@@ -245,7 +245,7 @@ def jvp_prog(p, pert_pi, pert_bc):
     av = p.in_avals()
     tav, pav, bav = av[:nT], av[nT:nT + nP], av[nT + nP:]
     avals = tav + [tav[i] for i in tf] + pav + [pav[i] for i in ip] + bav + [bav[i] for i in ib]
-    from ._reverse import forward_tangents      # (here: _reverse imports this module)
+    from ._reverse import forward_tangents  # (here: _reverse imports this module)
     with forward_tangents():        # (sparse table reads of an adjoint program: see _reverse.tread)
         cj = _mk(J, [_sds(a) for a in avals])
     tl = list(p.tallies) + [dataclasses.replace(p.tallies[i], name=p.tallies[i].name + "'") for i in tf]
@@ -436,7 +436,7 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                            nact=nb0 - 1 if n_active is not None else None)
         bc_all = bc + hoisted
         _diagnostics.record_program(prog)
-        from ._primitive import bind_call, make_node       # (here: _primitive imports this module)
+        from ._primitive import bind_call, make_node  # (here: _primitive imports this module)
         flat = bind_call(*pi, *bc_all, node=make_node(prog, backend, opts, _call_site(decl)))
         nt = len(prog.out_tallies)
         tvals, st, ys = flat[:nt], flat[nt], flat[nt + 1:]

@@ -119,7 +119,7 @@ def history():
 def _versions():
     import jaxlib
 
-    from . import __version__         # (here: the package imports this module before it sets __version__)
+    from . import __version__  # (here: the package imports this module before it sets __version__)
     return dict(tallymap=__version__, jax=jax.__version__, jaxlib=getattr(jaxlib, "__version__", "?"),
                 numpy=np.__version__, python=sys.version.split()[0])
 

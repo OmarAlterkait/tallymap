@@ -233,7 +233,7 @@ def tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N, ring):
     """cotangents (g_pi, g_bc) of base's per-item / broadcast operands flagged U_pi / U_bc, given the cotangents
     `cts` of ALL base outputs ([sum tallies] + [stats] + [per-item results]) and the record `ring` = [stats] +
     [queue leaves] of rec_primal(base) (see the module docstring); base spawns."""
-    from ._primitive import _inst, bind_call      # (here: _primitive imports this module)
+    from ._primitive import _inst, bind_call  # (here: _primitive imports this module)
     o = dict(node.opts)
     Q = int(base.spawn.capacity)
     Cg = min(int(_gen_capacity(Q)), Q)

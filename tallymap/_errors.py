@@ -45,7 +45,7 @@ def ad_advice(e, what):
     # never in advance: a closed-over tracer of the LIVE jax.jit around the call is legitimate)
     if (isinstance(e, (jax.errors.UnexpectedTracerError, jax.errors.TracerArrayConversionError))
             or ("No constant handler for type" in s and "Tracer" in s)):
-        from ._api import UnsupportedError          # (here: _api imports this module)
+        from ._api import UnsupportedError  # (here: _api imports this module)
         return UnsupportedError(f"tallymap: cannot build the {what} of this item.{CLOSED_TRACER}\n{s}")
     if "custom_vjp" in s:
         from ._api import UnsupportedError
