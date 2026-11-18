@@ -7,7 +7,7 @@ Two questions, kept apart, and the one frozen statistical contract between imple
 - **A. Mechanics.** Is the derivative the exact derivative of the program as written?
   - Compare against the same transformation of the dense reference (`tm.reference`, which is `jax.vmap(item)`
     with real per-item tally arrays, summed) at small N.
-  - Use the same keys, use f64 or `Sum(fixed_point=True)` wherever bitwise agreement is expected, and compare reverse
+  - Use the same keys, use f64 or `Sum(fixed_point=True)` (exact for float32) wherever bitwise agreement is expected, and compare reverse
     mode against forward mode (`jacfwd`) on the same keys.
   - tallymap is responsible for A. `tests/` checks it: `tests/edge.py`, `tests/transforms.py`,
     `tests/reverse.py`, `tests/reverse_spawn.py`.
@@ -32,7 +32,7 @@ used to answer a B question.
   on the host. The inputs then differ by one unit in the last place from the jitted ones, and chaotic Monte Carlo
   paths diverge from there to O(1) differences. This has produced more false alarms than any other mistake on
   this list.
-- Expect bitwise agreement only from deterministic sums: CPU, or `Sum(fixed_point=True)` (int64 fixed point). f32
+- Expect bitwise agreement only from deterministic sums: CPU, or `Sum(fixed_point=True)` (exact for float32, int64 fixed point otherwise). f32
   tallies on a GPU are accumulated with atomics on the kernel backend and with a GPU scatter-add on the xla
   backend, so their summation order, and their last bits, change from run to run. Rerun the same keys twice as
   the control before blaming a difference on anything else.

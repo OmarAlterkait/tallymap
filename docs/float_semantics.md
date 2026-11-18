@@ -13,14 +13,40 @@ math modes, schedules and JAX versions.
 3. **f32 sums agree within float reassociation.**  Sum outputs are accumulated with atomics (cuda) or a scatter-add
    (xla; on a GPU also atomic), so their summation order, and their last bits, change from run to run on a GPU.
    CPU runs are deterministic.
-4. **`Sum(fixed_point=True)` is order-independent.**  Each value is rounded to int64 fixed point
-   (`round(v * scale)`) before an integer add: bitwise results across schedules, `vmap`, and the two backends.  On the
-   xla backend it needs `jax_enable_x64`.  Unrepresentable values are dropped and counted
-   (`stats['fixed_point_overflow']`), and the bin each was emitted to is NaN (primal and tangent bins each by their own emits).
-   A bin's running sum does not wrap: each bin keeps the net signed carry out of its int64 word as a high word (from
-   the old value of each atomic add, so it is a sum of +-1 and order-independent), and the readout is the exact
-   128-bit total rounded once to float64, then cast.  A total that does not fit the output dtype is counted in
-   `stats['fixed_point_overflow']` too, and a float bin then is NaN.
+4. **`Sum(fixed_point=True)` is order-independent; for float32 it is exact.**
+   - **float32 (the default dtype): the exact sum.**  Every finite f32 is an integer multiple of 2^-149 below
+     2^128 (277 bits), so a bin keeps the INTEGER sum of every value emitted into it, and the output is that sum
+     rounded once to f32 (to nearest, ties to even): the correctly rounded f32 of the exact sum, with no scale, no
+     floor and no cap (`scale` is not used).  Integer adds commute, so the result is bitwise the same for every
+     order of the emits: run to run, schedules, `vmap`, the AD modes and the two backends.  A jvp / jacfwd tangent
+     of the output is exact in the same way (a tangent far below the primal is not rounded away).
+     On the kernel backend a bin keeps that integer in five signed int64 words, word j of weight 2^(63 j): an
+     emit adds its (at most two) signed pieces below 2^63 with atomic adds, and a word whose add overflows int64
+     (read from the atomic's old value) adds +-2 into the next word (2^64 = 2 x 2^63).  A carry is needed only
+     when a word drifts by 2^63, never because the total changes sign.  44 bytes per bin with the output.  The
+     top word cannot overflow while the sum of |v| over a bin stays below 2^165: guaranteed while a bin receives
+     fewer than 2^64 adds (stated, not checked: centuries of atomics into one address) and the call makes fewer
+     than 2^31 emits of magnitude >= 2^96 into that output (counted: past it every bin of the output is NaN,
+     counted in `stats['fixed_point_overflow']`; a carry out of a top word would do the same, never silently).
+     The xla backend keeps the same integer as 32-bit digits in nine int64 words
+     (scatter-adds cannot carry) and rounds it the same way, so the two backends agree bitwise; it needs
+     `jax_enable_x64` and raises without it.  A non-finite emit makes its bin NaN, and a total beyond f32's range
+     makes its bin NaN; both are counted in `stats['fixed_point_overflow']`.
+   - **other dtypes: fixed point.**  Each value is rounded to int64 fixed point (`round(v * scale)`) before an
+     integer add: bitwise results across schedules, `vmap`, and the two backends.  On the xla backend it needs
+     `jax_enable_x64`.  Unrepresentable values are dropped and counted (`stats['fixed_point_overflow']`), and the
+     bin each was emitted to is NaN (primal and tangent bins each by their own emits).  A bin's running sum does
+     not wrap: each bin keeps the net signed carry out of its int64 word as a high word (from the old value of each
+     atomic add, so it is a sum of +-1 and order-independent), and the readout is the exact 128-bit total rounded
+     once to float64, then cast.  A total that does not fit the output dtype is counted in
+     `stats['fixed_point_overflow']` too, and a float bin then is NaN.
+
+   **Reverse-mode cotangents of broadcast operands are exact.**  An f32 broadcast operand's cotangent (a
+   parameter's or a table's gradient under `jax.grad`) is a sum of one contribution per item, or per table read,
+   into a few bins.  It is accumulated as the exact sum above, so it is exact and order-independent for every finite
+   f32 contribution, then rounded once to f32.  The kernel backend always does this; the xla backend does it with
+   `jax_enable_x64` (the same bits), and without x64 adds in f32.  A non-finite contribution makes that gradient
+   entry NaN.  Cotangents of other dtypes (f64, f16, bf16) are added in their own dtype.
 5. **Forward, tangent and adjoint share one item program.**  The adjoint replays the same jaxpr with the same options
    (same math), so a replay is bit-exact on the same backend (gated in tests/reverse.py, "REPLAY GATE").
 

@@ -96,7 +96,9 @@ class Node:
             p = self.prog
             k = (digest(p.cj.jaxpr), tuple(id(c) for c in p.cj.consts),
                  tuple(id(c) for c in host_callbacks(p.cj.jaxpr)),
-                 tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.fixed_point, s.scale, s.kind) for s in p.tallies),
+                 tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.fixed_point, s.scale, s.kind, s.exact,
+                        s.x64_fallback)
+                       for s in p.tallies),
                  p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), p.nact, p.rec, self.backend,
                  self.opts)
             object.__setattr__(self, "_key", k)

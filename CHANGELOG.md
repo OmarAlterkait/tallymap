@@ -8,6 +8,26 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Fixed
 
+- `Sum(fixed_point=True)` of float32 is now EXACT, forward, in every tangent and in reverse mode: each bin is the
+  correctly rounded f32 of the exact sum of every finite value emitted into it, with no scale, floor or cap
+  (`scale` is no longer used for float32; other dtypes keep int64 fixed point). The 2^32 fixed point it replaces
+  rounded every emit to 2^-32 of the output's scale, tangents included, so a tangent below that quantum was
+  silently 0: lumen's SBND d/d(TPB WLSABSLENGTH) was 0 against an exact 3.368e-8, and a d/dlog of it lost 6% of its
+  sum. A bin is the integer sum of the emits in units of 2^-149 (every finite f32 is one, below 2^277), kept in
+  five signed int64 words of weight 2^(63 j) (a word that overflows carries +-2 into the next): integer adds, so
+  the result is bitwise the same in any order, run to run, in every AD mode and on both backends (the xla backend
+  keeps the same integer in nine int64 words and needs `jax_enable_x64`; without it it raises instead of summing
+  in float). Device memory: 44 B per bin with the output (2^32 fixed point: 20 B). A non-finite emit makes its bin
+  NaN and is counted in `stats['fixed_point_overflow']`; exactness holds while a bin receives fewer than 2^64 adds
+  (stated) and an output fewer than 2^31 emits of magnitude >= 2^96 (counted: past it the output is NaN).
+  Measured on a 2080 Ti: lumen SK forward 1.01x and jvp 1.03x the time of 2^32 fixed point, SK jvp at 16 charge
+  replicas 6.4 GB peak. `docs/float_semantics.md` item 4; tests/edge.py "exact".
+- Reverse mode: the cotangent of an f32 broadcast operand (a parameter's or a table's `jax.grad`) was added in f32
+  atomics, one contribution per item into a few bins, so every add lost its part below the bin's ulp, always in
+  the same direction and in a different order each run (lumen's WCTE gradient at 524288 photons was 1.1e-3 low
+  against jvp and not repeatable). These sums are now the exact sum above: bitwise repeatable, the same on both
+  backends. The xla backend needs `jax_enable_x64` for this and otherwise adds them in f32 as before.
+  tests/reverse.py "broadcast cotangents".
 - Kernel backend: a `lax.cond` whose operand array filled two operand slots could write two outputs of that
   array's shape into its one storage, the second overwriting the first (the in-place destination rule tracked
   slots, not storages). Seen as `jax.vmap` of a jvp over exactly one tangent being wrong; any cond with that

@@ -1,5 +1,6 @@
 """Phase-2 edge-case matrix.  python tests/edge.py  (env: BACKENDS=xla,cuda  TEST_X64=1  ONLY=substr)
 Prints one line per (case, backend): PASS / FAIL <why> / RAISE <exception> and a summary table."""
+import math
 import os
 import re
 import sys
@@ -32,6 +33,11 @@ GPU = jax.default_backend() == "gpu"
 BACKENDS = os.environ.get("BACKENDS", "xla,auto").split(",")
 ONLY = os.environ.get("ONLY", "")
 F = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
+# an emit a fixed_point=True output of dtype F cannot represent: past 2^63 / scale for f64 fixed point; for the exact
+# float32 sum (which represents every finite f32) a non-finite one.  TOVF: a factor that makes an f32 item value
+# overflow to inf (an exact f32 tangent then has a non-finite emit) and is past 2^63 / 2^20 for f64
+OVF = F(1e15) if jax.config.jax_enable_x64 else F(np.inf)
+TOVF = F(1e15) if jax.config.jax_enable_x64 else F(3e38)
 print("jax", jax.__version__, jax.__file__, jax.devices(), "x64", jax.config.jax_enable_x64, flush=True)
 RES = []
 NB = 8
@@ -727,16 +733,16 @@ def _(b):
 
 # (helpers of the next cell, defined first: @case runs its cell at decoration time)
 def _tangent_overflow(b, x2):
-    """(G7) only the TANGENT overflows: emit x*(s0-1)*1e15 + x*s1 at s = (1, 1) -> primal x (finite), tangent
-    column 0 x*1e15 (unrepresentable), column 1 x.  On every jvp path the column-0 tangent bin is NaN, the column-1
-    bin and every primal bin are finite, and the primal is bitwise the plain call's."""
+    """(G7) only the TANGENT overflows: emit x*(s0-1)*TOVF + x*s1 at s = (1, 1) -> primal x (finite), tangent
+    column 0 x*TOVF (unrepresentable; inf in f32), column 1 x.  On every jvp path the column-0 tangent bin is NaN,
+    the column-1 bin and every primal bin are finite, and the primal is bitwise the plain call's."""
     from tallymap import _primitive as P_
     out = {"Q": tm.Sum((NB,), F, fixed_point=True, scale=2.0 ** 20)}
     s0 = jnp.ones((2,), F)
     eye = jnp.eye(2, dtype=F)
 
     def mk(**o):
-        g = tm.vmap(lambda t, x, s: t.add("Q", 0, x * (s[0] - 1) * 1e15 + x * s[1]), outputs=out,
+        g = tm.vmap(lambda t, x, s: t.add("Q", 0, x * (s[0] - 1) * TOVF + x * s[1]), outputs=out,
                     in_axes=(0, None), backend=b, **o)
         return lambda s: g(x2, s).outputs["Q"]
     ref = np.asarray(mk()(s0))
@@ -799,7 +805,7 @@ def _(b):
     a2 = np.asarray(f(x2[::-1], k2[::-1], tab, TH).outputs["Q"])          # different item order
     if not np.array_equal(a1, a2):
         raise Fail("fixed-point output depends on item order")
-    big = tm.vmap(lambda t, x: t.add("Q", 0, x * 1e15), outputs=out, backend=b)(x2)
+    big = tm.vmap(lambda t, x: t.add("Q", 0, x * OVF), outputs=out, backend=b)(x2)
     if int(big.stats["fixed_point_overflow"]) != n:
         raise Fail(f"overflow count {int(big.stats['fixed_point_overflow'])} != {n}")
     # an overflow poisons the BIN it was emitted to, nothing else: other bins, other fixed-point outputs and float
@@ -810,7 +816,7 @@ def _(b):
     def ovf(t, x, s):
         return t.add("Q", 0, x * s).add("Q", 1, x).add("E", 1, x).add("P", 0, x)
     g = tm.vmap(ovf, outputs=mix, in_axes=(0, None), backend=b)
-    r = g(x2, F(1e15))
+    r = g(x2, OVF)
     q = np.asarray(r.outputs["Q"])
     if not (np.isnan(q[0]) and np.isfinite(q[1:]).all() and np.isfinite(np.asarray(r.outputs["E"])).all()):
         raise Fail(f"exact_overflow={int(r.stats['fixed_point_overflow'])}: want only Q[0] NaN, got Q {q[:3]} "
@@ -1575,22 +1581,147 @@ def _(b):
             "not ours")
 
 
-@case("fixed_point=True on cuda without x64: equals the host fixed-point sum bitwise, order-independent", ["auto"])
+def _units(v):
+    """float32 values -> their exact values as Python ints in units of 2^-149 (every finite f32 is one)."""
+    b = np.asarray(v, np.float32).view(np.uint32).astype(np.int64)
+    e, mant = (b >> 23) & 255, b & 0x7FFFFF
+    m, p = np.where(e > 0, mant | 0x800000, mant), np.maximum(e - 1, 0)
+    return [(-int(mi) if s else int(mi)) << int(pi) for s, mi, pi in zip(b >> 31, m, p)]
+
+
+def _f32_round(T):
+    """the correctly rounded float32 (nearest, ties to even) of the integer T x 2^-149: the exact sum's reference."""
+    if T == 0:
+        return np.float32(0.0)
+    m = abs(T)
+    sh = max(m.bit_length() - 24, 0)
+    q, r = divmod(m, 1 << sh)
+    if sh and (2 * r > (1 << sh) or (2 * r == (1 << sh) and q & 1)):
+        q += 1
+    with np.errstate(over="ignore"):
+        v = np.float32(math.ldexp(float(q), sh - 149))
+    return -v if T < 0 else v
+
+
+def _exact_ref(vals, bins, nbins):
+    tot = [0] * nbins
+    for u, i in zip(_units(vals), np.asarray(bins)):
+        tot[int(i)] += u
+    return np.array([_f32_round(t) for t in tot], np.float32)
+
+
+@case("fixed_point=True float32 on the kernel backend: the correctly rounded exact sum (host integer reference) "
+      "bitwise, order-independent", ["auto"])
 def _(b):
-    n, scale = 1 << 15, 2.0 ** 20
+    n = 1 << 15
     v = jnp.asarray(np.random.default_rng(3).uniform(-3, 3, n), jnp.float32)
     i = jnp.arange(n, dtype=jnp.int32)
     f = tm.vmap(lambda t, x, j: t.add("Q", j % NB, x).add("Q", (j + 1) % NB, x * 3.0),
-                outputs={"Q": tm.Sum((NB,), jnp.float32, fixed_point=True, scale=scale)}, backend="auto")
+                outputs={"Q": tm.Sum((NB,), jnp.float32, fixed_point=True)}, backend="auto")
     a1, a2 = np.asarray(f(v, i).outputs["Q"]), np.asarray(f(v[::-1], i[::-1]).outputs["Q"])
-    acc = np.zeros(NB, np.int64)
-    vv = np.asarray(v).astype(np.float64)
-    np.add.at(acc, np.arange(n) % NB, np.round(vv * scale).astype(np.int64))
-    np.add.at(acc, (np.arange(n) + 1) % NB, np.round(np.asarray(v * 3.0).astype(np.float64) * scale).astype(np.int64))
-    want = (acc.astype(np.float64) * (1.0 / scale)).astype(np.float32)
+    vv = np.asarray(v)
+    want = _exact_ref(np.r_[vv, np.asarray(v * 3.0)], np.r_[np.arange(n) % NB, (np.arange(n) + 1) % NB], NB)
     if not (np.array_equal(a1, a2) and np.array_equal(a1, want)):
-        raise Fail(f"fixed-point sum: order-independent {np.array_equal(a1, a2)}, == host {np.array_equal(a1, want)}")
-    return f"{NB}/{NB} bins bitwise equal to the host int64 sum (x64 off)"
+        raise Fail(f"exact sum: order-independent {np.array_equal(a1, a2)}, == host {np.array_equal(a1, want)}")
+    return f"{NB}/{NB} bins bitwise the correctly rounded exact sum (x64 {jax.config.jax_enable_x64})"
+
+
+@case("fixed_point=True float32 is exact: 65536 x 1e-11 into one bin -- primal, a jvp tangent beside an O(1) primal "
+      "(Q32 rounded both to 0), a reverse cotangent; the xla backend without x64 raises")
+def _(b):
+    out = {"s": tm.Sum((1,), jnp.float32, fixed_point=True)}
+    if b == "xla" and not jax.config.jax_enable_x64:
+        raises(NotImplementedError, lambda: tm.vmap(lambda t, x: t.add("s", 0, x), outputs=out, backend=b)(
+            jnp.ones(4, jnp.float32)), "x64")
+        return "needs x64 on xla (raises: never a silent float sum)"
+    n = 65536
+    xs = jnp.full((n,), 1e-11, jnp.float32)
+    want = _f32_round(sum(_units(xs)))
+    f = tm.vmap(lambda t, x: t.add("s", 0, x), outputs=out, backend=b)
+    p = np.asarray(f(xs).outputs["s"])[0]
+    g = tm.vmap(lambda t, x, th: t.add("s", 0, 1.0 + th * x), outputs=out, in_axes=(0, None), backend=b)
+    pj, tj = jax.jvp(lambda th: g(xs, th).outputs["s"][0], (jnp.float32(0.0),), (jnp.float32(1.0),))
+    h = tm.vmap(lambda t, x, tab: t.add("s", 0, tab[0] * x + tab[1]), outputs=out, in_axes=(0, None), backend=b)
+    gr = np.asarray(jax.grad(lambda tab: h(xs, tab).outputs["s"][0])(jnp.ones(2, jnp.float32)))
+    got = (p, np.float32(tj), np.float32(gr[0]))
+    if not all(x == want for x in got) or float(pj) != n or float(gr[1]) != n:
+        raise Fail(f"primal / tangent / cotangent {got}, want {want!r}; jvp primal {float(pj)}, d/dtab1 {gr[1]}")
+    return f"primal, tangent and cotangent {float(want)!r} (the f32 of the exact sum)"
+
+
+@case("exact f32 sum: carries and borrows under contention -- mixed signs across 64-bit word boundaries, totals "
+      "crossing zero, cancellation to 0 and to a subnormal; bitwise the host reference in any item order, run to run, "
+      "for the primal and the jvp tangent, privatised and global bins")
+def _(b):
+    if b == "xla" and not jax.config.jax_enable_x64:
+        return "skipped (needs x64 on xla; the raise is checked above)"
+    rng = np.random.default_rng(11)
+    GB = 1024                                  # over PRIV_BYTES: a global tally; Q (NB bins) is privatised
+    # pairs +v / -v of the same bin (they cancel exactly, in a random order: the running total crosses zero, borrows
+    # ripple to the top word) with exponents whose 24-bit piece straddles a 64-bit word (p % 64 > 40), subnormals and
+    # values up to 2^127 (|v| >= 2^96 counted); plus small residuals that make the totals; bin NB-2 gets pairs only
+    # (total 0), bin NB-1 2^100 - 2^100 + 2^-149 (total the smallest subnormal)
+    m = 1 << 14
+    e = rng.choice(np.r_[np.arange(42, 65), np.arange(106, 129), np.arange(170, 193), np.arange(234, 255), [0, 0]], m)
+    bits = (e.astype(np.uint32) << 23) | rng.integers(0, 1 << 23, m).astype(np.uint32)
+    pv = (bits | (rng.integers(0, 2, m).astype(np.uint32) << 31)).view(np.float32)
+    pb = rng.integers(0, NB - 1, m)
+    rv = (rng.uniform(0.5, 1.0, m) * 2.0 ** rng.integers(-40, 40, m) * rng.choice([-1.0, 1.0], m)).astype(np.float32)
+    rb = rng.integers(0, NB - 2, m)
+    tiny = np.array([2.0 ** 100, -(2.0 ** 100), 2.0 ** -149], np.float32)
+    vals = np.r_[pv, -pv, rv, tiny]
+    bins = np.r_[pb, pb, rb, [NB - 1] * 3]
+    perm = rng.permutation(len(vals))
+    vals, bins = vals[perm], bins[perm]
+    gbin = bins * (GB // NB) + 3
+    # XLA:CPU flushes subnormal operands to zero (x * s is 0 for a subnormal x there), so on the xla backend on a CPU
+    # the emitted values, and so the reference, have the subnormals flushed; the kernel backend keeps them
+    ftz = b == "xla" and not GPU
+    rvals = np.where(np.abs(vals) < np.float32(2.0 ** -126), np.float32(0.0), vals) if ftz else vals
+    wq, wg = _exact_ref(rvals, bins, NB), _exact_ref(rvals, gbin, GB)
+    if not (wq[NB - 2] == 0 and wq[NB - 1] == np.float32(0.0 if ftz else 2.0 ** -149) and np.isfinite(wq).all()):
+        raise Fail(f"test setup: reference {wq}")
+    out = {"Q": tm.Sum((NB,), jnp.float32, fixed_point=True), "G": tm.Sum((GB,), jnp.float32, fixed_point=True)}
+    g = tm.vmap(lambda t, x, i, j, s: t.add("Q", i, x * s).add("G", j, x * s), outputs=out, in_axes=(0, 0, 0, None),
+                backend=b)
+    x, i, j, one = jnp.asarray(vals), jnp.asarray(bins, jnp.int32), jnp.asarray(gbin, jnp.int32), jnp.float32(1.0)
+
+    def chk(nm, r):
+        q, gg = np.asarray(r["Q"]), np.asarray(r["G"])
+        if not (np.array_equal(q.view(np.uint32), wq.view(np.uint32))
+                and np.array_equal(gg.view(np.uint32), wg.view(np.uint32))):
+            dq = np.flatnonzero(q.view(np.uint32) != wq.view(np.uint32))
+            dg = np.flatnonzero(gg.view(np.uint32) != wg.view(np.uint32))
+            raise Fail(f"{nm}: Q bins {dq.tolist()} got {q[dq].tolist()} want {wq[dq].tolist()}; G bins "
+                       f"{dg.tolist()[:8]} got {gg[dg[:8]].tolist()} want {wg[dg[:8]].tolist()}")
+    r1 = g(x, i, j, one)
+    chk("primal", r1.outputs)
+    if int(r1.stats["fixed_point_overflow"]) != 0:
+        raise Fail(f"fixed_point_overflow {int(r1.stats['fixed_point_overflow'])}")
+    chk("primal, items reversed", g(x[::-1], i[::-1], j[::-1], one).outputs)
+    chk("primal, rerun", g(x, i, j, one).outputs)
+    p, t = jax.jvp(lambda s: g(x, i, j, s).outputs, (one,), (one,))
+    chk("jvp primal", p)
+    chk("jvp tangent", t)
+    return (f"{len(vals)} emits, {NB} privatised + {GB} global bins bitwise the reference (incl. 0 and 2^-149) in 3 "
+            "orders and the jvp" + (" (XLA:CPU: subnormal emits flushed to 0 by XLA)" if ftz else ""))
+
+
+@case("exact f32 sum: device memory per bin on the kernel backend is 40 B of accumulator + 1 flag bit + the output",
+      ["auto"])
+def _(b):
+    B = 1 << 20
+    vm = tm.vmap(lambda t, x, i: t.add("h", i, x), outputs={"h": tm.Sum((B,), jnp.float32, fixed_point=True)},
+                 backend="auto")
+    x, i = jnp.ones(4096, jnp.float32), (jnp.arange(4096, dtype=jnp.int32) * 997) % B
+    ma = jax.jit(lambda x, i: vm(x, i).outputs["h"]).lower(x, i).compile().memory_analysis()
+    if ma is None:
+        return "skipped (no memory analysis on this platform)"
+    tmp, out = int(ma.temp_size_in_bytes), int(ma.output_size_in_bytes)
+    if not (out == 4 * B and 40 * B <= tmp <= 40 * B + B // 8 + (1 << 16)):
+        raise Fail(f"{B} bins: output {out} B (want {4 * B}), scratch {tmp} B (want 40 B / bin + flag bits: "
+                   f"{40 * B + B // 8})")
+    return f"{B} bins: output {out / B:.2f} B / bin, scratch {tmp / B:.3f} B / bin"
 
 
 @case("closed-over PYTREE of tracers (dict of params) is hoisted: grad / jacfwd / hessian vs dense")

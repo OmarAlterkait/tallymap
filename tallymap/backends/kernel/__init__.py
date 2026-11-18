@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ..._api import UnsupportedError
+from ..._api import DENSE_WORDS, UnsupportedError
 from ..._compat import key_impl
 from ..._jaxpr import digest
 from . import codegen
@@ -45,7 +45,9 @@ def _const_sig(c):
 def _key(p, opts):
     # the structural part is _jaxpr.digest (was str(p.cj.jaxpr): JAX's pretty-printer, 95 s per build on DTRAX)
     return (digest(p.cj.jaxpr), tuple(_const_sig(c) for c in p.cj.consts),
-            tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.fixed_point, s.scale, s.kind) for s in p.tallies),
+            tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.fixed_point, s.scale, s.kind, s.exact,
+                   s.x64_fallback)
+                  for s in p.tallies),
             p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), p.nact, p.rec,
             tuple(sorted(opts.items())),
             codegen.FILL, codegen.INPLACE)          # (the test-only fill byte / in-place switch change the source)
@@ -147,7 +149,10 @@ def run(p, pi, bc, target="cuda", cuda_math="approx", schedule="item", ndev=1, *
         if k in L.r_scr:
             s = p.tallies[k]
             n = int(np.prod(s.lead, dtype=np.int64)) * s.S
-            rs.append(jax.ShapeDtypeStruct((4 * n,), jnp.uint32))  # u64 low words + i32 carry words + u32 flags
+            # u32 words: fixed point: per bin a u64 low word, an i32 carry word and a u32 flag; exact: per bin
+            # DENSE_WORDS int64 words, then one flag bit per bin and the tally's two big-emit words (kernel.DENSE)
+            w = 2 * DENSE_WORDS * n + (n + 31) // 32 + 2 if s.exact else 4 * n
+            rs.append(jax.ShapeDtypeStruct((w,), jnp.uint32))
     rs.append(jax.ShapeDtypeStruct((2,), jnp.uint32))          # claim counter (u64)
     rs.append(jax.ShapeDtypeStruct((5,), jnp.int32))           # stats
     if p.spawn is not None:

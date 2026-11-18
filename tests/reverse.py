@@ -1058,6 +1058,54 @@ def _(b):
     return "; ".join(msg) + "; jvp / jacfwd tangents NaN when truncated"
 
 
+def _exact_f32(xs, js, nb):
+    """f32 of the exact (rational) per-bin sums of 2 * xs (host)."""
+    from fractions import Fraction
+    tot = [Fraction(0)] * nb
+    for x, j in zip(xs.tolist(), js.tolist()):
+        tot[j] += 2 * Fraction(x)
+    return np.array([float(t) for t in tot], np.float32)
+
+
+@case("broadcast cotangents: exact f32 sums, bitwise run to run (1e5 items into one bin; +-1e30 cancelling; a bin "
+      "of 1e-30 parts; dense and sparse)", backends=["auto", "xla"] if X64 else ["auto"])
+def _(b):
+    def item(t, x, j, th):      # 2 loop steps of th[j] * x: the item's own cotangent of th[j] is 2x, exact in f32
+        _, t = lax.while_loop(lambda c: c[0] < 2, lambda c: (c[0] + 1, c[1].add("q", 0, th[j] * x)), (0, t))
+        return t, {}
+    n = 1 << 17
+    rng = np.random.default_rng(7)
+    cases = {}
+    x1 = np.where(rng.random(n) < 1e-3, 1.0, 1e-6).astype(np.float32)            # tm_repro: many small parts
+    cases["one bin"] = (x1, np.zeros(n, np.int32), 2)
+    nb = 64                                                                       # >= SPARSE_MIN: emitted per read
+    x2 = (rng.random(n) * 1e-6).astype(np.float32)
+    j2 = rng.integers(0, nb - 1, n).astype(np.int32)
+    big = (rng.random(1024) * 1e31 + 1e29).astype(np.float32)
+    x2[:1024], x2[1024:2048] = big, -big                                          # cancel exactly, bin by bin
+    j2[1024:2048] = j2[:1024]
+    x2[2048:3072] = (rng.standard_normal(1024) * 1e-30).astype(np.float32)
+    j2[2048:3072] = nb - 1                                                        # a bin of 1e-30 parts only
+    p = rng.permutation(n)
+    cases["+-1e30 / 1e-30, 64 bins"] = (x2[p], j2[p], nb)
+    cases["+-1e30 / 1e-30, 2 bins"] = (x2[p], (j2[p] == nb - 1).astype(np.int32), 2)
+    out = []
+    for nm, (xs, js, k) in cases.items():
+        f = tm.vmap(item, outputs={"q": tm.Sum((1,), jnp.float32)}, in_axes=(0, 0, None), backend=b)
+        g = jax.jit(jax.grad(lambda th: jnp.sum(f(jnp.asarray(xs), jnp.asarray(js), th).outputs["q"])))
+        th = jnp.ones((k,), jnp.float32)
+        rs = [np.asarray(g(th)) for _ in range(3)]
+        want = _exact_f32(xs, js, k)
+        if not np.array_equal(rs[0], want):
+            raise Fail(f"{nm}: grad {rs[0][:4]} != exact f32 {want[:4]} (rel {relerr(rs[0], want):.2g})")
+        if not all(np.array_equal(r.view(np.uint32), rs[0].view(np.uint32)) for r in rs[1:]):
+            raise Fail(f"{nm}: grad not bitwise repeatable: {[r[:2] for r in rs]}")
+        if [d for d, _ in _reverse.LAST["sparse"]] != ([] if k < _reverse.SPARSE_MIN else [0]):
+            raise Fail(f"{nm}: table path {_reverse.LAST}")
+        out.append(f"{nm}: == exact f32 x3")
+    return "; ".join(out)
+
+
 print("\n================ SUMMARY", jax.__version__, "x64" if X64 else "", jax.devices()[0].device_kind)
 for n, b, m in RES:
     print(f"{n:58s} {b:8s} {m[:200]}")

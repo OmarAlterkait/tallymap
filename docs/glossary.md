@@ -8,7 +8,7 @@ Terms used in the code, the docs and the error messages.
 |---|---|
 | **item** | one mapped element: one walker, path, chain, particle.  The user writes the function of ONE item. |
 | **Tally** | the item's write-only, commutative outputs.  Threaded linearly through the item like a pseudo-random-number-generator key: `t = t.add(name, index, value)`.  Outside tallymap it is a dense array; inside, the backends write straight into one shared accumulator. |
-| **tally output** / `Sum` | one named output: the sum over items of everything emitted into it.  `Sum(fixed_point=True)` sums in int64 fixed point (each value rounded to a multiple of `1/scale`), which is bitwise order-independent. |
+| **tally output** / `Sum` | one named output: the sum over items of everything emitted into it.  `Sum(fixed_point=True)` is bitwise order-independent: for float32 the exact sum (the correctly rounded f32 of the exact total), for other dtypes int64 fixed point (each value rounded to a multiple of `1/scale`). |
 | **emit** | one `t.add(...)`: `tally[index] += value`.  An out-of-range or negative index is dropped, exactly as JAX's own scatter drops an out-of-bounds update, and counted in `stats['dropped_emits']`. |
 | **spawn** / `Queue` | `t.spawn(child, when)` appends a new item with the same input structure; `Queue(capacity)` bounds the PENDING children.  A child that does not fit is dropped, counted in `stats['children_dropped']`, and makes the call's float tallies NaN. |
 | **truncation** | an item that hits `max_steps`.  Counted in `stats['n_truncated']`, flagged per item in `Result.truncated`, and it makes the call's float tallies NaN, exactly like a dropped spawn child. |

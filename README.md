@@ -249,9 +249,15 @@ non-zero count almost always means an off-by-one in your binning: `(x * NB).asty
 
 `tm.Sum(shape, dtype=float32, fixed_point=False)`. f32 sums over millions of emits lose low-order bits, and forward and
 reverse mode accumulate in different orders, so their derivatives agree only to that accumulation error, which
-can be 1e-4 relative on a large tree and varies from run to run on a GPU. With `fixed_point=True` the sum is
-accumulated in int64 fixed point (each value rounded to a multiple of `1/scale`): bitwise order-independent,
-identical across backends and schedules (the xla backend needs `jax_enable_x64` for it). Unrepresentable values
+can be 1e-4 relative on a large tree and varies from run to run on a GPU. With `fixed_point=True` a float32 sum is
+EXACT: each bin is the correctly rounded f32 of the exact sum of every finite value emitted into it, with no scale,
+floor or cap, bitwise the same in any order, on both backends, in every AD mode (its tangents are exact too: a
+tangent far below its primal is not rounded away). It costs 44 bytes of device memory per bin (the xla backend
+needs `jax_enable_x64`; it raises without it). A non-finite emit makes its bin NaN and is counted in
+`stats['fixed_point_overflow']`. The exactness has one stated condition, fewer than 2^64 adds into one bin, and one
+counted one (docs/float_semantics.md, item 4). For other dtypes `fixed_point=True` is int64 fixed point (each value
+rounded to a multiple of `1/scale`): bitwise order-independent, identical across backends and schedules (the xla
+backend needs `jax_enable_x64` for it). Unrepresentable values
 are dropped and counted in `stats['fixed_point_overflow']`, and the bin they were emitted to is NaN. A bin's total
 is not limited to int64: each bin carries a signed high word, so it is exact beyond `2^63 / scale` (a total that does
 not fit the output dtype is counted there too, and NaN in a float bin). Each kernel

@@ -51,7 +51,21 @@ def _call_site(fallback=None):
 # ------------------------------------------------------------------------------------------- user specs
 @dataclasses.dataclass(frozen=True)
 class Sum:
-    """A commutative (sum) output.  fixed_point=True accumulates round(v * scale) in int64 fixed point: bitwise
+    """A commutative (sum) output.
+
+    fixed_point=True with dtype float32 (the default) is EXACT: each bin is the correctly rounded float32 of the exact
+    sum of every finite f32 value emitted into it, bitwise independent of the order of the emits (run to run, AD mode,
+    backend), with no scale, no floor and no cap (`scale` is not used).  Every finite f32 is an integer multiple of
+    2^-149 below 2^128, and a bin keeps that integer sum (5 signed int64 words on the kernel backend).  It cannot
+    overflow while a bin receives fewer than 2^64 adds (stated, not checked: centuries of atomics into one address)
+    and the call makes fewer than 2^31 emits of magnitude >= 2^96 into that output (counted: past it every bin of the
+    output is NaN and counted in stats['fixed_point_overflow']).  A non-finite emit makes its bin NaN, and so does a
+    total beyond float32's range; both are counted in 'fixed_point_overflow'.  Its jvp / jacfwd tangents are exact
+    too.  Device memory on the
+    kernel backend: 44 B per bin (a 40 B accumulator + the output).  The xla backend needs jax_enable_x64 (it raises
+    without it).  docs/float_semantics.md.
+
+    fixed_point=True with another dtype accumulates round(v * scale) in int64 fixed point: bitwise
     order-independent, each value rounded to a multiple of 1/scale (needs jax_enable_x64 on the xla backend).
     |v * scale| >= 9.2e18 cannot be represented: such an emit is dropped, counted in
     Result.stats['fixed_point_overflow'], and the BIN it was emitted to becomes NaN (every kernel flags its own bins: a
@@ -78,8 +92,8 @@ class Queue:
 
 class Result(NamedTuple):
     """What a tallymap.vmap function returns.  When a tallymap resource limit intervened (max_steps, the spawn
-    Queue capacity) every float output is NaN; a fixed_point=True bin an unrepresentable emit was dropped from is
-    NaN.
+    Queue capacity) every float output is NaN; a fixed_point=True bin an unrepresentable emit was dropped from (a
+    non-finite one, for float32) is NaN.
     The counters in `stats` say which limit it was."""
     outputs: dict        # name -> summed output (float: NaN when a resource limit intervened)
     per_item: Any        # pytree of [N, ...] per-item results (None if the item returns only its tally)
@@ -103,6 +117,21 @@ class TSpec:
     fixed_point: bool = False
     kind: str = "sum"      # 'sum' | 'spawn' | 'discard'
     scale: float = 2.0 ** 32
+    exact: bool = False    # float32 sum, exact and order-independent: the integer sum of every finite f32 value (in
+                           # units of 2^-149), rounded once to f32 at readout; no scale, no floor, no cap.  A user's
+                           # Sum(fixed_point=True) of dtype float32, its jvp / jacfwd tangents, and the reverse
+                           # program's cotangent tallies (vjp_prog).  The kernel backend keeps DENSE_WORDS int64 words
+                           # per bin, the xla backend EXACT_WORDS int64 words (needs jax_enable_x64).
+    x64_fallback: bool = False   # an exact tally the xla backend may add in float32 without jax_enable_x64 (the
+                                 # reverse cotangents, as before they were exact); any other exact tally raises there
+
+
+# an f32 value is m * 2^(p - 149), m < 2^24, p = max(biased exponent - 1, 0) <= 253: an integer below 2^277 in units of
+# 2^-149.  The kernel backend keeps a bin's integer sum in DENSE_WORDS signed int64 words of weight 2^(63 j) (an int64
+# overflow of a word carries +-2 into the next: kernel.DENSE); the xla backend in EXACT_WORDS int64 words of 32-bit
+# digits (no carries: scatter-add)
+EXACT_WORDS = 9
+DENSE_WORDS = 5
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -342,8 +371,11 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                              "your keys)")
         shapes = {n: (outs_spec[n].shape,) if isinstance(outs_spec[n].shape, int) else tuple(outs_spec[n].shape)
                   for n in names}
+        # a fixed_point float32 Sum is the exact sum (TSpec.exact); fixed point at `scale` for the other dtypes
+        ex = {n: bool(outs_spec[n].fixed_point) and np.dtype(outs_spec[n].dtype) == np.float32 for n in names}
         tspecs = [TSpec(n, int(np.prod(shapes[n], dtype=np.int64)), np.dtype(outs_spec[n].dtype), (),
-                        bool(outs_spec[n].fixed_point), "sum", float(outs_spec[n].scale)) for n in names]
+                        bool(outs_spec[n].fixed_point) and not ex[n], "sum", float(outs_spec[n].scale), exact=ex[n])
+                  for n in names]
         if spawn is not None:
             tspecs.append(TSpec("__spawn__", 1, np.dtype(np.int32), (), False, "spawn"))
         nT = len(tspecs)

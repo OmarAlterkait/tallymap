@@ -168,6 +168,7 @@ static inline double atomicAdd(double* a, double v) {
 static inline int atomicSub(int* a, int v) { return __atomic_fetch_sub(a, v, __ATOMIC_RELAXED); }
 static inline unsigned atomicSub(unsigned* a, unsigned v) { return __atomic_fetch_sub(a, v, __ATOMIC_RELAXED); }
 static inline unsigned atomicExch(unsigned* a, unsigned v) { return __atomic_exchange_n(a, v, __ATOMIC_SEQ_CST); }
+static inline unsigned atomicOr(unsigned* a, unsigned v) { return __atomic_fetch_or(a, v, __ATOMIC_RELAXED); }
 static inline int atomicExch(int* a, int v) { return __atomic_exchange_n(a, v, __ATOMIC_SEQ_CST); }
 template <class T> static inline T sj_amax(T* a, T v) { T o = __atomic_load_n(a, __ATOMIC_RELAXED); while (o < v && !__atomic_compare_exchange_n(a, &o, v, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {} return o; }
 template <class T> static inline T sj_amin(T* a, T v) { T o = __atomic_load_n(a, __ATOMIC_RELAXED); while (o > v && !__atomic_compare_exchange_n(a, &o, v, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {} return o; }

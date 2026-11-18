@@ -164,7 +164,10 @@ answer either: 20 us helped the L40S (0.68 -> 0.23 ms) and hurt the 2080 Ti (0.5
   cubin's `.nv.info` records); the driver would refuse it with `invalid argument`. Effects, such as `jax.debug.print` or an input/output callback, raise on both backends.
 - N, the number of items, is a runtime kernel argument: neither the compiled kernel nor the in-memory kernel cache
   key contains it. One call takes fewer than 2^31 items.
-- `Sum(fixed_point=True)`: int64 fixed point, `round(v * scale)`, with one scale per output. Unrepresentable values,
+- `Sum(fixed_point=True)` of float32: the exact sum (docs/float_semantics.md item 4): an integer superaccumulator, 5 int64
+  words per bin on the kernel backend; it replaced 2^32 fixed point, which rounded tangents below 2^-33 of the
+  output's scale to 0 without a flag.  Other dtypes:
+  int64 fixed point, `round(v * scale)`, with one scale per output. Unrepresentable values,
   meaning `|v * scale| >= 9.2e18`, are dropped AND counted (`stats['fixed_point_overflow']`, per launch) on both backends,
   and flag their bin, which the kernel writes as NaN. The flag is per bin of the launch's own outputs, so a fused
   jvp's tangent overflow never poisons its primal, and an unfused tangent node poisons its own bins. A fixed

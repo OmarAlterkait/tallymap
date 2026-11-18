@@ -3,13 +3,15 @@ run by persistent threads that claim items with warp-aggregated atomics.  Emits 
 (small outputs privatised in shared memory); spawned children go through a bounded MPMC ticket queue.
 
 Buffers (one by-value struct of pointers): [per-item inputs] [broadcast inputs] [hoisted constants]
-| results: [sum tallies] [scratch accumulators (fixed point: u64 low words, i32 carry words, u32 flags)]
+| results: [sum tallies] [scratch accumulators (fixed point: u64 low words, i32 carry words, u32 flags;
+           exact: DENSE_WORDS int64 words per bin, flag bits, 2 u32 big-emit words)]
            [claim counter u64] [stats i32[5]]
            [spawn: queue leaves, seq, qctl] [per-item results].
 N (the item count) is a kernel ARGUMENT: one cubin serves every N.
 """
 import numpy as np
 
+from ..._api import DENSE_WORDS
 from .codegen import CodegenError, Emitter, Local, Scalar, Table, VTally, _size, ctype, elem, fill_decl, unravel
 from .op_table import phys
 
@@ -279,7 +281,8 @@ def privatised(tallies, budget=PRIV_BYTES):
     for k, s in enumerate(tallies):
         if s.kind != "sum":
             continue
-        nbytes = int(np.prod(s.lead, dtype=np.int64)) * s.S * (8 if _acc_t(s) in ("u64", "double") else 4)
+        nbytes = (int(np.prod(s.lead, dtype=np.int64)) * s.S * (8 if _acc_t(s) in ("u64", "double") else 4)
+                  * (DENSE_WORDS if s.exact else 1))
         if 0 < nbytes <= budget:
             budget -= nbytes
             out.append(k)
@@ -497,7 +500,30 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
         tot = int(np.prod(s.lead, dtype=np.int64)) * s.S
         dst = f"(({ot}*)P.p[{L.r_out[k]}])"
         at = _acc_t(s)
-        if s.fixed_point:
+        nacc = tot * (DENSE_WORDS if s.exact else 1)      # accumulator words
+        if s.exact:
+            # the exact f32 sum (DENSE): DENSE_WORDS int64 words per bin (bin i's at a[i * W]); after them one flag bit
+            # per bin (a non-finite emit: counted in stats[3], the bin NaN), then the tally's count of emits of
+            # |v| >= 2^96 and its sticky word, set when that count passes 2^31 or a carry leaves a top word (then
+            # every bin is NaN and counted: the sum could alias)
+            if DENSE not in src:
+                src.append(DENSE)
+            W = DENSE_WORDS
+            gp = f"((u64*)P.p[{L.r_scr[k]}])"
+            fl = f"((u32*)P.p[{L.r_scr[k]}] + {2 * nacc})"
+            big = f"((u32*)P.p[{L.r_scr[k]}] + {2 * nacc + (tot + 31) // 32})"
+            src.append(f"__device__ __forceinline__ void sj_emit{k}(const SjParams& P, u64* a, i64 i, float v) {{ "
+                       f"const int r = sj_demit(&a[i * {W}], v); if (r == 0) return; if (r == 1) {{ "
+                       f"atomicAdd(&SJ_STATS[3], 1); atomicOr(&{fl}[i >> 5], 1u << (i & 31)); return; }} "
+                       f"if ((r & 4) || ((r & 2) && atomicAdd(&{big}[0], 1u) == 0x7fffffffu)) {big}[1] = 1u; }}")
+            post.append(f"for (i64 i = g; i < {tot}; i += s) {{ bool bad = {big}[1] != 0u; "
+                        f"const float o = sj_dread(&{gp}[i * {W}], &bad); const bool f = (({fl}[i >> 5] >> (i & 31)) & 1u) "
+                        f"!= 0u; if (bad && !f) atomicAdd(&SJ_STATS[3], 1); "
+                        f"{dst}[i] = (f || bad) ? __int_as_float(0x7fc00000) : o; }}")
+            # a privatised copy's flush: each of its signed words added into the same word of the global bin
+            op = lambda a, i, v, W=W, big=big: (f"if (sj_dadd(&{a}[({i}) / {W} * {W}], (int)(({i}) % {W}), (i64){v})) "
+                                                f"{big}[1] = 1u;")
+        elif s.fixed_point:
             if WIDE not in src:
                 src.append(WIDE)
             gp = f"((u64*)P.p[{L.r_scr[k]}])"
@@ -544,10 +570,10 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
         else:
             raise CodegenError(f"sum output of dtype {s.dtype} is not supported")
         if k in priv:
-            acc_decl += [f"  __shared__ {at} sj_sh{k}[{tot}];",
-                         f"  for (int i = threadIdx.x; i < {tot}; i += blockDim.x) sj_sh{k}[i] = ({at})0;",
+            acc_decl += [f"  __shared__ {at} sj_sh{k}[{nacc}];",
+                         f"  for (int i = threadIdx.x; i < {nacc}; i += blockDim.x) sj_sh{k}[i] = ({at})0;",
                          f"  {at}* const sj_acc{k} = sj_sh{k};"]
-            acc_flush.append(f"  for (int i = threadIdx.x; i < {tot}; i += blockDim.x) {{ const {at} x = sj_sh{k}[i]; "
+            acc_flush.append(f"  for (int i = threadIdx.x; i < {nacc}; i += blockDim.x) {{ const {at} x = sj_sh{k}[i]; "
                              f"if (x != ({at})0) {{ {at}* const g = {gp}; {op('g', 'i', 'x')} }} }}")
         else:
             acc_decl.append(f"  {at}* const sj_acc{k} = {gp};")
@@ -718,6 +744,77 @@ __device__ __noinline__ double sj_wide_big(u64 lo, i32 c) {
   return neg ? -m : m; }
 __device__ __forceinline__ double sj_wide_f64(u64 lo, i32 c) { return c == 0 ? (double)(i64)lo : sj_wide_big(lo, c); }
 """
+# the exact f32 sum (TSpec.exact).  An f32 v = m * 2^(p - 149) (m < 2^24: the mantissa with its implicit bit; p =
+# biased exponent - 1, 0 for a subnormal) is an integer below 2^277 in units of 2^-149.  A bin keeps the sum of those
+# integers in DENSE_WORDS = 5 signed int64 words, word j of weight 2^(63 j) (carry-save: adjacent words overlap by one
+# bit): an emit adds the signed pieces of m << (p % 63) below 2^63 into words p / 63 and p / 63 + 1 with atomicAdd.  A
+# word whose add overflows int64 (read from the old value: the total of that word is then off by 2^64 = 2 x 2^63) adds
+# +-2 into the next word.  Each step keeps sum(word_j 2^(63 j)) + the carry in flight, so once every add has run the
+# words represent the exact total, whatever the order of the adds (the words themselves may differ; sj_dread
+# canonicalises them): bitwise deterministic, no scale, no floor, no cap.  A carry is needed only when a word drifts by
+# 2^63, never because the total changes sign (a two's-complement bin would ripple through every upper word at each zero
+# crossing: measured 1.20x lumen's SK time).  The top word cannot overflow while sum|v| < 2^165: an emit of |v| >= 2^96
+# returns 2 (the caller counts it per tally), so with fewer than 2^31 of them and fewer than 2^64 adds into a bin,
+# sum|v| < 2^159 + 2^160; a carry out of the top word would return 4 (the caller flags the tally: never silent).
+# sj_dread sums the words into a two's-complement 384-bit integer, takes its magnitude, its top 64 bits plus a sticky
+# bit, and rounds once to 24 bits (nearest, ties to even): the correctly rounded f32 of the exact total (an
+# f32-subnormal total is below 2^24 units, so exact).  tallymap/backends/xla.py (_xemit, _xread) keeps the same integer
+# as 32-bit digits in int64 words (EXACT_WORDS) and rounds it the same way, so the backends agree bitwise.
+DENSE = r"""
+__device__ __noinline__ bool sj_dwrap(u64* a, int j, i64 c) {       // the rare carry c = +-2 into word j; true: lost
+  for (; j < 5; ++j) { const i64 o = (i64)atomicAdd((unsigned long long*)&a[j], (unsigned long long)c);
+    const i64 r = (i64)((u64)o + (u64)c);
+    if (!((c > 0 && r < o) || (c < 0 && r > o))) return false; }
+  return true; }
+__device__ __forceinline__ bool sj_dadd(u64* a, int j, i64 q) {     // word j += q; an int64 overflow carries +-2
+  const i64 o = (i64)atomicAdd((unsigned long long*)&a[j], (unsigned long long)q);
+  const i64 r = (i64)((u64)o + (u64)q);
+  if (q > 0 && r < o) return sj_dwrap(a, j + 1, 2);
+  if (q < 0 && r > o) return sj_dwrap(a, j + 1, -2);
+  return false; }
+__device__ __forceinline__ int sj_demit(u64* a, float v) {          // 0 added, 1 non-finite (not added), | 2: |v| >= 2^96, | 4: carry lost
+  const u32 b = __float_as_uint(v), e = (b >> 23) & 255u;
+  if (e == 255u) return 1;
+  const u64 m = (u64)(b & 0x7fffffu) | (e ? 0x800000ull : 0ull);
+  if (m == 0ull) return 0;                                          // +-0 adds nothing
+  const u32 p = e ? e - 1u : 0u, j = p / 63u, s = p - 63u * j;
+  const i64 lo = (i64)((m << s) & 0x7fffffffffffffffull), hi = s >= 40u ? (i64)(m >> (63u - s)) : 0ll;
+  const bool neg = (b >> 31) != 0u;
+  bool lost = false;
+  if (lo) lost = sj_dadd(a, (int)j, neg ? -lo : lo);
+  if (hi) lost = sj_dadd(a, (int)j + 1, neg ? -hi : hi) || lost;
+  return (e >= 223u ? 2 : 0) | (lost ? 4 : 0); }
+__device__ __noinline__ float sj_dread(const u64* a, bool* bad) {
+  u64 d[6] = {0ull, 0ull, 0ull, 0ull, 0ull, 0ull};                  // sum_j word_j 2^(63 j), two's complement
+  for (int j = 0; j < 5; ++j) {
+    const i64 w = (i64)a[j];
+    const int sh = 63 * j, l = sh >> 6, b = sh & 63;
+    const u64 ext = w < 0 ? ~0ull : 0ull;
+    u64 x[2] = {(u64)w << b, b ? (u64)(w >> (64 - b)) : ext};
+    u64 c = 0ull;
+    for (int k = l; k < 6; ++k) {
+      const u64 y = k - l < 2 ? x[k - l] : ext, t = d[k] + y, u = t + c;
+      c = (t < y ? 1ull : 0ull) + (u < t ? 1ull : 0ull);
+      d[k] = u; } }
+  const bool neg = (i64)d[5] < 0;
+  if (neg) {                                                        // the magnitude: ~d + 1
+    u64 k = 1ull;
+    for (int j = 0; j < 6; ++j) { d[j] = ~d[j] + k; k = (k && d[j] == 0ull) ? 1ull : 0ull; } }
+  int t = 5;
+  while (t >= 0 && d[t] == 0ull) --t;
+  if (t < 0) return 0.0f;
+  const int s = __clzll((long long)d[t]);
+  const u64 d1 = t >= 1 ? d[t - 1] : 0ull;
+  const u64 top = s ? (d[t] << s) | (d1 >> (64 - s)) : d[t];       // the top 64 bits (bit 63 set)
+  bool st = s ? (d1 << s) != 0ull : d1 != 0ull;                     // sticky: any bit below them
+  for (int j = 0; j < t - 1; ++j) st = st || d[j] != 0ull;
+  u64 q = top >> 40;
+  const u64 r = top & 0xffffffffffull, half = 0x8000000000ull;
+  if (r > half || (r == half && (st || (q & 1ull)))) ++q;
+  const float o = (float)ldexp((double)q, 64 * t + 40 - s - 149);
+  if (!(fabs((double)o) <= 3.4028234663852886e38)) *bad = true;
+  return neg ? -o : o; }
+"""
 # integer output types: [lo, hi) of the values a fixed-point bin converts to without overflow
 _IRANGE = {"i8": ("-128.0", "128.0"), "u8": ("0.0", "256.0"), "i16": ("-32768.0", "32768.0"), "u16": ("0.0", "65536.0"),
            "i32": ("-2147483648.0", "2147483648.0"), "u32": ("0.0", "4294967296.0"),
@@ -725,11 +822,11 @@ _IRANGE = {"i8": ("-128.0", "128.0"), "u8": ("0.0", "256.0"), "i16": ("-32768.0"
 
 
 def _scratch(s):
-    return np.int64 if s.fixed_point else None
+    return np.int64 if s.fixed_point or s.exact else None
 
 
 def _acc_t(s):
-    if s.fixed_point:
+    if s.fixed_point or s.exact:
         return "u64"
     ot = ctype(s.dtype)
     return "u64" if ot in ("i64", "u64") else ot
