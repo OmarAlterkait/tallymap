@@ -17,6 +17,11 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   names the host, the pid and a random token (still renamed into place atomically). tests/edge.py.
 - CPU target: a host kernel whose `-fstack-usage` file was missing ran without its stack-size check. A cached
   kernel without that file is now rebuilt, and a build that does not write it is an error. tests/edge.py.
+- CPU target: the host kernel build took any `-fstack-usage` file for its hash from the cache directory, so it
+  could take another node's half-written one for the same kernel. It now builds in a private directory and
+  takes only its own file. tests/edge.py.
+- Cuda target: a cubin from which no frame size could be read passed the per-thread local-memory check. NVRTC
+  writes a record for every function (a 0-byte frame included), so this is now an error. tests/edge.py.
 
 ### Changed
 

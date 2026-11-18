@@ -241,7 +241,8 @@ def frame_bytes(cubin):
     """-> {kernel name: per-thread local memory bytes} read from the cubin itself (no device, no module load): each
     function's EIATTR_MIN_STACK_SIZE (0x12, its frame plus what its callees need) in the ELF .nv.info section, else
     its EIATTR_FRAME_SIZE (0x11).  These equal cuFuncGetAttribute(CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES) (checked on
-    DTRAX's kernels: 70,160 / 178,160 / 557,248 B).  {} when the cubin carries no such record."""
+    DTRAX's kernels: 70,160 / 178,160 / 557,248 B).  {} when the cubin carries no such record (NVRTC 12.9 writes
+    one for every function, a 0-byte frame included, sm_75 to sm_90: {} means the cubin could not be read)."""
     import struct
     b = bytes(cubin)
     if b[:4] != b"\x7fELF" or b[4] != 2:
@@ -284,7 +285,11 @@ def check_frame(cubin, where="", note=""):
     """run-or-raise: a kernel whose per-thread local memory is over LOCAL_LIMIT cannot launch on any GPU; raise
     UnsupportedError naming the bytes and the limit BEFORE the launch, instead of the driver's `invalid argument`.
     note: the schedule that ran (cuda.schedule_note), appended to the error."""
-    over = {k: v for k, v in frame_bytes(cubin).items() if v > LOCAL_LIMIT}
+    frames = frame_bytes(cubin)
+    if not frames:
+        raise RuntimeError("tallymap: no frame size could be read from the cuda kernel's cubin, so its per-thread "
+                           "local memory cannot be checked (internal error; backend='xla' runs the program meanwhile)")
+    over = {k: v for k, v in frames.items() if v > LOCAL_LIMIT}
     if over:
         from ..._api import UnsupportedError
         k, v = max(over.items(), key=lambda kv: kv[1])

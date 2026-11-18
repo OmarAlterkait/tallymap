@@ -20,6 +20,7 @@ import hashlib
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -249,17 +250,22 @@ def compile_so(src, where="", note=""):
     if not cached:
         cc = os.path.join(d, f"k_{h}.cc")
         C._atomic_write(cc, src.encode())
+        # built in a private directory (its name unique across nodes), where the -fstack-usage file is this build's
+        # whatever the compiler names it (GCC 11: <output>-k_<h>.su), never another build's half-written one
         tmp = C.tmp_path(so)
-        cmd = [C.host_cxx(), *OPTS, "-fstack-usage", cc, "-o", tmp]
-        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", cwd=d)
-        if r.returncode:
-            raise RuntimeError(f"tallymap: compiling the host kernel failed (internal error; backend='xla' runs the "
-                               f"program meanwhile):\n{' '.join(cmd)}\n{r.stderr[-4000:]}")
-        # -fstack-usage names its file after the output and the source (GCC 11: <tmp>-k_<h>.su); take it by pattern
-        for cand in glob.glob(os.path.join(d, f"*{h}*.su")):
-            if cand != su:
+        os.mkdir(tmp)
+        try:
+            out = os.path.join(tmp, f"k_{h}.so")
+            cmd = [C.host_cxx(), *OPTS, "-fstack-usage", cc, "-o", out]
+            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", cwd=tmp)
+            if r.returncode:
+                raise RuntimeError(f"tallymap: compiling the host kernel failed (internal error; backend='xla' runs "
+                                   f"the program meanwhile):\n{' '.join(cmd)}\n{r.stderr[-4000:]}")
+            for cand in glob.glob(os.path.join(tmp, "*.su")):
                 os.replace(cand, su)
-        os.replace(tmp, so)
+            os.replace(out, so)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
     dt = time.perf_counter() - t
     stack = _stack_bytes(su)
     if stack is None:

@@ -2070,8 +2070,8 @@ def _(b):
     return f"{names['nodeA']} != {names['nodeB']}"
 
 
-@case("host kernel cache: a missing -fstack-usage file is an error, and a cached .so without its .su is rebuilt",
-      ["xla"])
+@case("host kernel cache: a missing -fstack-usage file is an error, a cached .so without its .su is rebuilt, and "
+      "another node's .su for the same kernel is never taken", ["xla"])
 def _(b):
     import subprocess
     import tempfile
@@ -2106,13 +2106,40 @@ def _(b):
         tmp = calls[-1][calls[-1].index("-o") + 1]
         if C.socket.gethostname() not in tmp:
             raise Fail(f"the host kernel's temp name {tmp!r} does not name the host")
+        # another node building the same kernel at the same time: its .su (here a huge bound) sits in the cache dir
+        # while this build runs; this build must take only its own .su and leave the other one alone
+        other = []
+
+        def racing_cxx(cmd, **kw):
+            h = os.path.basename(cmd[-3])[2:-3]
+            other.append(os.path.join(os.path.dirname(cmd[-3]), f"k_{h}.so.tmp.nodeB.4242.00000000-k_{h}.su"))
+            with open(other[0], "w") as f:
+                f.write("k.cc:1:6:void sj_main()\t999999999\tstatic\n")
+            return fake_cxx(cmd, **kw)
+        H.subprocess.run = racing_cxx
+        _, info3 = H.compile_so("// edge: a concurrent build on another node\n")
+        if info3["stack"] != 64 or not os.path.exists(other[0]):
+            raise Fail(f"took another build's .su: stack {info3['stack']}, its file left {os.path.exists(other[0])}")
     finally:
         H.compiler_identity, C.host_cxx, H.stack_limit, H.subprocess.run, old = saved
         if old is None:
             os.environ.pop("TALLYMAP_CACHE", None)
         else:
             os.environ["TALLYMAP_CACHE"] = old
-    return "missing .su raises; .so without .su rebuilt; both cached -> no compile"
+    return "missing .su raises; .so without .su rebuilt; both cached -> no compile; another build's .su left alone"
+
+
+@case("cuda frame check: a cubin with no readable frame record is an error, not a pass", ["xla"])
+def _(b):
+    # NVRTC writes a frame record for every function, a 0-byte frame included (sm_75..sm_90), so no record at all
+    # means the cubin was not read; every real kernel compiled by the cuda cells passes through this same check
+    from tallymap.backends.kernel import compile as C
+    elf_no_sections = b"\x7fELF\x02\x01\x01" + bytes(0x40 - 7)
+    for what, cub in (("not an ELF", b"not a cubin"), ("an ELF64 with no sections", elf_no_sections)):
+        if C.frame_bytes(cub) != {}:
+            raise Fail(f"{what}: frame_bytes {C.frame_bytes(cub)}")
+        raises(RuntimeError, lambda cub=cub: C.check_frame(cub), "frame size")
+    return "no record -> RuntimeError"
 
 print("\n================ SUMMARY", jax.__version__, "x64" if jax.config.jax_enable_x64 else "",
       jax.devices()[0].device_kind)
