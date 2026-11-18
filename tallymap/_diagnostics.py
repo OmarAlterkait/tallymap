@@ -3,6 +3,7 @@
     tm.diagnostics()                       # environment + the host-side counters + the last programs / kernels
     tm.diagnostics(f, *args)               # ... and what jax.jit(f).lower(*args) builds: item jaxprs, cuda kernels
     tm.diagnostics(reset=True)             # read, then clear the counters and the history
+    tm.history()                           # cheap: the last programs' closed_over_floats and the kernel records
 
 Keys:
   versions   tallymap / jax / jaxlib / numpy / python
@@ -85,6 +86,16 @@ def _capture():
         yield c
     finally:
         _CAPTURE.remove(c)
+
+
+def history():
+    """-> dict(programs=[dict(tag, closed_over_floats)], kernels=[kernel records]): the history diagnostics() reports
+    (the last HISTORY item programs bound by tm.vmap and the last kernels used, oldest first), without its cost: no
+    jaxpr is rendered (JAX's printer: see record_program), no environment, GPU or compiler is probed, and no kernel
+    resources are queried.  history()["programs"][-1]["closed_over_floats"] is what the last tm.vmap
+    call's item function closed over; history()["kernels"][i]["schedule"] the schedule kernel i ran."""
+    return dict(programs=[dict(tag=r["tag"], closed_over_floats=float_consts(r["consts"])) for r in PROGRAMS],
+                kernels=[dict(r) for r in KERNELS])
 
 
 def _versions():

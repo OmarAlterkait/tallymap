@@ -407,6 +407,9 @@ common cause is first:
 `tm.diagnostics()` is the one place to look when something is wrong, and what to paste into a bug report:
 versions, GPU, compute capability, driver, the CUDA compiler and cache directory, these counters, and the last
 item jaxprs and generated kernels. `tm.diagnostics(f, *args)` reports what `jax.jit(f).lower(*args)` builds.
+`tm.history()` is its cheap part, safe to call on every trace: the last programs' `closed_over_floats` (the float
+constants an item function closed over, which no derivative reaches) and the kernel records (tag, target, schedule,
+hash, source), with no jaxpr rendered and nothing probed.
 
 ## Backends
 

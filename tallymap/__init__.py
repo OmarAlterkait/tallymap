@@ -15,7 +15,7 @@ from . import _primitive  # noqa: F401  (registers tallymap_call / tallymap_jvp 
 from ._api import Queue, Result, Sum, UnsupportedError, vmap
 from ._compare import reference
 from ._compat import TESTED_JAX, _check_jax_version
-from ._diagnostics import diagnostics
+from ._diagnostics import diagnostics, history
 from ._rewrite import TallyError
 from ._tally import Tally
 
@@ -30,5 +30,5 @@ def supported_primitives():
 
 __version__ = "0.7.1"
 _check_jax_version()       # one warning at import, only when JAX is newer than the newest tested version
-__all__ = ["vmap", "Sum", "Queue", "Result", "Tally", "reference", "diagnostics",
+__all__ = ["vmap", "Sum", "Queue", "Result", "Tally", "reference", "diagnostics", "history",
            "supported_primitives", "TallyError", "UnsupportedError", "TESTED_JAX"]

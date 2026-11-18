@@ -1226,6 +1226,38 @@ def _(b):
     return f"captured {pc[0]['closed_over_floats']}, operand []; the operand's tangent reaches the tally"
 
 
+@case("tm.history(): the last program's closed_over_floats and the kernel records, nothing rendered")
+def _(b):
+    tabc = jnp.linspace(0.5, 1.5, 32, dtype=F)
+    out = {"Q": tm.Sum((1,), F)}
+    cap = tm.vmap(lambda t, xi: t.add("Q", 0, xi * tabc[_ix(xi)]), outputs=out, backend=b)
+    opr = tm.vmap(lambda t, xi, tb: t.add("Q", 0, xi * tb[_ix(xi)]), outputs=out, in_axes=(0, None), backend=b)
+    tm.diagnostics(reset=True)
+    jax.block_until_ready(cap(xs).outputs["Q"])
+    h = tm.history()
+    if set(h) != {"programs", "kernels"}:
+        raise Fail(f"history keys {sorted(h)}")
+    p = h["programs"][-1]
+    if set(p) != {"tag", "closed_over_floats"} or [sh for sh, _, _ in p["closed_over_floats"]] != [(32,)]:
+        raise Fail(f"last program record {p}")
+    jax.block_until_ready(opr(xs, tabc).outputs["Q"])
+    h2 = tm.history()
+    if len(h2["programs"]) != 2 or h2["programs"][-1]["closed_over_floats"]:
+        raise Fail(f"an operand is listed as closed over: {h2['programs']}")
+    d = tm.diagnostics()                 # the same history, the expensive way
+    if [r["closed_over_floats"] for r in d["programs"]] != [r["closed_over_floats"] for r in h2["programs"]]:
+        raise Fail("history() and diagnostics() disagree on closed_over_floats")
+    if [(k["tag"], k["schedule"], k["hash"]) for k in h2["kernels"]] != \
+            [(k["tag"], k["schedule"], k["hash"]) for k in d["kernels"]]:
+        raise Fail("history() and diagnostics() disagree on the kernels")
+    if (b == "auto") != (len(h2["kernels"]) == 2):
+        raise Fail(f"kernel records {h2['kernels']}")
+    h2["kernels"].clear()
+    if b == "auto" and not tm.history()["kernels"]:
+        raise Fail("history() returned the library's own list")
+    return f"{len(h2['programs'])} programs, {len(tm.history()['kernels'])} kernels: {p['closed_over_floats']}"
+
+
 @case("a located error keeps the original exception's attributes", ["xla"])
 def _(b):
     from tallymap._jaxpr import located
