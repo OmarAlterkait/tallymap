@@ -5,6 +5,8 @@ a program raised; `holds_tracer` is asked by the lowering rule in `_primitive.py
 """
 import jax
 
+from ._jaxpr import subjaxprs
+
 CUSTOM_VJP = (
     " The item contains a custom_vjp, which JAX cannot forward-differentiate and which tallymap's reverse mode "
     "also has to probe in forward mode. Inside an item write the function without it: tallymap differentiates "
@@ -26,7 +28,6 @@ def holds_tracer(cj, _seen=None):
     """-> True if a ClosedJaxpr (or a sub-jaxpr) holds a tracer among its constants.  Asked only AFTER lowering a
     program failed: closed-over values of the live jax.jit around the call are hoisted into operands before
     lowering, so a tracer still here is a stale one, and it is what broke the lowering."""
-    from ._jaxpr import subjaxprs
     _seen = set() if _seen is None else _seen
     if id(cj) in _seen:
         return False
@@ -44,7 +45,7 @@ def ad_advice(e, what):
     # never in advance: a closed-over tracer of the LIVE jax.jit around the call is legitimate)
     if (isinstance(e, (jax.errors.UnexpectedTracerError, jax.errors.TracerArrayConversionError))
             or ("No constant handler for type" in s and "Tracer" in s)):
-        from ._api import UnsupportedError
+        from ._api import UnsupportedError          # (here: _api imports this module)
         return UnsupportedError(f"tallymap: cannot build the {what} of this item.{CLOSED_TRACER}\n{s}")
     if "custom_vjp" in s:
         from ._api import UnsupportedError

@@ -38,6 +38,9 @@ import sys
 import jax
 import numpy as np
 
+from ._rewrite import isfloat
+
+# (the kernel backend is imported inside the functions that read it: it imports _api, which imports this module)
 HISTORY = 16
 PROGRAMS = collections.deque(maxlen=HISTORY)       # (tag, jaxpr object) of item programs bound by tm.vmap
 KERNELS = collections.deque(maxlen=HISTORY)        # dicts recorded by backends/kernel.kernel()
@@ -66,7 +69,6 @@ def _render(rec):
 def float_consts(consts):
     """[(shape, dtype, size)] of the FLOAT ones among an item program's constants: the values its item function
     closed over, which a derivative cannot reach (a constant's tangent is zero, silently)."""
-    from ._rewrite import isfloat
     out = []
     for c in consts:
         dt = c.dtype if hasattr(c, "dtype") else np.asarray(c).dtype
@@ -117,7 +119,7 @@ def history():
 def _versions():
     import jaxlib
 
-    from . import __version__
+    from . import __version__         # (here: the package imports this module before it sets __version__)
     return dict(tallymap=__version__, jax=jax.__version__, jaxlib=getattr(jaxlib, "__version__", "?"),
                 numpy=np.__version__, python=sys.version.split()[0])
 

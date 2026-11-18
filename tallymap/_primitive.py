@@ -47,10 +47,15 @@ from jax.extend.core import ClosedJaxpr, Primitive, jaxpr_as_fun
 from jax.interpreters import ad, mlir
 from jax.interpreters import partial_eval as _pe
 
+from . import _errors
 from ._api import _WARNED, ItemProgram, UnsupportedError, _mk, _sds, jvp_prog
 from ._compat import NM, convert_constvars_jaxpr, drop_var, register_batcher, requires_devices
-from ._reverse import vjp_prog
+from ._jaxpr import call_jaxpr, cond_branches, digest, host_callbacks, scan_parts, subjaxprs, while_parts
+from ._reverse import LEAN_C, vjp_prog
+from ._reverse_spawn import rec_primal, tree_vjp
 from ._rewrite import isfloat
+from .backends import kernel as KB
+from .backends import xla as XB
 
 tallymap_call_p = Primitive("tallymap_call")
 tallymap_call_p.multiple_results = True
@@ -92,7 +97,6 @@ class Node:
         them; a cached entry keeps its objects alive)."""
         k = self.__dict__.get("_key")
         if k is None:
-            from ._jaxpr import digest, host_callbacks
             p = self.prog
             k = (digest(p.cj.jaxpr), tuple(id(c) for c in p.cj.consts),
                  tuple(id(c) for c in host_callbacks(p.cj.jaxpr)),
@@ -163,7 +167,6 @@ def _run(node, args, platform, ndev=1):
     """platform: the one JAX is lowering this computation for ('cuda', 'cpu', or another).  tallymap never picks a
     device: jax.default_device, device_put and jit placement decide where the computation runs, and so which
     kernel target (or, on a platform the kernel backend does not compile for, the xla backend) runs it."""
-    from .backends import xla as XB
     p = node.prog
     pi, bc = _split(node, args)
     opts = dict(node.opts)
@@ -176,7 +179,6 @@ def _run(node, args, platform, ndev=1):
         _warn_once(f"tallymap: the kernel backend compiles for CUDA GPUs and CPUs, not for {platform!r}; running the "
                    "xla backend (plain JAX)", node.site)
         return list(XB.run(p, pi, bc, **opts))
-    from .backends import kernel as KB
     try:
         return list(KB.run(p, pi, bc, target=platform, ndev=ndev, **opts))
     except UnsupportedError as e:
@@ -323,7 +325,6 @@ def _lowering(platform):
         except UnsupportedError:
             raise
         except Exception as e:
-            from . import _errors
             if _errors.holds_tracer(node.prog.cj):
                 raise UnsupportedError(f"tallymap: cannot lower this item program.{_errors.CLOSED_TRACER}\n"
                                        f"{type(e).__name__}: {str(e)[:300]}") from None
@@ -430,8 +431,7 @@ def _lean(node):
         return node
     k = node.__dict__.get("_lean")
     if k is None:
-        from . import _reverse
-        o = dict(node.opts, rev_checkpoints=_reverse.LEAN_C)
+        o = dict(node.opts, rev_checkpoints=LEAN_C)
         q = vjp_prog(node.base, node.pp, node.pb, o)
         k = node.derived(q, "adjoint", base=node.base, pp=node.pp, pb=node.pb, lin_pi=node.lin_pi,
                          lin_bc=node.lin_bc, opts=tuple(sorted(o.items())))
@@ -482,7 +482,6 @@ def _tangent_node(node, pp, pb, ring=()):
 def _ring_node(node, pp, pb):
     """the tangent node of a spawning call under reverse mode: its trailing operands are the tree adjoint's record,
     [stats] + [queue leaves] of the recording primal (_reverse_spawn.rec_primal; _bind_recorded)"""
-    from ._reverse_spawn import rec_primal
     r = rec_primal(node.prog)
     Q = r.spawn.capacity
     ring = [jax.ShapeDtypeStruct((5,), jnp.int32)] + [jax.ShapeDtypeStruct((Q,) + tuple(a.shape), a.dtype)
@@ -492,7 +491,6 @@ def _ring_node(node, pp, pb):
 
 def _bind_recorded(node, pi, bc):
     """-> (the primal outputs, the record) of a spawning call run as its recording primal"""
-    from ._reverse_spawn import rec_primal
     N = pi[0].shape[0]
     o = bind_call(*pi, *[jnp.zeros((N,), jnp.int32)] * 4, *bc, node=node.derived(rec_primal(node.prog), "primal"))
     nt, nY = len(_out_specs(node.prog)), node.prog.nY
@@ -536,7 +534,6 @@ def _vjp_call(node, base, pi, bc, U_pi, U_bc, cts, N, ring=()):
         if len(ring) != base.nP + 5:    # ([stats] + the queue leaves of rec_primal(base))
             raise NotImplementedError("tallymap: reverse mode through spawn is supported for a spawning call's own "
                                       "first-order jvp only (no second order)")
-        from ._reverse_spawn import tree_vjp
         return tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N, ring)
     ot, tf, yf = _float_slots(base)
     nt = len(ot)
@@ -771,8 +768,6 @@ def _balanced(size, cap):
 def _taint_max(jaxpr, tin, in_loop):
     """(max size of a tainted first-order loop intermediate, taint of the outvars)."""
     from jax.extend.core import Literal
-
-    from ._jaxpr import call_jaxpr, cond_branches, scan_parts, subjaxprs, while_parts
     tv = {v: t for v, t in zip(jaxpr.invars, tin)}
     m = 0
     for e in jaxpr.eqns:
@@ -826,7 +821,6 @@ def _taint_max(jaxpr, tin, in_loop):
 
 
 def _largest_loop_array(jaxpr, in_loop=False):
-    from ._jaxpr import subjaxprs
     m = 0
     for e in jaxpr.eqns:
         subs = subjaxprs(e)

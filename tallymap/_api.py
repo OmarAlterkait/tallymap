@@ -22,7 +22,8 @@ from jax import lax
 from jax.core import Tracer
 from jax.extend.core import ClosedJaxpr, jaxpr_as_fun
 
-from . import _errors
+from . import _diagnostics, _errors
+from ._jaxpr import item_name, located, subjaxprs
 from ._rewrite import check_tallies, isfloat, retrace
 from ._tally import Tally, emit_p
 
@@ -223,7 +224,7 @@ def jvp_prog(p, pert_pi, pert_bc):
     av = p.in_avals()
     tav, pav, bav = av[:nT], av[nT:nT + nP], av[nT + nP:]
     avals = tav + [tav[i] for i in tf] + pav + [pav[i] for i in ip] + bav + [bav[i] for i in ib]
-    from ._reverse import forward_tangents
+    from ._reverse import forward_tangents      # (here: _reverse imports this module)
     with forward_tangents():        # (sparse table reads of an adjoint program: see _reverse.tread)
         cj = _mk(J, [_sds(a) for a in avals])
     tl = list(p.tallies) + [dataclasses.replace(p.tallies[i], name=p.tallies[i].name + "'") for i in tf]
@@ -338,7 +339,6 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
         raise TypeError("tallymap: spawn must be tallymap.Queue(capacity)")
     outs_spec = {k: (v if isinstance(v, Sum) else Sum(v)) for k, v in outputs.items()}
     names = sorted(outs_spec)
-    from ._jaxpr import item_name
     where = item_name(fn)
     decl = _call_site()          # where tm.vmap was written: the fallback when the call itself is all JAX frames
 
@@ -420,9 +420,8 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                            nY - 1 if max_steps is not None else None, spawn, where=where,
                            nact=nb0 - 1 if n_active is not None else None)
         bc_all = bc + hoisted
-        from ._diagnostics import record_program
-        record_program(prog)
-        from ._primitive import bind_call, make_node
+        _diagnostics.record_program(prog)
+        from ._primitive import bind_call, make_node       # (here: _primitive imports this module)
         flat = bind_call(*pi, *bc_all, node=make_node(prog, backend, opts, _call_site(decl)))
         nt = len(_out_tallies(prog))
         tvals, st, ys = flat[:nt], flat[nt], flat[nt + 1:]
@@ -493,7 +492,6 @@ def _poison_primal(outs, bad):
 
 
 def _check_spawn(cj, pav, where=""):
-    from ._jaxpr import located, subjaxprs
     want = [(tuple(a.shape), a.dtype) for a in pav]     # not np.dtype: a typed PRNG key
 
     def walk(j):

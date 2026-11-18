@@ -47,9 +47,11 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 
+from ._api import ItemProgram, TSpec, _mk, _sds
 from ._diagnostics import record_reverse
+from ._reverse import check_slots, vjp_prog
 from ._rewrite import isfloat, retrace
-from ._tally import emit_p
+from ._tally import emit_p, spawn_p
 
 MIN_BUCKET = 256
 
@@ -83,8 +85,6 @@ def rec_primal(p):
     """p with the int32 per-item leaves (me, par, ord, gen) appended (see the module docstring); cached on p."""
     q = p.__dict__.get("_rec_primal")
     if q is None:
-        from ._api import _mk, _sds
-        from ._tally import spawn_p
         nT, nP, ks = p.nT, p.nP, _spawn_slot(p)
         av = [_sds(a) for a in p.in_avals()]
 
@@ -123,7 +123,6 @@ def build_rec(p, Cg):
     """the rewritten item program of base ItemProgram p (see module docstring).
     invars : [user tallies][SPf_l (float leaves)][FP] + [pi][off, cnt, z] + [bc][nact]
     outvars: same tallies + [user per-item results][n]"""
-    from ._api import _mk, _sds
     nT, nP, nB = p.nT, p.nP, p.nB
     ks = _spawn_slot(p)
     us = tuple(k for k in range(nT) if k != ks)
@@ -173,8 +172,6 @@ def build_rec(p, Cg):
 
 def _progs(p, Cg, U_bc, o):
     """(Rec, adjoint-base ItemProgram, its vjp ItemProgram, pert_pi, pert_bc) for base p; cached on p."""
-    from ._api import ItemProgram, TSpec
-    from ._reverse import check_slots, vjp_prog
     cache = p.__dict__.setdefault("_tree_cache", {})
     key = (Cg, tuple(U_bc), tuple(sorted(o.items())), _replay_inputs)
     if key in cache:
@@ -236,7 +233,7 @@ def tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N, ring):
     """cotangents (g_pi, g_bc) of base's per-item / broadcast operands flagged U_pi / U_bc, given the cotangents
     `cts` of ALL base outputs ([sum tallies] + [stats] + [per-item results]) and the record `ring` = [stats] +
     [queue leaves] of rec_primal(base) (see the module docstring); base spawns."""
-    from ._primitive import _float_slots, _inst, bind_call
+    from ._primitive import _float_slots, _inst, bind_call      # (here: _primitive imports this module)
     o = dict(node.opts)
     Q = int(base.spawn.capacity)
     Cg = min(int(_gen_capacity(Q)), Q)

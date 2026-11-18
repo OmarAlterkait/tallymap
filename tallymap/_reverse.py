@@ -47,8 +47,10 @@ from jax.interpreters import ad as _jad
 from jax.interpreters import batching as _batching
 from jax.interpreters import mlir as _mlir
 
+from ._api import ItemProgram, TSpec, _mk, _sds
 from ._diagnostics import record_reverse
-from ._rewrite import isfloat
+from ._jaxpr import bind, contains, is_dropvar, lit, subjaxprs, while_parts
+from ._rewrite import TallyError, _walk_eqn, check_tallies, isfloat, retrace
 from ._tally import emit_p
 
 FLOAT0 = jax.dtypes.float0
@@ -440,13 +442,11 @@ SINGLE = "auto"                  # 'auto' (by single_blocker) | 'force' (wheneve
 
 
 def _n_eqns(jaxpr):
-    from ._jaxpr import subjaxprs
     return sum(1 + sum(_n_eqns(sj.jaxpr) for sj in subjaxprs(e)) for e in jaxpr.eqns)
 
 
 def single_blocker(p):
     """-> None if the single-loop adjoint is used for program p, else why not."""
-    from ._jaxpr import while_parts
     if SINGLE == "off":
         return "off"
     ws = [e for e in p.cj.jaxpr.eqns if e.primitive.name == "while"]
@@ -462,7 +462,6 @@ def _tally_slots(jaxpr, kinds):
     """var -> the item tally it descends from, for the TOP-LEVEL vars of an item jaxpr (check_tallies' walk)."""
     from jax.extend.core import Literal
 
-    from ._rewrite import _walk_eqn
     slot, state, prod = {}, {}, {}
     for k, v in enumerate(jaxpr.invars[:len(kinds)]):
         slot[v], state[v] = k, "live"
@@ -486,9 +485,6 @@ def fold_post(p):
     meta = (probe carry, truncation carry or -1)."""
     from jax.extend.core import Literal, jaxpr_as_fun
 
-    from ._api import _mk, _sds
-    from ._jaxpr import bind, contains, is_dropvar, lit, subjaxprs, while_parts
-    from ._rewrite import check_tallies
     cj, nT = p.cj, p.nT
     jx = cj.jaxpr
     w = [i for i, e in enumerate(jx.eqns) if e.primitive.name == "while"][0]
@@ -836,7 +832,6 @@ def tread(eqn, tok, ins):
     A custom_jvp: primal = the equation itself (and tok passes through), tangent = the read of the table tangent
     (dense uses only, symbolic zero otherwise) + tlin_p of the token tangent.  The flat indices read are the same
     equation applied to an iota table (out-of-range fill -> index -1 -> dropped by emit)."""
-    from ._jaxpr import bind
     p2 = dict(eqn.params)
     if "fill_value" in p2:
         p2["fill_value"] = -1
@@ -870,8 +865,6 @@ def vjp_prog(p, pert_pi, pert_bc, opts=None):
     [same tallies] + [per-item operand cotangents] + [(the replay's truncation flag, bool: max_steps only)].
     The truncation flag is the adjoint's OWN (its replay runs the same capped loops as the forward): _vjp_call
     poisons the cotangents with it, so a gradient needs no forward launch."""
-    from ._api import ItemProgram, TSpec, _mk, _sds
-    from ._rewrite import retrace
     if p.spawn is not None:          # (spawning programs go through the tree adjoint, _reverse_spawn.tree_vjp)
         raise NotImplementedError("tallymap: vjp_prog of a spawning program (internal error: use the tree adjoint)")
     o = rev_opts(opts)
@@ -973,7 +966,6 @@ def _mixed_use_tables(cj, o, nT, tables, avals):
     """the trace-time pass of vjp_prog: the token indices (of `tables`) of the tables that also have uses other than
     reads, which need the dense cotangent for every use.  (tests/reverse.py patches it to return nothing as a
     NEGATIVE CONTROL: the mixed table's gradient must then be wrong.)"""
-    from ._rewrite import retrace
     rep = {}
     jax.make_jaxpr(retrace(cj, rev=o, n_tally=nT, tables=tables, report=rep))(*avals)
     return rep["dense"]
@@ -983,7 +975,6 @@ def check_slots(cj, tl, tag):
     """check_tallies with the program's SLOT LEGEND appended to a refusal: a reverse program's slots are the user's
     tallies, then one cotangent tally per perturbed broadcast operand, then one cotangent token per sparse table,
     which the user never wrote and cannot recognise from an index alone."""
-    from ._rewrite import TallyError, check_tallies
     try:
         check_tallies(cj, [s.kind for s in tl], name=tag)
     except TallyError as e:
