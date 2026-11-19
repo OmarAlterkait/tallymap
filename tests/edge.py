@@ -1540,14 +1540,17 @@ def _(b):
 
 @case("cuda_math='fast' (opt-in): a different, FMA-contracted kernel; results close to 'approx' and xla", ["auto"])
 def _(b):
-    """the fast mode compiles its own kernel (multiply-adds contracted); its results agree with the default mode
+    """the fast mode compiles its own kernel (multiply-adds contracted, the guarded reciprocal 1 / where(|d| < eps,
+    eps, d) a div.approx); its results agree with the default mode
     and xla to float tolerance, forward and jvp.  The CPU target ignores it (IEEE): there the two modes are equal."""
     def item(t, x, key):
         def body(k, c):
             a, v = c
             r = jax.random.uniform(jax.random.fold_in(key, k), (3,), F)
             v = v * F(0.9) + r * x
-            return a + jnp.dot(v, r) / (F(1.5) + r[0]), v
+            d = r[1] - F(0.5)                                            # a guarded reciprocal (fast division)
+            inv = F(1) / jnp.where(jnp.abs(d) < F(1e-3), F(1e-3), d)
+            return a + jnp.dot(v, r) / (F(1.5) + r[0]) + F(1e-3) * jnp.minimum(jnp.abs(inv), F(1e3)), v
         a, v = lax.fori_loop(0, 8, body, (F(0), jnp.zeros(3, F)))
         t = t.add("Q", (bits(key, 99) % NB).astype(jnp.int32), a)
         return t, (a, v)
@@ -1565,6 +1568,10 @@ def _(b):
         ka, kb = artifacts(g({}), xs, keys)[0], artifacts(g(dict(cuda_math="fast")), xs, keys)[0]
         if ka == kb:
             raise Fail("cuda_math='fast' compiled the same kernel as 'approx'")
+        d = tm.diagnostics(g(dict(cuda_math="fast")), xs, keys)["kernels"]
+        srcs = [open(k["source"]).read() for k in d if k.get("source") and os.path.exists(k["source"])]
+        if srcs and not any("sj_div_approx(" in s for s in srcs):
+            raise Fail("the guarded reciprocal did not get the fast division")
         same = all(np.asarray(p).tobytes() == np.asarray(q).tobytes()
                    for p, q in zip(jax.tree_util.tree_leaves(fast.per_item), jax.tree_util.tree_leaves(ref.per_item)))
         return f"close; per-item results bitwise {'equal' if same else 'different'} (FMA rounds differently)"

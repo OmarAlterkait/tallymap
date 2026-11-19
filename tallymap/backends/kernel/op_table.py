@@ -39,6 +39,7 @@ from .codegen import (
     ravel,
     unravel,
     vff,
+    vml,
     vrng,
 )
 
@@ -122,6 +123,9 @@ def b_mul(em, a, ts, t, p, vals):
 def b_div(em, a, ts, t, p, vals):
     if t in ("sj_c64", "sj_c128"):
         return f"sj_cdiv({a[0]}, {a[1]})"
+    if t == "float" and em.fast and len(vals) == 2 and (vml(vals[1]) or 0) >= ranges.TINY:
+        # cuda_math='fast', a divisor kept away from zero (a guarded direction component / slope): div.approx
+        return f"sj_div_approx({a[0]}, {a[1]})"
     if t == "float":
         return f"SJ_FDIV({a[0]}, {a[1]})"
     if t == "double":
@@ -1474,6 +1478,7 @@ def _set_carry_ranges(vals, pt, rs):
         if not p_ and not isinstance(v, VTally):
             v.rng = r
             v.ff = None
+            v.mlo = None
 
 
 def _batched_body(em, w, pred, bc, cars, vals, pt):
@@ -1604,6 +1609,7 @@ def _cond(em, eqn, ins, **p):
         x.ff = (all(f[0] for f in fs), all(f[1] for f in fs))
         if isinstance(o, Local):
             o.rng, o.ff = r, x.ff
+            o.mlo = None
     return res
 
 

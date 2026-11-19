@@ -291,6 +291,20 @@ def vff(v):
     return f or ranges.FF_NONE
 
 
+def vml(v):
+    """the magnitude floor of a float value v (|v| >= m > 0 everywhere; ranges.mag_floor), or None."""
+    dt = getattr(v, "dtype", None)
+    if dt is None or isinstance(v, VTally) or not ranges._is_float(dt):
+        return None
+    if v.cval is not None:
+        c = abs(float(np.asarray(v.cval)))
+        return c if np.isfinite(c) and c > 0 else None
+    m = getattr(v, "mlo", None)
+    if m is None and isinstance(v, View) and np.dtype(v.src.dtype) == np.dtype(dt):
+        m = vml(v.src)
+    return m
+
+
 def elem(v, idx):
     """C expression of v[idx] (idx: list of int / str index expressions)."""
     if isinstance(v, Scalar):
@@ -861,6 +875,8 @@ class Emitter:
                 ff = (ranges.float_facts(eqn.primitive.name, [vff(x) for x in ins], ins,
                                          getattr(eqn.outvars[0].aval, "dtype", None))
                       if len(eqn.outvars) == 1 and guard is None else None)
+                ml = (ranges.mag_floor(eqn.primitive.name, [vml(x) for x in ins], ins, self.same_value)
+                      if self.fast and len(eqn.outvars) == 1 and guard is None else None)
                 ovars = [e2.outvars[0]] if guard is not None else eqn.outvars
                 for v, x, r in zip(ovars, outs, rr):
                     if not is_dropvar(v):
@@ -877,10 +893,32 @@ class Emitter:
                             elif ff is not None:
                                 old = getattr(x, "ff", None) if any(x is i for i in ins) else None
                                 x.ff = (ff[0] or old[0], ff[1] or old[1]) if old else ff
+                            if not any(x is i for i in ins):
+                                if ml is not None:
+                                    x.mlo = ml
+                            elif eqn.primitive.name in _INPLACE_PRIMS or guard is not None:
+                                x.mlo = None                # (updated in place)
                         env[v] = x
             return [read(a) for a in jaxpr.outvars]
         finally:
             self._scopes.pop()
+
+    def same_value(self, a, b):
+        """are a and b the same value: one object, or the same C text for every element (pure expressions)."""
+        if a is b:
+            return True
+        if (tuple(getattr(a, "shape", ())) != tuple(getattr(b, "shape", ())) or isinstance(a, VTally)
+                or isinstance(b, VTally)):
+            return False
+        saved = (self.lines, self.ind, self.uid)
+        try:
+            self.lines = []
+            q = [f"_q{j}" for j in range(len(a.shape))]
+            return elem(a, q) == elem(b, q)
+        except Exception:
+            return False
+        finally:
+            self.lines, self.ind, self.uid = saved
 
     def _guard_text(self, pred, k):
         """the C condition under which a guarded update stores: the select's predicate when the update is its case

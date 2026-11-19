@@ -130,7 +130,8 @@ def run(p, pi, bc, target="cuda", cuda_math="approx", schedule="item", ndev=1, *
     measured 1.5x fwd / 1.65x jvp faster than ieee; validated by the pre-registered compare runs,
     docs/validation.md) |
     'ieee' (correctly rounded f32 div/sqrt: portable) |
-    'fast' (opt-in, statistical: approx plus FMA contraction of every float multiply-add; the CPU target ignores it)."""
+    'fast' (opt-in, statistical: approx plus FMA contraction of every float multiply-add and div.approx for an f32
+    divisor proven |b| >= 2^-126; the CPU target ignores it)."""
     math = cuda_math or "approx"
     if target == "cpu":
         math = "ieee"                       # (no approx PTX on the host: every operation is IEEE)

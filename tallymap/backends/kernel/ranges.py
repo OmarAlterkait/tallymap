@@ -444,3 +444,44 @@ def float_facts(name, ffs, ins, out_dt):
     except Exception:
         return FF_NONE
     return None                 # no claim: a call / loop result keeps the facts its own body gave it
+
+
+# ----------------------------------------------------------------------------- magnitude floors (fast mode)
+# |x| >= m > 0 for every element (None: unknown).  cuda_math='fast' divides by such a divisor with div.approx
+# (MUFU.RCP + FMUL, 2 ulp for 2^-126 <= |b| <= 2^126) instead of div.full's range-safe sequence: the divisor of a
+# guarded reciprocal 1 / where(|d| < eps, c, d) or 1 / max(|d|, eps) -- a direction component or a slope kept away
+# from zero.  (Above 2^126 div.approx returns 0 where div.full returns a value below 2^-126 |a|; the fast mode is
+# validated statistically.)  Sources: nonzero literals, the guards, max with a positive operand, abs / neg,
+# products of floored values, selects of floored values.
+TINY = 2.0 ** -126
+
+
+def mag_floor(name, mls, ins, same=None):
+    """the magnitude floor of an equation's (first) result from its operands' floors `mls` and values `ins`; same(a,
+    b): are two values the same value (jnp indexes d[a] afresh for each use)."""
+    same = same or (lambda a, b: a is b)
+    try:
+        if name in ("neg", "abs", "broadcast_in_dim", "reshape", "squeeze", "expand_dims", "copy", "copy_p",
+                    "reduce_precision"):
+            return mls[0]
+        if name == "mul":
+            return mls[0] * mls[1] if mls[0] and mls[1] else None
+        if name == "max":
+            pos = [float(v.cval) for v in ins if v.cval is not None and np.ndim(v.cval) == 0 and float(v.cval) > 0]
+            if pos:
+                return max(pos)
+            return None
+        if name == "select_n" and len(ins) == 3:
+            m0, m1 = mls[1], mls[2]
+            org = getattr(ins[0], "origin", None)
+            # where(|d| < eps, c, d) = select_n(|d| < eps, d, c): d only where |d| >= eps
+            if org is not None and org[0] in ("lt", "le") and len(org[1]) == 2:
+                a, e = org[1]
+                ao = getattr(a, "origin", None)
+                if (ao is not None and ao[0] == "abs" and same(ao[1][0], ins[1]) and e.cval is not None
+                        and np.ndim(e.cval) == 0 and float(e.cval) > 0):
+                    m0 = float(e.cval)              # (lt: |d| >= eps there; le: |d| > eps)
+            return min(m0, m1) if m0 and m1 else None
+    except Exception:
+        return None
+    return None

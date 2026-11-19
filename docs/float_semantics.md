@@ -66,10 +66,17 @@ math modes, schedules and JAX versions.
   to a hand-tuned kernel.
 - **cuda, `cuda_math='ieee'`**: correctly rounded f32 add / sub / mul / div / sqrt (round to nearest), rsqrt as
   rcp(sqrt) (two roundings): the portable choice.  Use it when portability matters more than speed.
-- **Both cuda modes**: no FMA contraction (`-fmad=false`), no flush-to-zero (`--ftz=false`); transcendentals call the
+- **The approx and ieee modes**: no FMA contraction (`-fmad=false`), no flush-to-zero (`--ftz=false`); transcendentals call the
   CUDA math library (libdevice) with its documented maximum ulp errors; f64 arithmetic is IEEE.  No attempt is made
   to reproduce XLA's own algebraic rewrites or polynomial approximations, so cuda and xla agree statistically,
   not bitwise.
+- **cuda, `cuda_math='fast'` (opt-in, never the default)**: `approx` plus FMA contraction (f32 / f64 add, sub and
+  mul are written as plain operators and compiled with `-fmad=true`, so multiply-add chains become FFMA) and, for an
+  f32 division whose divisor is proven at least 2^-126 in magnitude (a guarded reciprocal such as
+  `1 / jnp.where(jnp.abs(d) < eps, c, d)` or `1 / jnp.maximum(jnp.abs(d), eps)`), `div.approx.f32` (2 ulp for
+  2^-126 <= |b| <= 2^126; above 2^126, which is not proven, it returns 0 where `div.full` returns a value below
+  2^-126 |a|).  Results agree with the other modes statistically only; validate a fast run with the statistics of
+  your problem.  The CPU target ignores it (IEEE).
 - `cuda_math` is an option only (no environment default: a process-global numerics switch is a hidden input).  A
   driver frozen with the old default passes `cuda_math='ieee'` explicitly.
 

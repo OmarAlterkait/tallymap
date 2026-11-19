@@ -67,6 +67,9 @@ __device__ __forceinline__ float sj_rsqrt_approx(float b) { float r; asm("rsqrt.
 #define SJ_FSQRT(x) sj_sqrt_approx(x)
 #define SJ_FRSQRT(x) sj_rsqrt_approx(x)
 #endif
+#ifdef TALLYMAP_FAST             // cuda_math='fast': division by a divisor proven away from zero (op_table.b_div)
+__device__ __forceinline__ float sj_div_approx(float a, float b) { float r; asm("div.approx.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+#endif
 
 template <class T> __device__ __forceinline__ T sj_ld(const T* p) { return __ldg(p); }
 template <> __device__ __forceinline__ bool sj_ld<bool>(const bool* p) { return __ldg((const u8*)p) != 0; }
