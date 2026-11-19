@@ -273,7 +273,8 @@ _WARNED = set()
 
 # ------------------------------------------------------------------------------------------- vmap
 _OPTS = {                  # the public options; measurement switches are test-only module constants
-    "cuda_math": "kernel backend on a CUDA GPU, f32 div/sqrt: 'approx' (default) | 'ieee' (the CPU is always IEEE)",
+    "cuda_math": "kernel backend on a CUDA GPU, f32 div/sqrt: 'approx' (default) | 'ieee' | 'fast' (opt-in: also FMA "
+                 "contraction; statistical) (the CPU is always IEEE)",
     "schedule": "kernel backend: 'item' (default: a thread runs whole items) | 'step' (refill per loop step)",
     "xla_batch_size": "xla backend: items per batch",
     "rev_checkpoints": "reverse mode: checkpoint buffer size C (default 'auto': from the loop state's size)",
@@ -298,7 +299,8 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                cannot compile raises UnsupportedError; other platforms run the xla backend with a one-time warning
                | 'xla': the plain-JAX reference interpreter
     opts:      cuda_math          cuda f32 div/sqrt: 'approx' (default; XLA:GPU's own PTX) | 'ieee' (correctly
-                                  rounded and portable).
+                                  rounded and portable) | 'fast' (opt-in: approx plus FMA
+                                  contraction of multiply-adds; results agree only statistically, never bitwise).
                schedule           cuda: 'item' (default: a thread runs one whole item, then claims the next) |
                                   'step' (the step schedule: a thread is refilled with a new item at loop-STEP
                                   granularity, so a thread whose item ended does not idle until its warp's longest

@@ -82,6 +82,8 @@ def _iar(t, a, b, op):
 def b_add(em, a, ts, t, p, vals):
     if t in ("sj_c64", "sj_c128"):
         return f"sj_cadd({a[0]}, {a[1]})"
+    if t in ("float", "double") and em.fast:          # cuda_math='fast': NVRTC may fuse it with a multiply (FMA)
+        return f"(({a[0]}) + ({a[1]}))"
     if t == "float":
         return f"__fadd_rn({a[0]}, {a[1]})"
     if t == "double":
@@ -94,6 +96,8 @@ def b_add(em, a, ts, t, p, vals):
 def b_sub(em, a, ts, t, p, vals):
     if t in ("sj_c64", "sj_c128"):
         return f"sj_csub({a[0]}, {a[1]})"
+    if t in ("float", "double") and em.fast:
+        return f"(({a[0]}) - ({a[1]}))"
     if t == "float":
         return f"__fsub_rn({a[0]}, {a[1]})"
     if t == "double":
@@ -104,6 +108,8 @@ def b_sub(em, a, ts, t, p, vals):
 def b_mul(em, a, ts, t, p, vals):
     if t in ("sj_c64", "sj_c128"):
         return f"sj_cmul({a[0]}, {a[1]})"
+    if t in ("float", "double") and em.fast:
+        return f"(({a[0]}) * ({a[1]}))"
     if t == "float":
         return f"__fmul_rn({a[0]}, {a[1]})"
     if t == "double":

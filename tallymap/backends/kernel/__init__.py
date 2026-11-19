@@ -55,15 +55,22 @@ def _key(p, opts):
             _kernel_mod.SHARED_TABLES, _kernel_mod.SHARED_TABLE_MAX)           #  the source)
 
 
-MATH_OPTS = {"ieee": [], "approx": ["-DTALLYMAP_APPROX_DIVSQRT", "--prec-div=false", "--prec-sqrt=false"]}
+# 'fast' (opt-in; validated statistically, never bitwise): approx's div / sqrt plus FMA contraction of every f32 / f64
+# multiply-add (the emitter writes plain * and + and NVRTC fuses them with -fmad=true)
+MATH_OPTS = {"ieee": [], "approx": ["-DTALLYMAP_APPROX_DIVSQRT", "--prec-div=false", "--prec-sqrt=false"],
+             "fast": ["-DTALLYMAP_APPROX_DIVSQRT", "-DTALLYMAP_FAST", "--prec-div=false", "--prec-sqrt=false",
+                      "-fmad=true"]}
 
 
 class Kernel:
     def __init__(self, p, target="cuda", schedule="item", strict=False, math="approx"):
         self.block = BLOCK
         self.target = target
+        if math not in MATH_OPTS:
+            raise ValueError("tallymap: cuda_math must be 'approx', 'ieee' or 'fast'")
         try:
-            self.src, self.L = build_source(p, schedule=schedule, strict=strict, target=target)
+            self.src, self.L = build_source(p, schedule=schedule, strict=strict, target=target,
+                                            fast=target == "cuda" and math == "fast")
         except CodegenError as e:
             raise UnsupportedError(str(e)) from None
         note = schedule_note(self.L)
@@ -74,8 +81,6 @@ class Kernel:
             so, self.info = host.compile_so(self.src, p.where, note)   # run-or-raise on the stack bound
             self.kid = host.register(so, self.info)
             return
-        if math not in MATH_OPTS:
-            raise ValueError("tallymap: cuda_math must be 'ieee' or 'approx'")
         cubin, self.info = C.compile_cubin(self.src, C.device_arch(), MATH_OPTS[math])
         C.check_frame(cubin, p.where, note)      # run-or-raise: over CUDA's per-thread local limit never launches
         self.kid = C.register_kernel(cubin, note)
@@ -124,7 +129,8 @@ def run(p, pi, bc, target="cuda", cuda_math="approx", schedule="item", ndev=1, *
     cuda_math: 'approx' (DEFAULT: div.full / sqrt.approx / rsqrt.approx, the PTX XLA:GPU itself emits for f32;
     measured 1.5x fwd / 1.65x jvp faster than ieee; validated by the pre-registered compare runs,
     docs/validation.md) |
-    'ieee' (correctly rounded f32 div/sqrt: portable)."""
+    'ieee' (correctly rounded f32 div/sqrt: portable) |
+    'fast' (opt-in, statistical: approx plus FMA contraction of every float multiply-add; the CPU target ignores it)."""
     math = cuda_math or "approx"
     if target == "cpu":
         math = "ieee"                       # (no approx PTX on the host: every operation is IEEE)

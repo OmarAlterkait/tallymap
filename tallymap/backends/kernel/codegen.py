@@ -483,6 +483,7 @@ class Emitter:
         self.where = ""           # the item function (error messages)
         self.inplace = INPLACE    # False (test-only codegen.INPLACE): never update an array in place
         self.guarded = GUARDED    # False (test-only codegen.GUARDED): never fuse a guarded update
+        self.fast = False         # cuda_math='fast' (kernel.build_source): contractible float arithmetic
         self.store_guard = None   # the C condition the update rule being emitted stores under (guarded_updates)
         self.store_guard_eqn = None   # id() of the update equation it belongs to
         self._mulmemo = {}        # mul_chain: id(jaxpr) -> (jaxpr, output chain depth)

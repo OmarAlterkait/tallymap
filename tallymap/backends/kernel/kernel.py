@@ -354,7 +354,7 @@ def _stage_tables(fdefs, tables, budget=None, tmax=None):
     return decl, copy
 
 
-def build_source(p, *, block=BLOCK, schedule="item", strict=False, target="cuda"):
+def build_source(p, *, block=BLOCK, schedule="item", strict=False, target="cuda", fast=False):
     """-> (CUDA source, Layout).  p: tallymap._api.ItemProgram.  Its jaxpr is first rewritten into the
     canonical primitives (canon.py).  schedule: 'item' (one whole item per thread at a time) | 'step' (the step
     schedule wherever the program splits, else 'item'; strict: raise when it does not split).  Layout.mode is the
@@ -364,6 +364,7 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False, target="cuda"
     from .canon import canonical
     p = dataclasses.replace(p, cj=canonical(p.cj))
     em = Emitter()
+    em.fast = fast                 # cuda_math='fast': FMA-contractible f32 / f64 arithmetic (op_table.b_add ...)
     em.where = p.where
     L = Layout()
     jx = p.cj.jaxpr

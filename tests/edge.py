@@ -1538,6 +1538,39 @@ def _(b):
     return "bits equal to the facts-off cubin (which differs); values, NaN and zero signs equal to xla"
 
 
+@case("cuda_math='fast' (opt-in): a different, FMA-contracted kernel; results close to 'approx' and xla", ["auto"])
+def _(b):
+    """the fast mode compiles its own kernel (multiply-adds contracted); its results agree with the default mode
+    and xla to float tolerance, forward and jvp.  The CPU target ignores it (IEEE): there the two modes are equal."""
+    def item(t, x, key):
+        def body(k, c):
+            a, v = c
+            r = jax.random.uniform(jax.random.fold_in(key, k), (3,), F)
+            v = v * F(0.9) + r * x
+            return a + jnp.dot(v, r) / (F(1.5) + r[0]), v
+        a, v = lax.fori_loop(0, 8, body, (F(0), jnp.zeros(3, F)))
+        t = t.add("Q", (bits(key, 99) % NB).astype(jnp.int32), a)
+        return t, (a, v)
+    run = lambda bk, **o: V(item, bk, **o)(xs, keys)
+    ref = run("auto")
+    fast = run("auto", cuda_math="fast")
+    close(fast, ref, rtol=1e-4, what="fast vs approx")
+    close(fast, run("xla"), rtol=1e-4, what="fast vs xla")
+    tj = jax.jvp(lambda s: V(item, "auto", cuda_math="fast")(xs * s, keys).per_item[0], (F(1),), (F(1),))
+    rj = jax.jvp(lambda s: V(item, "auto")(xs * s, keys).per_item[0], (F(1),), (F(1),))
+    close(tj, rj, rtol=1e-4, what="jvp fast vs approx")
+    if GPU:
+        g = lambda o: (lambda a, k: V(item, "auto", **o)(a, k).per_item[0])
+        from ab_rule import artifacts
+        ka, kb = artifacts(g({}), xs, keys)[0], artifacts(g(dict(cuda_math="fast")), xs, keys)[0]
+        if ka == kb:
+            raise Fail("cuda_math='fast' compiled the same kernel as 'approx'")
+        same = all(np.asarray(p).tobytes() == np.asarray(q).tobytes()
+                   for p, q in zip(jax.tree_util.tree_leaves(fast.per_item), jax.tree_util.tree_leaves(ref.per_item)))
+        return f"close; per-item results bitwise {'equal' if same else 'different'} (FMA rounds differently)"
+    return "close (CPU: the mode is ignored)"
+
+
 @case("staged tables: small broadcast / constant tables read from shared memory == SHARED_TABLES off == xla "
       "(bitwise)", ["auto"])
 def _(b):
