@@ -13,6 +13,7 @@ import numpy as np
 
 from ..._compat import key_impl, random_bits, random_bits_streams, random_fold_in, random_seed, random_split
 from ..._jaxpr import call_jaxpr, cond_branches, scan_parts, while_parts
+from . import ranges
 from .codegen import (
     _ST,
     _UT,
@@ -37,6 +38,7 @@ from .codegen import (
     lit,
     ravel,
     unravel,
+    vrng,
 )
 
 RULES = {}
@@ -416,6 +418,20 @@ def _ew_rule(em, eqn, ins, **p):
     ct = ctype(dt)
     ts = [ctype(v.dtype) for v in ins]
     b = EW[name]
+    # integer ranges (ranges.py) decide a comparison / a select: the constant, or the case it picks (same bits)
+    if impl is None and name in ranges._CMP and len(ins) == 2:
+        c = ranges.compare(name, vrng(ins[0]), vrng(ins[1]), ins[0].dtype, ins[1].dtype)
+        if c is not None:
+            cv = np.asarray(c, dt)[()]
+            if shape == ():
+                return Scalar(lit(cv, dt), dt, cval=cv)
+            return Lazy(shape, dt, lambda idx: lit(cv, dt), cval=cv)
+    if name == "select_n" and not any(isinstance(v, VTally) for v in ins):
+        r = vrng(ins[0])
+        if r is not None and r[0] == r[1] and 0 <= r[0] < len(ins) - 1:
+            pick = ins[1 + r[0]]
+            if tuple(pick.shape) == tuple(shape) and np.dtype(pick.dtype) == dt and pick.key_impl is impl:
+                return pick
     # compile-time folding of exact scalar ops (what XLA's constant folder does on the host)
     if shape == () and all(v.cval is not None for v in ins):
         if name in _FOLD or name == "convert_element_type" or (name == "div" and _isf(dt)):
@@ -587,16 +603,58 @@ def _slice(em, eqn, ins, start_indices, limit_indices, strides=None):
     return View(src, pshape, lambda idx: [ia(s, im(i, d)) for s, i, d in zip(st, idx, sd)])
 
 
+_I32 = (-(1 << 31), (1 << 31) - 1)
+
+
+def _narrow(t, r):
+    """may index x (C type t, range r) be clamped in 32 bits?  A 32-bit or narrower signed type, or a range inside
+    int32."""
+    return t in ("i8", "i16", "i32", "bool") or (r is not None and r[0] >= _I32[0] and r[1] <= _I32[1])
+
+
+def _clamp_expr(x, dt, r, hi):
+    """C int expression of clamp(x, 0, hi) (JAX / XLA start-index semantics: the same value as sj_clampi((i64)x, hi)),
+    the cheapest form the range r of x (ranges.py) allows: none inside [0, hi], one side, else in 32 bits when x
+    fits (sj_clamp32), 64 bits otherwise."""
+    t = ctype(dt)
+    if r is not None and r[0] >= 0 and r[1] <= hi:
+        return f"((int)({x}))"
+    if t.startswith("u"):
+        if t == "u64" and not (r is not None and r[1] <= _I32[1]):
+            return f"((int)((u64)({x}) < (u64){hi} ? (u64)({x}) : (u64){hi}))"
+        return f"((int)((u32)({x}) < (u32){hi} ? (u32)({x}) : (u32){hi}))"
+    if _narrow(t, r):
+        if r is not None and r[0] >= 0:
+            return f"sj_imin<i32>((i32)({x}), {hi})"
+        if r is not None and r[1] <= hi:
+            return f"sj_imax<i32>((i32)({x}), 0)"
+        return f"sj_clamp32((i32)({x}), {hi})"
+    return f"((int)sj_clampi((i64)({x}), {hi}))"
+
+
+def _inb_expr(x, dt, r, hi):
+    """C bool expression of 0 <= x <= hi (sj_inb), or None when the range r of x proves it."""
+    if r is not None and r[0] >= 0 and r[1] <= hi:
+        return None
+    if r is not None and (r[1] < 0 or r[0] > hi):
+        return "false"
+    t = ctype(dt)
+    if t.startswith("u"):
+        return f"((u64)({x}) <= (u64){hi})" if t == "u64" else f"((u32)({x}) <= (u32){hi})"
+    if _narrow(t, r):
+        return f"((u32)(i32)({x}) <= (u32){hi})"
+    return f"sj_inb((i64)({x}), {hi})"
+
+
 def _clamp_start(em, v, hi):
     """int C variable = clamp(start, 0, hi) with jax/XLA dynamic_slice semantics."""
     if v.cval is not None:
         return int(min(max(int(v.cval), 0), hi))
+    r = vrng(v)
+    if r is not None and r[0] == r[1]:
+        return int(min(max(r[0], 0), hi))
     n = em.fresh("st")
-    t = ctype(v.dtype)
-    if t.startswith("u"):
-        em.line(f"const int {n} = (int)((u64)({elem(v, [])}) < (u64){hi} ? (u64)({elem(v, [])}) : (u64){hi});")
-    else:
-        em.line(f"const int {n} = (int)sj_clampi((i64)({elem(v, [])}), {hi});")
+    em.line(f"const int {n} = {_clamp_expr(elem(v, []), v.dtype, r, hi)};")
     return n
 
 
@@ -1008,6 +1066,7 @@ def _gather(em, eqn, ins, dimension_numbers, slice_sizes, mode=None, fill_value=
     fv = lit(_fill_default(odt) if fill_value is None else fill_value, odt)
     nidx = ind.shape[-1] if ind.shape else 1
     ind_scalar_vec = len(ind.shape) == 0
+    rind = vrng(ind)
 
     # hoist the clamped start indices when there is no batch dimension (the common case)
     pre = None
@@ -1020,9 +1079,10 @@ def _gather(em, eqn, ins, dimension_numbers, slice_sizes, mode=None, fill_value=
             s = _clamp_start(em, raw, hi)
             okv = None
             if m == "fill":
-                okv = em.fresh("ok")
-                r = elem(raw, [])
-                em.line(f"const bool {okv} = sj_inb((i64)({r}), {hi});")
+                c = _inb_expr(elem(raw, []), raw.dtype, vrng(raw), hi)
+                if c is not None:
+                    okv = em.fresh("ok")
+                    em.line(f"const bool {okv} = {c};")
             pre.append((d, s, okv))
 
     def fn(idx):
@@ -1046,9 +1106,11 @@ def _gather(em, eqn, ins, dimension_numbers, slice_sizes, mode=None, fill_value=
                 d = sim[k]
                 raw = elem(ind, bidx + [k])
                 hi = op.shape[d] - slice_sizes[d]
-                src[d] = ia(f"(int)sj_clampi((i64)({raw}), {hi})", src[d])
+                src[d] = ia(_clamp_expr(raw, ind.dtype, rind, hi), src[d])
                 if m == "fill":
-                    conds.append(f"sj_inb((i64)({raw}), {hi})")
+                    c = _inb_expr(raw, ind.dtype, rind, hi)
+                    if c is not None:
+                        conds.append(c)
         x = elem(op, src)
         return f"(({' && '.join(conds)}) ? ({x}) : ({fv}))" if conds else x
     if LAZY_GATHER and _size(oshape) > LAZY_GATHER and isinstance(op, (Table, Lazy, View)):
@@ -1077,6 +1139,7 @@ def _scatter(em, eqn, ins, dimension_numbers, mode=None, **p):
     uwd = tuple(dn.update_window_dims)
     iwd = set(dn.inserted_window_dims) | set(obd)
     sdod = tuple(dn.scatter_dims_to_operand_dims)
+    rind = vrng(ind)
     m = _mode(mode)
     # in place when the operand is dead (the dynamic_update_slice rule).  x.at[i].set(v) with a traced i is a
     # scatter, not a dynamic_update_slice; copying it every time cost DTRAX's g0102 item 17 copies of its
@@ -1102,10 +1165,12 @@ def _scatter(em, eqn, ins, dimension_numbers, mode=None, **p):
             raw = elem(ind, bidx + [k]) if ind.shape else elem(ind, [])
             hi = op.shape[d] - wsize[d]
             if m == "clip":
-                dst[d] = ia(f"(int)sj_clampi((i64)({raw}), {hi})", dst[d])
+                dst[d] = ia(_clamp_expr(raw, ind.dtype, rind, hi), dst[d])
             else:
                 dst[d] = ia(f"(int)({raw})", dst[d])
-                conds.append(f"sj_inb((i64)({raw}), {hi})")
+                c = _inb_expr(raw, ind.dtype, rind, hi)
+                if c is not None:
+                    conds.append(c)
         tgt = f"{out.name}[{ravel(dst, op.shape)}]" if op.shape else out.name
         val = elem(upd, idx)
         rhs = val if comb is None else _bin(em, comb, tgt, val, t)
@@ -1329,7 +1394,12 @@ def _while(em, eqn, ins, **p):
             next((X for X in _src_locals(v).values() if _may_overwrite(em, X, [(v, ins)])), None)
             for v, p_ in zip(init, pt)]
     cars = _carry_vars(em, init, pt, dest)
+    # integer ranges of the carries (ranges.while_ranges): the loop invariant, and inside the body the invariant
+    # narrowed by a `carry < bound` predicate
+    body_r, inv_r = ranges.while_ranges(eqn, [vrng(v) for v in ins])
+    _set_carry_ranges(cars, pt, inv_r)
     vals = [_carry_val(c) if not p_ else c for c, p_ in zip(cars, pt)]
+    _set_carry_ranges(vals, pt, inv_r)
     em.freeze(cc + bc + [c for c, p_ in zip(cars, pt) if p_])     # re-read every iteration: never in place
     start = len(em.lines)
     em.open("while (true)")
@@ -1338,14 +1408,25 @@ def _while(em, eqn, ins, **p):
     em.unfreeze()
     if pred.shape == ():
         em.line(f"if (!({elem(pred, [])})) break;")
-        outs = em.run_closed(w.body, bc + vals)
+        bvals = [_carry_val(c) if not p_ else c for c, p_ in zip(cars, pt)]
+        _set_carry_ranges(bvals, pt, body_r)
+        outs = em.run_closed(w.body, bc + bvals)
     else:
         outs = _batched_body(em, w, pred, bc, cars, vals, pt)
     pp = _update_carries(em, cars, outs, pt, start)
     em.close()
     em.unfreeze()
     _pingpong_exit(em, pp)
+    _set_carry_ranges(cars, pt, inv_r)
     return vals
+
+
+def _set_carry_ranges(vals, pt, rs):
+    """the carries' (or their values') integer ranges: rs (None = unknown, which also clears a range an initial
+    value's storage carried in: v3 makes that storage the carry, and the loop overwrites it)."""
+    for v, p_, r in zip(vals, pt, rs):
+        if not p_ and not isinstance(v, VTally):
+            v.rng = r
 
 
 def _batched_body(em, w, pred, bc, cars, vals, pt):
@@ -1463,7 +1544,18 @@ def _cond(em, eqn, ins, **p):
             if isinstance(o, tuple) and not (isinstance(r, Local) and r.name == o[1].name):
                 em.assign(o[1], r)
     em.close()
-    return [o[1] if isinstance(o, tuple) else (o if isinstance(o, VTally) else _carry_val(o)) for o in outs]
+    res = [o[1] if isinstance(o, tuple) else (o if isinstance(o, VTally) else _carry_val(o)) for o in outs]
+    for j, (o, x) in enumerate(zip(outs, res)):       # the hull of the branches' results (a destination too:
+        if isinstance(x, VTally):                       # its storage now holds them)
+            continue
+        r = None
+        for k, bd in enumerate(bodies):
+            rk = vrng(bd[1][j])
+            r = rk if k == 0 else ranges.join(r, rk)
+        x.rng = r
+        if isinstance(o, Local):
+            o.rng = r
+    return res
 
 
 @rule("scan")
@@ -1475,7 +1567,10 @@ def _scan(em, eqn, ins, **p):
     xs = list(ins[num_consts + num_carry:])
     pt = _pass_through(jaxpr.jaxpr, num_consts, num_carry)
     cars = _carry_vars(em, init, pt)
+    inv_r = ranges.scan_ranges(eqn, [vrng(v) for v in ins], carries=True)
+    _set_carry_ranges(cars, pt, inv_r)
     vals = [_carry_val(c) if not p_ else c for c, p_ in zip(cars, pt)]
+    _set_carry_ranges(vals, pt, inv_r)
     # an inert discard tally may be a scanned input / stacked output (a reverse-mode residual): it stays virtual
     from ..._rewrite import tally_flags_out
     yflag = tally_flags_out(jaxpr.jaxpr, [isinstance(v, VTally) for v in consts + init + xs])[num_carry:]
@@ -1515,6 +1610,7 @@ def _scan(em, eqn, ins, **p):
     pp = _update_carries(em, cars, outs[:num_carry], pt, start)
     em.close()
     _pingpong_exit(em, pp, length)
+    _set_carry_ranges(cars, pt, inv_r)
     return vals + ys
 
 

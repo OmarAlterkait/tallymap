@@ -27,6 +27,8 @@ from jax.extend.core import ClosedJaxpr, Literal
 
 from ..._errors import ad_advice
 from ..._jaxpr import is_dropvar, located
+from . import ranges
+from .ranges import eqn_ranges
 
 UNROLL = 32          # arrays with <= UNROLL elements are emitted as straight-line code
 MAX_LOCAL = 1 << 14  # largest per-thread local array we agree to materialise
@@ -253,6 +255,23 @@ def lazy_cost(v):
     return 0
 
 
+def vrng(v):
+    """the integer range (lo, hi) every element of v is known to lie in (ranges.py), or None.  Unsigned, bool and
+    narrow integer dtypes give at least their own range; a View reads its source's."""
+    from . import ranges
+    dt = getattr(v, "dtype", None)
+    if dt is None or isinstance(v, VTally) or not ranges._is_int(dt) or is_key_dtype(dt) or v.key_impl is not None:
+        return None
+    if not ranges.ENABLE:
+        return None
+    if v.cval is not None:
+        return ranges.lit_range(v.cval, dt)
+    r = getattr(v, "rng", None)
+    if r is None and isinstance(v, View) and np.dtype(v.src.dtype) == np.dtype(dt):
+        r = vrng(v.src)
+    return ranges.clip(ranges.full(r, dt), dt)
+
+
 def elem(v, idx):
     """C expression of v[idx] (idx: list of int / str index expressions)."""
     if isinstance(v, Scalar):
@@ -284,6 +303,10 @@ def elem(v, idx):
 # 1, 4 or 8 links the compile is 0.2 s at depth 16, 24 and 48; every 12 it is 2.2 s; every 16 it is 125.6 s;
 # identical SASS (928 == 928 instructions).
 MULCHAIN_K = 8
+
+# primitives whose rule may return its operand array updated in place (op_table._may_overwrite)
+_INPLACE_PRIMS = frozenset({"dynamic_update_slice", "scatter", "scatter-add", "scatter_add", "scatter-mul",
+                            "scatter_mul", "scatter-min", "scatter_min", "scatter-max", "scatter_max"})
 
 
 def _wide_mul(eqn):
@@ -675,9 +698,18 @@ class Emitter:
                 outs = self.eqn(eqn, ins)
                 if not eqn.primitive.multiple_results:
                     outs = [outs]
-                for v, x in zip(eqn.outvars, outs):
+                rr = eqn_ranges(eqn, [vrng(x) for x in ins], [getattr(x, "dtype", None) for x in ins], nested=False)
+                for v, x, r in zip(eqn.outvars, outs, rr):
                     if not is_dropvar(v):
-                        env[v] = self.brk(x) if v in cuts else self.mat_multi(x, uses.get(v, 0))
+                        x = self.brk(x) if v in cuts else self.mat_multi(x, uses.get(v, 0))
+                        if not isinstance(x, VTally):
+                            # an operand updated in place (scatter / dynamic_update_slice) gets r, even None; one
+                            # returned unchanged (a folded select) keeps its own, tighter fact; a new value gets r
+                            if any(x is i for i in ins) and eqn.primitive.name in _INPLACE_PRIMS:
+                                x.rng = r
+                            elif r is not None:
+                                x.rng = ranges.meet(getattr(x, "rng", None), r) if any(x is i for i in ins) else r
+                        env[v] = x
             return [read(a) for a in jaxpr.outvars]
         finally:
             self._scopes.pop()

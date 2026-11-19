@@ -1449,6 +1449,55 @@ def _(b):
     return "bitwise equal; in-place and copying cubins differ"
 
 
+@case("integer ranges: index normalisation / clamps elided == ranges off (bitwise) == xla", ["auto"])
+def _(b):
+    """kernel/ranges.py: an index provably inside its bounds (iota, fori_loop counter, clamp, argmax, unsigned
+    source, a counter narrowed by its loop predicate) loses JAX's `i < 0 ? i + n : i` and the clamp; an index that
+    may be negative (a decreasing counter, a raw input) keeps both.  Arms: ranges.ENABLE = False (every index
+    normalised and clamped as before; the cubins must differ: bitwise equal results) and xla (integers bitwise,
+    floats close)."""
+    ftab = jnp.arange(40).astype(F) * F(0.37) - F(3.0)
+    itab = (jnp.arange(24, dtype=jnp.int32) * 7) % 11 - 3
+
+    def item(t, x, key):
+        u = (bits(key, 0) % 200).astype(jnp.uint8)
+        m = jnp.argmax(jnp.sin(ftab[:12] * x.astype(F)))
+        s = ftab[m] + ftab[u % 40] + ftab[jnp.clip(x - 3, 0, 39)]
+
+        def body(i, c):                                          # fori_loop: 0 <= i < 9
+            a, w = c
+            a = a + itab[i * 2] * itab[9 - 1 - i + 2]             # 9 - 1 - i: decreasing, still >= 0
+            return a, w.at[i].set(a)                             # a scatter at a ranged index
+        a, w = lax.fori_loop(0, 9, body, (jnp.int32(0), jnp.zeros(9, jnp.int32)))
+
+        def wb(c):                                               # a counter that goes negative: the wrap stays
+            k, acc = c
+            return k - 1, acc + itab[k] + itab[k % 24]
+        k, acc = lax.while_loop(lambda c: c[0] > -5, wb, (x % 7, jnp.int32(0)))
+        neg = itab[x - 20] + itab[jnp.minimum(x, 23)]             # x - 20 may be negative: the wrap stays
+        sel = jnp.where(jnp.arange(4) < 9, jnp.arange(4) * 3, -1)  # a decided compare -> the case
+        t = t.add("Q", (u % NB).astype(jnp.int32), F(1))   # (an exact sum: float atomics have no fixed order)
+        return t, (s, a, w, acc, k, neg, sel.sum() + itab[jnp.arange(24)[x % 24]] + m)
+    ii = jnp.arange(N, dtype=jnp.int32) % 31
+    from tallymap.backends.kernel import ranges as RG
+    run = lambda bk: V(item, bk)(ii, keys)
+    g = lambda a, k: V(item, "auto")(a, k).per_item[0]
+    assert_arms_differ(g, g, ii, keys, patch_b=(RG, dict(ENABLE=False)))   # instrument: the ranges fired
+    on = run("auto")
+    with patched(RG, ENABLE=False):
+        off = run("auto")
+    for a, c in zip(jax.tree_util.tree_leaves(on), jax.tree_util.tree_leaves(off)):
+        if not np.array_equal(np.asarray(a), np.asarray(c)):
+            raise Fail("the ranged cuda result differs from the ranges-off cuda result")
+    x = run("xla")
+    for a, c in zip(jax.tree_util.tree_leaves(on), jax.tree_util.tree_leaves(x)):
+        a, c = np.asarray(a), np.asarray(c)
+        if a.dtype.kind in "iub" and not np.array_equal(a, c):
+            raise Fail("an integer result differs from xla")
+    close(on, x, what="vs xla")
+    return "bitwise equal to the ranges-off cubin (which differs); integers == xla"
+
+
 @case("buffer assignment (while init alias, cond destination, lazy write-back) == rule off == copying cuda == "
       "xla", ["auto"])
 def _(b):

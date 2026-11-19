@@ -12,6 +12,7 @@ N (the item count) is a kernel ARGUMENT: one cubin serves every N.
 import numpy as np
 
 from ..._api import DENSE_WORDS, STATS
+from . import ranges
 from .codegen import CodegenError, Emitter, Local, Scalar, Table, VTally, _size, ctype, elem, fill_decl, unravel
 from .op_table import phys
 
@@ -97,6 +98,8 @@ __device__ __forceinline__ double sj_canon_d(double x) { return x == 0.0 ? 0.0 :
 __device__ __forceinline__ i32 sj_tkey_f(float x) { i32 i = __float_as_int(x); return i ^ ((i >> 31) & 0x7fffffff); }
 __device__ __forceinline__ i64 sj_tkey_d(double x) { i64 i = __double_as_longlong(x); return i ^ ((i >> 63) & 0x7fffffffffffffffll); }
 __device__ __forceinline__ i64 sj_clampi(i64 x, i64 hi) { return x < 0 ? 0 : (x > hi ? hi : x); }
+// the same clamp of a 32-bit index (two IMNMX instead of 64-bit compare pairs and selects): op_table._clamp_expr
+__device__ __forceinline__ i32 sj_clamp32(i32 x, i32 hi) { return x < 0 ? 0 : (x > hi ? hi : x); }
 __device__ __forceinline__ bool sj_inb(i64 x, i64 hi) { return x >= 0 && x <= hi; }
 
 // threefry2x32 (20 rounds), bitwise identical to jax.random's threefry2x32_p
@@ -257,7 +260,7 @@ def _split(cj):
     pre_cj = jax.make_jaxpr(pre)(*in_av)
     post_cj = jax.make_jaxpr(post)(*in_av, *[sds(v) for v in state], *[sds(v) for v in we.outvars])
     return dict(pre=pre_cj, post=post_cj, cond=wp.cond, body=wp.body, ops=wops, state=state,
-                nc=nc, nb=nb, invars=list(jx.invars), constvars=consts)
+                nc=nc, nb=nb, invars=list(jx.invars), constvars=consts, eqn=we)
 
 
 BLOCK = 128          # threads per block (measured: 64 / 128 / 256 within 1%)
@@ -416,6 +419,22 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
         pc = [as_param(val_of(v), f"c{j}") for j, v in enumerate(cc)]
         pb = [as_param(val_of(v), f"b{j}") for j, v in enumerate(bc)]
         pk = [as_param(x, f"w{j}") for j, x in enumerate(kvals)]
+        # integer ranges across the split (ranges.py): the loop's operands from the item jaxpr, its carries'
+        # invariant in cond / post and the predicate-narrowed one in the body
+        renv = {}
+        ranges.jaxpr_ranges(p.cj, [None] * len(jx.invars), renv)
+        wr = [ranges.lit_range(v.val, v.aval.dtype) if type(v).__name__ == "Literal" else renv.get(v)
+              for v in sp["eqn"].invars]
+        body_r, inv_r = ranges.while_ranges(sp["eqn"], wr)
+        for (d, x, _), r in zip(pc + pb + pk, wr[:nc] + wr[nc:nc + nb] + list(inv_r)):
+            if d is not None:
+                x.rng = r
+        pk_body = []
+        for j, ((d, x, a), r) in enumerate(zip(pk, body_r)):
+            if d is not None:
+                x = _val(f"w{j}", tuple(x.shape), x.dtype, x.key_impl)
+                x.rng = r
+            pk_body.append((d, x, a))
         function("cond", sp["cond"], [(d, x) for d, x, _ in pc + pk])
         decls += "  bool sj_pr;\n"
         cargs = [a for _, _, a in pc + pk if a is not None]
@@ -426,7 +445,9 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
         ipc = {j for j, x in enumerate(kvals) if em.inplace and isinstance(x, Local) and x.shape != ()
                and _size(x.shape) >= STEP_INPLACE_MIN}
         pkb = [(_decl(f"w{j}", tuple(x.shape), x.dtype, const=False), _val(f"w{j}", tuple(x.shape), x.dtype,
-                x.key_impl), f"k{j}") if j in ipc else q for j, (x, q) in enumerate(zip(kvals, pk))]
+                x.key_impl), f"k{j}") if j in ipc else q for j, (x, q) in enumerate(zip(kvals, pk_body))]
+        for j in ipc:
+            pkb[j][1].rng = body_r[j]
         bargs = [a for _, _, a in pb + pkb if a is not None]
         bres, bspec = function("body", sp["body"], [(d, x) for d, x, _ in pb + pkb],
                                inplace_out={j: f"w{j}" for j in ipc})

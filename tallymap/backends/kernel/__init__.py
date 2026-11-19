@@ -24,7 +24,7 @@ import numpy as np
 from ..._api import UnsupportedError
 from ..._compat import key_impl
 from ..._jaxpr import digest
-from . import codegen
+from . import codegen, ranges
 from . import compile as C
 from .codegen import CodegenError, is_key_dtype
 from .kernel import BLOCK, build_source
@@ -50,7 +50,7 @@ def _key(p, opts):
                   for s in p.tallies),
             p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), p.nact, p.rec,
             tuple(sorted(opts.items())),
-            codegen.FILL, codegen.INPLACE)          # (the test-only fill byte / in-place switch change the source)
+            codegen.FILL, codegen.INPLACE, ranges.ENABLE)   # (test-only switches that change the source)
 
 
 MATH_OPTS = {"ieee": [], "approx": ["-DTALLYMAP_APPROX_DIVSQRT", "--prec-div=false", "--prec-sqrt=false"]}
