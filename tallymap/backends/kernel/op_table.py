@@ -674,6 +674,7 @@ def _dynamic_slice(em, eqn, ins, slice_sizes):
 @rule("dynamic_update_slice")
 def _dus(em, eqn, ins, **p):
     src, upd, starts = ins[0], ins[1], ins[2:]
+    guard = _take_guard(em, eqn)
     st = [_clamp_start(em, s, src.shape[d] - upd.shape[d]) for d, s in enumerate(starts)]
     st += [0] * (len(src.shape) - len(st))
     # in place when the operand's storage may be overwritten: the update and the indices are read while the
@@ -682,10 +683,24 @@ def _dus(em, eqn, ins, **p):
 
     def body(idx):
         em.line(f"{out.name}[{ravel([ia(s, i) for s, i in zip(st, idx)], src.shape)}] = {elem(upd, idx)};")
+    if guard is not None:
+        em.open(f"if ({guard})")
     em.each(upd.shape, body)
+    if guard is not None:
+        em.close()
     out.key_impl = src.key_impl
     out.undef = False                  # (written: no longer an undefined value, codegen.Emitter.assign)
     return out
+
+
+def _take_guard(em, eqn):
+    """the guard of a fused guarded update (codegen.guarded_updates) when `eqn` is its update, else None: a bool
+    variable, evaluated before the update began (the predicate may read the array being updated)."""
+    g = getattr(em, "store_guard", None)
+    if g is None or getattr(em, "store_guard_eqn", None) != id(eqn):
+        return None
+    em.store_guard = None
+    return g
 
 
 def _static_pick(idx_d, bounds):
@@ -1132,6 +1147,7 @@ _SCAT = {"scatter": None, "scatter-add": "add", "scatter_add": "add", "scatter-m
 @rule(*_SCAT)
 def _scatter(em, eqn, ins, dimension_numbers, mode=None, **p):
     op, ind, upd = ins
+    guard = _take_guard(em, eqn)
     comb = _SCAT[eqn.primitive.name]
     dn = dimension_numbers
     obd = tuple(getattr(dn, "operand_batching_dims", ()))
@@ -1160,7 +1176,7 @@ def _scatter(em, eqn, ins, dimension_numbers, mode=None, **p):
             dst[d] = widx[j]
         for od, sd in zip(obd, sibd):      # vmapped scatter: batching dim pinned to the index batch coordinate
             dst[od] = bidx[sd]
-        conds = []
+        conds = [guard] if guard is not None else []
         for k, d in enumerate(sdod):
             raw = elem(ind, bidx + [k]) if ind.shape else elem(ind, [])
             hi = op.shape[d] - wsize[d]

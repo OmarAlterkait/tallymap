@@ -21,12 +21,14 @@ CUDA math library (libdevice; libm on the CPU).  Results agree with XLA only sta
 never bitwise by design.
 """
 
+import re
+
 import jax
 import numpy as np
 from jax.extend.core import ClosedJaxpr, Literal
 
 from ..._errors import ad_advice
-from ..._jaxpr import is_dropvar, located
+from ..._jaxpr import call_jaxpr, is_dropvar, located
 from . import ranges
 from .ranges import eqn_ranges
 
@@ -39,6 +41,9 @@ FILL = None
 # TEST-ONLY A/B control of the aliasing analysis: False never updates a per-item array in place (every
 # dynamic_update_slice and scatter copies; the step schedule copies every loop carry).  Part of the kernel key.
 INPLACE = True
+# TEST-ONLY A/B control: False never fuses a functional update under a select into one guarded update
+# (guarded_updates).  Part of the kernel key.
+GUARDED = True
 
 
 def fill_decl(n):
@@ -344,6 +349,111 @@ def mul_chain(jaxpr, memo, cuts=None):
     return max([d.get(v, 0) for v in jaxpr.outvars if not isinstance(v, Literal)] or [0])
 
 
+# ----------------------------------------------------------------------------- guarded functional updates
+# primitives whose result is the operand with some elements replaced (the guard composes with every one of them)
+_GUARDABLE = frozenset({"dynamic_update_slice", "scatter", "scatter-add", "scatter_add", "scatter-mul", "scatter_mul",
+                        "scatter-min", "scatter_min", "scatter-max", "scatter_max"})
+
+
+_CALLS = ("pjit", "jit", "closed_call", "core_call")
+
+
+def _select_of(e, depth=0):
+    """(p, case0, case1) of a two-case select_n with a bool predicate that `e` is, or that makes the single result of
+    the call `e` (jnp.where is a pjit), as variables of `e`'s own jaxpr; a predicate broadcast inside the call maps to
+    its scalar operand.  None otherwise."""
+    if e.primitive.name == "select_n":
+        if len(e.invars) != 3 or isinstance(e.invars[0], Literal) or np.dtype(e.invars[0].aval.dtype) != np.bool_:
+            return None
+        return tuple(e.invars)
+    if e.primitive.name not in _CALLS or len(e.outvars) != 1 or depth > 8:
+        return None
+    sub = call_jaxpr(e)
+    if sub is None or isinstance(sub.jaxpr.outvars[0], Literal):
+        return None
+    j = sub.jaxpr
+    inner = next((q for q in j.eqns if j.outvars[0] in q.outvars), None)
+    s = None if inner is None else _select_of(inner, depth + 1)
+    if s is None:
+        return None
+    prod = {v: q for q in j.eqns for v in q.outvars}
+
+    def outer(v, bcast=False):
+        if isinstance(v, Literal):
+            return None
+        if v in j.invars:
+            w = e.invars[j.invars.index(v)]
+            return None if isinstance(w, Literal) else w
+        q = prod.get(v)
+        if bcast and q is not None and q.primitive.name == "broadcast_in_dim" and q.invars[0].aval.shape == ():
+            return outer(q.invars[0])
+        return None
+    m = (outer(s[0], bcast=True), outer(s[1]), outer(s[2]))
+    return None if any(v is None for v in m) else m
+
+
+def _guard_target(e, x, depth=0):
+    """the update equation that makes `e`'s single result from operand x: e itself (a scatter / dynamic_update_slice
+    of x), or, through a call (jnp's x.at[i].set is a pjit), the one inside it that makes the call's only result
+    from the parameter x is passed as.  None when there is no such equation."""
+    if len(e.outvars) != 1 or depth > 8:
+        return None
+    if e.primitive.name in _GUARDABLE:
+        return e if e.invars[0] is x else None
+    sub = call_jaxpr(e) if e.primitive.name in _CALLS else None
+    if sub is None or x not in e.invars or list(e.invars).count(x) != 1:
+        return None
+    j = sub.jaxpr
+    xi = j.invars[list(e.invars).index(x)]
+    o = j.outvars[0]
+    if isinstance(o, Literal):
+        return None
+    inner = next((q for q in j.eqns if o in q.outvars), None)
+    return None if inner is None else _guard_target(inner, xi, depth + 1)
+
+
+def guarded_updates(eqns, uses):
+    """find `y = update(x, ...)` (scatter / dynamic_update_slice) whose ONLY use is `select_n(p, x, y)` or
+    `select_n(p, y, x)` with a bool p: jnp.where(p, x.at[i].set(v), x), a stack push under a condition.  The pair is
+    emitted as one update of x guarded by p (Emitter.run_jaxpr), instead of a copy of x, the update and an
+    elementwise select over the whole array.  -> (the equations with each such update moved to just before its
+    select, so the select's operands are all computed when it is emitted; {id(update eqn): (select eqn, k, target)},
+    k the select case the update is, target the update equation itself (inside a call for jnp's x.at[i].set)).
+    Moving it is valid: its only consumer is the select, and its operands come earlier."""
+    prod = {}
+    for e in eqns:
+        for v in e.outvars:
+            if not is_dropvar(v):
+                prod[v] = e
+    pairs = {}
+    for e2 in eqns:
+        sel = _select_of(e2)
+        if sel is None:
+            continue
+        p = sel[0]
+        for k in (1, 2):
+            y, x = sel[k], sel[3 - k]
+            if isinstance(y, Literal) or isinstance(x, Literal) or uses.get(y, 0) != 1 or y is x:
+                continue
+            e1 = prod.get(y)
+            tgt = _guard_target(e1, x) if e1 is not None and id(e1) not in pairs and y is not p else None
+            if tgt is None:
+                continue
+            pairs[id(e1)] = (e2, k, tgt, p)
+            break
+    if not pairs:
+        return eqns, {}
+    before = {id(e2): e1 for e1 in eqns if id(e1) in pairs for e2 in [pairs[id(e1)][0]]}
+    out = []
+    for e in eqns:
+        if id(e) in pairs:
+            continue
+        if id(e) in before:
+            out.append(before[id(e)])
+        out.append(e)
+    return out, pairs
+
+
 # ----------------------------------------------------------------------------- emitter
 class Emitter:
     def __init__(self):
@@ -358,6 +468,9 @@ class Emitter:
         self._frozen = [set()]    # names of Local arrays that must never be mutated (loop consts, function params)
         self.where = ""           # the item function (error messages)
         self.inplace = INPLACE    # False (test-only codegen.INPLACE): never update an array in place
+        self.guarded = GUARDED    # False (test-only codegen.GUARDED): never fuse a guarded update
+        self.store_guard = None   # the C condition the update rule being emitted stores under (guarded_updates)
+        self.store_guard_eqn = None   # id() of the update equation it belongs to
         self._mulmemo = {}        # mul_chain: id(jaxpr) -> (jaxpr, output chain depth)
         self.n_brk = 0            # chain cuts emitted (sj_brk)
         self.lane_masks = []      # enclosing while loops with a per-lane predicate: (mask Local, predicate shape)
@@ -685,21 +798,53 @@ class Emitter:
         rem = dict(uses)
         cuts = set()
         mul_chain(jaxpr, self._mulmemo, cuts)
+        eqns, fused = guarded_updates(jaxpr.eqns, uses) if self.guarded else (jaxpr.eqns, {})
+        skip = set()
         self._scopes.append((env, rem))
         try:
-            for eqn in jaxpr.eqns:
+            for eqn in eqns:
+                if id(eqn) in skip:
+                    continue
+                pair = fused.get(id(eqn))
+                guard = None
+                if pair is not None:
+                    e2, k, tgt, pv = pair
+                    guard = self._guard_text(read(pv), k)
+                    if guard is not None:          # evaluated now, before anything the update emits
+                        gv = self.fresh("gd")
+                        self.line(f"const bool {gv} = {guard};")
+                        guard = gv
                 ins = [read(a) for a in eqn.invars]
                 for a in eqn.invars:
                     if not isinstance(a, Literal):
                         rem[a] -= 1
+                if guard is not None:
+                    # x.at[i].set(v) under jnp.where(p, ., x) (or where(p, x, .)): ONE update, guarded by p, of x's
+                    # storage (in place when x is dead after the select, else of a copy).  Either way its result is
+                    # the select's value: the select is consumed here (its operands' uses too) and skipped
+                    for a in e2.invars:
+                        if not isinstance(a, Literal) and a is not eqn.outvars[0]:
+                            rem[a] -= 1
+                    skip.add(id(e2))
                 # jaxpr-local use counts of this equation's results (rules may fuse one-use values lazily;
                 # 0 = only a nested-call result, consumers unknown here)
                 self.out_uses = [uses.get(v, 0) if not is_dropvar(v) else 0 for v in eqn.outvars]
-                outs = self.eqn(eqn, ins)
+                if guard is None:
+                    outs = self.eqn(eqn, ins)
+                else:
+                    saved_g = (self.store_guard, self.store_guard_eqn)
+                    self.store_guard, self.store_guard_eqn = guard, id(tgt)
+                    try:
+                        outs = self.eqn(eqn, ins)
+                        if self.store_guard is not None:    # (the update rule takes it: _take_guard)
+                            raise CodegenError("internal: a guarded update was not emitted")
+                    finally:
+                        self.store_guard, self.store_guard_eqn = saved_g
                 if not eqn.primitive.multiple_results:
                     outs = [outs]
                 rr = eqn_ranges(eqn, [vrng(x) for x in ins], [getattr(x, "dtype", None) for x in ins], nested=False)
-                for v, x, r in zip(eqn.outvars, outs, rr):
+                ovars = [e2.outvars[0]] if guard is not None else eqn.outvars
+                for v, x, r in zip(ovars, outs, rr):
                     if not is_dropvar(v):
                         x = self.brk(x) if v in cuts else self.mat_multi(x, uses.get(v, 0))
                         if not isinstance(x, VTally):
@@ -713,6 +858,24 @@ class Emitter:
             return [read(a) for a in jaxpr.outvars]
         finally:
             self._scopes.pop()
+
+    def _guard_text(self, pred, k):
+        """the C condition under which a guarded update stores: the select's predicate when the update is its case
+        k == 2 (picked where it is true), negated for k == 1; None when the predicate is not one value for every
+        element (an elementwise mask: the update is not fused)."""
+        if pred.shape != () and not isinstance(pred, (View, Lazy, Scalar)):
+            return None
+        saved = (self.lines, self.ind, self.uid)
+        try:
+            self.lines = []
+            t = elem(pred, [f"_q{j}" for j in range(len(pred.shape))])
+        except Exception:
+            return None
+        finally:
+            self.lines, self.ind, self.uid = saved
+        if re.search(r"(?<![A-Za-z0-9_])_q[0-9]+(?![A-Za-z0-9_])", t):
+            return None
+        return f"({t})" if k == 2 else f"(!({t}))"
 
     def eqn(self, eqn, ins):
         try:

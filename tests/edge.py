@@ -1498,6 +1498,50 @@ def _(b):
     return "bitwise equal to the ranges-off cubin (which differs); integers == xla"
 
 
+@case("guarded update: jnp.where(p, x.at[i].set(v), x) as one guarded store == codegen.GUARDED off == xla "
+      "(bitwise)", ["auto"])
+def _(b):
+    """codegen.guarded_updates: a stack push under a condition inside a loop (in place), the negated form
+    where(p, x, x.at[i].add(v)), a predicate that reads the array itself (evaluated before the store), a
+    dynamic_update_slice window, an old array still live after the select (the guarded store goes to a copy), and an
+    elementwise mask (not fused).  Arms: GUARDED = False (the copy + whole-array select; the cubins must differ) and
+    xla; integer programs, so all bitwise."""
+    def item(t, x, key):
+        def body(c):
+            k, sp, st, acc = c
+            b_ = bits(key, k)
+            push = (b_ % 3) != 0
+            st = jnp.where(push, st.at[jnp.minimum(sp, 15)].set(k * 7 + x), st)           # push under a condition
+            sp = jnp.where(push, jnp.minimum(sp + 1, 16), jnp.maximum(sp - 1, 0))
+            st = jnp.where((b_ % 5) == 0, st, st.at[(b_ % 16).astype(jnp.int32)].add(3))  # negated, scatter-add
+            st = jnp.where(st[0] > st[1], st.at[0].set(st[1]), st)                      # predicate reads st
+            acc = acc + st[jnp.maximum(sp - 1, 0)]
+            return k + 1, sp, st, acc
+        k, sp, st, acc = lax.while_loop(lambda c: c[0] < 11, body,
+                                        (jnp.int32(0), jnp.int32(0), jnp.zeros(16, jnp.int32), jnp.int32(0)))
+        w = jnp.arange(8, dtype=jnp.int32) * x
+        w2 = jnp.where(x % 2 == 0, lax.dynamic_update_slice(w, jnp.array([5, 6, 7], jnp.int32), (x % 6,)), w)
+        live = jnp.arange(6, dtype=jnp.int32) + x
+        l2 = jnp.where(x > 3, live.at[x % 6].set(-1), live)                            # `live` read again below
+        m = jnp.where(jnp.arange(6) < x % 6, live.at[2].set(9), live)                    # elementwise mask
+        t = t.add("Q", (acc % NB).astype(jnp.int32), F(1))
+        return t, (st, sp, acc, w2, l2 + live, m)
+    ii = jnp.arange(N, dtype=jnp.int32) % 13
+    from tallymap.backends.kernel import codegen as CG
+    run = lambda bk: V(item, bk)(ii, keys)
+    g = lambda a, k: V(item, "auto")(a, k).per_item[0]
+    assert_arms_differ(g, g, ii, keys, patch_b=(CG, dict(GUARDED=False)))   # instrument: the fusion fired
+    rs = [run("auto")]
+    with patched(CG, GUARDED=False):
+        rs.append(run("auto"))
+    rs.append(run("xla"))
+    for r in rs[1:]:
+        for a, c in zip(jax.tree_util.tree_leaves(rs[0]), jax.tree_util.tree_leaves(r)):
+            if not np.array_equal(np.asarray(a), np.asarray(c)):
+                raise Fail("the guarded-update result differs from the unfused cuda / xla result")
+    return "bitwise equal to the unfused cubin (which differs) and to xla"
+
+
 @case("buffer assignment (while init alias, cond destination, lazy write-back) == rule off == copying cuda == "
       "xla", ["auto"])
 def _(b):
