@@ -280,6 +280,45 @@ adjoint's memory is proportional to capacity times the per-item state size, whic
 workload fits in one call: split bigger workloads into several calls. The CUDA spawn queue needs compute
 capability 7.0 or newer.
 
+### Records: a variable number of records per item
+
+A `Sum` needs a bin for everything an item might write. When each item produces a list of unknown length (a
+photon's sensor deposits, a particle's hits), declare a **records** output and append to it:
+
+```python
+@tm.vmap(outputs={"Q": tm.Sum((n_sens,)),
+                  "dep": tm.Records({"sensor": jnp.int32, "t": jnp.float32, "w": jnp.float32},
+                                    capacity=1 << 20)},
+         in_axes=(0, None))
+def transport(t, photon, tables):
+    ...  t = t.append("dep", {"sensor": s, "t": time, "w": weight}, when=hit)  ...
+    return t
+res = transport(photons, tables)
+res.outputs["dep"]["t"]            # float32[capacity]
+res.stats["appended"]["dep"]       # how many records there are (the rest of the slots are zero)
+```
+
+- **Layout.** Records are in **(item, append order)**: item 0's records in the order it appended them, then item
+  1's, and so on. Record k of item i sits at slot `offset[i] + k`, where `offset` is the exclusive prefix sum of
+  the per-item counts. The layout is deterministic: it does not depend on the backend, the schedule, the order the
+  items ran in or the run. With `spawn` the items are the nodes of the spawn tree in breadth-first order: the roots
+  in item order, then each generation ordered by (parent, spawn ordinal).
+- **Capacity** is the outputs' length, so it is static. A call that appends more records is a resource limit like
+  a full Queue: every float output of the call is NaN, every integer record field is -1, and
+  `stats['records_dropped']` says how many did not fit. `capacity=None` sizes the output from the eager call's own
+  count (rounded up to a power of two); under `jax.jit` or a `jax.vmap` of the call pass an int.
+- **Derivatives.** Float fields carry the pathwise derivative of each record's value (jvp, grad, jacfwd, jacrev,
+  `jax.checkpoint`, reverse through spawn). Whether a record exists is a discrete decision and has no derivative,
+  as with an emit inside a branch. Integer fields have none. A float field stores each value exactly, except that
+  -0.0 is stored as +0.0.
+- **How it runs.** tallymap runs the items twice: a count pass (each item's number of records, nothing else is
+  kept) and a fill pass that writes record k of item i at `offset[i] + k`. The count pass costs one more run of
+  the item loop in the forward pass. The fill pass writes an item's records only while k is below its count, so a
+  fill that disagrees with its count (the two passes did not replay bitwise) never writes into another item's
+  slots: it poisons the call like an overflow and is counted in `stats['records_mismatch']`.
+- **Not supported:** `t.append` inside a `jax.vmap` within the item (the lanes would need lane-dependent slots,
+  which tallymap's emits do not support either).
+
 ### One key per item, and the 32-bit limit
 
 tallymap invents no randomness: pass per-item keys (`jax.random.split`), or an item id and `fold_in` it. Results

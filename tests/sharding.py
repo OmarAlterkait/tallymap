@@ -62,8 +62,26 @@ def shower(t, x):
     return t.spawn(x * 0.5, when=x > 0.2)
 
 
+def walker_rec(t, x, key, theta):          # Records: every step appends (x, step); a slot is written by one device
+    def body(c):
+        i, x, t = c
+        u = jax.random.uniform(jax.random.fold_in(key, i))
+        t = t.append("rec", {"x": theta * x, "i": i}, when=u > 0.3)
+        return i + 1, x * (0.5 + 0.5 * u), t
+    i, x, t = lax.while_loop(lambda c: c[1] > 0.05, body, (0, x, t))
+    return t
+
+
+def shower_rec(t, x):
+    t = t.append("rec", {"x": x, "i": (x * 1000).astype(jnp.int32)})
+    return t.spawn(x * 0.5, when=x > 0.2)
+
+
 f = tm.vmap(walker, outputs={"hist": tm.Sum((NB,))}, in_axes=(0, 0, None), max_steps=100)
 fs = tm.vmap(shower, outputs={"hist": tm.Sum((NB,))}, spawn=tm.Queue(4 * N))   # >= the whole tree: nothing dropped
+RF = {"x": jnp.float32, "i": jnp.int32}
+fr = tm.vmap(walker_rec, outputs={"rec": tm.Records(RF, capacity=16 * N)}, in_axes=(0, 0, None))
+frs = tm.vmap(shower_rec, outputs={"rec": tm.Records(RF, capacity=8 * N)}, spawn=tm.Queue(4 * N))
 CASES = {   # name -> (function, all-gathers allowed: grad through spawn compacts its generations in plain JAX)
     "forward": (lambda xs, ks, th: (lambda r: (r.outputs["hist"], r.per_item, r.stats["n_truncated"]))(
         f(xs, ks, th)), 0),
@@ -73,6 +91,12 @@ CASES = {   # name -> (function, all-gathers allowed: grad through spawn compact
     "spawn": (lambda xs, ks, th: (lambda r: (r.outputs["hist"], r.stats["spawned"], r.stats["children_dropped"]))(
         fs(xs)), 0),
     "grad through spawn": (jax.grad(lambda xs, ks, th: fs(xs * th).outputs["hist"].sum(), argnums=(0, 2)), None),
+    "records": (lambda xs, ks, th: (lambda r: (r.outputs["rec"]["x"], r.outputs["rec"]["i"], r.stats["appended"]))(
+        fr(xs, ks, th)), None),
+    "records grad": (jax.grad(lambda xs, ks, th: jnp.sum(fr(xs, ks, th).outputs["rec"]["x"] ** 2), argnums=(0, 2)),
+                     None),
+    "records + spawn": (lambda xs, ks, th: (lambda r: (r.outputs["rec"]["x"], r.outputs["rec"]["i"],
+                                                       r.stats["children_dropped"]))(frs(xs * th)), None),
 }
 xs = np.linspace(0.1, 0.99, N, dtype=np.float32)
 ks = np.asarray(jax.random.split(jax.random.PRNGKey(0), N))

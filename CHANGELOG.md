@@ -6,6 +6,17 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ## Unreleased
 
+### Added
+
+- `tm.Records(fields, capacity=None)` outputs and `t.append(name, {field: value}, when=...)`: a variable number of
+  records per item, in the deterministic (item, append order) layout (with `spawn`: the spawn tree's nodes in
+  breadth-first order, children by spawn ordinal). Implemented as count-then-fill inside `tm.vmap` (a count pass,
+  an offset prefix sum, a fill pass of ordinary Sum tallies), so every transformation, both backends, `spawn`,
+  `n_active`, `max_steps` and sharded `jax.jit` work unchanged. Overflow past the capacity and a count / fill
+  disagreement poison the call (float outputs NaN, integer record fields -1), counted in
+  `stats['records_dropped']` and `stats['records_mismatch']`; `stats['appended']` is the true total. Not supported:
+  `t.append` inside a `jax.vmap` within an item. README "Records"; tests/records.py, tests/sharding.py.
+
 ### Fixed
 
 - `Sum(fixed_point=True)` of float32 is now EXACT, forward, in every tangent and in reverse mode: each bin is the

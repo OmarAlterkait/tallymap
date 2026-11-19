@@ -12,6 +12,7 @@ an array and jax.vmap(item)(xs) followed by a sum over items IS the semantics (t
 """
 import jax
 import jax.numpy as jnp
+from jax import lax
 from jax.core import ShapedArray
 from jax.extend.core import Primitive
 from jax.interpreters import ad, mlir
@@ -138,6 +139,23 @@ register_batcher(spawn_p, _spawn_batch)
 
 
 # ----------------------------------------------------------------------------------------------- Tally
+# A Records output (tallymap.Records) has no primitive of its own: tallymap.vmap traces the item twice.  In the COUNT
+# pass t.append only advances the item's append ordinal k; in the FILL pass it also emits each field into an ordinary
+# Sum tally of the launch's capacity at slot off + k (off: the item's first slot, the exclusive prefix sum of the
+# counts), guarded by k < cnt (the item's count from the count pass) so that a fill that disagrees with its count
+# never writes into the next item's slots.  k, off and cnt are int32 scalars carried in the Tally (pytree leaves),
+# so they follow the user's loops exactly like the tally.  tm.reference has a third mode, REF: each item appends into
+# its own dense buffer at index k (the plain-JAX meaning, independent of the offsets).
+RSEP = "\x1f"
+LANED = ("tallymap: t.append inside jax.vmap within an item (e.g. a vmapped while loop) is not supported: the "
+         "records of the lanes would share one append ordinal.  Append from the item's own, unbatched code.")
+
+
+def rkey(name, field):
+    """the tally key of a Records output's field."""
+    return f"{name}{RSEP}{field}"
+
+
 @jax.tree_util.register_pytree_node_class
 class Tally:
     """Write-only commutative outputs of one item.  Thread it through loops: ``t = t.add(name, idx, val)``.
@@ -145,35 +163,54 @@ class Tally:
     Every operation returns a NEW Tally; using an old one again (forking) or dropping one is rejected by
     tallymap.vmap (it would silently disagree with the dense meaning)."""
 
-    def __init__(self, arrays, shapes, q=None, child_tree=None):
+    def __init__(self, arrays, shapes, q=None, child_tree=None, rec=None, rinfo=None):
         self._a = dict(arrays)           # name -> flat array [*lead, S]
         self._shapes = dict(shapes)      # name -> user shape
         self._q = q                      # spawn token (int32 scalar) or None
         self._child_tree = child_tree    # treedef of the per-item inputs (spawn) or None
+        self._r = dict(rec or {})        # Records name -> (k,) | (k, off, cnt): int32 scalars
+        self._ri = rinfo                 # static: (mode, {name: (capacity, ((field, dtype), ...))}) as a tuple
 
     def tree_flatten(self):
         names = tuple(sorted(self._a))
-        ch = tuple(self._a[n] for n in names) + ((self._q,) if self._q is not None else ())
-        return ch, (names, tuple(self._shapes[n] for n in names), self._q is not None, self._child_tree)
+        rn = tuple(sorted(self._r))
+        ch = (tuple(self._a[n] for n in names) + ((self._q,) if self._q is not None else ())
+              + tuple(x for r in rn for x in self._r[r]))
+        return ch, (names, tuple(self._shapes[n] for n in names), self._q is not None, self._child_tree,
+                    tuple((r, len(self._r[r])) for r in rn), self._ri)
 
     @classmethod
     def tree_unflatten(cls, aux, ch):
-        names, shapes, has_q, tree = aux
-        q = ch[-1] if has_q else None
-        return cls(dict(zip(names, ch[:len(names)])), dict(zip(names, shapes)), q, tree)
+        names, shapes, has_q, tree, rl, ri = aux
+        n = len(names)
+        q = ch[n] if has_q else None
+        o = n + int(has_q)
+        rec = {}
+        for r, m in rl:
+            rec[r] = tuple(ch[o:o + m])
+            o += m
+        return cls(dict(zip(names, ch[:n])), dict(zip(names, shapes)), q, tree, rec, ri)
 
-    def _with(self, name=None, arr=None, q=None):
+    def _with(self, name=None, arr=None, q=None, rec=None):
         a = dict(self._a)
         if name is not None:
             a[name] = arr
-        return Tally(a, self._shapes, self._q if q is None else q, self._child_tree)
+        return Tally(a, self._shapes, self._q if q is None else q, self._child_tree,
+                     self._r if rec is None else rec, self._ri)
+
+    def _records(self):
+        return dict(self._ri[1]) if self._ri else {}
 
     def add(self, name, index, value):
         """tally[name][index] += value.  `index`: int array (flat index for 1-D outputs) or a tuple of int arrays
         (one per output dimension); any shape, value broadcast to it.  Out-of-range or negative indices are
         DROPPED, as JAX's own scatter drops out-of-bounds updates, and counted in Result.stats['dropped_emits']."""
-        if name not in self._a:
-            raise KeyError(f"tallymap: unknown output {name!r} (outputs: {sorted(self._a)})")
+        if name in self._records():
+            raise KeyError(f"tallymap: output {name!r} is a tallymap.Records output: write it with "
+                           f"t.append({name!r}, {{field: value, ...}})")
+        if name not in self._a or RSEP in name:
+            raise KeyError(f"tallymap: unknown output {name!r} (outputs: "
+                           f"{sorted([n for n in self._a if RSEP not in n] + list(self._records()))})")
         shape = self._shapes[name]
         t = self._a[name]
         if isinstance(index, tuple):
@@ -211,7 +248,63 @@ class Tally:
         w = jnp.asarray(when)
         if w.shape != () or w.dtype != jnp.bool_:
             raise TypeError("tallymap: spawn `when` must be a scalar bool")
-        return self._with(q=spawn_p.bind(self._q, w, *[jnp.asarray(x) for x in leaves]))
+        leaves = [jnp.asarray(x) for x in leaves]
+        if RSEP in self._r:     # (Records fill pass) the child's canonical node id: its parent's first child + ordinal
+            first, s = self._r[RSEP]
+            rec = {**self._r, RSEP: (first, s + w.astype(jnp.int32))}
+            return self._with(q=spawn_p.bind(self._q, w, *leaves, first + s), rec=rec)
+        return self._with(q=spawn_p.bind(self._q, w, *leaves))
+
+    def append(self, name, values, when=True):
+        """Append one record to the tallymap.Records output `name`: `values` = {field: scalar} with exactly the
+        declared fields; nothing is appended when `when` (a scalar bool) is False.  The output holds the records of
+        every item in (item index, append order) order (see tallymap.Records)."""
+        recs = self._records()
+        if name not in recs:
+            raise KeyError(f"tallymap: {name!r} is not a tallymap.Records output (Records outputs: {sorted(recs)})"
+                           + ("; write a Sum output with t.add" if name in self._a else ""))
+        mode = self._ri[0]
+        C, fields = recs[name]
+        if not isinstance(values, dict) or set(values) != {f for f, _ in fields}:
+            got = sorted(values) if isinstance(values, dict) else type(values).__name__
+            raise TypeError(f"tallymap: t.append({name!r}, ...) takes a dict of exactly the declared fields "
+                            f"{sorted(f for f, _ in fields)}, got {got}")
+        w = jnp.asarray(when)
+        if w.shape != () or w.dtype != jnp.bool_:
+            raise TypeError("tallymap: t.append `when` must be a scalar bool")
+        st = self._r[name]
+        k = st[0]
+        if jnp.ndim(k) != 0:
+            raise TypeError(LANED)
+        vals = []
+        for f, dt in fields:
+            v = values[f]
+            if (not jnp.issubdtype(dt, jnp.inexact) and not isinstance(v, (int, float))
+                    and jnp.issubdtype(jnp.asarray(v).dtype, jnp.inexact)):
+                raise TypeError(f"tallymap: t.append({name!r}, ...): a float value for the integer field {f!r}")
+            v = jnp.asarray(v)
+            if v.shape != ():
+                raise TypeError(f"tallymap: t.append({name!r}, ...): field {f!r} must be a scalar, got shape "
+                                f"{v.shape}")
+            vals.append(v.astype(dt))
+        k2 = k + w.astype(jnp.int32)
+        if mode == "count":
+            return self._with(rec={**self._r, name: (k2,)})
+        keys = [rkey(name, f) for f, _ in fields]
+        a = dict(self._a)
+        if mode == "ref":                       # the item's own buffer, slot k (a too-small buffer drops)
+            for key, v in zip(keys, vals):
+                a[key] = emit_p.bind(a[key], jnp.where(w, k, -1), v)
+            return Tally(a, self._shapes, self._q, self._child_tree, {**self._r, name: (k2,)}, self._ri)
+        _, off, cnt = st
+        j = off + k
+        ok = w & (k < cnt) & (j < C)            # the fill guard: never past the item's counted slots or the capacity
+
+        def put(ts):
+            return tuple(emit_p.bind(t, j, v) for t, v in zip(ts, vals))
+        ts = lax.cond(ok, put, lambda ts: ts, tuple(a[key] for key in keys))
+        a.update(zip(keys, ts))
+        return Tally(a, self._shapes, self._q, self._child_tree, {**self._r, name: (k2, off, cnt)}, self._ri)
 
 
 def _check_int(i):

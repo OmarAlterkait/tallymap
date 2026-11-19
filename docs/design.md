@@ -32,6 +32,14 @@ tm.vmap(item)                     _api.py        user contract: Tally, Sum, Queu
 - **Resource limits poison, never truncate silently.** An item that hits `max_steps` or a child the `Queue`
   drops makes every float tally NaN, with the count in `Result.stats`. Out-of-range emits are dropped, as JAX's
   scatter drops them, and counted.
+- **Records are two ordinary programs.** A `Records` output adds no primitive and no rule: `tm.vmap` traces the
+  item twice. The count program discards every Sum and returns each item's append count; the fill program writes
+  record k of item i into ordinary Sum tallies of the capacity at `offset[i] + k`, behind a `k < count` guard.
+  The fill's per-item flag "my count disagrees" is the program's truncation flag (`ItemProgram.trunc`), so every
+  derived kernel (tangent, dual lanes, replay and single-loop adjoints) recomputes it in its own replay and
+  poisons itself. With spawn, the count pass runs as the tree adjoint's recording primal and the canonical node
+  ids come from the recorded tree (breadth-first, children by spawn ordinal), never from queue slots; the fill
+  hands each child its id through the spawn. The layout is the one a one-pass version would produce.
 
 ## One primitive (notes section 2)
 

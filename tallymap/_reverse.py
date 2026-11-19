@@ -949,8 +949,10 @@ def vjp_prog(p, pert_pi, pert_bc, opts=None):
     avals = (tav + [flat_aval(i) for i in ib] + [flat_aval(i) for i in big] + pav + [ya[j] for j in yf] + bav
              + [jax.ShapeDtypeStruct(tuple(p.tallies[i].lead) + (p.tallies[i].S,), p.tallies[i].dtype) for i in tf])
     cj = _mk(V, [_sds(x) for x in avals])
-    if sh:
-        cj = _dce(cj)
+    # dead code out, inside loop bodies and cond branches too: the transpose of a cond returns each tally operand's
+    # pass-through cotangent as a cond output, unused but materialised per item by the kernel emitter (a tally-sized
+    # local array: "too large" for an emit inside a lax.cond in a loop; tests/records.py "big tally"), on every path
+    cj = _dce(cj)
     tl = (tuple(dataclasses.replace(s, kind="discard") for s in p.tallies)
           # a broadcast operand's cotangent sums one contribution per item (or per table read) into one bin: exact
           # (TSpec.exact), since float32 atomics drop each add's part below the bin's ulp, one-signed, in a different

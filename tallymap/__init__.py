@@ -12,7 +12,7 @@ The meaning of a tm.vmap function is jax.vmap(item) followed by a sum over items
 it.  See README.md and docs/.
 """
 from . import _primitive  # noqa: F401  (registers tallymap_call / tallymap_jvp and their rules)
-from ._api import Queue, Result, Sum, UnsupportedError, vmap
+from ._api import Queue, Records, Result, Sum, UnsupportedError, vmap
 from ._compare import reference
 from ._compat import TESTED_JAX, _check_jax_version
 from ._diagnostics import diagnostics, history
@@ -30,5 +30,5 @@ def supported_primitives():
 
 __version__ = "0.7.1"
 _check_jax_version()       # one warning at import, only when JAX is newer than the newest tested version
-__all__ = ["vmap", "Sum", "Queue", "Result", "Tally", "reference", "diagnostics", "history",
+__all__ = ["vmap", "Sum", "Queue", "Records", "Result", "Tally", "reference", "diagnostics", "history",
            "supported_primitives", "TallyError", "UnsupportedError", "TESTED_JAX"]

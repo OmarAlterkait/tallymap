@@ -25,7 +25,7 @@ from jax.extend.core import ClosedJaxpr, jaxpr_as_fun
 from . import _diagnostics, _errors
 from ._jaxpr import item_name, located, subjaxprs
 from ._rewrite import check_tallies, isfloat, retrace
-from ._tally import Tally, emit_p
+from ._tally import LANED, RSEP, Tally, emit_p, rkey
 
 MAX_ITEMS = 2 ** 31 - 1
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -90,6 +90,71 @@ class Queue:
     capacity: int
 
 
+@dataclasses.dataclass(frozen=True, init=False)
+class Records:
+    """A RECORDS output: each item appends records with ``t = t.append(name, {field: value, ...}, when=...)``.
+
+        tallymap.Records({"sensor": jnp.int32, "t": jnp.float32, "w": jnp.float32}, capacity=1 << 20)
+        tallymap.Records(1 << 20, {...})            # (the same: capacity first)
+        tallymap.Records({...})                     # eager only: capacity from the counted records
+
+    Result.outputs[name] is {field: array[capacity]}: the concatenation over items, in item order, of each item's
+    records in the order it appended them, i.e. record k of item i is at slot offset[i] + k (offset = the exclusive
+    prefix sum of the per-item counts).  Slots past the last record are zero.  Result.stats['appended'][name] is
+    the number of records (the true total, also when it exceeds the capacity).  The layout is deterministic: it does
+    not depend on the backend, on the order the items ran in or on the run.
+
+    Fields are scalars of a numeric dtype.  Float fields carry tangents and cotangents (the pathwise derivative of
+    each record's value); whether a record exists is a discrete decision and carries no derivative; integer fields
+    have none.  A float field stores each value exactly, except that -0.0 is stored as +0.0.
+
+    capacity: the number of slots (static: it is the outputs' shape).  None: the eager call's own count, rounded up
+    to a power of two (a traced call -- jax.jit, a vmap of the call -- needs an int).  A call that appends more than
+    `capacity` records is a resource-limit violation like a full Queue: every float output of the call (records and
+    sums) is NaN, every integer record field is -1, and stats['records_dropped'][name] counts the records that did
+    not fit.
+
+    Implementation (count-then-fill): the call runs the items twice, a count pass (the per-item record counts; every
+    other output is discarded) and the fill pass, which writes record k of item i at offset[i] + k.  The fill writes
+    an item's records only while k < its counted number, and an item whose fill appends a different number of
+    records than its count (the two passes did not replay bitwise) poisons the call like an overflow:
+    stats['records_mismatch'][name] counts those items.  With spawn the items are the spawn tree's nodes in
+    breadth-first order (the roots in item order, then each generation by (parent, spawn ordinal)): the count pass
+    runs as the tree adjoint's recording primal and each child receives its node id through the spawn.  Not
+    supported (raises): t.append inside jax.vmap within an item (its lanes would need lane-dependent slots, which
+    tallymap's emits do not support)."""
+    fields: tuple          # ((name, np.dtype), ...), sorted by name
+    capacity: Any = None
+
+    def __init__(self, *args, fields=None, capacity=None):
+        for a in args:
+            if isinstance(a, dict):
+                if fields is not None:
+                    raise TypeError("tallymap.Records: fields given twice")
+                fields = a
+            elif a is None or isinstance(a, (int, np.integer)):
+                capacity = a
+            else:
+                raise TypeError(f"tallymap.Records(capacity, fields): unexpected argument {a!r}")
+        if not isinstance(fields, dict) or not fields:
+            raise TypeError("tallymap.Records needs fields: a non-empty dict {field name: dtype}")
+        fl = []
+        for f, dt in sorted(fields.items()):
+            dt = np.dtype(dt)
+            if not isinstance(f, str) or not (np.issubdtype(dt, np.number)):
+                raise TypeError(f"tallymap.Records: field {f!r}: a str name and a numeric dtype, got {dt} (store a "
+                                "bool as an integer)")
+            fl.append((f, dt))
+        if capacity is not None:
+            if isinstance(capacity, bool) or not isinstance(capacity, (int, np.integer)) or not (
+                    1 <= int(capacity) <= MAX_ITEMS):
+                raise ValueError(f"tallymap.Records: capacity must be an int in [1, 2^31 - 1] or None, got "
+                                 f"{capacity!r}")
+            capacity = int(capacity)
+        object.__setattr__(self, "fields", tuple(fl))
+        object.__setattr__(self, "capacity", capacity)
+
+
 class Result(NamedTuple):
     """What a tallymap.vmap function returns.  When a tallymap resource limit intervened (max_steps, the spawn
     Queue capacity) every float output is NaN; a fixed_point=True bin an unrepresentable emit was dropped from (a
@@ -130,6 +195,8 @@ class TSpec:
                            # per bin, the xla backend EXACT_WORDS int64 words (needs jax_enable_x64).
     x64_fallback: bool = False   # an exact tally the xla backend adds in float32 without jax_enable_x64 (the reverse
                                  # cotangents: the one documented exception); any other exact tally raises there
+    slots: bool = False    # indexed by the recording primal's queue slot (ItemProgram.rec): under a sharded jit it is
+                           # renumbered across devices like the queue ring (_primitive._global_ring), not summed
 
 
 # an f32 value is m * 2^(p - 149), m < 2^24, p = max(biased exponent - 1, 0) <= 253: an integer below 2^277 in units of
@@ -288,7 +355,7 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
 
     Meaning: jax.vmap(fn) over the items followed by a sum of their tallies.  Every JAX transformation works.
 
-    outputs:   {name: tallymap.Sum(shape, dtype=float32, fixed_point=False)}
+    outputs:   {name: tallymap.Sum(shape, dtype=float32, fixed_point=False) | tallymap.Records(fields, capacity)}
     in_axes:   0 (mapped) or None (broadcast, e.g. tables) per positional arg, like jax.vmap
     max_steps: cap on every top-level while_loop.  None (the default) is exactly jax.vmap: no cap, and an item
                that does not terminate does not terminate.  Setting it is the recommended safety net; an item that
@@ -355,8 +422,12 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
         raise ValueError(f"tallymap: unknown backend {backend!r}; backends are {', '.join(BACKENDS)}")
     if spawn is not None and not isinstance(spawn, Queue):
         raise TypeError("tallymap: spawn must be tallymap.Queue(capacity)")
-    outs_spec = {k: (v if isinstance(v, Sum) else Sum(v)) for k, v in outputs.items()}
-    names = sorted(outs_spec)
+    outs_spec = {k: (v if isinstance(v, (Sum, Records)) else Sum(v)) for k, v in outputs.items()}
+    rspec = {k: v for k, v in outs_spec.items() if isinstance(v, Records)}
+    if any(RSEP in k for k in outs_spec):
+        raise ValueError("tallymap: an output name must not contain the character \\x1f")
+    names = sorted(k for k in outs_spec if k not in rspec)      # the Sum outputs
+    rnames = sorted(rspec)                                      # the Records outputs
     where = item_name(fn)
     decl = _call_site()          # where tm.vmap was written: the fallback when the call itself is all JAX frames
 
@@ -389,58 +460,116 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                   for n in names}
         # a fixed_point float32 Sum is the exact sum (TSpec.exact); fixed point at `scale` for the other dtypes
         ex = {n: bool(outs_spec[n].fixed_point) and np.dtype(outs_spec[n].dtype) == np.float32 for n in names}
-        tspecs = [TSpec(n, int(np.prod(shapes[n], dtype=np.int64)), np.dtype(outs_spec[n].dtype), (),
+        sspecs = [TSpec(n, int(np.prod(shapes[n], dtype=np.int64)), np.dtype(outs_spec[n].dtype), (),
                         bool(outs_spec[n].fixed_point) and not ex[n], "sum", float(outs_spec[n].scale), exact=ex[n])
                   for n in names]
-        if spawn is not None:
-            tspecs.append(TSpec("__spawn__", 1, np.dtype(np.int32), (), False, "spawn"))
-        nT = len(tspecs)
-        meta = {}
-
-        def item(*flat):
-            ta = {n: flat[i] for i, n in enumerate(names)}
-            t = Tally(ta, shapes, flat[nT - 1] if spawn is not None else None, ctree if spawn is not None else None)
-            m = jax.tree_util.tree_unflatten(ptree, list(flat[nT:nT + nmp]))
-            b = jax.tree_util.tree_unflatten(btree, list(flat[nT + len(pi):nT + len(pi) + nbu]))
-            mi, bi = iter(m), iter(b)
-            uargs = [next(mi) if x == 0 else next(bi) for x in axes]
-            r = fn(t, *uargs)
-            if isinstance(r, Tally):
-                t2, y = r, None
-            elif isinstance(r, tuple) and len(r) == 2 and isinstance(r[0], Tally):
-                t2, y = r
-            else:
-                raise TypeError("tallymap: the item function must return its Tally or (Tally, per_item_result)")
-            tl = jax.tree_util.tree_leaves(t2)
-            yl, meta["ytree"] = jax.tree_util.tree_flatten(y)
-            return tl + [jnp.asarray(v) for v in yl]
-        tav = [_tally_aval(s) for s in tspecs]
         pav = [jax.ShapeDtypeStruct(x.shape[1:], x.dtype) for x in pi]
         bav = [_sds(x) for x in bc]
-        cj = _mk(item, tav + pav + bav)
-        kinds = [s.kind for s in tspecs]
-        check_tallies(cj, kinds, name=f"item function {where}")
-        # hoist closed-over tracers (outer jit/grad/jvp/vmap values) as explicit broadcast operands
-        hidx = [k for k, c in enumerate(cj.consts) if isinstance(c, Tracer)]
-        hoisted = [cj.consts[k] for k in hidx]
         nb0 = len(bc)
+        meta = {}
 
-        def item2(*a):
-            consts = list(cj.consts)
-            for k, x in zip(hidx, a[nT + len(pi) + nb0:]):
-                consts[k] = x
-            return retrace(ClosedJaxpr(cj.jaxpr, consts), cap=max_steps, n_tally=nT)(*a[:nT + len(pi) + nb0])
-        cj2 = _mk(item2, tav + pav + bav + [_sds(h) for h in hoisted])
-        if spawn is not None:
-            _check_spawn(cj2, pav, where)
-        nY = len(cj2.jaxpr.outvars) - nT
-        prog = ItemProgram(cj2, tuple(tspecs), len(pi), len(bc) + len(hoisted),
-                           nY - 1 if max_steps is not None else None, spawn, where=where,
-                           nact=nb0 - 1 if n_active is not None else None)
-        bc_all = bc + hoisted
-        _diagnostics.record_program(prog)
+        def build(tspecs, tshapes, mode=None, caps=None, M=0):
+            """trace the user's item into an ItemProgram.  mode None: the plain program.  With Records outputs:
+            'count': the tallies are the Sums, discarded (and the Queue); per-item results = each Records output's
+            count.  'fill': one hidden int32 per-item operand, the item's canonical node id `cid` (a root: its index;
+            a spawned child: its parent's first child + its spawn ordinal, carried by the spawn), and hidden
+            broadcast tables after the user's ([first child per node, with spawn] + [offset, count] per Records
+            output, indexed by cid); the tallies are the Sums, the field tallies and the mismatch tally; per-item
+            results = the user's, then [truncated], then the item's POISON flag (ItemProgram.trunc: its fill count
+            differs from its count, or it was truncated), so every derived kernel poisons itself when its own replay
+            disagrees with the count."""
+            nT = len(tspecs)
+            tn = [s.name for s in tspecs if s.kind != "spawn"]
+            fill = mode == "fill"
+            nh = int(fill)
+            nbx = (int(spawn is not None) + 2 * len(rnames)) if fill else 0
+            rinfo = (mode, tuple((r, (caps[r], rspec[r].fields)) for r in rnames)) if mode else None
+            ys0 = int(spawn is not None) if fill else 0      # first offset/count table
+
+            def item(*flat):
+                ta = {n: flat[i] for i, n in enumerate(tn)}
+                rec, cnts = None, []
+                if mode == "count":
+                    rec = {r: (jnp.int32(0),) for r in rnames}
+                elif fill:
+                    cid = flat[nT + nmp]
+                    tabs = flat[nT + nmp + nh + nb0:nT + nmp + nh + nb0 + nbx]
+                    cnts = [tabs[ys0 + 2 * j + 1][cid] for j in range(len(rnames))]
+                    rec = {r: (jnp.int32(0), tabs[ys0 + 2 * j][cid], cnts[j]) for j, r in enumerate(rnames)}
+                    if spawn is not None:
+                        rec[RSEP] = (tabs[0][cid], jnp.int32(0))
+                t = Tally(ta, tshapes, flat[nT - 1] if spawn is not None else None,
+                          ctree if spawn is not None else None, rec, rinfo)
+                m = jax.tree_util.tree_unflatten(ptree, list(flat[nT:nT + nmp]))
+                b = jax.tree_util.tree_unflatten(btree, list(flat[nT + nmp + nh:nT + nmp + nh + nbu]))
+                mi, bi = iter(m), iter(b)
+                uargs = [next(mi) if x == 0 else next(bi) for x in axes]
+                r = fn(t, *uargs)
+                if isinstance(r, Tally):
+                    t2, y = r, None
+                elif isinstance(r, tuple) and len(r) == 2 and isinstance(r[0], Tally):
+                    t2, y = r
+                else:
+                    raise TypeError("tallymap: the item function must return its Tally or (Tally, per_item_result)")
+                ks = []
+                for rn in rnames:
+                    if rn not in t2._r or jnp.ndim(t2._r[rn][0]) != 0:
+                        raise TypeError(LANED)
+                    ks.append(t2._r[rn][0])
+                a2 = dict(t2._a)
+                extra = []
+                if fill:                            # the item's count mismatch: counted per output, and its flag
+                    mis = jnp.stack([k != c for k, c in zip(ks, cnts)])
+                    a2[MISMATCH] = emit_p.bind(a2[MISMATCH], jnp.arange(len(rnames), dtype=jnp.int32),
+                                               mis.astype(jnp.int32))
+                    extra = [jnp.any(mis)]
+                tl = [a2[n] for n in tn] + ([t2._q] if spawn is not None else [])
+                yl, meta["ytree"] = jax.tree_util.tree_flatten(y)
+                if mode == "count":                 # (the user's per-item results are not computed)
+                    return tl + ks
+                return tl + [jnp.asarray(v) for v in yl] + extra
+            tav = [_tally_aval(s) for s in tspecs]
+            hav = [jax.ShapeDtypeStruct((), jnp.int32)] * nh
+            xav = [jax.ShapeDtypeStruct((M,), jnp.int32)] * nbx
+            cj = _mk(item, tav + pav + hav + bav + xav)
+            check_tallies(cj, [s.kind for s in tspecs], name=f"item function {where}")
+            # hoist closed-over tracers (outer jit/grad/jvp/vmap values) as explicit broadcast operands
+            hidx = [k for k, c in enumerate(cj.consts) if isinstance(c, Tracer)]
+            hoisted = [cj.consts[k] for k in hidx]
+            npi, nbt = nmp + nh, nb0 + nbx
+            cap1 = int(max_steps is not None)
+
+            def item2(*a):
+                consts = list(cj.consts)
+                for k, x in zip(hidx, a[nT + npi + nbt:]):
+                    consts[k] = x
+                outs = list(retrace(ClosedJaxpr(cj.jaxpr, consts), cap=max_steps, n_tally=nT)(*a[:nT + npi + nbt]))
+                if fill:                            # [.., mismatch, (truncated)] -> [.., (truncated), poison flag]
+                    mis = outs.pop(len(outs) - 1 - cap1)
+                    outs.append(mis | outs[-1] if cap1 else mis)
+                return outs
+            cj2 = _mk(item2, tav + pav + hav + bav + xav + [_sds(h) for h in hoisted])
+            if spawn is not None:
+                _check_spawn(cj2, pav + hav, where)
+            nY = len(cj2.jaxpr.outvars) - nT
+            trunc = nY - 1 if (fill or (mode is None and max_steps is not None)) else None
+            prog = ItemProgram(cj2, tuple(tspecs), npi, nbt + len(hoisted), trunc, spawn, where=where,
+                               nact=nb0 - 1 if n_active is not None else None)
+            _diagnostics.record_program(prog)
+            return prog, hoisted
+
         from ._primitive import bind_call, make_node  # (here: _primitive imports this module)
-        flat = bind_call(*pi, *bc_all, node=make_node(prog, backend, opts, _call_site(decl)))
+        site = _call_site(decl)
+
+        def call(prog, pi_, bc_):
+            return bind_call(*pi_, *bc_, node=make_node(prog, backend, opts, site))
+        if rnames:
+            return _records(build, call, sspecs, shapes, names, rnames, rspec, pi, bc, max_steps, meta, N, spawn)
+        tspecs = list(sspecs)
+        if spawn is not None:
+            tspecs.append(TSpec("__spawn__", 1, np.dtype(np.int32), (), False, "spawn"))
+        prog, hoisted = build(tspecs, shapes)
+        flat = call(prog, pi, bc + hoisted)
         nt = len(prog.out_tallies)
         tvals, st, ys = flat[:nt], flat[nt], flat[nt + 1:]
         res_out = {n: tvals[i].reshape(shapes[n]) for i, n in enumerate(names)}
@@ -460,6 +589,150 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
         return Result(res_out, per_item, trunc, stats)
     mapped.__wrapped__ = fn
     return mapped
+
+
+# ------------------------------------------------------------------------------------------- Records
+_COUNTS_HOOK = None     # test-only: f(name, counts) -> counts handed to the fill pass (the mismatch negative control)
+MISMATCH = rkey("", "mismatch")     # the fill's hidden int32 tally: items whose fill count != count, per output
+
+
+def _sg(x):
+    return lax.stop_gradient(x) if isfloat(x.dtype) else x
+
+
+def _count_recorder(p, R):
+    """the count program of a spawning call, run as the tree adjoint's recording primal (_reverse_spawn.rec_primal:
+    each item's (me, par, ord, gen), the queue ring returned), plus one int32 tally of the Queue's capacity per
+    Records output into which a CHILD emits its count at its queue slot `me` (a child's per-item results are
+    discarded).  Tallies: [the discarded Sums] + [the counts] + [the queue]."""
+    from ._reverse_spawn import rec_primal  # (here: _reverse_spawn imports this module)
+    q = rec_primal(p)
+    Q, ns = int(q.spawn.capacity), q.nT - 1
+    f = jaxpr_as_fun(q.cj)
+    cspec = [TSpec(f"{RSEP}count{j}", Q, np.dtype(np.int32), slots=True) for j in range(R)]
+
+    def item(*a):
+        sums, cnts, sp, rest = a[:ns], a[ns:ns + R], a[ns + R], a[ns + R + 1:]
+        outs = f(*sums, sp, *rest)
+        me = rest[q.rec]
+        cnts = [emit_p.bind(c, jnp.where(me >= 0, me, -1), k) for c, k in zip(cnts, outs[q.nT:q.nT + R])]
+        return list(outs[:ns]) + cnts + [outs[ns]] + list(outs[q.nT:])
+    tl = tuple(q.tallies[:ns]) + tuple(cspec) + (q.tallies[ns],)
+    cj = _mk(item, [_tally_aval(s) for s in tl] + [_sds(a) for a in q.in_avals()[q.nT:]])
+    check_tallies(cj, [s.kind for s in tl], name=f"records count recorder ({q.where})")
+    return dataclasses.replace(q, cj=cj, tallies=tl, tag=q.tag + "+count")
+
+
+def _tree_order(N, Q, par, ordn, gen, spawned):
+    """canonical node ids of a spawn tree from the recording primal's ring: roots 0..N-1 (item order), then each
+    generation in turn, its children ordered by (parent id, spawn ordinal) -- so a parent's children have consecutive
+    ids, first[parent] + ordinal.  Deterministic: it reads only the tree, never the queue slots' order.
+    -> (cid per queue slot (-1: unused), first child id per node [N + Q])."""
+    M = N + Q
+    slot = jnp.arange(Q, dtype=jnp.int32)
+    valid = slot < spawned
+    pcid = lambda cs: jnp.where(par >= 0, cs[jnp.clip(par, 0, Q - 1)], -1 - par)
+
+    def body(c):
+        g, base, cs, _ = c
+        m = valid & (gen == g)
+        pc = jnp.where(m, pcid(cs), M)
+        i1 = jnp.argsort(jnp.where(m, ordn, 0), stable=True)
+        i2 = i1[jnp.argsort(pc[i1], stable=True)]
+        rank = jnp.zeros((Q,), jnp.int32).at[i2].set(slot)
+        n = jnp.sum(m.astype(jnp.int32))
+        return g + 1, base + n, jnp.where(m, base + rank, cs), n
+    c = lax.while_loop(lambda c: c[3] > 0, body,
+                       (jnp.int32(1), jnp.int32(N), jnp.full((Q,), -1, jnp.int32), jnp.int32(1)))
+    cs = c[2]
+    first = jnp.full((M,), M, jnp.int32).at[jnp.where(valid, pcid(cs), M)].min(jnp.where(valid, cs, M), mode="drop")
+    return cs, jnp.where(first == M, 0, first)
+
+
+def _records(build, call, sspecs, shapes, names, rnames, rspec, pi, bc, max_steps, meta, N, spawn):
+    """a call with Records outputs: count pass, canonical offsets, fill pass (see Records).  Both passes are
+    ordinary tallymap programs, so every transformation applies to the fill unchanged; the count pass is not
+    differentiated (its operands are stop_gradient'ed: counts are integers)."""
+    R = len(rnames)
+    qspec = [TSpec("__spawn__", 1, np.dtype(np.int32), (), False, "spawn")] if spawn is not None else []
+    # 1. count: every Sum discarded, the user's per-item results dropped; per-item results = the counts
+    cprog, ch = build([dataclasses.replace(s, kind="discard") for s in sspecs] + qspec, shapes, "count",
+                      {r: 0 for r in rnames})
+    psg, bsg = [_sg(x) for x in pi], [_sg(x) for x in bc + ch]
+    if spawn is None:
+        M, tabs0 = N, []
+        cflat = call(cprog, psg, bsg)
+        cys = cflat[len(cprog.out_tallies) + 1:]
+        counts = {r: cys[j] for j, r in enumerate(rnames)}
+    else:                       # node ids in the canonical tree order; a child's count from its queue slot
+        Q = int(spawn.capacity)
+        M = N + Q
+        rp = _count_recorder(cprog, R)
+        cflat = call(rp, psg + [jnp.zeros((N,), jnp.int32)] * 4, bsg)
+        nt = len(rp.out_tallies)
+        ring = cflat[nt + 1 + rp.nY:]
+        cs, first = _tree_order(N, Q, ring[rp.rec + 1], ring[rp.rec + 2], ring[rp.rec + 3],
+                                cflat[nt][ST["spawned"]])
+        dest = jnp.where(cs >= 0, cs, M)
+        counts = {r: jnp.zeros((M,), jnp.int32).at[:N].set(cflat[nt + 1 + j]).at[dest].set(cflat[j], mode="drop")
+                  for j, r in enumerate(rnames)}
+        tabs0 = [first]
+    if _COUNTS_HOOK is not None:
+        counts = {r: _COUNTS_HOOK(r, c) for r, c in counts.items()}
+    totals = {r: jnp.sum(c, dtype=jnp.int32) for r, c in counts.items()}
+    caps = {}
+    for r in rnames:
+        C = rspec[r].capacity
+        if C is None:
+            try:
+                tot = int(totals[r])
+            except (jax.errors.ConcretizationTypeError, jax.errors.TracerIntegerConversionError):
+                raise ValueError(f"tallymap: Records output {r!r} has no capacity, and this call is traced (jax.jit, "
+                                 "a jax.vmap of the call, ...), so its number of records is not known when the "
+                                 "outputs' shape is fixed: pass tallymap.Records(fields, capacity=...)") from None
+            C = 1 << max(0, (tot - 1).bit_length())
+        caps[r] = C
+    offs = {r: (jnp.cumsum(c, dtype=jnp.int32) - c).astype(jnp.int32) for r, c in counts.items()}
+    # 2. fill: the Sums, one Sum of the capacity per Records field (written once per slot: 0 + v = v), the mismatch
+    # counter; hidden operands: the node id (roots: the item index), [first child,] offset and count tables
+    rspecs = [TSpec(rkey(r, f), caps[r], dt) for r in rnames for f, dt in rspec[r].fields]
+    fspecs = list(sspecs) + rspecs + [TSpec(MISMATCH, R, np.dtype(np.int32))] + qspec
+    fshapes = dict(shapes, **{s.name: (s.S,) for s in rspecs}, **{MISMATCH: (R,)})
+    fprog, fh = build(fspecs, fshapes, "fill", caps, M)
+    tabs = tabs0 + [x for r in rnames for x in (offs[r], counts[r])]
+    flat = call(fprog, list(pi) + [jnp.arange(N, dtype=jnp.int32)], list(bc) + tabs + fh)
+    nt = len(fprog.out_tallies)
+    tvals, st, ys = flat[:nt], flat[nt], list(flat[nt + 1:])
+    ys.pop()                                             # the poison flag (the derived kernels read it)
+    trunc = ys.pop() if max_steps is not None else jnp.zeros((N,), bool)
+    tv = {s.name: v for s, v in zip([fspecs[k] for k in fprog.out_tallies], tvals)}
+    stats = {n: st[ST[n]] for n in ("fixed_point_overflow", "dropped_emits")}
+    if spawn is not None:
+        stats.update((n, st[ST[n]]) for n in ("spawned", "children_dropped", "children_truncated"))
+    stats["n_truncated"] = jnp.sum(trunc.astype(jnp.int32))
+    stats["appended"] = totals
+    stats["records_dropped"] = {r: jnp.maximum(totals[r] - caps[r], 0) for r in rnames}
+    stats["records_mismatch"] = {r: tv[MISMATCH][j] for j, r in enumerate(rnames)}
+    lim = jnp.any(tv[MISMATCH] > 0)     # poisoned by the derived kernels themselves too (ItemProgram.trunc)
+    if max_steps is not None:
+        lim = lim | (stats["n_truncated"] > 0)
+    ovf = jnp.bool_(False)              # from the count pass: a multiply that carries the poison into derivatives
+    for r in rnames:
+        ovf = ovf | (totals[r] > caps[r])
+    if spawn is not None:               # (as a spawning call without Records: the poison that differentiates)
+        ovf = ovf | lim | (stats["children_dropped"] > 0)
+        if max_steps is not None:
+            ovf = ovf | (stats["children_truncated"] > 0)
+    out = {n: tv[n].reshape(shapes[n]) for n in names}
+    out.update((s.name, tv[s.name]) for s in rspecs)
+    out = _poison(_poison_primal(out, lim), ovf)
+    bad = lim | ovf
+    res = {n: out[n] for n in names}
+    for r in rnames:
+        res[r] = {f: out[rkey(r, f)] if isfloat(dt) else jnp.where(bad, jnp.asarray(-1, dt), out[rkey(r, f)])
+                  for f, dt in rspec[r].fields}
+    per_item = jax.tree_util.tree_unflatten(meta["ytree"], ys)
+    return Result(res, per_item, trunc, stats)
 
 
 def _limits(stats, st, spawn, max_steps):

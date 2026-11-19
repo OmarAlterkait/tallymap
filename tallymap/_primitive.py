@@ -247,8 +247,20 @@ def _cp_partition(c, mesh, arg_shapes, result_shape):
         if not axes:
             return outs
         ring = _global_ring(p, outs[len(outs) - nr:], outs[nsum - 1], axes, a[nc].shape[0]) if nr else []
-        return [lax.psum(o, axes) for o in outs[:nsum]] + list(outs[nsum:nsum + p.nY]) + ring
+        sl = [p.tallies[k].slots for k in p.out_tallies] + [False]       # (a slot-indexed tally: as the ring)
+        red = [_global_slots(o, outs[nsum - 1], axes) if s else lax.psum(o, axes) for o, s in zip(outs[:nsum], sl)]
+        return red + list(outs[nsum:nsum + p.nY]) + ring
     return mesh, lower, outs_sh, args_sh
+
+
+def _global_slots(t, stats, axes):
+    """a tally indexed by this device's queue slots (TSpec.slots) -> indexed by the call's slots (the devices'
+    children packed in device order, as _global_ring packs the ring)"""
+    cnt = lax.all_gather(stats[ST["spawned"]], axes)
+    off = jnp.cumsum(cnt) - cnt
+    Q = t.shape[-1]
+    dest = jnp.where(jnp.arange(Q)[None] < cnt[:, None], off[:, None] + jnp.arange(Q)[None], Q).reshape(-1)
+    return jnp.zeros_like(t).at[..., dest].set(lax.all_gather(t, axes, axis=t.ndim - 1, tiled=True), mode="drop")
 
 
 def _global_ring(p, ring, stats, axes, n):
