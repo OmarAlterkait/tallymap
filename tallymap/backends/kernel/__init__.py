@@ -26,6 +26,7 @@ from ..._compat import key_impl
 from ..._jaxpr import digest
 from . import codegen, ranges
 from . import compile as C
+from . import kernel as _kernel_mod  # (the module: this package's `kernel` is the function below)
 from .codegen import CodegenError, is_key_dtype
 from .kernel import BLOCK, build_source
 
@@ -50,8 +51,8 @@ def _key(p, opts):
                   for s in p.tallies),
             p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), p.nact, p.rec,
             tuple(sorted(opts.items())),
-            codegen.FILL, codegen.INPLACE, codegen.GUARDED,
-            ranges.ENABLE)                          # (test-only switches that change the source)
+            codegen.FILL, codegen.INPLACE, codegen.GUARDED, ranges.ENABLE,     # (test-only switches that change
+            _kernel_mod.SHARED_TABLES, _kernel_mod.SHARED_TABLE_MAX)           #  the source)
 
 
 MATH_OPTS = {"ieee": [], "approx": ["-DTALLYMAP_APPROX_DIVSQRT", "--prec-div=false", "--prec-sqrt=false"]}
@@ -62,7 +63,7 @@ class Kernel:
         self.block = BLOCK
         self.target = target
         try:
-            self.src, self.L = build_source(p, schedule=schedule, strict=strict)
+            self.src, self.L = build_source(p, schedule=schedule, strict=strict, target=target)
         except CodegenError as e:
             raise UnsupportedError(str(e)) from None
         note = schedule_note(self.L)

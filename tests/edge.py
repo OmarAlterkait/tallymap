@@ -1538,6 +1538,45 @@ def _(b):
     return "bits equal to the facts-off cubin (which differs); values, NaN and zero signs equal to xla"
 
 
+@case("staged tables: small broadcast / constant tables read from shared memory == SHARED_TABLES off == xla "
+      "(bitwise)", ["auto"])
+def _(b):
+    """kernel._stage_tables: small tables (a broadcast f32 input, a closed-over int32 constant, a bool table, an odd
+    byte count) are copied into shared memory per block and read there; a table over SHARED_TABLE_MAX stays global.
+    Arms: kernel.SHARED_TABLES = 0 (the cubins must differ) and xla; gathers and integer arithmetic are exact."""
+    import importlib
+    KM = importlib.import_module("tallymap.backends.kernel.kernel")
+    ftab = jnp.arange(37).astype(F) * F(0.75) - F(4.0)            # broadcast input (in_axes None)
+    ctab = jnp.asarray((np.arange(50, dtype=np.int32) * 13) % 29 - 7)        # a closed-over constant
+    btab = jnp.asarray(np.arange(19) % 3 == 0)                                # bool
+    u8t = jnp.asarray((np.arange(7) * 37 % 251).astype(np.uint8))             # 7 bytes: not a multiple of 4
+    big = jnp.asarray(np.arange(4096, dtype=np.int32) * 3)                    # 16 KB: stays in global memory
+
+    def item(t, x, key, tab):
+        def body(k, acc):
+            i = (bits(key, k) % 37).astype(jnp.int32)
+            v = tab[i] * F(2) + ctab[(i + k) % 50].astype(F)
+            v = jnp.where(btab[i % 19], v, -v) + u8t[i % 7].astype(F) + big[(i * 97 + k) % 4096].astype(F)
+            return acc + v
+        acc = lax.fori_loop(0, 6, body, F(0))
+        t = t.add("Q", (x % NB).astype(jnp.int32), F(1))
+        return t, acc
+    ii = jnp.arange(N, dtype=jnp.int32) % 23
+    run = lambda bk: V(item, bk, in_axes=(0, 0, None))(ii, keys, ftab)
+    g = lambda a, k, tb: V(item, "auto", in_axes=(0, 0, None))(a, k, tb).per_item
+    if GPU:                                  # (the CPU target stages nothing: the host has no per-block memory)
+        assert_arms_differ(g, g, ii, keys, ftab, patch_b=(KM, dict(SHARED_TABLES=0)))   # instrument: staged
+    on = run("auto")
+    with patched(KM, SHARED_TABLES=0):
+        off = run("auto")
+    xl = run("xla")
+    for a, c in zip(jax.tree_util.tree_leaves(on), jax.tree_util.tree_leaves(off)):
+        if np.asarray(a).tobytes() != np.asarray(c).tobytes():
+            raise Fail("the staged-table result differs (bits) from the global-table result")
+    close(on, xl, what="vs xla")
+    return "bitwise equal to the unstaged cubin (which differs); == xla"
+
+
 @case("guarded update: jnp.where(p, x.at[i].set(v), x) as one guarded store == codegen.GUARDED off == xla "
       "(bitwise)", ["auto"])
 def _(b):

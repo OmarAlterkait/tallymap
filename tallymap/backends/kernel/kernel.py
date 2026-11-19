@@ -70,6 +70,8 @@ __device__ __forceinline__ float sj_rsqrt_approx(float b) { float r; asm("rsqrt.
 
 template <class T> __device__ __forceinline__ T sj_ld(const T* p) { return __ldg(p); }
 template <> __device__ __forceinline__ bool sj_ld<bool>(const bool* p) { return __ldg((const u8*)p) != 0; }
+// a table staged in shared memory (kernel._stage_tables): a plain load, never __ldg (global only)
+template <class T> __device__ __forceinline__ T sj_lds(const T* p) { return *p; }
 // lax.max/min: NaN-propagating
 template <class T> __device__ __forceinline__ T sj_fmax(T a, T b) { return (a >= b || a != a) ? a : b; }
 template <class T> __device__ __forceinline__ T sj_fmin(T a, T b) { return (a <= b || a != a) ? a : b; }
@@ -277,6 +279,12 @@ def _split(cj):
 BLOCK = 128          # threads per block (measured: 64 / 128 / 256 within 1%)
 STEP_INPLACE_MIN = 64    # step schedule: array loop carries of at least this many elements are updated in place
 PRIV_BYTES = 4096    # shared-memory budget for privatised sum tallies per block
+# Small read-only tables (broadcast inputs and hoisted constants) copied into shared memory once per block at kernel
+# start (kernel._stage_tables): their loads become LDS at a constant address instead of LDG through a pointer read
+# from the parameter bank.  A table of at most SHARED_TABLE_MAX bytes is staged, most-referenced first, while the
+# block's total stays within SHARED_TABLES bytes (0: off; a test-only A/B control, part of the kernel key).
+SHARED_TABLES = 4096
+SHARED_TABLE_MAX = 2048
 # the spawn queue's 5 control words (claim / head / pending / occupancy / in flight) each on its own 128-byte line:
 # every idle thread polls two of them, every spawn and pop updates the others, and on one shared line the polls
 # queued every atomic behind them (docs/design_notes.md section 1c)
@@ -297,7 +305,56 @@ def privatised(tallies, budget=PRIV_BYTES):
     return out
 
 
-def build_source(p, *, block=BLOCK, schedule="item", strict=False):
+def _stage_tables(fdefs, tables, budget=None, tmax=None):
+    """copy small read-only tables into one shared-memory array per block (SHARED_TABLES, SHARED_TABLE_MAX).
+    tables: [(P.p index, pointer spelling in the source ("P.p[i]" / "SJ_CONST(j)"), bytes)].  The function
+    definitions `fdefs` are rewritten in place: every load `sj_ld(((const T*)<spelling>) + o)` of a staged table
+    reads `sj_lds(((const T*)(sj_tab + off)) + o)` (the same bytes, from shared memory).  -> (file-scope
+    declaration, per-block copy lines for the kernel's start; both empty when nothing is staged)."""
+    import re
+    budget = SHARED_TABLES if budget is None else budget
+    tmax = SHARED_TABLE_MAX if tmax is None else tmax
+    if budget <= 0 or not tables:
+        return "", []
+    text = "\n".join(fdefs)
+    cand = []
+    for idx, sp, nb in tables:
+        refs = len(re.findall(r"sj_ld\(\(?\(const \w+\*\)\(?\(const \w+\*\)" + re.escape(sp) + r"\)", text))
+        refs += len(re.findall(r"sj_ld\(\(\(const \w+\*\)" + re.escape(sp) + r"\)", text))
+        if 0 < nb <= tmax and refs:
+            cand.append((-refs, nb, idx, sp))
+    cand.sort()
+    chosen, off = [], 0
+    for _, nb, idx, sp in cand:
+        if off + nb > budget:
+            continue
+        chosen.append((idx, sp, nb, off))
+        off += (nb + 15) // 16 * 16
+    if not chosen:
+        return "", []
+    pats = []
+    for idx, sp, nb, o in chosen:
+        e = re.escape(sp)
+        pats.append((re.compile(r"sj_ld\(\(\(const (\w+)\*\)" + e + r"\)"), rf"sj_lds(((const \1*)(sj_tab + {o}))"))
+        pats.append((re.compile(r"sj_ld\(\(const u8\*\)\(\(const u8\*\)" + e + r"\)"),
+                     rf"sj_lds((const u8*)((const u8*)(sj_tab + {o}))"))
+    for k, ln in enumerate(fdefs):
+        if "sj_ld(" in ln:
+            for pat, rep in pats:
+                ln = pat.sub(rep, ln)
+            fdefs[k] = ln
+    decl = f"__shared__ __align__(16) unsigned char sj_tab[{off}];   // staged tables (kernel._stage_tables)"
+    copy = []
+    for idx, sp, nb, o in chosen:
+        if nb % 4 == 0:
+            copy.append(f"  for (int i = threadIdx.x; i < {nb // 4}; i += blockDim.x) "
+                        f"((u32*)(sj_tab + {o}))[i] = ((const u32*)P.p[{idx}])[i];")
+        else:
+            copy.append(f"  for (int i = threadIdx.x; i < {nb}; i += blockDim.x) sj_tab[{o} + i] = ((const u8*)P.p[{idx}])[i];")
+    return decl, copy
+
+
+def build_source(p, *, block=BLOCK, schedule="item", strict=False, target="cuda"):
     """-> (CUDA source, Layout).  p: tallymap._api.ItemProgram.  Its jaxpr is first rewritten into the
     canonical primitives (canon.py).  schedule: 'item' (one whole item per thread at a time) | 'step' (the step
     schedule wherever the program splits, else 'item'; strict: raise when it does not split).  Layout.mode is the
@@ -600,7 +657,18 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
                              f"if (x != ({at})0) {{ {at}* const g = {gp}; {op('g', 'i', 'x')} }} }}")
         else:
             acc_decl.append(f"  {at}* const sj_acc{k} = {gp};")
-    if any("__shared__" in a for a in acc_decl):
+    # small tables into shared memory (the cuda target only: the host has no per-block memory)
+    tab_decl, tab_copy = "", []
+    if target == "cuda":
+        tabs = [(i, f"P.p[{i}]", _size(sh) * np.dtype(dt).itemsize) for i, (sh, dt, impl) in zip(L.i_bc, bav)
+                if impl is None]
+        for j, c in enumerate(L.consts):
+            sh, dt = (c[3], c[4]) if c[0] == "dyn" else (c[2].shape, c[2].dtype)
+            tabs.append((base_const + j, f"SJ_CONST({j})", _size(tuple(sh)) * np.dtype(dt).itemsize))
+        tab_decl, tab_copy = _stage_tables(fdefs, tabs)
+    L.staged = len(tab_copy)
+    acc_decl += tab_copy
+    if tab_copy or any("__shared__" in a for a in acc_decl):
         acc_decl.append("  __syncthreads();")
         acc_flush.insert(0, "  __syncthreads();")
     if spawn is not None:
@@ -616,6 +684,8 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False):
     L.flags = flags
     if em.n_brk:
         src.append(BRK)
+    if tab_decl:
+        src.append(tab_decl)
     src += fdefs
 
     # ---------------------------------------------------------------- main kernel
