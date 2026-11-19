@@ -106,7 +106,9 @@ class Records:
 
     Fields are scalars of a numeric dtype.  Float fields carry tangents and cotangents (the pathwise derivative of
     each record's value); whether a record exists is a discrete decision and carries no derivative; integer fields
-    have none.  A float field stores each value exactly, except that -0.0 is stored as +0.0.
+    have none.  A float field stores each value exactly, subnormals included, except that -0.0 is stored as +0.0
+    (on the xla backend on a CPU, XLA:CPU flushes subnormals to zero in its own arithmetic, so they are stored as
+    0 there; docs/float_semantics.md item 6).
 
     capacity: the number of slots (static: it is the outputs' shape).  None: the eager call's own count, rounded up
     to a power of two (a traced call -- jax.jit, a vmap of the call -- needs an int).  A call that appends more than
@@ -756,17 +758,33 @@ def _limits(stats, st, spawn, max_steps):
 def _poison(outs, bad):
     """Every float output becomes NaN when a resource limit intervened: a truncated or dropped item is never
     silently missing from a sum.  The counters in Result.stats stay the signal; integer tallies cannot be NaN.
-    x * 1.0 is exact, so a call that hit no limit is bitwise unchanged, and the multiply carries the poison into
-    tangents and cotangents (a NaN gradient, never a wrong one)."""
+    The primal is a select, so a call that hit no limit is bitwise unchanged (a multiply by 1.0 is not: XLA:CPU
+    flushes a subnormal product to zero); the tangent is unchanged too, or times NaN when poisoned, which carries the
+    poison into tangents and cotangents (a NaN gradient, never a wrong one)."""
     if bad is None:
         return outs
     poison = jnp.where(bad, jnp.float32(np.nan), jnp.float32(1.0))
-    return {n: v * poison.astype(v.dtype) if isfloat(v.dtype) else v for n, v in outs.items()}
+    return {n: _psel(v, poison.astype(v.dtype)) if isfloat(v.dtype) else v for n, v in outs.items()}
+
+
+def _sel(x, f):
+    """x where the poison f is 1, NaN where it is NaN: bitwise x (subnormals included) or NaN."""
+    return jnp.where(jnp.isnan(f), f, x)
+
+
+@jax.custom_jvp
+def _psel(x, f):
+    return _sel(x, f)
+
+
+# the tangent: tangent * NaN where poisoned, else the tangent itself (bitwise; a select of two linear functions of the
+# tangent, so it transposes to the cotangent)
+_psel.defjvp(lambda pr, tg: (_psel(*pr), jnp.where(jnp.isnan(pr[1]), tg[0] * pr[1], tg[0])))
 
 
 @jax.custom_jvp
 def _pmul(x, f):
-    return x * f
+    return _sel(x, f)
 
 
 _pmul.defjvp(lambda pr, tg: (_pmul(*pr), tg[0]))

@@ -54,6 +54,30 @@ math modes, schedules and JAX versions.
    dtype.
 5. **Forward, tangent and adjoint share one item program.**  The adjoint replays the same jaxpr with the same options
    (same math), so a replay is bit-exact on the same backend (gated in tests/reverse.py, "REPLAY GATE").
+6. **Subnormal values are kept, as XLA's arithmetic keeps them on a GPU.**  A GPU's f32 atomic add into global
+   memory (PTX `red` / `atom.add.f32`, which XLA's own scatter-add uses too) flushes subnormal inputs and results to
+   zero whatever `--ftz` says; measured on a 2080 Ti, 4 x 1.4e-44 added that way is 0, and so is
+   1.5 x 2^-126 - 2^-126.  tallymap's f32 sums do not use it for those adds:
+   - **kernel backend**: an emit of |v| >= 2^-102 (or a NaN / inf) is the one-instruction atomic, which is bitwise
+     the IEEE add there: a subnormal bin is below half an ulp of v, and v + bin is never subnormal (it is a
+     multiple of 2^-126, or |bin| < 2^-103 and |v + bin| > 2^-126).  A smaller nonzero v is added by a
+     compare-and-swap loop of the IEEE add.  An emit of +-0 is skipped: it changes no bin (a bin starts at +0 and
+     never becomes -0).  The same holds for the block's flush of a privatised (shared-memory) tally.  All three
+     `cuda_math` modes, `fast` included, emit this way.  f64 atomics do not flush; the CPU target's atomics are an
+     IEEE compare-and-swap loop.
+   - **xla backend**: the adds below 2^-102 (subnormals and zeros) go, times 2^100 (exact, and normal), into one
+     more row of the tally, and the readout adds that row times 2^-100 (exact) to the others: the other rows only
+     ever hold multiples of 2^-125, so no add meets a subnormal.  One more rounding, a reassociation of the same
+     adds (item 3); memory: one more row of the tally.
+   So a float `Sum` keeps subnormals in its adds, and a `Records` float field stores every value exactly (-0.0 as
+   +0.0), in the primal, its jvp tangents and its reverse-mode cotangents.  `Sum(fixed_point=True)` of f32 (item 4)
+   sums integers in units of 2^-149 and was always exact for subnormals.  The NaN poison of a call that hit a resource
+   limit is a select, not a multiply by 1.0 (which flushes a subnormal on XLA:CPU), so an unpoisoned output passes
+   through bitwise.
+   **The exception: the xla backend on a CPU.**  XLA:CPU flushes subnormals to zero in its own arithmetic (its
+   `jnp.sum` of two 2^-149 is 0), so there subnormal emits become 0, in every kind of `Sum` and in `Records`: the
+   xla backend follows XLA's platform arithmetic.  JAX's own operations outside a call (your loss, a cotangent sum
+   in an eager `jax.grad`) run on XLA:CPU as well.  `tests/edge.py` "subnormal f32 emits".
 
 ## Arithmetic per backend
 

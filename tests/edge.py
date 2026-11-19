@@ -2680,6 +2680,109 @@ def _(b):
     return _alias_arms(item)
 
 
+# subnormal f32 emits (a GPU's f32 atomic add flushes subnormal inputs and results to zero; tallymap must not):
+# (bin, value) pairs whose per-bin sums are exact in any order.  Bin 0: 4 x 1.4e-44 (lumen's report: 0 in a float Sum
+# and a Records field); 1: two normals cancelling to a subnormal; 2: a normal + a subnormal; 3: one subnormal; 4: a
+# negative subnormal total; 5: 1 + 2^-149 (rounds to 1); 6: 3 x 2^-110 (small normals); 7: -0.0 only.
+_TN = 2.0 ** -126
+_SUBN = [(0, 1.4e-44)] * 4 + [(1, 1.5 * _TN), (1, -_TN), (2, _TN), (2, 2.0 ** -140), (3, 2.0 ** -140), (4, -3e-44),
+                              (4, 1e-45), (5, 1.0), (5, 1e-45)] + [(6, 2.0 ** -110)] * 3 + [(7, -0.0)]
+_SUBN_I = jnp.asarray([i for i, _ in _SUBN], jnp.int32)
+_SUBN_X = jnp.asarray(np.array([x for _, x in _SUBN], np.float32))
+
+
+def _subn_skip(b):
+    """the xla backend on a CPU follows XLA:CPU, which flushes subnormals in its own arithmetic: -> a skip message
+    when XLA's own reduce of two 2^-149 is 0 there (else None: the cell runs)."""
+    if b != "xla" or GPU:
+        return None
+    s = float(jax.jit(jnp.sum)(jnp.full((2,), 1e-45, jnp.float32)))
+    return None if s != 0.0 else ("skipped: XLA:CPU flushes subnormals (its own jnp.sum of 2 x 2^-149 is 0.0); the "
+                                  "xla backend follows XLA's platform arithmetic")
+
+
+def _bitwise(a, b_):
+    a, b_ = np.asarray(a, np.float32), np.asarray(b_, np.float32)
+    return a.shape == b_.shape and np.array_equal(a.view(np.uint32), b_.view(np.uint32))
+
+
+@case("subnormal f32 emits survive: Sum, exact Sum (fixed_point=True) and a Records field, privatised and global "
+      "bins, bitwise the exact sum (= XLA:GPU's own reduce)")
+def _(b):
+    if (m := _subn_skip(b)):
+        return m
+    want = _exact_ref(np.asarray(_SUBN_X), np.asarray(_SUBN_I), NB)
+    if GPU:      # XLA's own arithmetic on a GPU keeps subnormals: its dense reduce is the same exact sums
+        dense = jax.jit(lambda x, i: jnp.sum(jnp.where(i[:, None] == jnp.arange(NB), x[:, None], 0.0), 0))(
+            _SUBN_X, _SUBN_I)
+        if not _bitwise(dense, want):
+            raise Fail(f"XLA's dense reduce {np.asarray(dense)} != the exact sums {want}")
+    done = []
+    for S in (NB, 2048):                              # NB: privatised (shared memory, then the global flush); 2048
+        for fp in (False, True):
+            if fp and b == "xla" and not jax.config.jax_enable_x64:
+                continue
+            f = tm.vmap(lambda t, x, i: t.add("s", i, x), outputs={"s": tm.Sum((S,), jnp.float32, fixed_point=fp)},
+                        backend=b)
+            got = np.asarray(f(_SUBN_X, _SUBN_I).outputs["s"])[:NB]
+            if not _bitwise(got, want):
+                raise Fail(f"Sum({S}, fixed_point={fp}) {got} != the exact sums {want}")
+            done.append(f"Sum{S}/fp={fp}")
+    f = tm.vmap(lambda t, x: t.append("r", {"q": x}), outputs={"r": tm.Records({"q": jnp.float32}, capacity=32)},
+                backend=b)
+    q = np.asarray(f(_SUBN_X).outputs["r"]["q"])
+    wantq = np.zeros(32, np.float32)
+    wantq[:len(_SUBN)] = np.where(np.asarray(_SUBN_X) == 0, np.float32(0.0), np.asarray(_SUBN_X))    # -0.0 -> +0.0
+    if not _bitwise(q, wantq):
+        raise Fail(f"Records q {q[:len(_SUBN)]} != the emitted values {wantq[:len(_SUBN)]}")
+    if jax.config.jax_enable_x64:                     # f64: the values times 2^-900 (f64 subnormals), exact
+        f = tm.vmap(lambda t, x, i: t.add("s", i, x.astype(jnp.float64) * 2.0 ** -900),
+                    outputs={"s": tm.Sum((2048,), jnp.float64)}, backend=b)
+        got = np.asarray(f(_SUBN_X, _SUBN_I).outputs["s"])[:NB]
+        if not np.array_equal(got, want.astype(np.float64) * 2.0 ** -900):
+            raise Fail(f"f64 Sum {got} != {want.astype(np.float64) * 2.0 ** -900}")
+        done.append("f64")
+    return f"{', '.join(done)}, Records: bitwise"
+
+
+@case("subnormal f32 emits survive in jvp tangents and grad cotangents (Sum, exact Sum, Records)")
+def _(b):
+    if (m := _subn_skip(b)):
+        return m
+    X, I = np.asarray(_SUBN_X), np.asarray(_SUBN_I)
+    want = _exact_ref(X, I, NB)
+    w = jnp.asarray(np.isin(np.arange(NB), [0, 3, 4]), jnp.float32)          # bins whose values are all subnormal
+    gwant = _exact_ref(X[np.isin(I, [0, 3, 4])], np.zeros(int(np.isin(I, [0, 3, 4]).sum()), int), 1)[0]
+    done = []
+    for S in (NB, 2048):
+        for fp in (False, True):
+            if fp and b == "xla" and not jax.config.jax_enable_x64:
+                continue
+            f = tm.vmap(lambda t, x, i, th: t.add("s", i, x * th), in_axes=(0, 0, None),
+                        outputs={"s": tm.Sum((S,), jnp.float32, fixed_point=fp)}, backend=b)
+            p, tg = jax.jvp(lambda th: f(_SUBN_X, _SUBN_I, th).outputs["s"][:NB], (jnp.float32(1.0),),
+                            (jnp.float32(1.0),))
+            g = jax.grad(lambda th: jnp.sum(f(_SUBN_X, _SUBN_I, th).outputs["s"][:NB] * w))(jnp.float32(1.0))
+            if not (_bitwise(p, want) and _bitwise(tg, want) and _bitwise(g, gwant)):
+                raise Fail(f"Sum({S}, fixed_point={fp}): primal {np.asarray(p)}, tangent {np.asarray(tg)} (want "
+                           f"{want}); grad {float(g)!r} (want {float(gwant)!r})")
+            done.append(f"Sum{S}/fp={fp}")
+    f = tm.vmap(lambda t, x, th: t.append("r", {"q": x * th}), in_axes=(0, None),
+                outputs={"r": tm.Records({"q": jnp.float32}, capacity=32)}, backend=b)
+    p, tg = jax.jvp(lambda th: f(_SUBN_X, th).outputs["r"]["q"], (jnp.float32(1.0),), (jnp.float32(1.0),))
+    wantq = np.zeros(32, np.float32)
+    wantq[:len(_SUBN)] = np.where(X == 0, np.float32(0.0), X)
+    sub = np.zeros(32, np.float32)
+    sub[:len(_SUBN)] = np.abs(X) < _TN                                       # the subnormal records
+    g = jax.grad(lambda th: jnp.sum(f(_SUBN_X, th).outputs["r"]["q"] * sub))(jnp.float32(1.0))
+    rg = _exact_ref(X[np.abs(X) < _TN], np.zeros(int((np.abs(X) < _TN).sum()), int), 1)[0]
+    if not (_bitwise(p, wantq) and _bitwise(np.where(np.asarray(tg) == 0, np.float32(0), tg), wantq)
+            and _bitwise(g, rg)):
+        raise Fail(f"Records: primal {np.asarray(p)[:len(_SUBN)]}, tangent {np.asarray(tg)[:len(_SUBN)]} (want "
+                   f"{wantq[:len(_SUBN)]}); grad {float(g)!r} (want {float(rg)!r})")
+    return f"{', '.join(done)}, Records: primal, tangent and cotangent bitwise"
+
+
 print("\n================ SUMMARY", jax.__version__, "x64" if jax.config.jax_enable_x64 else "",
       jax.devices()[0].device_kind)
 for n, b, m in RES:

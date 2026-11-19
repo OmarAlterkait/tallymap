@@ -19,6 +19,20 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Fixed
 
+- Subnormal f32 values were flushed to zero by `Sum` (fixed_point=False) and therefore by `Records` float fields,
+  contradicting "a float field stores each value exactly": lumen's record readout lost every deposit whose q
+  relative to the row weight was subnormal (4 x 1.4e-44 emitted gave 0; XLA's multiply keeps them). The cause is
+  not a compile flag (`--ftz=false` was already set, in every `cuda_math` mode): a GPU's f32 atomic add into global
+  memory (`red` / `atom.add.f32`) flushes subnormal inputs and results to zero by definition. The kernel backend
+  now emits |v| >= 2^-102 with that atomic (provably bitwise IEEE there), adds a smaller nonzero v with a
+  compare-and-swap loop of the IEEE add, and skips +-0 (a no-op); the block flush of privatised tallies too. The
+  xla backend (XLA's scatter-add is the same atomic) adds values below 2^-102, times 2^100, into one more row of
+  the tally. And the NaN poison of a call that can hit a resource limit (`Records`, `max_steps`, `spawn`, the
+  adjoint's truncation) multiplied every float output by 1.0, which XLA:CPU flushes: it is now a select (tangent:
+  times NaN only when poisoned). `Sum(fixed_point=True)` of f32 was always exact for subnormals. The xla backend on
+  a CPU still follows XLA:CPU, which flushes subnormals in its own arithmetic. `docs/float_semantics.md` item 6;
+  tests/edge.py "subnormal f32 emits".
+
 - `Sum(fixed_point=True)` of float32 is now EXACT, forward, in every tangent and in reverse mode: each bin is the
   correctly rounded f32 of the exact sum of every finite value emitted into it, with no scale, floor or cap
   (`scale` is no longer used for float32; other dtypes keep int64 fixed point). The 2^32 fixed point it replaces

@@ -22,6 +22,19 @@ BLOCK = 1 << 18
 # error grows with the number of adds per bin: 85x plain JAX's on a 3.6e3-per-bin tally (round4/xla, Q1).  R rows
 # cut the adds per bin R-fold; the rows cost R x the tally memory, so R shrinks to stay within ROWS_ELEMS.
 ROWS, ROWS_ELEMS = 64, 1 << 24
+# f32 sum tallies keep subnormals: a GPU's f32 scatter-add is an atomic add that flushes subnormal inputs and results
+# to zero (measured on a 2080 Ti, jax 0.6.2: XLA's own .at[].add of 4 x 1.4e-44 is 0).  An add of |v| >= 2^-102 never
+# meets a subnormal when every value in its accumulator is a sum of such values (they are all multiples of 2^-125),
+# so the accumulator takes only those; a smaller v (subnormals, zeros) is added, times 2^100 (exact, and normal), into
+# one more row of the tally, LOW, whose values are multiples of 2^-49 (never subnormal).  The readout adds
+# LOW * 2^-100 (exact) to the sum of the rows: one more rounding, a reassociation of the same adds.
+SPLIT, LOW, UNLOW = np.float32(2.0 ** -102), np.float32(2.0 ** 100), np.float32(2.0 ** -100)
+
+
+def _low(spec):
+    """an f32 non-fixed-point sum tally: one more row, for its adds below SPLIT (scaled by LOW)."""
+    return (spec.kind == "sum" and not spec.fixed_point and not _exact(spec)
+            and np.dtype(spec.dtype) == np.dtype(np.float32))
 
 
 class VT:
@@ -269,6 +282,18 @@ def _emit(st, t, idx, val):
             jnp.concatenate([v & jnp.int64(0xFFFFFFFF), v >> 32], axis=-1), mode="drop")
         return t
     v = v.astype(a.dtype)
+    if _low(spec):                                    # SPLIT: a small value goes, scaled, into the LOW row
+        RS = R * S
+        small = jnp.abs(v) < SPLIT                    # (NaN: False)
+        ix = jnp.where(f < RS, jnp.where(small, RS + f % S, f), RS + S)     # [*L, P*I] (dropped: out of range)
+        q = jnp.where(small, v * LOW, v)
+        if nl == 0:
+            st.accs[t.slot] = a.at[ix].add(q, mode="drop")
+        else:
+            a2, n = a.reshape(-1, a.shape[-1]), int(np.prod(L, dtype=np.int64))
+            st.accs[t.slot] = a2.at[jnp.arange(n)[:, None], ix.reshape(n, -1)].add(
+                q.reshape(n, -1), mode="drop").reshape(a.shape)
+        return t
     st.accs[t.slot] = a.at[..., f].add(v, mode="drop")
     return t
 
@@ -519,7 +544,7 @@ def run(p, pi, bc, xla_batch_size=None, **_):
             dt = jnp.int64 if s.fixed_point or _exact(s) else s.dtype
             if s.fixed_point:
                 _fixed(jnp.zeros(()), 1.0)
-            w = EXACT_WORDS if _exact(s) else 2 if s.fixed_point else _rows(s)
+            w = EXACT_WORDS if _exact(s) else 2 if s.fixed_point else _rows(s) + _low(s)
             accs[k] = jnp.zeros(tuple(s.lead) + (w * s.S,), dt)
     ys0 = [jnp.zeros((N,) + tuple(a.shape), a.dtype) for a in ya]
     P = int(min(max(N, 1), xla_batch_size or BLOCK))
@@ -607,8 +632,13 @@ def _finish(p, accs, sp, ys, st):
     for k, s in enumerate(p.tallies):
         if s.kind == "sum":
             a = accs[k]
-            if _rows(s) > 1:
-                a = jnp.sum(a.reshape(tuple(s.lead) + (_rows(s), s.S)), axis=-2)
+            R = _rows(s)
+            if _low(s):                             # the rows' sum + LOW * 2^-100 (exact: LOW holds multiples of
+                a = a.reshape(tuple(s.lead) + (R + 1, s.S))    # 2^-49, so the product is a multiple of 2^-149)
+                lo = a[..., R, :]
+                a = (jnp.sum(a[..., :R, :], axis=-2) if R > 1 else a[..., 0, :]) + lo * UNLOW
+            elif R > 1:
+                a = jnp.sum(a.reshape(tuple(s.lead) + (R, s.S)), axis=-2)
             if s.fixed_point or _exact(s):          # a bin that dropped an emit is NaN (as on cuda)
                 a, big = _xread(a, s) if _exact(s) else _wide(a, s)
                 st.ovf = st.ovf + jnp.sum((big & ~st.bad[k]).astype(jnp.int32), dtype=jnp.int32)

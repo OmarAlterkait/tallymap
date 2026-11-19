@@ -117,6 +117,22 @@ __device__ __forceinline__ i64 sj_clampi(i64 x, i64 hi) { return x < 0 ? 0 : (x 
 // the same clamp of a 32-bit index (two IMNMX instead of 64-bit compare pairs and selects): op_table._clamp_expr
 __device__ __forceinline__ i32 sj_clamp32(i32 x, i32 hi) { return x < 0 ? 0 : (x > hi ? hi : x); }
 __device__ __forceinline__ bool sj_inb(i64 x, i64 hi) { return x >= 0 && x <= hi; }
+// an f32 sum's atomic add, keeping subnormals.  The GPU's f32 atomic add into global memory (red / atom.add.f32)
+// flushes subnormal inputs AND results to zero whatever --ftz says (PTX ISA; measured on a 2080 Ti: 4 x 1.4e-44 summed
+// to 0, 1.5 x 2^-126 - 2^-126 to 0).  An add of |v| >= 2^-102 never meets a subnormal: a subnormal bin is below half
+// an ulp of v (ulp(v) >= 2^-125), so IEEE gives v as the flushed add does; and v + bin is a multiple of
+// min(ulp(v), ulp(bin)) >= 2^-126, or |bin| < 2^-103 and |v + bin| > 2^-126: never a subnormal.  So that add (and a
+// NaN / inf) keeps the one-instruction atomic, bitwise IEEE; a smaller v is added by a compare-and-swap loop of the
+// IEEE add (__fadd_rn: no ftz); adding +-0 changes no bin (a bin starts at +0 and never becomes -0), so it is skipped.
+#ifdef __CUDA_ARCH__
+__device__ __forceinline__ void sj_fatom(float* a, float v) {
+  if (v == 0.0f) return;
+  if (!(fabsf(v) < __int_as_float(0x0c800000))) { atomicAdd(a, v); return; }    // 0x0c800000 = 2^-102
+  u32* const u = (u32*)a; u32 o = *(volatile u32*)u, w;
+  do { w = o; o = atomicCAS(u, w, __float_as_uint(__fadd_rn(__uint_as_float(w), v))); } while (o != w); }
+#else
+__device__ __forceinline__ void sj_fatom(float* a, float v) { atomicAdd(a, v); }   // the host's: an IEEE CAS loop
+#endif
 
 // threefry2x32 (20 rounds), bitwise identical to jax.random's threefry2x32_p
 __device__ __forceinline__ u32 sj_rotl(u32 x, int d) { return (x << d) | (x >> (32 - d)); }
@@ -648,9 +664,11 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False, target="cuda"
             op = lambda a, i, v: f"atomicAdd((unsigned long long*)&{a}[{i}], (unsigned long long){v});"
         elif ot in ("float", "double", "i32", "u32"):
             gp = dst
+            # f32: sj_fatom keeps subnormals (the hardware f32 atomic flushes them); f64 / int atomics are exact
+            fa = "sj_fatom" if ot == "float" else "atomicAdd"
             src.append(f"__device__ __forceinline__ void sj_emit{k}(const SjParams& P, {ot}* a, i64 i, {ot} v) {{ "
-                       f"atomicAdd(&a[i], v); }}")
-            op = lambda a, i, v: f"atomicAdd(&{a}[{i}], {v});"
+                       f"{fa}(&a[i], v); }}")
+            op = lambda a, i, v, fa=fa: f"{fa}(&{a}[{i}], {v});"
         else:
             raise CodegenError(f"sum output of dtype {s.dtype} is not supported")
         if k in priv:

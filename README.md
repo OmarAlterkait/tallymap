@@ -309,8 +309,9 @@ res.stats["appended"]["dep"]       # how many records there are (the rest of the
   count (rounded up to a power of two); under `jax.jit` or a `jax.vmap` of the call pass an int.
 - **Derivatives.** Float fields carry the pathwise derivative of each record's value (jvp, grad, jacfwd, jacrev,
   `jax.checkpoint`, reverse through spawn). Whether a record exists is a discrete decision and has no derivative,
-  as with an emit inside a branch. Integer fields have none. A float field stores each value exactly, except that
-  -0.0 is stored as +0.0.
+  as with an emit inside a branch. Integer fields have none. A float field stores each value exactly, subnormals
+  included, except that -0.0 is stored as +0.0 (on the xla backend on a CPU, XLA:CPU flushes subnormals to zero;
+  `docs/float_semantics.md` item 6).
 - **How it runs.** tallymap runs the items twice: a count pass (each item's number of records, nothing else is
   kept) and a fill pass that writes record k of item i at `offset[i] + k`. The count pass costs one more run of
   the item loop in the forward pass. The fill pass writes an item's records only while k is below its count, so a

@@ -48,7 +48,7 @@ from jax.interpreters import ad, mlir
 from jax.interpreters import partial_eval as _pe
 
 from . import _errors
-from ._api import _WARNED, ST, STATS, ItemProgram, UnsupportedError, _mk, _sds, jvp_prog
+from ._api import _WARNED, ST, STATS, ItemProgram, UnsupportedError, _mk, _psel, _sds, jvp_prog
 from ._compat import NM, convert_constvars_jaxpr, drop_var, register_batcher, requires_devices
 from ._jaxpr import call_jaxpr, cond_branches, digest, host_callbacks, scan_parts, subjaxprs, while_parts
 from ._reverse import LEAN_C, vjp_prog
@@ -548,10 +548,11 @@ def _vjp_call(node, base, pi, bc, U_pi, U_bc, cts, N, ring=()):
         tr = outs.pop()                 # the replay's own truncation flags (max_steps)
         if any(not _is_zero(cts[j]) for j in tf):
             # a truncated call's TALLIES are NaN, so a gradient through one is NaN; one through per-item results
-            # only stays exact.  The adjoint's own flags: no forward launch.  (A multiply: differentiated again,
-            # NaN * d stays NaN.)
+            # only stays exact.  The adjoint's own flags: no forward launch.  (_api._psel: a select, bitwise o when
+            # not truncated -- a multiply by 1.0 flushes a subnormal on XLA:CPU --, whose tangent is NaN when
+            # truncated: differentiated again, NaN * d stays NaN.)
             f = jnp.where(jnp.any(tr), np.nan, 1.0)
-            outs = [o * f.astype(o.dtype) if isfloat(o.dtype) else o for o in outs]
+            outs = [_psel(o, f.astype(o.dtype)) if isfloat(o.dtype) else o for o in outs]
     nib = sum(U_bc)
     g_bc_it, g_pi_it = iter(outs[:nib]), iter(outs[nib + 1:])
     g_pi = [next(g_pi_it) if u else None for u in U_pi]
