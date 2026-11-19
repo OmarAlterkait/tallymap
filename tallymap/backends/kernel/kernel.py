@@ -73,6 +73,17 @@ template <> __device__ __forceinline__ bool sj_ld<bool>(const bool* p) { return 
 // lax.max/min: NaN-propagating
 template <class T> __device__ __forceinline__ T sj_fmax(T a, T b) { return (a >= b || a != a) ? a : b; }
 template <class T> __device__ __forceinline__ T sj_fmin(T a, T b) { return (a <= b || a != a) ? a : b; }
+// the same where both operands are proven non-NaN (ranges.float_facts): no NaN test; and, f32 with no signed-zero tie
+// the two forms break differently (fmaxf(-0, +0) = +0 where sj_fmax gives -0), one FMNMX on the device
+template <class T> __device__ __forceinline__ T sj_fmaxn(T a, T b) { return a >= b ? a : b; }
+template <class T> __device__ __forceinline__ T sj_fminn(T a, T b) { return a <= b ? a : b; }
+#ifdef __CUDA_ARCH__
+__device__ __forceinline__ float sj_fmaxz(float a, float b) { return fmaxf(a, b); }
+__device__ __forceinline__ float sj_fminz(float a, float b) { return fminf(a, b); }
+#else
+__device__ __forceinline__ float sj_fmaxz(float a, float b) { return a >= b ? a : b; }
+__device__ __forceinline__ float sj_fminz(float a, float b) { return a <= b ? a : b; }
+#endif
 template <class T> __device__ __forceinline__ T sj_imax(T a, T b) { return a > b ? a : b; }
 template <class T> __device__ __forceinline__ T sj_imin(T a, T b) { return a < b ? a : b; }
 template <class T> __device__ __forceinline__ T sj_fsign(T a) { return a > (T)0 ? (T)1 : (a < (T)0 ? (T)-1 : a); }

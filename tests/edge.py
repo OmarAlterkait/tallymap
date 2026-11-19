@@ -1498,6 +1498,46 @@ def _(b):
     return "bitwise equal to the ranges-off cubin (which differs); integers == xla"
 
 
+@case("float facts: min / max of proven non-NaN operands (no NaN test; FMNMX without a zero tie) == facts off "
+      "(bitwise) == xla", ["auto"])
+def _(b):
+    """ranges.float_facts: operands from integer conversions, literals, the NaN guard where(x != x, c, x), selects
+    and min / max chains lose sj_fmax's NaN test (and are one FMNMX where the -0 / +0 tie cannot occur); operands
+    that may be NaN (a table with NaN, inf, -0) keep it.  Arms: ranges.ENABLE = False (the cubins must differ) and
+    xla, bitwise (min / max / select / convert are exact)."""
+    sp = jnp.array([0.0, -0.0, np.nan, np.inf, -np.inf, 1.5, -2.5, 3.0], F)
+
+    def item(t, x, key):
+        u = sp[(bits(key, 0) % 8).astype(jnp.int32)]                       # may be NaN / inf / -0
+        xi = (x % 7 - 3).astype(F)                                         # integer -> float: non-NaN
+        g = jnp.where(u != u, F(0.25), u)                                  # NaN guard: non-NaN
+        a = jnp.maximum(xi, F(0))                                          # literal +0 second: tie possible
+        c = jnp.maximum(F(0), xi)                                          # literal +0 first: FMNMX
+        d = jnp.minimum(jnp.maximum(g, F(-1)), F(2))                       # clamp of a guarded value
+        e = jnp.maximum(u, xi)                                             # may be NaN: sj_fmax
+        f = jnp.minimum(jnp.where(x > 3, xi, F(-0.0)), g)                  # select of non-NaN values
+        t = t.add("Q", (x % NB).astype(jnp.int32), F(1))
+        return t, (a, c, d, e, f, jnp.maximum(-xi, F(-0.0)))
+    ii = jnp.arange(N, dtype=jnp.int32) % 17
+    from tallymap.backends.kernel import ranges as RG
+    run = lambda bk: V(item, bk)(ii, keys)
+    g_ = lambda a, k: V(item, "auto")(a, k).per_item[0]
+    assert_arms_differ(g_, g_, ii, keys, patch_b=(RG, dict(ENABLE=False)))   # instrument: the facts fired
+    rs = [run("auto")]
+    with patched(RG, ENABLE=False):
+        rs.append(run("auto"))
+    rs.append(run("xla"))
+    for a, c in zip(jax.tree_util.tree_leaves(rs[0]), jax.tree_util.tree_leaves(rs[1])):
+        if np.asarray(a).tobytes() != np.asarray(c).tobytes():
+            raise Fail("a min / max result differs (bits) from the facts-off cuda result")
+    for a, c in zip(jax.tree_util.tree_leaves(rs[0]), jax.tree_util.tree_leaves(rs[2])):
+        a, c = np.asarray(a), np.asarray(c)
+        if not (np.array_equal(a, c, equal_nan=a.dtype.kind == "f") and np.array_equal(np.signbit(a), np.signbit(c))
+                if a.dtype.kind == "f" else np.array_equal(a, c)):
+            raise Fail("a min / max result differs from xla (value, NaN or zero sign)")
+    return "bits equal to the facts-off cubin (which differs); values, NaN and zero signs equal to xla"
+
+
 @case("guarded update: jnp.where(p, x.at[i].set(v), x) as one guarded store == codegen.GUARDED off == xla "
       "(bitwise)", ["auto"])
 def _(b):

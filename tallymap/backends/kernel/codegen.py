@@ -277,6 +277,20 @@ def vrng(v):
     return ranges.clip(ranges.full(r, dt), dt)
 
 
+def vff(v):
+    """(nonnan, finite) facts of a float value v (ranges.float_facts): from its literal, its own facts, or its View's
+    source; (False, False) when nothing is known."""
+    dt = getattr(v, "dtype", None)
+    if dt is None or isinstance(v, VTally) or not ranges._is_float(dt) or not ranges.ENABLE:
+        return ranges.FF_NONE
+    if v.cval is not None:
+        return ranges.ff_lit(v.cval, dt)
+    f = getattr(v, "ff", None)
+    if f is None and isinstance(v, View) and np.dtype(v.src.dtype) == np.dtype(dt):
+        f = vff(v.src)
+    return f or ranges.FF_NONE
+
+
 def elem(v, idx):
     """C expression of v[idx] (idx: list of int / str index expressions)."""
     if isinstance(v, Scalar):
@@ -843,6 +857,9 @@ class Emitter:
                 if not eqn.primitive.multiple_results:
                     outs = [outs]
                 rr = eqn_ranges(eqn, [vrng(x) for x in ins], [getattr(x, "dtype", None) for x in ins], nested=False)
+                ff = (ranges.float_facts(eqn.primitive.name, [vff(x) for x in ins], ins,
+                                         getattr(eqn.outvars[0].aval, "dtype", None))
+                      if len(eqn.outvars) == 1 and guard is None else None)
                 ovars = [e2.outvars[0]] if guard is not None else eqn.outvars
                 for v, x, r in zip(ovars, outs, rr):
                     if not is_dropvar(v):
@@ -854,6 +871,11 @@ class Emitter:
                                 x.rng = r
                             elif r is not None:
                                 x.rng = ranges.meet(getattr(x, "rng", None), r) if any(x is i for i in ins) else r
+                            if any(x is i for i in ins) and (eqn.primitive.name in _INPLACE_PRIMS or guard is not None):
+                                x.ff = None                 # (updated in place: its float facts are stale)
+                            elif ff is not None:
+                                old = getattr(x, "ff", None) if any(x is i for i in ins) else None
+                                x.ff = (ff[0] or old[0], ff[1] or old[1]) if old else ff
                         env[v] = x
             return [read(a) for a in jaxpr.outvars]
         finally:

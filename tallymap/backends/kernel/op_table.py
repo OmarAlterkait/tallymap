@@ -38,6 +38,7 @@ from .codegen import (
     lit,
     ravel,
     unravel,
+    vff,
     vrng,
 )
 
@@ -130,9 +131,32 @@ def b_rem(em, a, ts, t, p, vals):
     return f"sj_irem({a[0]}, {a[1]})"
 
 
+def _fminmax(op, a, t, vals):
+    """lax.max / min of floats: NaN-propagating sj_fmax / sj_fmin; where both operands are proven non-NaN (float
+    facts) the comparison alone (sj_fmaxn: no NaN test); and for f32 where also the signed-zero tie cannot occur
+    (FMNMX gives +0 for max(-0, +0) and -0 for min(+0, -0); lax gives its first operand), one FMNMX.  Same values."""
+    if len(vals) == 2 and all(getattr(v, "dtype", None) is not None for v in vals):
+        fa, fb = vff(vals[0]), vff(vals[1])
+        if fa[0] and fb[0]:
+            za, zb = _zeros(vals[0]), _zeros(vals[1])
+            tie = ("-" in za and "+" in zb) if op == "max" else ("+" in za and "-" in zb)
+            if t == "float" and not tie:
+                return f"sj_f{op}z({a[0]}, {a[1]})"
+            return f"sj_f{op}n({a[0]}, {a[1]})"
+    return f"sj_f{op}({a[0]}, {a[1]})"
+
+
+def _zeros(v):
+    """the signed zeros the float value v may be: a literal's own, else both."""
+    if v.cval is None:
+        return "+-"
+    x = float(v.cval)
+    return "" if x != 0.0 else ("-" if np.signbit(x) else "+")
+
+
 def b_max(em, a, ts, t, p, vals):
     if t in ("float", "double"):
-        return f"sj_fmax({a[0]}, {a[1]})"
+        return _fminmax("max", a, t, vals)
     if t == "bool":
         return f"({a[0]} || {a[1]})"
     return f"sj_imax<{t}>({a[0]}, {a[1]})"
@@ -140,7 +164,7 @@ def b_max(em, a, ts, t, p, vals):
 
 def b_min(em, a, ts, t, p, vals):
     if t in ("float", "double"):
-        return f"sj_fmin({a[0]}, {a[1]})"
+        return _fminmax("min", a, t, vals)
     if t == "bool":
         return f"({a[0]} && {a[1]})"
     return f"sj_imin<{t}>({a[0]}, {a[1]})"
@@ -1443,6 +1467,7 @@ def _set_carry_ranges(vals, pt, rs):
     for v, p_, r in zip(vals, pt, rs):
         if not p_ and not isinstance(v, VTally):
             v.rng = r
+            v.ff = None
 
 
 def _batched_body(em, w, pred, bc, cars, vals, pt):
@@ -1569,8 +1594,10 @@ def _cond(em, eqn, ins, **p):
             rk = vrng(bd[1][j])
             r = rk if k == 0 else ranges.join(r, rk)
         x.rng = r
+        fs = [vff(bd[1][j]) for bd in bodies]
+        x.ff = (all(f[0] for f in fs), all(f[1] for f in fs))
         if isinstance(o, Local):
-            o.rng = r
+            o.rng, o.ff = r, x.ff
     return res
 
 

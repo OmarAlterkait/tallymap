@@ -366,3 +366,81 @@ def scan_ranges(eqn, rs, carries=False):
             return cr if carries else cr + out[nk:]
         cr = [_widen(a, b, d) if it >= 1 and _is_int(d) else b for a, b, d in zip(cr, new, dts)]
     return [None] * (nk if carries else len(eqn.outvars))
+
+
+# ----------------------------------------------------------------------------- float facts
+# (nonnan, finite): every element is not NaN / is finite.  A min / max of two non-NaN operands needs no NaN test
+# (op_table.b_max / b_min), and is one FMNMX when the signed-zero tie it breaks differently cannot occur.  Facts flow
+# from literals, integer -> float conversions, selects, sign / rounding / abs / neg, min / max, the bounded
+# functions, the NaN guards jnp.where(x != x, c, x) / jnp.where(isfinite(x), x, c), and finite + finite (never NaN,
+# though it may overflow).  Loop carries carry none (unknown).
+FF_NONE = (False, False)
+
+
+def _is_float(dt):
+    dt = _np(dt)
+    return dt is not None and dt.kind == "f"
+
+
+def ff_lit(val, dt):
+    if not _is_float(dt):
+        return FF_NONE
+    a = np.asarray(val, dtype=_np(dt))
+    return (bool(not np.isnan(a).any()), bool(np.isfinite(a).all()))
+
+
+def _and(*fs):
+    return (all(f[0] for f in fs), all(f[1] for f in fs))
+
+
+_FF_SAME = {"neg", "abs", "floor", "ceil", "round", "reduce_max", "reduce_min", "broadcast_in_dim", "reshape",
+            "transpose", "slice", "rev", "squeeze", "expand_dims", "dynamic_slice", "copy", "copy_p", "cummax",
+            "cummin", "reduce_precision", "real", "imag"}
+
+
+def float_facts(name, ffs, ins, out_dt):
+    """(nonnan, finite) of an equation's (first) float result from its operands' facts `ffs` and values `ins`
+    (Val.origin = (primitive, operands) of a computed operand: the NaN-guard patterns), or None (not a float)."""
+    if not ENABLE or not _is_float(out_dt):
+        return None
+    try:
+        if name == "convert_element_type":
+            src = getattr(ins[0], "dtype", None)
+            if _is_int(src):
+                return (True, True)
+            if _is_float(src):
+                return (ffs[0][0], ffs[0][1] and _np(out_dt).itemsize >= _np(src).itemsize)
+            return FF_NONE
+        if name in _FF_SAME:
+            return ffs[0]
+        if name == "sign":
+            return (ffs[0][0], ffs[0][0])
+        if name == "iota":
+            return (True, True)
+        if name in ("max", "min"):
+            return _and(ffs[0], ffs[1])
+        if name in ("add", "sub", "mul"):
+            return (ffs[0][1] and ffs[1][1], False)
+        if name in ("exp", "exp2"):
+            return (ffs[0][0], False)
+        if name in ("tanh", "logistic", "erf"):
+            return (ffs[0][0], ffs[0][0])
+        if name in ("sin", "cos"):
+            return (ffs[0][1], ffs[0][1])
+        if name == "select_n":
+            out = _and(*ffs[1:])
+            org = getattr(ins[0], "origin", None)
+            if len(ins) == 3 and org is not None:
+                p, ops = org
+                # where(x != x, c, x) = select_n(x != x, x, c): x where it equals itself (not NaN), else c
+                if p == "ne" and len(ops) == 2 and ops[0] is ops[1] and ops[0] is ins[1]:
+                    return (ffs[2][0], ffs[2][1] and ffs[1][1])
+                # where(isfinite(x), x, c) = select_n(isfinite(x), c, x): x where finite, else c
+                if p == "is_finite" and len(ops) == 1 and ops[0] is ins[2]:
+                    return ffs[1]
+            return out
+        if name == "concatenate" or name == "pad":
+            return _and(*ffs)
+    except Exception:
+        return FF_NONE
+    return None                 # no claim: a call / loop result keeps the facts its own body gave it
