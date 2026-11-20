@@ -7,7 +7,7 @@ primitives by `backends/kernel/canon.py` before emission; `tally` = tallymap's o
 Any other primitive raises `tm.UnsupportedError` on cuda; the xla backend runs every JAX
 primitive.
 
-150 names (129 rules, 19 canonicalised).
+151 names (129 rules, 19 canonicalised).
 
 | primitive | how |
 |---|---|
