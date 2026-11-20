@@ -31,8 +31,8 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Fixed
 
-- Reverse mode (grad, vjp, jacrev) through more than one gated `t.append` (or `lax.cond`-gated `t.add`) per item
-  outside a loop, or more than one per loop step: the transpose of each `lax.cond` returned the output's whole
+- Reverse mode (grad, vjp, jacrev) through more than one gated `t.append` per item outside a
+  loop, or more than one per loop step: the transpose of each `lax.cond` returned the output's whole
   cotangent (capacity-sized for `Records`) as a cond output and chained it into the previous one, a per-item array of
   the output's size: the xla backend allocated items x capacity (out of memory: 128 GiB for a 2^22-slot `Records`),
   the kernel backend raised "per-item array ... too large" from 2^16 slots. The adjoint now forwards every cond (and

@@ -899,7 +899,7 @@ def _(b):
             raise Fail(f"{d}: {sl[d][1]:.1f} B per slot vs the forward's {sl['fwd'][1]:.1f}")
         if not abs(sl[d][1] - sl[d][0]) <= 0.1 * sl[d][1] + 1:
             raise Fail(f"{d}: not linear in the capacity: {sl[d][0]:.1f} then {sl[d][1]:.1f} B per slot")
-    return "B/slot " + ", ".join(f"{d} {v[1]:.1f}" for d, v in sl.items()) + f"; MB at 2^22 " + \
+    return "B/slot " + ", ".join(f"{d} {v[1]:.1f}" for d, v in sl.items()) + "; MB at 2^22 " + \
         ", ".join(f"{d} {v[2] / 1e6:.0f}" for d, v in m.items())
 
 
