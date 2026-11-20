@@ -821,7 +821,7 @@ for kind in ("top", "nested", "cond2", "scan", "jaxop"):
 def _(b):
     # _dce's guarded aliases see z == tab under (br in {0}); z's reads in branch 1 of a cond on br (the zeros) and in
     # a cond on br2 must keep reading z.  A wrong alias gives sum(tab) for sum(z) there.
-    R, CC = 64, 65
+    R, CC = 16, 65            # z is a genuine per-item table: 64x65 in f64 exceeds turing kernel local memory
 
     def make(real):
         def item(t, x, key, tab, th):
