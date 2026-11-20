@@ -25,7 +25,7 @@ from ._jaxpr import (
     with_source,
 )
 
-TALLYMAP_PRIMS = ("tallymap_emit", "tallymap_spawn")
+TALLYMAP_PRIMS = ("tallymap_emit", "tallymap_spawn", "tallymap_claim")
 
 
 class TallyError(TypeError):
@@ -248,7 +248,7 @@ SELECT = ("gather", "dynamic_slice", "slice")          # reads that can get a sp
 _CUSTOM = ("custom_jvp_call", "custom_vjp_call")
 
 
-def retrace(cj, *, cap=None, rev=False, n_tally=0, tables=None, report=None, spawn=None):
+def retrace(cj, *, cap=None, rev=False, n_tally=0, tables=None, report=None, spawn=None, claim=None):
     """-> python function f(*invars) evaluating cj with (cap) every top-level while loop capped at `cap`
     iterations (f returns its outputs + [truncated:bool]), or (rev: a _reverse.RevOpts) every while loop replaced
     by a reverse-differentiable loop (_reverse.checkpointed_while, through the RevOpts hooks: this module never
@@ -257,6 +257,7 @@ def retrace(cj, *, cap=None, rev=False, n_tally=0, tables=None, report=None, spa
     spawn: f(token, when, *child) -> token' replaces every spawn (the tree adjoint, _reverse_spawn.py).  With the hook
     the spawn token may be a python TUPLE (e.g. (token, count)): equations it flows into are interpreted (never bound),
     and lax control flow carries it as a pytree.  Only for rev=False (the hooked program is re-traced to a flat jaxpr).
+    claim: f(token, when, k, r=) -> (token', slot) replaces every Records slot claim (_records.twin: the fill twin).
     tables (rev only): {invar index: token index}.  Reads (gather/dynamic_slice/slice) of these operands become
     _reverse.tread calls threading a cotangent token; f then takes the tokens as extra trailing arguments and returns
     them as extra trailing outputs.  report: a dict that receives 'dense' = token indices of tables that also have
@@ -267,7 +268,7 @@ def retrace(cj, *, cap=None, rev=False, n_tally=0, tables=None, report=None, spa
     def f(*args):
         args = list(args)
         a, toks = (args[:len(args) - nt], args[len(args) - nt:]) if nt else (args, [])
-        ctx = {"trunc": jnp.bool_(False), "spawn": spawn, "toks": list(toks),
+        ctx = {"trunc": jnp.bool_(False), "spawn": spawn, "claim": claim, "toks": list(toks),
                "tread": nt > 0, "dense": set()}
         flags = [True] * n_tally + [False] * (len(a) - n_tally)
         tags = [tables.get(i) for i in range(len(a))]
@@ -280,7 +281,8 @@ def retrace(cj, *, cap=None, rev=False, n_tally=0, tables=None, report=None, spa
 
 def _needs(jaxpr, rev, top, cap, ctx):
     return ((rev or (cap is not None and top)) and contains(jaxpr, ("while",))) or \
-        (ctx.get("spawn") is not None and contains(jaxpr, ("tallymap_spawn",)))
+        (ctx.get("spawn") is not None and contains(jaxpr, ("tallymap_spawn",))) or \
+        (ctx.get("claim") is not None and contains(jaxpr, ("tallymap_claim",)))
 
 
 def _set_tok(ctx, i, v):
@@ -331,6 +333,8 @@ def _interp(jaxpr, consts, args, flags, ctx, cap, rev, top, tags=None):
                     outs, oflags = _while(eqn, ins, fin, ctx, cap, rev, top)
                 elif name == "tallymap_spawn" and ctx.get("spawn") is not None:
                     outs = [ctx["spawn"](*ins)]
+                elif name == "tallymap_claim" and ctx.get("claim") is not None:
+                    outs = list(ctx["claim"](*ins, **eqn.params))
                 elif not force and not any(_needs(s.jaxpr, rev, top, cap, ctx) for s in subs):
                     outs = bind(eqn, ins)
                 elif call_jaxpr(eqn) is not None:
@@ -359,7 +363,7 @@ def _flags_through(eqn, fin, any_branch=False):
     name = eqn.primitive.name
     n = len(eqn.outvars)
     if name in TALLYMAP_PRIMS:
-        return [True]
+        return [True] + [False] * (n - 1)       # (claim_p: the key tally's successor, then the slot)
     if not any(fin):
         return [False] * n
     sub = call_jaxpr(eqn)

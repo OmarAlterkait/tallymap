@@ -1,4 +1,4 @@
-"""Records outputs (tallymap.Records + t.append): count-then-fill inside tallymap.vmap.
+"""Records outputs (tallymap.Records + t.append): one pass (the default) and count-then-fill (spawn, capacity=None).
 python tests/records.py  (env: BACKENDS=xla,auto  TEST_X64=1  ONLY=substr)
 
 The toy: a 2-D lattice walk in an L x L box.  Every DECISION is integer-exact (RNG bits), so the backends and the
@@ -11,7 +11,9 @@ Cells: the canonical (item, k) layout and the dense reference; bitwise determini
 xla batch sizes); capacity / overflow / capacity=None; the fill guard and the count-mismatch poison (negative
 control through _api._COUNTS_HOOK); jvp / vjp / jacfwd / jacrev against central differences and the reference;
 jax.checkpoint, the replay adjoint (small rev_checkpoints) and the single-loop adjoint; jit, n_active, jax.vmap of
-the call, max_steps; refusals (spawn, t.append inside jax.vmap within an item) and misuse errors.
+the call, max_steps; refusals (t.append inside jax.vmap within an item) and misuse errors.  One pass: bitwise equal to
+count-then-fill (_api.ONE_PASS = False) in every output and derivative; the count report (stats['appended'] on
+overflow); contention; the unfused jvp and the fill twin's mismatch poison; subnormal fields.
 """
 import os
 import sys
@@ -269,13 +271,13 @@ def _hook(name, c):
     return c.at[0].add(-1).at[3].add(1)
 
 
-@case("count mismatch: the fill guard k < count, and the poison (negative control)")
+@case("count-then-fill count mismatch: the fill guard k < count, and the poison (negative control)")
 def _(b):
     ref = V(b)(IDS, KEYS, MU, VV, F(0.0))
     cnt = np.asarray(ref.per_item[0])
     if cnt[0] < 1:
         raise Fail("toy: item 0 has no record")
-    with patched(_api, _COUNTS_HOOK=_hook):
+    with patched(_api, _COUNTS_HOOK=_hook, ONE_PASS=False):
         r = V(b)(IDS, KEYS, MU, VV, F(0.0))
         h = r.outputs["hits"]
         if int(r.stats["records_mismatch"]["hits"]) != 2:
@@ -439,6 +441,175 @@ def _(b):
     raises(ValueError, lambda: tm.Records({"a": F}, capacity=0), "capacity")
     if tm.Records(16, {"a": F}) != tm.Records({"a": F}, capacity=16):
         raise Fail("Records(capacity, fields) != Records(fields, capacity=)")
+
+
+# ------------------------------------------------------------------------------------------------ one pass
+# The default implementation is one pass (_records.py); _api.ONE_PASS = False runs the same calls as count-then-fill
+# (step 1).  The two must agree BITWISE: the layout, the values, the stats, and every derivative.  (The toy's Sum Q is
+# an ordinary float sum, whose atomics add in a run-dependent order: it is compared to a tolerance, and the losses
+# here read the records only.)
+def _lossr(f):
+    return lambda th: (lambda h: jnp.sum(h["w"] * jnp.cos(0.3 * h["t"]) * (1.0 + (h["sensor"] % 5).astype(F))))(
+        f(IDS, KEYS, th[0], th[1], F(0.0)).outputs["hits"])
+
+
+def _fl(f):
+    return lambda th: (lambda h: (h["t"], h["w"]))(f(IDS, KEYS, th[0], th[1], F(0.0)).outputs["hits"])
+
+
+def _red2(f):
+    return lambda th: (lambda h: jnp.stack([jnp.sum(h["w"]), jnp.sum(h["t"] * h["w"])]))(
+        f(IDS, KEYS, th[0], th[1], F(0.0)).outputs["hits"])
+
+
+def _everything(b, **kw):
+    f = V(b, **kw)
+    r = f(IDS, KEYS, MU, VV, F(0.0))
+    o = {f"fwd {n}": r.outputs["hits"][n] for n in FIELDS}
+    o.update({"per-item k": r.per_item[0], "per-item w": r.per_item[1],
+              "appended": r.stats["appended"]["hits"], "dropped": r.stats["records_dropped"]["hits"]})
+    p, t = jax.jvp(_fl(f), (TH,), (jnp.array([1.0, 0.5], F),))
+    o.update({"jvp primal t": p[0], "jvp primal w": p[1], "jvp tangent t": t[0], "jvp tangent w": t[1]})
+    v, g = jax.value_and_grad(_lossr(f))(TH)
+    o.update({"value": v, "grad": g, "grad (checkpoint)": jax.grad(jax.checkpoint(_lossr(f)))(TH)})
+    jf = jax.jacfwd(_fl(f))(TH)
+    o.update({"jacfwd t": jf[0], "jacfwd w": jf[1], "jacrev": jax.jacrev(_red2(f))(TH)})
+    o["grad (rev_checkpoints=2)"] = jax.grad(_lossr(V(b, rev_checkpoints=2, **kw)))(TH)
+    o["hessian"] = jax.hessian(_lossr(f))(TH)
+    return o, r.outputs["Q"]
+
+
+@case("one pass == count-then-fill (step 1) BITWISE: layout, stats, jvp, grad, jacfwd, jacrev, checkpoint, hessian")
+def _(b):
+    one, q1 = _everything(b)
+    with patched(_api, ONE_PASS=False):
+        ctf, q2 = _everything(b)
+    for k in one:
+        same(one[k], ctf[k], k)
+    close(q1, q2, 1e-6, 0.0, "Q")
+    if not np.all(np.isfinite(np.asarray(one["grad"]))):
+        raise Fail("grad not finite")
+    return f"{len(one)} outputs bitwise"
+
+
+@case("one pass == count-then-fill BITWISE with max_steps, n_active and an overflowed call")
+def _(b):
+    def run():
+        r1 = V(b, max_steps=1000)(IDS, KEYS, MU, VV, F(0.0))
+        r2 = jax.jit(lambda n: V(b)(IDS, KEYS, MU, VV, F(0.0), n_active=n))(jnp.int32(N // 3))
+        r3 = V(b, cap=100)(IDS, KEYS, MU, VV, F(0.0))
+        g3 = jax.grad(_lossr(V(b, cap=100)))(TH)
+        return [x for r in (r1, r2, r3) for x in jax.tree_util.tree_leaves((r.outputs["hits"], r.stats, r.truncated,
+                                                                           r.per_item))] + [g3]
+    one = run()
+    with patched(_api, ONE_PASS=False):
+        ctf = run()
+    for j, (a, c) in enumerate(zip(one, ctf)):
+        same(a, c, f"leaf {j}")
+
+
+@case("the count report: stats['appended'] of an overflowed call sizes the rerun (next power of two)")
+def _(b):
+    full = V(b)(IDS, KEYS, MU, VV, F(0.0))
+    tot = int(full.stats["appended"]["hits"])
+    small = V(b, cap=64)(IDS, KEYS, MU, VV, F(0.0))
+    a = int(small.stats["appended"]["hits"])
+    if a != tot or int(small.stats["records_dropped"]["hits"]) != tot - 64:
+        raise Fail(f"appended {a} (want {tot}), dropped {small.stats['records_dropped']}")
+    h = small.outputs["hits"]
+    if not (np.all(np.isnan(np.asarray(h["w"]))) and np.all(np.asarray(h["sensor"]) == -1)):
+        raise Fail("overflow not poisoned")
+    again = V(b, cap=64)(IDS, KEYS, MU, VV, F(0.0))        # overflow is deterministic: the poisoned output and stats
+    for n in FIELDS:
+        same(again.outputs["hits"][n], h[n], f"overflowed twice {n}")
+    same(again.stats["appended"]["hits"], small.stats["appended"]["hits"], "appended twice")
+    C = 1 << (a - 1).bit_length()
+    rr = V(b, cap=C)(IDS, KEYS, MU, VV, F(0.0))
+    for n in FIELDS:
+        same(np.asarray(rr.outputs["hits"][n])[:tot], np.asarray(full.outputs["hits"][n])[:tot], f"rerun {n}")
+    if int(rr.stats["records_dropped"]["hits"]):
+        raise Fail("rerun dropped")
+    j = jax.jit(lambda: V(b, cap=64)(IDS, KEYS, MU, VV, F(0.0)).stats["appended"]["hits"])()
+    if int(j) != tot:
+        raise Fail(f"jit appended {int(j)}")
+    return f"appended {a} at capacity 64 -> rerun at {C}"
+
+
+def burst(t, i, key, mu_a, v, wcut):
+    """every item appends 1 + i % 7 records back to back: all lanes contend for the slot counter at once."""
+    def body(c):
+        j, t = c
+        return j + 1, t.append("r", {"a": i.astype(F) * mu_a + j.astype(F), "i": i, "j": j})
+    return lax.while_loop(lambda c: c[0] < 1 + i % 7, body, (jnp.int32(0), t))[1]
+
+
+@case("contention: every item appends at once; capacity exact / one short; schedule='step'")
+def _(b):
+    nb = np.arange(N) % 7 + 1
+    tot = int(nb.sum())
+    want_i = np.repeat(np.arange(N), nb)
+    want_j = np.concatenate([np.arange(c) for c in nb])
+    RFs = {"a": F, "i": jnp.int32, "j": jnp.int32}
+    mk = lambda cap, **kw: tm.vmap(burst, outputs={"r": tm.Records(RFs, capacity=cap)}, in_axes=AX, backend=b, **kw)
+    for kw in ({}, {"schedule": "step"} if b != "xla" else {"xla_batch_size": 33}):
+        r = mk(tot, **kw)(IDS, KEYS, MU, VV, F(0.0)).outputs["r"]
+        if not (np.array_equal(np.asarray(r["i"]), want_i) and np.array_equal(np.asarray(r["j"]), want_j)):
+            raise Fail(f"layout {kw}")
+        close(r["a"], want_i * float(MU) + want_j, 1e-6, 0.0, f"values {kw}")
+        s = mk(tot - 1, **kw)(IDS, KEYS, MU, VV, F(0.0))
+        if not (np.all(np.isnan(np.asarray(s.outputs["r"]["a"]))) and np.all(np.asarray(s.outputs["r"]["i"]) == -1)
+                and int(s.stats["records_dropped"]["r"]) == 1):
+            raise Fail(f"one short {kw}")
+    return f"{tot} records"
+
+
+@case("one pass: unfused jvp (FUSE_JVP=False) == fused; the twin's count-mismatch poison (negative control)")
+def _(b):
+    from tallymap import _primitive as _P
+    f = V(b)
+    fused = jax.jvp(_fl(f), (TH,), (jnp.array([1.0, 0.5], F),))
+    with patched(_P, FUSE_JVP=False):
+        unf = jax.jvp(_fl(f), (TH,), (jnp.array([1.0, 0.5], F),))
+    for a, c, n in zip(jax.tree_util.tree_leaves(fused), jax.tree_util.tree_leaves(unf), ("pt", "pw", "tt", "tw")):
+        same(a, c, f"unfused {n}")
+    base = f(IDS, KEYS, MU, VV, F(0.0)).outputs["hits"]
+    g0 = jax.grad(loss_of(f))(TH)
+    with patched(_api, _COUNTS_HOOK=_hook):
+        r = f(IDS, KEYS, MU, VV, F(0.0))
+        for n in FIELDS:              # (one pass: the forward hands no counts over, so nothing changes)
+            same(r.outputs["hits"][n], base[n], f"hooked forward {n}")
+        j = jax.jvp(_fl(f), (TH,), (jnp.array([1.0, 0.5], F),))     # (fused: one launch, no record either)
+        same(j[1][1], fused[1][1], "hooked fused jvp")
+        g = jax.grad(loss_of(f))(TH)          # the twin replays with the hooked counts: mismatch -> NaN
+        with patched(_P, FUSE_JVP=False):
+            ju = jax.jvp(_fl(f), (TH,), (jnp.array([1.0, 0.5], F),))[1][1]
+    if not np.all(np.isnan(np.asarray(g))):
+        raise Fail(f"grad with mismatched counts {g} (unhooked {g0})")
+    if not np.all(np.isnan(np.asarray(ju))):
+        raise Fail("unfused jvp with mismatched counts not NaN")
+
+
+@case("subnormal record fields: one pass == count-then-fill == the emitted values, primal / tangent / cotangent")
+def _(b):
+    if b == "xla" and jax.devices()[0].platform == "cpu":
+        return "skip: XLA:CPU flushes subnormals in its own arithmetic (docs/float_semantics.md item 6)"
+    vals = jnp.array([1.4e-44, 2.0 ** -140, -(2.0 ** -130), 2.0 ** -126, 1.0, 0.0, 3.0 * 2.0 ** -149, 2.0 ** -100],
+                     jnp.float32)
+
+    def run():
+        f = tm.vmap(lambda t, x, s: t.append("r", {"q": x * s}), outputs={"r": tm.Records({"q": jnp.float32},
+                    capacity=16)}, in_axes=(0, None), backend=b)
+        q = f(vals, jnp.float32(1.0)).outputs["r"]["q"]
+        tg = jax.jvp(lambda s: f(vals, s).outputs["r"]["q"], (jnp.float32(1.0),), (jnp.float32(1.0),))[1]
+        ct = jax.grad(lambda x: jnp.sum(f(x, jnp.float32(1.0)).outputs["r"]["q"] * jnp.arange(16.0)))(vals)
+        return q, tg, ct
+    one = run()
+    with patched(_api, ONE_PASS=False):
+        ctf = run()
+    for a, c, n in zip(one, ctf, ("primal", "tangent", "cotangent")):
+        same(a, c, n)
+    same(np.asarray(one[0])[:8], np.asarray(vals), "primal == the emitted values")
+    same(np.asarray(one[1])[:8], np.asarray(vals), "tangent == the emitted values")
 
 
 

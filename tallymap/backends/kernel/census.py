@@ -37,10 +37,11 @@ def supported_primitives():
     'tally' (tallymap's own emit / spawn).  Anything else raises tm.UnsupportedError on cuda (the xla backend runs every
     JAX primitive)."""
     from . import canon, op_table
-    names = set(op_table.RULES) | set(canon.SUGAR) | {"tallymap_emit", "tallymap_spawn"}
+    names = set(op_table.RULES) | set(canon.SUGAR) | {"tallymap_emit", "tallymap_spawn", "tallymap_claim"}
     rows = []
     for n in sorted(names):
-        how = "tally" if n in ("tallymap_emit", "tallymap_spawn") else "canonicalised" if n in canon.SUGAR else "rule"
+        how = ("tally" if n in ("tallymap_emit", "tallymap_spawn", "tallymap_claim") else
+               "canonicalised" if n in canon.SUGAR else "rule")
         rows.append(dict(name=n, how=how))
     return rows
 

@@ -32,14 +32,24 @@ tm.vmap(item)                     _api.py        user contract: Tally, Sum, Queu
 - **Resource limits poison, never truncate silently.** An item that hits `max_steps` or a child the `Queue`
   drops makes every float tally NaN, with the count in `Result.stats`. Out-of-range emits are dropped, as JAX's
   scatter drops them, and counted.
-- **Records are two ordinary programs.** A `Records` output adds no primitive and no rule: `tm.vmap` traces the
-  item twice. The count program discards every Sum and returns each item's append count; the fill program writes
-  record k of item i into ordinary Sum tallies of the capacity at `offset[i] + k`, behind a `k < count` guard.
-  The fill's per-item flag "my count disagrees" is the program's truncation flag (`ItemProgram.trunc`), so every
-  derived kernel (tangent, dual lanes, replay and single-loop adjoints) recomputes it in its own replay and
-  poisons itself. With spawn, the count pass runs as the tree adjoint's recording primal and the canonical node
-  ids come from the recorded tree (breadth-first, children by spawn ordinal), never from queue slots; the fill
-  hands each child its id through the spawn. The layout is the one a one-pass version would produce.
+- **Records: one pass, canonicalised by the primitive.** The default program appends with one item-level
+  primitive, `claim_p` (a raw slot from an atomic counter per output, threaded through the output's key tally so
+  the backends order it like an emit), and writes each record and its key (item, k) at that slot; the item's final
+  k is a per-item result. Every launch of such a program (`ItemProgram.app`) is canonicalised inside the
+  primitive's lowering (`_records.canon`, from the same launch's keys and counts), so every output of the
+  primitive, tangents and dual lanes included, is already in the `offset[i] + k` layout and no AD rule sees a raw
+  slot. A jvp is one launch (the tangent fields go to the same raw slot). Where JAX splits the computation (partial
+  evaluation for grad / vjp / linearize, `jax.checkpoint`, an unfused jvp or batch), the replaying launch runs the
+  program's FILL TWIN (`_records.twin`: `claim_p` rewritten by `retrace` into `offset + k` behind `k < count`, the
+  offsets and counts two hidden per-item operands taken from the primal's launch: the record, a residual like the
+  spawn ring), whose per-item flag "my count disagrees" is its truncation flag (`ItemProgram.trunc`), so every
+  derived kernel recomputes it in its own replay and poisons itself.
+- **Records fallback: two ordinary programs.** With `spawn` or `capacity=None`, `tm.vmap` traces the item twice.
+  The count program discards every Sum and returns each item's append count; the fill program writes record k of
+  item i into ordinary Sum tallies of the capacity at `offset[i] + k`, behind a `k < count` guard, with the same
+  truncation-flag poison. With spawn, the count pass runs as the tree adjoint's recording primal and the canonical
+  node ids come from the recorded tree (breadth-first, children by spawn ordinal), never from queue slots; the fill
+  hands each child its id through the spawn. Both implementations give the same outputs bitwise.
 
 ## One primitive (notes section 2)
 

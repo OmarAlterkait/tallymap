@@ -305,18 +305,33 @@ res.stats["appended"]["dep"]       # how many records there are (the rest of the
   in item order, then each generation ordered by (parent, spawn ordinal).
 - **Capacity** is the outputs' length, so it is static. A call that appends more records is a resource limit like
   a full Queue: every float output of the call is NaN, every integer record field is -1, and
-  `stats['records_dropped']` says how many did not fit. `capacity=None` sizes the output from the eager call's own
-  count (rounded up to a power of two); under `jax.jit` or a `jax.vmap` of the call pass an int.
+  `stats['records_dropped']` says how many did not fit. Overflow is deterministic (decided by the true total; the
+  poisoned outputs do not depend on which records reached the buffer). `stats['appended']` is exact also on
+  overflow, so a caller that sizes the capacity from memory can rerun at the next power of two above it; it is an
+  int32 scalar computed in the same launch (a sum of the per-item counts), and reading it on the host is one
+  device-to-host copy of 4 bytes. `capacity=None` sizes the output from the eager call's own count (rounded up to
+  a power of two; this runs count-then-fill, below); under `jax.jit` or a `jax.vmap` of the call pass an int.
 - **Derivatives.** Float fields carry the pathwise derivative of each record's value (jvp, grad, jacfwd, jacrev,
   `jax.checkpoint`, reverse through spawn). Whether a record exists is a discrete decision and has no derivative,
   as with an emit inside a branch. Integer fields have none. A float field stores each value exactly, subnormals
   included, except that -0.0 is stored as +0.0 (on the xla backend on a CPU, XLA:CPU flushes subnormals to zero;
   `docs/float_semantics.md` item 6).
-- **How it runs.** tallymap runs the items twice: a count pass (each item's number of records, nothing else is
-  kept) and a fill pass that writes record k of item i at `offset[i] + k`. The count pass costs one more run of
-  the item loop in the forward pass. The fill pass writes an item's records only while k is below its count, so a
-  fill that disagrees with its count (the two passes did not replay bitwise) never writes into another item's
-  slots: it poisons the call like an overflow and is counted in `stats['records_mismatch']`.
+- **How it runs: one pass** (the default, given a capacity and without `spawn`). Each append takes the next slot
+  of a raw buffer from an atomic counter and writes its fields and its key (item, k) there; the same launch then
+  moves every record to `offset[i] + k`, with the offsets from that launch's own per-item counts. A jvp writes each
+  record's tangent to the same slot in the same launch. A derivative that replays the items in another launch
+  (grad, vjp, `jax.linearize`, `jax.checkpoint`) writes record k of item i straight to `offset[i] + k` using the
+  primal's per-item counts, and only while k is below that count; a replay that does not reproduce a count makes
+  that derivative NaN rather than misaligned. Memory: the raw buffer and two key words per slot are held next to
+  the output during the launch.
+- **How it runs: count-then-fill** (with `spawn` or `capacity=None`, automatically; the same result bitwise). The
+  items run twice: a count pass (each item's number of records, nothing else is kept) and a fill pass that writes
+  record k of item i at `offset[i] + k`. The count pass costs one more run of the item loop in the forward pass.
+  The fill pass writes an item's records only while k is below its count, so a fill that disagrees with its count
+  (the two passes did not replay bitwise) never writes into another item's slots: it poisons the call like an
+  overflow and is counted in `stats['records_mismatch']` (always 0 in one pass). With `spawn` the canonical order
+  needs the whole tree before any record can be placed, which one pass would get only by recording the tree in
+  every forward launch; count-then-fill's count pass already records it.
 - **Not supported:** `t.append` inside a `jax.vmap` within the item (the lanes would need lane-dependent slots,
   which tallymap's emits do not support either).
 

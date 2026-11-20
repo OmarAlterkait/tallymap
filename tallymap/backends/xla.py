@@ -15,6 +15,7 @@ from jax.extend.core import Literal, jaxpr_as_fun
 from .._api import EXACT_WORDS
 from .._errors import ad_advice
 from .._jaxpr import bind, call_jaxpr, cond_branches, lit, located, scan_parts, while_parts
+from .._tally import KK
 
 BLOCK = 1 << 18
 # f32 sum tallies: R partial accumulators (lane p adds into row p % R), summed by jnp.sum at the end.  One
@@ -70,16 +71,20 @@ class _St:
         self.drops = jnp.int32(0)       # out-of-range (dropped) emit indices
         self.mask = None
         self.lanes = []                 # enclosing while loops with a batched predicate: their [P, *B] masks
+        # Records one-pass claim counters (_claim), one per output, keyed by its key tally (the claim token)
+        self.ctr = {k: jnp.int32(0) for k, s in enumerate(p.tallies) if s.kind == "sum" and s.name.endswith(KK)}
 
     # ------------------------------------------------------------- state threaded through lax control flow
     def pack(self):
         q = self.queue
         return (tuple(self.accs[k] for k in sorted(self.accs)), tuple(self.bad[k] for k in sorted(self.bad)), self.ovf,
                 None if q is None else (tuple(q["leaves"]), q["head"], q["tail"], q["spawned"], q["dropped"]),
-                self.drops, tuple(self.nadd[k] for k in sorted(self.nadd)))
+                self.drops, tuple(self.nadd[k] for k in sorted(self.nadd)),
+                tuple(self.ctr[k] for k in sorted(self.ctr)))
 
     def unpack(self, s):
-        a, bad, self.ovf, q, self.drops, na = s
+        a, bad, self.ovf, q, self.drops, na, ct = s
+        self.ctr = dict(zip(sorted(self.ctr), ct))
         self.accs = dict(zip(sorted(self.accs), a))
         self.bad = dict(zip(sorted(self.bad), bad))
         self.nadd = dict(zip(sorted(self.nadd), na))
@@ -328,6 +333,20 @@ def _spawn(st, t, when, leaves):
     return t
 
 
+def _claim(st, t, when):
+    """a Records one-pass slot claim: the batch's claiming lanes take the next slots of the output's counter in lane
+    order (masked lockstep: deterministic here; the layout is canonicalised after the launch either way,
+    _primitive._canon).  slot -1: not claimed, or past the capacity (the raw buffer is full)."""
+    if st.lanes:
+        raise NotImplementedError("tallymap: t.append inside a while loop with a batched predicate is not supported")
+    if st.p.tallies[t.slot].kind == "discard":
+        return [t, B(jnp.full((st.P,), -1, jnp.int32), True)]
+    w = _bc(when, st.P) & st.mask
+    pos = st.ctr[t.slot] + jnp.cumsum(w.astype(jnp.int32), dtype=jnp.int32) - 1
+    st.ctr[t.slot] = st.ctr[t.slot] + jnp.sum(w.astype(jnp.int32), dtype=jnp.int32)
+    return [t, B(jnp.where(w & (pos < st.p.tallies[t.slot].S), pos, -1).astype(jnp.int32), True)]
+
+
 def _ev(st, jaxpr, consts, args):
     env = {}
 
@@ -345,6 +364,8 @@ def _ev(st, jaxpr, consts, args):
             outs = [_emit(st, ins[0], ins[1], ins[2])]
         elif name == "tallymap_spawn":
             outs = [_spawn(st, ins[0], ins[1], ins[2:])]
+        elif name == "tallymap_claim":
+            outs = _claim(st, ins[0], ins[1])
         elif call_jaxpr(e) is not None:
             s = call_jaxpr(e)
             outs = _ev(st, s.jaxpr, s.consts, ins)

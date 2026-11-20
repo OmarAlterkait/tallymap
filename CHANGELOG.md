@@ -16,6 +16,14 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   disagreement poison the call (float outputs NaN, integer record fields -1), counted in
   `stats['records_dropped']` and `stats['records_mismatch']`; `stats['appended']` is the true total. Not supported:
   `t.append` inside a `jax.vmap` within an item. README "Records"; tests/records.py, tests/sharding.py.
+- `Records` run in ONE pass by default (given a capacity, without `spawn`): each append takes a raw slot from an
+  atomic counter and writes its record and key (item, k) there, and the launch canonicalises its own output into
+  the same (item, append order) layout, so the forward is one run of the item loop instead of two and a jvp is one
+  launch. Derivatives that replay in another launch (grad, vjp, linearize, `jax.checkpoint`) use the primal's
+  per-item counts as their record and write each record's slot directly; a replay that disagrees poisons that
+  derivative. Outputs, stats and every derivative are bitwise those of count-then-fill, which remains the
+  implementation with `spawn` or `capacity=None`. `stats['appended']` is exact on overflow (the count report for
+  sizing a rerun).
 
 ### Fixed
 

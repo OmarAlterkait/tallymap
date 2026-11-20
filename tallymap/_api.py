@@ -25,7 +25,7 @@ from jax.extend.core import ClosedJaxpr, jaxpr_as_fun
 from . import _diagnostics, _errors
 from ._jaxpr import item_name, located, subjaxprs
 from ._rewrite import check_tallies, isfloat, retrace
-from ._tally import LANED, RSEP, Tally, emit_p, rkey
+from ._tally import KI, KK, LANED, RSEP, Tally, emit_p, rkey
 
 MAX_ITEMS = 2 ** 31 - 1
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -114,17 +114,27 @@ class Records:
     to a power of two (a traced call -- jax.jit, a vmap of the call -- needs an int).  A call that appends more than
     `capacity` records is a resource-limit violation like a full Queue: every float output of the call (records and
     sums) is NaN, every integer record field is -1, and stats['records_dropped'][name] counts the records that did
-    not fit.
+    not fit.  Overflow is deterministic: it is decided by the true total, and the poisoned outputs do not depend on
+    which records reached the buffer.  Sizing: stats['appended'][name] is exact also on overflow (the sum of the
+    per-item counts of the same launch, an int32 scalar on the device), so a caller can rerun at the next power of
+    two above it.
 
-    Implementation (count-then-fill): the call runs the items twice, a count pass (the per-item record counts; every
-    other output is discarded) and the fill pass, which writes record k of item i at offset[i] + k.  The fill writes
-    an item's records only while k < its counted number, and an item whose fill appends a different number of
+    Implementation.  ONE PASS (the default, with a capacity and without spawn; _records.py): each append takes the
+    next slot of a raw buffer (one atomic counter per output) and writes its fields and its key (item, k) there; the
+    same launch then moves every record to offset[i] + k (offset from that launch's own per-item counts), so the
+    layout is exactly count-then-fill's.  A jvp writes each record's tangent to the same slot in the same launch.  A
+    derivative that replays the items in another launch (grad, vjp, linearize, jax.checkpoint, an unfused jvp) runs
+    the program's fill twin with the primal's per-item counts as its record: record k of item i at offset[i] + k,
+    written only while k < count; a replay whose count differs (not bitwise) makes that derivative NaN.
+    COUNT-THEN-FILL (spawn, capacity=None): the call runs the items twice, a count pass (the per-item record counts;
+    every other output is discarded) and the fill pass, which writes record k of item i at offset[i] + k.  The fill
+    writes an item's records only while k < its counted number, and an item whose fill appends a different number of
     records than its count (the two passes did not replay bitwise) poisons the call like an overflow:
-    stats['records_mismatch'][name] counts those items.  With spawn the items are the spawn tree's nodes in
-    breadth-first order (the roots in item order, then each generation by (parent, spawn ordinal)): the count pass
-    runs as the tree adjoint's recording primal and each child receives its node id through the spawn.  Not
-    supported (raises): t.append inside jax.vmap within an item (its lanes would need lane-dependent slots, which
-    tallymap's emits do not support)."""
+    stats['records_mismatch'][name] counts those items (always 0 in one pass).  With spawn the items are the spawn
+    tree's nodes in breadth-first order (the roots in item order, then each generation by (parent, spawn ordinal)):
+    the count pass runs as the tree adjoint's recording primal and each child receives its node id through the spawn.
+    Both implementations give the same outputs bitwise (tests/records.py).  Not supported (raises): t.append inside
+    jax.vmap within an item (its lanes would need lane-dependent slots, which tallymap's emits do not support)."""
     fields: tuple          # ((name, np.dtype), ...), sorted by name
     capacity: Any = None
 
@@ -227,6 +237,9 @@ class ItemProgram:
     rec: Any = None        # spawn, the tree adjoint's recording primal (_reverse_spawn.rec_primal): index of the int32
                            # per-item leaf `me`, which the backend sets to each item's queue slot (a child) or -1 - its
                            # index (a root) when it starts; the queue leaves are returned after the per-item results.
+    app: Any = None        # a ONE-PASS Records program (_records.py): (index of the per-item operand cid, ((output
+                           # name, capacity, index of its per-item count result), ...)).  Every launch is canonicalised
+                           # (_records.canon); a replay in another launch runs its fill twin (_records.twin).
 
     @property
     def nT(self):
@@ -309,7 +322,8 @@ def jvp_prog(p, pert_pi, pert_bc):
         out, dout = jax.jvp(g, ([t[i] for i in tf], [pi[i] for i in ip], [bc[i] for i in ib]), (td, pid, bcd))
         dt = [dout[i] for i in tf]
         if p.trunc is not None:      # (max_steps) a truncated item poisons the tangent sums itself: _poison_tally
-            dt = [_poison_tally(x, out[nT + p.trunc]) if p.tallies[i].kind == "sum" else x for i, x in zip(tf, dt)]
+            bad = jnp.any(out[nT + p.trunc])          # (a dual-lanes program flags per lane: lanes share control flow)
+            dt = [_poison_tally(x, bad) if p.tallies[i].kind == "sum" else x for i, x in zip(tf, dt)]
         return list(out[:nT]) + dt + list(out[nT:]) + [dout[nT + j] for j in yf]
     av = p.in_avals()
     tav, pav, bav = av[:nT], av[nT:nT + nP], av[nT + nP:]
@@ -319,7 +333,7 @@ def jvp_prog(p, pert_pi, pert_bc):
         cj = _mk(J, [_sds(a) for a in avals])
     tl = list(p.tallies) + [dataclasses.replace(p.tallies[i], name=p.tallies[i].name + "'") for i in tf]
     return ItemProgram(cj, tuple(tl), nP + len(ip), nB + len(ib), p.trunc, p.spawn, p.tag + "+jvp", where=p.where,
-                       nact=p.nact)
+                       nact=p.nact, app=p.app)
 
 
 def _poison_tally(t, bad):
@@ -483,7 +497,7 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
             nT = len(tspecs)
             tn = [s.name for s in tspecs if s.kind != "spawn"]
             fill = mode == "fill"
-            nh = int(fill)
+            nh = int(mode in ("fill", "one"))
             nbx = (int(spawn is not None) + 2 * len(rnames)) if fill else 0
             rinfo = (mode, tuple((r, (caps[r], rspec[r].fields)) for r in rnames)) if mode else None
             ys0 = int(spawn is not None) if fill else 0      # first offset/count table
@@ -493,6 +507,8 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                 rec, cnts = None, []
                 if mode == "count":
                     rec = {r: (jnp.int32(0),) for r in rnames}
+                elif mode == "one":                 # (one pass: the record key's cid, the item index)
+                    rec = {r: (jnp.int32(0), flat[nT + nmp]) for r in rnames}
                 elif fill:
                     cid = flat[nT + nmp]
                     tabs = flat[nT + nmp + nh + nb0:nT + nmp + nh + nb0 + nbx]
@@ -529,6 +545,8 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                 yl, meta["ytree"] = jax.tree_util.tree_flatten(y)
                 if mode == "count":                 # (the user's per-item results are not computed)
                     return tl + ks
+                if mode == "one":                   # (the counts: the per-item results after the user's)
+                    return tl + [jnp.asarray(v) for v in yl] + ks
                 return tl + [jnp.asarray(v) for v in yl] + extra
             tav = [_tally_aval(s) for s in tspecs]
             hav = [jax.ShapeDtypeStruct((), jnp.int32)] * nh
@@ -554,9 +572,13 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
             if spawn is not None:
                 _check_spawn(cj2, pav + hav, where)
             nY = len(cj2.jaxpr.outvars) - nT
-            trunc = nY - 1 if (fill or (mode is None and max_steps is not None)) else None
+            trunc = nY - 1 if (fill or (mode in (None, "one") and max_steps is not None)) else None
+            app = None
+            if mode == "one":
+                nyc = nY - cap1 - len(rnames)
+                app = (nmp, tuple((r, caps[r], nyc + j) for j, r in enumerate(rnames)))
             prog = ItemProgram(cj2, tuple(tspecs), npi, nbt + len(hoisted), trunc, spawn, where=where,
-                               nact=nb0 - 1 if n_active is not None else None)
+                               nact=nb0 - 1 if n_active is not None else None, app=app)
             _diagnostics.record_program(prog)
             return prog, hoisted
 
@@ -594,12 +616,54 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
 
 
 # ------------------------------------------------------------------------------------------- Records
-_COUNTS_HOOK = None     # test-only: f(name, counts) -> counts handed to the fill pass (the mismatch negative control)
+_COUNTS_HOOK = None     # test-only: f(name, counts) -> counts handed to a fill (count-then-fill's fill pass; one pass:
+                        # the fill twin of a derived launch) -- the mismatch negative control
 MISMATCH = rkey("", "mismatch")     # the fill's hidden int32 tally: items whose fill count != count, per output
+ONE_PASS = True         # test-only: False runs every Records call as count-then-fill (step 1's implementation)
 
 
 def _sg(x):
     return lax.stop_gradient(x) if isfloat(x.dtype) else x
+
+
+def _records_one(build, call, sspecs, shapes, names, rnames, rspec, pi, bc, max_steps, meta, N):
+    """a call with Records outputs in ONE pass (see Records): one launch of the one-pass program, canonicalised by
+    the primitive itself (_records.canon), so its outputs, and every derivative's, are in the count-then-fill
+    layout."""
+    R = len(rnames)
+    caps = {r: rspec[r].capacity for r in rnames}
+    rspecs = [TSpec(rkey(r, f), caps[r], dt) for r in rnames for f, dt in rspec[r].fields]
+    kspecs = [TSpec(rkey(r, x), caps[r], np.dtype(np.int32)) for r in rnames for x in (KI, KK)]
+    fspecs = list(sspecs) + rspecs + kspecs
+    fshapes = dict(shapes, **{s.name: (s.S,) for s in rspecs + kspecs})
+    prog, h = build(fspecs, fshapes, "one", caps)
+    flat = call(prog, list(pi) + [jnp.arange(N, dtype=jnp.int32)], list(bc) + h)
+    nt = len(prog.out_tallies)
+    tvals, st, ys = flat[:nt], flat[nt], list(flat[nt + 1:])
+    trunc = ys.pop() if max_steps is not None else jnp.zeros((N,), bool)
+    counts = ys[len(ys) - R:]
+    ys = ys[:len(ys) - R]
+    tv = {s.name: v for s, v in zip([fspecs[k] for k in prog.out_tallies], tvals)}
+    stats = {n: st[ST[n]] for n in ("fixed_point_overflow", "dropped_emits")}
+    stats["n_truncated"] = jnp.sum(trunc.astype(jnp.int32))
+    totals = {r: jnp.sum(c, dtype=jnp.int32) for r, c in zip(rnames, counts)}
+    stats["appended"] = totals
+    stats["records_dropped"] = {r: jnp.maximum(totals[r] - caps[r], 0) for r in rnames}
+    stats["records_mismatch"] = {r: jnp.int32(0) for r in rnames}
+    lim = stats["n_truncated"] > 0 if max_steps is not None else None
+    ovf = jnp.bool_(False)              # (a multiply that carries the poison into derivatives)
+    for r in rnames:
+        ovf = ovf | (totals[r] > caps[r])
+    out = {n: tv[n].reshape(shapes[n]) for n in names}
+    out.update((s.name, tv[s.name]) for s in rspecs)
+    out = _poison(_poison_primal(out, lim), ovf)
+    bad = ovf if lim is None else lim | ovf
+    res = {n: out[n] for n in names}
+    for r in rnames:
+        res[r] = {f: out[rkey(r, f)] if isfloat(dt) else jnp.where(bad, jnp.asarray(-1, dt), out[rkey(r, f)])
+                  for f, dt in rspec[r].fields}
+    per_item = jax.tree_util.tree_unflatten(meta["ytree"], ys)
+    return Result(res, per_item, trunc, stats)
 
 
 def _count_recorder(p, R):
@@ -655,6 +719,8 @@ def _records(build, call, sspecs, shapes, names, rnames, rspec, pi, bc, max_step
     """a call with Records outputs: count pass, canonical offsets, fill pass (see Records).  Both passes are
     ordinary tallymap programs, so every transformation applies to the fill unchanged; the count pass is not
     differentiated (its operands are stop_gradient'ed: counts are integers)."""
+    if ONE_PASS and spawn is None and all(rspec[r].capacity is not None for r in rnames):
+        return _records_one(build, call, sspecs, shapes, names, rnames, rspec, pi, bc, max_steps, meta, N)
     R = len(rnames)
     qspec = [TSpec("__spawn__", 1, np.dtype(np.int32), (), False, "spawn")] if spawn is not None else []
     # 1. count: every Sum discarded, the user's per-item results dropped; per-item results = the counts

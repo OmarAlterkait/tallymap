@@ -48,6 +48,7 @@ from jax.interpreters import ad, mlir
 from jax.interpreters import partial_eval as _pe
 
 from . import _errors
+from . import _records as _R
 from ._api import _WARNED, ST, STATS, ItemProgram, UnsupportedError, _mk, _psel, _sds, jvp_prog
 from ._compat import NM, convert_constvars_jaxpr, drop_var, register_batcher, requires_devices
 from ._jaxpr import call_jaxpr, cond_branches, digest, host_callbacks, scan_parts, subjaxprs, while_parts
@@ -103,8 +104,8 @@ class Node:
                  tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.fixed_point, s.scale, s.kind, s.exact,
                         s.x64_fallback)
                        for s in p.tallies),
-                 p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), p.nact, p.rec, self.backend,
-                 self.opts)
+                 p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), p.nact, p.rec, p.app,
+                 self.backend, self.opts)
             object.__setattr__(self, "_key", k)
         return k
 
@@ -159,7 +160,16 @@ tallymap_jvp_p.def_abstract_eval(_abstract)
 KERNEL_PLATFORMS = ("cuda", "cpu")     # platforms the kernel backend compiles for; JAX's lowering platform decides
 
 
-def _run(node, args, platform, ndev=1):
+def _run(node, args, platform, ndev=1, axes=()):
+    outs = _run1(node, args, platform, ndev)
+    if node.prog.app is not None:       # a one-pass Records launch: its raw record layout -> the canonical one
+        pi = args[:node.prog.nP]
+        c = pi[node.prog.app[0]]
+        outs = _R.canon(node.prog, outs, axes, c[0] if c.shape[0] else 0)
+    return outs
+
+
+def _run1(node, args, platform, ndev=1):
     """platform: the one JAX is lowering this computation for ('cuda', 'cpu', or another).  tallymap never picks a
     device: jax.default_device, device_put and jit placement decide where the computation runs, and so which
     kernel target (or, on a platform the kernel backend does not compile for, the xla backend) runs it."""
@@ -243,7 +253,7 @@ def _cp_partition(c, mesh, arg_shapes, result_shape):
     nsum = len(outs_sh) - p.nY - nr
 
     def lower(*a):                                   # the call on this device's items
-        outs = _run(node, a[nc:], plat, ndev=ndev)
+        outs = _run(node, a[nc:], plat, ndev=ndev, axes=axes)
         if not axes:
             return outs
         ring = _global_ring(p, outs[len(outs) - nr:], outs[nsum - 1], axes, a[nc].shape[0]) if nr else []
@@ -470,6 +480,11 @@ def _jvp(primals, tangents, *, node):
         outs = [o[j] for j in prim_idx]
         touts = [o[j] for j in tan_idx]
         return outs, _tangents_out(p, outs, touts[:len(p.float_outs)] + [None] + touts[len(p.float_outs):])
+    if p.app is not None:               # one-pass Records: the tangent replays the FILL TWIN at the primal's slots
+        outs = bind_call(*primals, node=node)
+        tabs = _R.tables(p, outs)
+        touts = bind_call(*pi, *tabs, *dl, *bc, *db, node=_app_lin(node, pp, pb))
+        return outs, _tangents_out(p, outs, touts)
     if p.spawn is not None and node.kind == "primal":      # (the tree adjoint's record: _ring_node)
         outs, ring = _bind_recorded(node, pi, bc)
         touts = bind_call(*pi, *dl, *bc, *db, *ring, node=_ring_node(node, pp, pb))
@@ -485,6 +500,31 @@ def _tangent_node(node, pp, pb, ring=()):
     q = tangent_prog(p, pp, pb, ring)
     return node.derived(q, "tangent", base=p, pp=pp, pb=pb, lin_pi=(False,) * p.nP + (True,) * sum(pp),
                         lin_bc=(False,) * p.nB + (True,) * sum(pb) + (False,) * len(ring))
+
+
+def _app_lin(fwd, pp, pb, chain=()):
+    """the tangent node of a ONE-PASS Records program (fwd.prog.app) under any split (partial evaluation, unfused
+    jvp, unfused batching): the tangent node of its fill twin (_records.twin), whose per-item operands are fwd's,
+    then the twin's tables (_records.tables of fwd's own launch: the record), then the tangents; chain: the dual-lanes
+    chain of a batched fused node (_fused_parts).  Its transpose is the twin's replay adjoint, which gathers each
+    record's cotangent at the primal's canonical slot.  Cached on fwd."""
+    key = (tuple(pp), tuple(pb), tuple(chain))
+    c = fwd.__dict__.setdefault("_app_cache", {})
+    if key in c:
+        return c[key]
+    P, nt = fwd.prog.nP, _R.ntab(fwd.prog)
+    ln = _tangent_node(fwd.derived(_R.twin(fwd.prog), "primal"), tuple(pp) + (False,) * nt, tuple(pb))
+    for T, bpi, bbc in chain:
+        bpi = tuple(bpi[:P]) + (False,) * nt + tuple(bpi[P:])
+        ln = ln.derived(dual_lanes_prog(ln.prog, T, bpi, bbc)[0], "dual_lanes", lin_pi=ln.lin_pi, lin_bc=ln.lin_bc)
+    c[key] = ln
+    return ln
+
+
+def _app_args(p, args, tabs):
+    """a fused node's (or a primal node's tangent-call) operands [pi, dpi | bc, dbc] -> those of its fill twin's tangent
+    node (_app_lin): [pi, tables, dpi | bc, dbc]"""
+    return list(args[:p.nP]) + list(tabs) + list(args[p.nP:])
 
 
 def _ring_node(node, pp, pb):
@@ -861,9 +901,13 @@ def _fused_node(node, pp, pb):
 def _fused_parts(jn):
     """-> (primal node, tangent node, primal operand positions).  base = (primal node, pp, pb, lanes chain): a fused_jvp
     node batched into dual lanes (_dual_lanes) keeps the chain of (T, bpi, bbc) so that its tangent part is the same
-    dual_lanes node."""
+    dual_lanes node.  A one-pass Records program (p.app): the tangent node of its fill twin (_app_lin), whose
+    operands are the fused node's with the twin's tables inserted after the primal per-item operands (_app_args)."""
     fwd, pp, pb, chain = jn.base
     p = fwd.prog
+    if p.app is not None:
+        nPj = p.nP + sum(pp)
+        return fwd, _app_lin(fwd, pp, pb, chain), list(range(p.nP)) + list(range(nPj, nPj + p.nB))
     ln = jn.__dict__.get("_lin")
     if ln is None:
         ln = _tangent_node(fwd, pp, pb)
@@ -905,7 +949,15 @@ def _fused_batch(args, dims, *, node):
         outs, od = bind_call(*[args[i] for i in pos], node=fwd), [NM] * (len(p.out_tallies) + 1 + p.nY)
     else:
         outs, od = (_fused_batch if fwd.kind == "fused_jvp" else _batch)([args[i] for i in pos], pd, node=fwd)
-    touts, td = _batch(list(args), list(dims), node=ln)
+    if p.app is not None:               # (the twin's tables: from the primal launch(es), batched like its counts)
+        nt = len(p.out_tallies)
+        cd = [od[nt + 1 + cy] for _, _, cy in p.app[1]]
+        tabs = _R.tables(p, [jnp.moveaxis(o, d, 0) if d is not NM and k in [nt + 1 + cy for _, _, cy in p.app[1]]
+                             else o for k, (o, d) in enumerate(zip(outs, od))])
+        td0 = [NM if d is NM else 0 for d in cd for _ in (0, 1)]
+        touts, td = _batch(_app_args(p, list(args), tabs), _app_args(p, list(dims), td0), node=ln)
+    else:
+        touts, td = _batch(list(args), list(dims), node=ln)
     return _assemble(p, outs, touts), _assemble(p, od, td)
 
 
@@ -933,6 +985,11 @@ def _fused_pe(trace, *tracers, node):
                                                 dict(node=rn))
         return _assemble(fwd.prog, [trace.new_const(o) for o in outs], touts)
     outs = bind_call(*[kn[i] for i in pos], node=fwd)
+    if fwd.prog.app is not None:        # one-pass Records: the twin's tables (the primal's counts) are residuals
+        tabs = [trace.new_const(t) for t in _R.tables(fwd.prog, outs)]
+        touts = trace.default_process_primitive(tallymap_call_p, _app_args(fwd.prog, list(tracers), tabs),
+                                                dict(node=ln))
+        return _assemble(fwd.prog, [trace.new_const(o) for o in outs], touts)
     touts = trace.default_process_primitive(tallymap_call_p, tracers, dict(node=ln))
     return _assemble(fwd.prog, [trace.new_const(o) for o in outs], touts)
 
@@ -950,6 +1007,23 @@ def _fused_pe_custom(saveable, unks_in, inst_in, eqn):
         return None, eqn, [True] * n, [True] * n, res_of(eqn.invars, inst_in)
     prim_idx, tan_idx = _fused_layout(fwd.prog)
     ntf = len(fwd.prog.float_outs)
+    _, pp, pb, chain = node.base
+    if fwd.prog.app is not None:        # one-pass Records (_fused_pe): the known side is a closed call returning the
+        # primal outputs + the fill twin's tables, which become residuals of the staged twin tangent node
+        from jax.extend.core import Var
+        from jax.extend.core.primitives import closed_call_p
+        pin = [eqn.invars[i] for i in pos]
+        cj = jax.make_jaxpr(lambda *a: (lambda o: list(o) + _R.tables(fwd.prog, o))(bind_call(*a, node=fwd)))(
+            *[jax.ShapeDtypeStruct(v.aval.shape, v.aval.dtype) for v in pin])
+        tabs = [Var(a) for a in cj.out_avals[len(prim_idx):]]
+        known = eqn.replace(primitive=closed_call_p, invars=pin, outvars=[eqn.outvars[j] for j in prim_idx] + tabs,
+                            params=dict(call_jaxpr=cj))
+        drop = drop_var(eqn.outvars[prim_idx[len(fwd.prog.out_tallies)]].aval)
+        tvars = [eqn.outvars[j] for j in tan_idx]
+        staged = eqn.replace(primitive=tallymap_call_p, outvars=tvars[:ntf] + [drop] + tvars[ntf:],
+                             params=dict(node=ln), invars=_app_args(fwd.prog, list(eqn.invars), tabs))
+        unk = [j in tan_idx for j in range(n)]
+        return known, staged, unk, list(unk), res_of(pin, [inst_in[i] for i in pos]) + tabs
     _, pp, pb, chain = node.base
     if fwd.prog.spawn is not None and fwd.kind == "primal" and not chain:   # the tree adjoint's record (_fused_pe):
         # the known side runs the recording primal (a closed call: its outputs + the record), the record becomes

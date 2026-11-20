@@ -95,6 +95,8 @@ CASES = {   # name -> (function, all-gathers allowed: grad through spawn compact
         fr(xs, ks, th)), None),
     "records grad": (jax.grad(lambda xs, ks, th: jnp.sum(fr(xs, ks, th).outputs["rec"]["x"] ** 2), argnums=(0, 2)),
                      None),
+    "records jvp": (lambda xs, ks, th: jax.jvp(lambda t: fr(xs, ks, t).outputs["rec"]["x"], (th,),
+                                               (jnp.float32(1.0),)), None),
     "records + spawn": (lambda xs, ks, th: (lambda r: (r.outputs["rec"]["x"], r.outputs["rec"]["i"],
                                                        r.stats["children_dropped"]))(frs(xs * th)), None),
 }

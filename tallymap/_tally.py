@@ -138,9 +138,50 @@ ad.primitive_jvps[spawn_p] = _spawn_jvp
 register_batcher(spawn_p, _spawn_batch)
 
 
+# ----------------------------------------------------------------------------------------------- claim_p
+# claim_p(tok:int32[C], when:bool[], k:int32[], r=j) -> (tok', slot:int32[])   (a Records output's one-pass append)
+# slot = the next free slot of the launch's raw record buffer of capacity C (an atomic counter per output), or -1
+# when `when` is False or the buffer is full.  tok is the output's hidden key tally (it orders the claim like an emit:
+# the backends treat claim_p as a tally operation); k is the item's append ordinal and r the output's index, which only
+# the fill twin reads (_records.twin: claim -> off + k).  No plain-JAX meaning, like spawn.
+claim_p = Primitive("tallymap_claim")
+claim_p.multiple_results = True
+
+
+def _claim_abstract(tok, when, k, *, r):
+    if when.shape != () or k.shape != ():
+        raise TypeError(LANED)
+    return [ShapedArray(tok.shape, tok.dtype), ShapedArray((), jnp.int32)]
+
+
+def _claim_impl(*a, **k):
+    raise NotImplementedError("tallymap: t.append's slot claim only runs inside tallymap.vmap")
+
+
+claim_p.def_impl(_claim_impl)
+claim_p.def_abstract_eval(_claim_abstract)
+mlir.register_lowering(claim_p, lambda ctx, *a, **k: _claim_impl())
+
+
+def _claim_jvp(primals, tangents, *, r):
+    outs = claim_p.bind(*primals, r=r)
+    return outs, [_zero_like(o) for o in outs]      # (integer outputs: the key tally and the slot)
+
+
+def _claim_batch(args, dims, *, r):
+    raise TypeError(LANED)
+
+
+ad.primitive_jvps[claim_p] = _claim_jvp
+register_batcher(claim_p, _claim_batch)
+
+
 # ----------------------------------------------------------------------------------------------- Tally
-# A Records output (tallymap.Records) has no primitive of its own: tallymap.vmap traces the item twice.  In the COUNT
-# pass t.append only advances the item's append ordinal k; in the FILL pass it also emits each field into an ordinary
+# A Records output (tallymap.Records).  ONE PASS (mode 'one', the default; _records.py): t.append claims a raw slot
+# (claim_p) and, when it got one, emits each field, the item's node id cid and k there; the launch's raw layout is
+# canonicalised by the primitive (_records.canon).  COUNT-THEN-FILL (spawn, capacity=None): tallymap.vmap traces the
+# item twice.  In the COUNT pass t.append only advances the item's append ordinal k; in the FILL pass it also emits
+# each field into an ordinary
 # Sum tally of the launch's capacity at slot off + k (off: the item's first slot, the exclusive prefix sum of the
 # counts), guarded by k < cnt (the item's count from the count pass) so that a fill that disagrees with its count
 # never writes into the next item's slots.  k, off and cnt are int32 scalars carried in the Tally (pytree leaves),
@@ -154,6 +195,9 @@ LANED = ("tallymap: t.append inside jax.vmap within an item (e.g. a vmapped whil
 def rkey(name, field):
     """the tally key of a Records output's field."""
     return f"{name}{RSEP}{field}"
+
+
+KI, KK = RSEP + "i", RSEP + "k"     # a one-pass Records output's hidden key tallies: each record's item (node id) and k
 
 
 @jax.tree_util.register_pytree_node_class
@@ -292,6 +336,19 @@ class Tally:
             return self._with(rec={**self._r, name: (k2,)})
         keys = [rkey(name, f) for f, _ in fields]
         a = dict(self._a)
+        if mode == "one":                       # one pass: a raw slot, the record and its key (cid, k) written there
+            cid = st[1]
+            j = [n for n, _ in self._ri[1]].index(name)
+            tok, slot = claim_p.bind(a[rkey(name, KK)], w, k, r=j)
+            ok = w & (slot >= 0) & (slot < C)
+            keys += [rkey(name, KI), rkey(name, KK)]
+            vals += [cid, k]
+
+            def put1(ts):
+                return tuple(emit_p.bind(t, slot, v) for t, v in zip(ts, vals))
+            ts = lax.cond(ok, put1, lambda ts: ts, tuple(a[key] for key in keys[:-1]) + (tok,))
+            a.update(zip(keys, ts))
+            return Tally(a, self._shapes, self._q, self._child_tree, {**self._r, name: (k2, cid)}, self._ri)
         if mode == "ref":                       # the item's own buffer, slot k (a too-small buffer drops)
             for key, v in zip(keys, vals):
                 a[key] = emit_p.bind(a[key], jnp.where(w, k, -1), v)

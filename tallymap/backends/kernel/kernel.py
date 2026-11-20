@@ -419,6 +419,8 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False, target="cuda"
         base_in.append(t)
     em.hooks["tallymap_emit"] = lambda em_, eqn, ins: _emit_rule(em_, p, ins)
     em.hooks["tallymap_spawn"] = lambda em_, eqn, ins: _spawn_rule(em_, p, ins, pav)
+    claims = {}                    # Records one-pass: claim token (key tally) slot -> its counter (SJ_APPC index)
+    em.hooks["tallymap_claim"] = lambda em_, eqn, ins, r: _claim_rule(em_, p, ins, claims)
     L.cjs = {}
     fdefs = []
 
@@ -573,6 +575,8 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False, target="cuda"
     L.r_scr = {k: result((_scratch_words(p.tallies[k]),), np.uint32)
                for k in outs if _scratch(p.tallies[k]) is not None}
     L.r_ctr = result((2,), np.uint32)                       # the claim counter (u64)
+    if claims:                                              # Records one-pass slot counters (u64 each)
+        L.r_app = result((2 * len(claims),), np.uint32)
     L.r_stats = result((len(STATS),), np.int32)
     if spawn is not None:
         L.r_q = [result((int(spawn.capacity) * max(1, _size(sh)),), dt) for sh, dt, _ in pav]
@@ -590,6 +594,8 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False, target="cuda"
     # 4 dropped_emits
     src = [PRELUDE, f"struct SjParams {{ void* p[{r}]; }};",
            f"#define SJ_CONST(j) (P.p[{base_const} + (j)])", f"#define SJ_STATS ((i32*)P.p[{L.r_stats}])"]
+    if claims:
+        src.append(f"#define SJ_APPC ((u64*)P.p[{L.r_app}])")
     if spawn is not None:
         src.append(f"#define SJ_Q(i) (((u32*)P.p[{L.r_qctl}])[(i) * {QCTL_STRIDE}])\n#define SJ_SEQ ((u32*)P.p[{L.r_seq}])\n"
                    f"#define SJ_QBUF(i) (P.p[{L.r_q[0] if L.r_q else 0} + (i)])")
@@ -1039,3 +1045,24 @@ def _spawn_rule(em, p, ins, pav):
 def _ravel(idx, shape):
     from .codegen import ravel
     return ravel(idx, shape)
+
+
+def _claim_rule(em, p, ins, claims):
+    """a Records one-pass slot claim (_tally.claim_p): the next slot of the output's raw buffer from its global u64
+    counter, -1 when `when` is false or the buffer is full.  One atomic per record; the counter keeps the true total
+    (the layout is canonicalised after the launch, _primitive._canon, from the per-item counts and the key tallies)."""
+    t, when, _k = ins
+    if em.lane_masks:
+        raise CodegenError("t.append inside a while loop with a batched predicate is not supported")
+    s = p.tallies[t.slot]
+    sl = em.fresh("as")
+    if s.kind == "discard":
+        em.line(f"const i32 {sl} = -1;")
+        return [t, Local(sl, (), np.int32)]
+    j = claims.setdefault(t.slot, len(claims))
+    em.line(f"i32 {sl} = -1;")
+    em.open(f"if ({elem(when, [])})")
+    em.line(f"const u64 o_{sl} = atomicAdd((unsigned long long*)&SJ_APPC[{j}], 1ull);")
+    em.line(f"if (o_{sl} < {int(s.S)}ull) {sl} = (i32)o_{sl};")
+    em.close()
+    return [t, Local(sl, (), np.int32)]
