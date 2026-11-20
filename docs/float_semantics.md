@@ -32,10 +32,12 @@ math modes, schedules and JAX versions.
      in the same way) and rounds it the same way, so the two backends agree bitwise.  A non-finite emit makes its
      bin NaN, and a total beyond f32's range makes its bin NaN; all of these are counted in
      `stats['fixed_point_overflow']`.
-     **The x64 rule (one rule, one exception).**  The xla backend needs `jax_enable_x64` for an exact sum: an
-     exact `Sum` or its tangent raises without it.  The one exception is the reverse-mode cotangents of f32
-     broadcast operands below, which tallymap makes itself: without x64 the xla backend adds them in f32 (as all
-     its cotangents were before), with x64 they are exact.  The kernel backend is always exact.
+     **The x64 rule.**  The xla backend needs `jax_enable_x64` for an exact `Sum`: an exact `Sum` or its tangent
+     raises without it.  The reverse-mode cotangents of f32 broadcast operands below, which tallymap makes itself,
+     are exact either way: without x64 the xla backend keeps the same integer as 8-bit digits in 37 int32 words
+     (carry-normalised before 2^21 pieces can have reached one; the top word is flagged at 2^30, the same threshold
+     as the int64 format's) and rounds it the same way, so the bits do not depend on x64.  The kernel backend is
+     always exact.
    - **other dtypes: fixed point.**  Each value is rounded to int64 fixed point (`round(v * scale)`) before an
      integer add: bitwise results across schedules, `vmap`, and the two backends.  On the xla backend it needs
      `jax_enable_x64`.  Unrepresentable values are dropped and counted (`stats['fixed_point_overflow']`), and the
@@ -48,8 +50,10 @@ math modes, schedules and JAX versions.
    **Reverse-mode cotangents of broadcast operands are exact.**  An f32 broadcast operand's cotangent (a
    parameter's or a table's gradient under `jax.grad`) is a sum of one contribution per item, or per table read,
    into a few bins.  It is accumulated as the exact sum above, so it is exact and order-independent for every finite
-   f32 contribution, then rounded once to f32: always on the kernel backend; on the xla backend with
-   `jax_enable_x64` (the same bits), and in f32 without it (the exception to the x64 rule above).  A non-finite
+   f32 contribution, then rounded once to f32, on both backends, with or without `jax_enable_x64` (the same bits):
+   a gradient does not change by a bit with the item order, the batch size, the schedule or the run.  (Earlier
+   versions of the xla backend added them in f32 without x64: a GPU scatter-add is an atomic, so `grad`, `jacrev`
+   and `hessian` changed in their last bits from run to run.)  A non-finite
    contribution makes that gradient entry NaN.  Cotangents of other dtypes (f64, f16, bf16) are added in their own
    dtype.
 5. **Forward, tangent and adjoint share one item program.**  The adjoint replays the same jaxpr with the same options

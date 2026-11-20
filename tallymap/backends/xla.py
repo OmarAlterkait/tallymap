@@ -66,8 +66,8 @@ class _St:
         self.ovf = jnp.int32(0)         # fixed-point overflow count
         self.bad = {k: jnp.zeros(a.shape[:-1] + (p.tallies[k].S,), bool)                           # flagged bins
                     for k, a in accs.items() if p.tallies[k].fixed_point or _exact(p.tallies[k])}
-        self.nadd = {k: jnp.int64(0) for k in accs if _exact(p.tallies[k])}   # exact: pieces added since the last
-                                                                                # carry normalisation (_xnorm)
+        self.nadd = {k: jnp.zeros((), _xfmt()[2]) for k in accs if _exact(p.tallies[k])}  # exact: pieces since the last
+                                                                               # carry normalisation (_xnorm)
         self.drops = jnp.int32(0)       # out-of-range (dropped) emit indices
         self.mask = None
         self.lanes = []                 # enclosing while loops with a batched predicate: their [P, *B] masks
@@ -102,62 +102,90 @@ def _fixed(v, scale):
 
 
 def _exact(s):
-    """an exact f32 sum tally (TSpec.exact) runs as one here only with jax_enable_x64 (int64 words).  Without it a
-    user-requested exact sum (a Sum(fixed_point=True) of float32, its tangents) raises; the one documented exception
-    is a reverse cotangent tally (TSpec.x64_fallback), added like any f32 sum (in float32, with partial rows)."""
+    """an exact f32 sum tally (TSpec.exact).  With jax_enable_x64 it keeps int64 words of 32-bit digits; without it a
+    user-requested exact sum (a Sum(fixed_point=True) of float32, its tangents) raises, and a reverse cotangent tally
+    (TSpec.x64_fallback) keeps the same integer in int32 words of 8-bit digits (_xfmt): exact, order-independent and
+    bitwise the x64 and kernel results either way (a float32 scatter-add there was an atomic on a GPU: gradients
+    changed from run to run)."""
     if not s.exact:
         return False
-    if jax.config.jax_enable_x64:
+    if jax.config.jax_enable_x64 or s.x64_fallback:
         return True
-    if s.x64_fallback:
-        return False
     raise NotImplementedError(f"tallymap: the exact float32 sum {s.name!r} (a fixed_point=True output or its tangent) "
                               "needs jax_enable_x64 on the xla backend (it keeps int64 words); enable it, or use the "
                               "kernel backend")
 
 
+# without x64 an exact tally keeps its integer (units of 2^-149) as 8-bit digits in EXACT_WORDS32 int32 words (a value
+# m << p, m < 2^24: m << (p % 8) < 2^31 is cut into 4 byte pieces at words p / 8 .. p / 8 + 3 <= 34).  Word 36 has
+# weight 2^288 and is flagged at 2^30: the same threshold (2^318 units) as the int64 format's top word (2^256 x 2^62).
+EXACT_WORDS32 = 37
+XNORM32 = 1 << 21
+
+
+def _xfmt():
+    """-> (words per bin, digit bits, word dtype, pieces per value, normalisation period, flag threshold)."""
+    if jax.config.jax_enable_x64:
+        return EXACT_WORDS, 32, jnp.int64, 2, XNORM, 1 << 62
+    return EXACT_WORDS32, 8, jnp.int32, 4, XNORM32, 1 << 30
+
+
 def _xemit(v):
-    """f32 values [..., M] -> (word index offsets [..., 2M] (p / 32, then p / 32 + 1), signed int64 digit pieces
-    [..., 2M], finite mask [..., M]): the 32-bit digit pieces of each value's integer in units of 2^-149 (the kernel
-    backend adds the same integer: kernel.DENSE)."""
-    b = lax.bitcast_convert_type(v.astype(jnp.float32), jnp.uint32).astype(jnp.int64)
+    """f32 values [..., M] -> (word index offsets [..., K M], signed digit pieces [..., K M], finite mask [..., M]):
+    the digit pieces (K of them, _xfmt) of each value's integer in units of 2^-149 (the kernel backend adds the same
+    integer: kernel.DENSE)."""
+    if jax.config.jax_enable_x64:
+        b = lax.bitcast_convert_type(v.astype(jnp.float32), jnp.uint32).astype(jnp.int64)
+        e = (b >> 23) & 255
+        m = (b & 0x7FFFFF) | jnp.where(e > 0, 0x800000, 0)
+        p = jnp.maximum(e - 1, 0)
+        x = m << (p & 31)
+        sg = jnp.where((b >> 31) != 0, -1, 1)
+        j = p >> 5
+        return (jnp.concatenate([j, j + 1], axis=-1),
+                jnp.concatenate([sg * (x & 0xFFFFFFFF), sg * (x >> 32)], axis=-1), e < 255)
+    b = lax.bitcast_convert_type(v.astype(jnp.float32), jnp.int32)
     e = (b >> 23) & 255
     m = (b & 0x7FFFFF) | jnp.where(e > 0, 0x800000, 0)
     p = jnp.maximum(e - 1, 0)
-    x = m << (p & 31)
-    sg = jnp.where((b >> 31) != 0, -1, 1)
-    j = p >> 5
-    return (jnp.concatenate([j, j + 1], axis=-1),
-            jnp.concatenate([sg * (x & 0xFFFFFFFF), sg * (x >> 32)], axis=-1), e < 255)
+    x = m << (p & 7)                                  # < 2^31
+    sg = jnp.where(b < 0, -1, 1)
+    j = p >> 3
+    return (jnp.concatenate([j, j + 1, j + 2, j + 3], axis=-1),
+            jnp.concatenate([sg * (x & 255), sg * ((x >> 8) & 255), sg * ((x >> 16) & 255), sg * (x >> 24)], axis=-1),
+            e < 255)
 
 
-# an exact tally's words take pieces below 2^32 (_xemit) by scatter-add, which cannot carry: they are carry-normalised
-# (_xnorm) before XNORM more pieces could have reached one word since the last time, so every word but the top stays
-# below 2^32 + XNORM 2^32 < 2^62 and none wraps; the top word only grows with the total, and one at or past 2^62
-# flags its bin (as a carry out of the top word does on the kernel backend): a bin is exact or NaN, never wrong
+# an exact tally's words take pieces below 2^D (_xemit) by scatter-add, which cannot carry: they are carry-normalised
+# (_xnorm) before XNORM (int64 words; XNORM32 for int32) more pieces could have reached one word since the last time,
+# so every word but the top stays below 2^D + XNORM 2^D (2^62; 2^30) and none wraps; the top word only grows with the
+# total, and one at or past the flag threshold (_xfmt) flags its bin (as a carry out of the top word does on the kernel
+# backend): a bin is exact or NaN, never wrong
 XNORM = 1 << 29
 
 
 def _xnorm(a, S):
-    """an exact tally's words [*lead, W * S] -> (the same integers with words 0..W-2 as 32-bit digits, the bins
-    whose top word is at or past 2^62)."""
-    W = EXACT_WORDS
+    """an exact tally's words [*lead, W * S] -> (the same integers with words 0..W-2 as D-bit digits, the bins
+    whose top word is at or past the flag threshold)."""
+    W, D, dt, _, _, lim = _xfmt()
     w = a.reshape(a.shape[:-1] + (S, W))
-    c = jnp.zeros(w.shape[:-1], jnp.int64)
+    c = jnp.zeros(w.shape[:-1], dt)
     out = []
     for j in range(W - 1):
         t = w[..., j] + c
-        out.append(t & jnp.int64(0xFFFFFFFF))
-        c = t >> 32
+        out.append(t & dt((1 << D) - 1))
+        c = t >> D
     top = w[..., W - 1] + c
     out.append(top)
-    return jnp.stack(out, axis=-1).reshape(a.shape), (top >= (1 << 62)) | (top <= -(1 << 62))
+    return jnp.stack(out, axis=-1).reshape(a.shape), (top >= lim) | (top <= -lim)
 
 
 def _xread(a, s):
     """an exact tally's words [*lead, W * S] -> (its f32 output, the bins that cannot be read: a word at or past
-    2^62, or a total past f32's range).  The rounding of the kernel backend's sj_dread (kernel.DENSE):
-    carry-normalise to 32-bit digits, take the magnitude, round it once to 24 bits (nearest, ties to even), scale."""
+    the flag threshold, or a total past f32's range).  The rounding of the kernel backend's sj_dread (kernel.DENSE):
+    carry-normalise to digits, take the magnitude, round it once to 24 bits (nearest, ties to even), scale."""
+    if not jax.config.jax_enable_x64:
+        return _xread32(a, s)
     W = EXACT_WORDS
     w = a.reshape(a.shape[:-1] + (s.S, W))
     bad = jnp.any((w >= (1 << 62)) | (w <= -(1 << 62)), axis=-1)
@@ -192,6 +220,50 @@ def _xread(a, s):
     r, half = top & jnp.uint64(0xFFFFFFFFFF), jnp.uint64(0x8000000000)
     q = q + ((r > half) | ((r == half) & (st | ((q & 1) != 0)))).astype(jnp.uint64)
     o = jnp.ldexp(q.astype(jnp.float64), 32 * (t - 1) - s_.astype(jnp.int32) - 149 + 40).astype(jnp.float32)
+    o = jnp.where(t < 0, jnp.float32(0), jnp.where(neg, -o, o))
+    return o, bad | ~jnp.isfinite(o)
+
+
+
+def _xread32(a, s):
+    """_xread for the int32 format (no x64): 8-bit digits, the same integer and the same rounding."""
+    W, ND = EXACT_WORDS32, EXACT_WORDS32 + 3             # (3 more digits take the top word's high bits: sign c)
+    w = a.reshape(a.shape[:-1] + (s.S, W))
+    bad = jnp.any((w >= (1 << 30)) | (w <= -(1 << 30)), axis=-1)
+    d, c = [], jnp.zeros(w.shape[:-1], jnp.int32)
+    for j in range(ND):
+        t = (w[..., j] if j < W else 0) + c
+        d.append(t & 255)
+        c = t >> 8
+    neg = c < 0                                          # (c is 0 or -1 here)
+    k = jnp.ones_like(c)
+    nd = []
+    for j in range(ND):
+        t = (~d[j] & 255) + k
+        nd.append(t & 255)
+        k = t >> 8
+    D = jnp.stack([jnp.where(neg, x, y) for x, y in zip(nd, d)], axis=-1).astype(jnp.uint32)   # magnitude digits
+    nz = D != 0
+    t = ND - 1 - jnp.argmax(nz[..., ::-1], axis=-1)                     # the top nonzero digit (-1: none)
+    t = jnp.where(jnp.any(nz, axis=-1), t, -1).astype(jnp.int32)
+    get = lambda i: jnp.where(i >= 0, jnp.take_along_axis(D, jnp.clip(i, 0, ND - 1)[..., None], axis=-1)[..., 0],
+                              jnp.uint32(0))
+    dt, d1, d2, d3, d4 = (get(t - i) for i in range(5))
+    s_ = (lax.clz(dt) - 24).astype(jnp.uint32)                          # [0, 7] (8 only for an all-zero bin)
+    h = (dt << 24) | (d1 << 16) | (d2 << 8) | d3
+    top = (h << s_) | (d4 >> (8 - s_))                                  # the top 32 bits, msb set
+    st = (((d4 << s_) & jnp.uint32(255)) != 0) | jnp.any(nz & (jnp.arange(ND) < (t - 4)[..., None]), axis=-1)
+    q = top >> 8
+    r, half = top & jnp.uint32(255), jnp.uint32(128)
+    q = q + ((r > half) | ((r == half) & (st | ((q & 1) != 0)))).astype(jnp.uint32)
+    E = 8 * t - s_.astype(jnp.int32) - 165                              # o = q 2^E
+    pow2 = lambda e: lax.bitcast_convert_type((e + 127) << 23, jnp.float32)     # 2^e, |e| <= 126
+    E1 = jnp.clip(E, -100, 100)
+    o = (q.astype(jnp.int32).astype(jnp.float32) * pow2(E1)) * pow2(E - E1)     # (exact, then one rounding)
+    # a total below 2^24 units is exact and its f32 bits ARE the integer (subnormal or the first binade): no
+    # multiply, so a platform that flushes subnormal arithmetic results keeps it
+    small = lax.bitcast_convert_type((D[..., 0] | (D[..., 1] << 8) | (D[..., 2] << 16)).astype(jnp.int32), jnp.float32)
+    o = jnp.where(t <= 2, small, o)
     o = jnp.where(t < 0, jnp.float32(0), jnp.where(neg, -o, o))
     return o, bad | ~jnp.isfinite(o)
 
@@ -253,28 +325,35 @@ def _emit(st, t, idx, val):
     nl = len(L)
     v = jnp.moveaxis(v, 0, nl).reshape(L + (-1,))      # [*L, P*I]
     a = st.accs[t.slot]
-    if _exact(spec):                                  # (R == 1) the two digit pieces of each value (_xemit)
-        W = EXACT_WORDS
-        # this call adds at most 2M pieces into one word (a value's two pieces go to two words; a word takes low
-        # pieces of some values and high pieces of others): normalise first if XNORM could be passed
-        k, M2 = t.slot, 2 * int(f.shape[-1])
-        cnt = st.nadd[k] + M2
+    if _exact(spec):                                  # (R == 1) the K digit pieces of each value (_xemit)
+        W, _, _, K, XN, _ = _xfmt()
+        k = t.slot
+        M = int(f.shape[-1])
+        CH = max(1, XN // K)                          # (an emit of more values runs in chunks, normalised between)
+        for c0 in range(0, max(M, 1), CH):
+            fc, vc = f[c0:c0 + CH], v[..., c0:c0 + CH]
+            # this chunk adds at most K M pieces into one word (a value's K pieces go to K words; a word takes low
+            # pieces of some values and high pieces of others): normalise first if XN could be passed
+            M2 = K * int(fc.shape[-1])
+            cnt = st.nadd[k] + M2
 
-        def norm(op):
-            a_, bad_, ovf_, _ = op
-            a_, top = _xnorm(a_, S)
-            return a_, bad_ | top, ovf_ + jnp.sum((top & ~bad_).astype(jnp.int32), dtype=jnp.int32), jnp.int64(M2)
-        a, st.bad[k], st.ovf, st.nadd[k] = lax.cond(cnt > XNORM, norm, lambda op: op, (a, st.bad[k], st.ovf, cnt))
-        jo, q, ok = _xemit(v)                         # [*L, 2 P*I], [*L, 2 P*I], [*L, P*I]
-        live = jnp.broadcast_to(f < S, ok.shape)
-        st.ovf = st.ovf + jnp.sum((~ok & live).astype(jnp.int32), dtype=jnp.int32)
-        st.bad[t.slot] = st.bad[t.slot].at[..., f].max(~ok, mode="drop")
-        f2 = jnp.concatenate([f, f])
-        ix = jnp.where(jnp.concatenate([ok, ok], axis=-1) & (f2 < S), f2 * W + jo, W * S)   # (dropped: out of range)
-        a2 = a.reshape(-1, W * S)
-        n = a2.shape[0]
-        ix, q = ix.reshape(n, -1), q.reshape(n, -1)
-        st.accs[t.slot] = a2.at[jnp.arange(n)[:, None], ix].add(q, mode="drop").reshape(a.shape)
+            def norm(op, M2=M2):
+                a_, bad_, ovf_, n_ = op
+                a_, top = _xnorm(a_, S)
+                return (a_, bad_ | top, ovf_ + jnp.sum((top & ~bad_).astype(jnp.int32), dtype=jnp.int32),
+                        jnp.asarray(M2, n_.dtype))
+            a, st.bad[k], st.ovf, st.nadd[k] = lax.cond(cnt > XN, norm, lambda op: op, (a, st.bad[k], st.ovf, cnt))
+            jo, q, ok = _xemit(vc)                    # [*L, K P*I], [*L, K P*I], [*L, P*I]
+            live = jnp.broadcast_to(fc < S, ok.shape)
+            st.ovf = st.ovf + jnp.sum((~ok & live).astype(jnp.int32), dtype=jnp.int32)
+            st.bad[k] = st.bad[k].at[..., fc].max(~ok, mode="drop")
+            fK = jnp.concatenate([fc] * K)
+            ix = jnp.where(jnp.concatenate([ok] * K, axis=-1) & (fK < S), fK * W + jo, W * S)  # (dropped: out of range)
+            a2 = a.reshape(-1, W * S)
+            n = a2.shape[0]
+            ix, q = ix.reshape(n, -1), q.reshape(n, -1)
+            a = a2.at[jnp.arange(n)[:, None], ix].add(q, mode="drop").reshape(a.shape)
+        st.accs[k] = a
         return t
     if spec.fixed_point:
         v, ok = _fixed(v, spec.scale)
@@ -562,10 +641,10 @@ def run(p, pi, bc, xla_batch_size=None, **_):
     accs = {}
     for k, s in enumerate(p.tallies):
         if s.kind == "sum":
-            dt = jnp.int64 if s.fixed_point or _exact(s) else s.dtype
+            dt = _xfmt()[2] if _exact(s) else jnp.int64 if s.fixed_point else s.dtype
             if s.fixed_point:
                 _fixed(jnp.zeros(()), 1.0)
-            w = EXACT_WORDS if _exact(s) else 2 if s.fixed_point else _rows(s) + _low(s)
+            w = _xfmt()[0] if _exact(s) else 2 if s.fixed_point else _rows(s) + _low(s)
             accs[k] = jnp.zeros(tuple(s.lead) + (w * s.S,), dt)
     ys0 = [jnp.zeros((N,) + tuple(a.shape), a.dtype) for a in ya]
     P = int(min(max(N, 1), xla_batch_size or BLOCK))

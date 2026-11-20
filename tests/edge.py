@@ -1957,6 +1957,53 @@ def _(b):
             "orders and the jvp" + (" (XLA:CPU: subnormal emits flushed to 0 by XLA)" if ftz else ""))
 
 
+@case("exact f32 reverse cotangents of broadcast operands (sparse table and dense parameter): carries / borrows, "
+      "cancellation, subnormals; bitwise the host reference in any item order, run to run, normalised and chunked "
+      "(the xla backend without x64 keeps int32 words of 8-bit digits)")
+def _(b):
+    rng = np.random.default_rng(12)
+    TB = 64                                    # >= _reverse.SPARSE_MIN: a sparse table (its reads emit cotangents)
+    m = 1 << 12
+    e = rng.choice(np.r_[np.arange(1, 30), np.arange(100, 140), np.arange(200, 255), [0, 0]], m)
+    bits_ = (e.astype(np.uint32) << 23) | rng.integers(0, 1 << 23, m).astype(np.uint32)
+    pv = (bits_ | (rng.integers(0, 2, m).astype(np.uint32) << 31)).view(np.float32)
+    pb = rng.integers(0, TB - 2, m)
+    rv = (rng.uniform(0.5, 1.0, m) * 2.0 ** rng.integers(-40, 40, m) * rng.choice([-1.0, 1.0], m)).astype(np.float32)
+    tiny = np.array([2.0 ** 100, -(2.0 ** 100), 2.0 ** -149], np.float32)
+    vals = np.r_[pv, -pv, rv, tiny]
+    bins = np.r_[pb, pb, rng.integers(0, TB - 2, m), [TB - 1] * 3]
+    perm = rng.permutation(len(vals))
+    vals, bins = vals[perm], bins[perm]
+    ftz = b == "xla" and not GPU               # (XLA:CPU flushes subnormal operands: x * ct is 0 there)
+    rvals = np.where(np.abs(vals) < np.float32(2.0 ** -126), np.float32(0.0), vals) if ftz else vals
+    want = _exact_ref(rvals, bins, TB)
+    want2 = _exact_ref(np.r_[rvals, rvals], np.r_[np.zeros(len(vals), int), np.ones(len(vals), int)], 2)
+    if not (want[TB - 2] == 0 and want[TB - 1] == np.float32(0.0 if ftz else 2.0 ** -149)):
+        raise Fail(f"test setup: reference {want[TB - 2:]}")
+
+    def grads(x, i, **kw):
+        f = tm.vmap(lambda t, x, i, tab, p: t.add("s", 0, x * tab[i] + x * p[0] + x * p[1]),
+                    outputs={"s": tm.Sum((1,), jnp.float32)}, in_axes=(0, 0, None, None), backend=b, **kw)
+        g = jax.grad(lambda tab, p: f(x, i, tab, p).outputs["s"][0], argnums=(0, 1))(
+            jnp.ones(TB, jnp.float32), jnp.ones(2, jnp.float32))
+        return np.asarray(g[0]), np.asarray(g[1])
+
+    x, i = jnp.asarray(vals), jnp.asarray(bins, jnp.int32)
+    runs = [("in order", grads(x, i)), ("rerun", grads(x, i)), ("items reversed", grads(x[::-1], i[::-1])),
+            ("batches of 1000", grads(x, i, xla_batch_size=1000) if b == "xla" else grads(x, i))]
+    if b == "xla":                             # many normalisations, and emits cut into chunks (_xfmt period / K)
+        from tallymap.backends import xla as X
+        with patched(X, XNORM=64, XNORM32=64):
+            runs.append(("normalised every 64 pieces", grads(x, i, xla_batch_size=2048)))
+    for nm, (gt, gp) in runs:
+        if not (np.array_equal(gt.view(np.uint32), want.view(np.uint32))
+                and np.array_equal(gp.view(np.uint32), want2.view(np.uint32))):
+            d = np.flatnonzero(gt.view(np.uint32) != want.view(np.uint32))
+            raise Fail(f"{nm}: table bins {d.tolist()[:8]} got {gt[d[:8]].tolist()} want {want[d[:8]].tolist()}; "
+                       f"param {gp.tolist()} want {want2.tolist()}")
+    return f"{len(vals)} contributions: {TB} table + 2 parameter cotangents bitwise the reference in {len(runs)} runs"
+
+
 @case("exact f32 sum: device memory per bin on the kernel backend is 40 B of accumulator + 1 flag bit + the output",
       ["auto"])
 def _(b):

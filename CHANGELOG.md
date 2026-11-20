@@ -31,6 +31,14 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Fixed
 
+- xla backend without `jax_enable_x64`: reverse-mode cotangents of f32 broadcast operands (a parameter's or a
+  table's gradient) were added in f32 by a scatter-add, which is an atomic on a GPU, so `grad`, `jacrev` and
+  `hessian` changed in their last bits from run to run (seen as the Records cell "one pass == count-then-fill
+  BITWISE" failing at random on GPU). They are now the exact sum there too, kept as 8-bit digits in 37 int32 words
+  and rounded like the int64 format: bitwise the same in any order, run to run, with or without x64 and on both
+  backends. An exact `Sum` itself still needs x64 on the xla backend. `docs/float_semantics.md` item 4;
+  tests/edge.py "exact f32 reverse cotangents", tests/records.py "derivatives BITWISE run to run".
+
 - Subnormal f32 values were flushed to zero by `Sum` (fixed_point=False) and therefore by `Records` float fields,
   contradicting "a float field stores each value exactly": lumen's record readout lost every deposit whose q
   relative to the row weight was subnormal (4 x 1.4e-44 emitted gave 0; XLA's multiply keeps them). The cause is

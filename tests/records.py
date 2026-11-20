@@ -214,6 +214,25 @@ def _(b):
         same(a[n], e[n], f"schedule {n}")
 
 
+@case("derivatives BITWISE run to run and across schedule / batch size: grad, jacrev, hessian (records + Sum loss)")
+def _(b):
+    # a broadcast operand's cotangent is an exact sum (every backend, x64 or not), so the order in which items add
+    # into it (atomics, lanes, batches) cannot change a bit; a float32 scatter-add there flaked on a GPU (xla, no x64)
+    def run(f):
+        wq = 1.0 + (jnp.arange(L * L) % 3).astype(F)
+        jr = lambda th: (lambda o: jnp.stack([jnp.sum(o["hits"]["w"]), jnp.sum(o["Q"] * wq)]))(
+            f(IDS, KEYS, th[0], th[1], F(0.0)).outputs)
+        return [jax.grad(loss_of(f))(TH), jax.jacrev(jr)(TH), jax.hessian(loss_of(f))(TH)]
+    ref = run(V(b))
+    alt = V(b, schedule="step") if b != "xla" else V(b, xla_batch_size=7)
+    for nm, f in (("rerun", V(b)), ("rerun", V(b)), ("schedule / batch size", alt)):
+        for k, x, y in zip(("grad", "jacrev", "hessian"), run(f), ref):
+            same(x, y, f"{nm} {k}")
+    if not np.all(np.isfinite(np.asarray(ref[2]))):
+        raise Fail("hessian not finite")
+    return "grad, jacrev, hessian bitwise in 4 runs"
+
+
 @case("only Records outputs (no Sum); zero records")
 def _(b):
     def item(t, i, key, mu_a, v, wcut):

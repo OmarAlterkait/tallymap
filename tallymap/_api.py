@@ -63,8 +63,8 @@ class Sum:
     stats['fixed_point_overflow'].  Its jvp / jacfwd tangents, and reverse-mode cotangents of float32 broadcast
     operands, are exact too.  Device memory on the kernel backend: 44 B per bin (a 40 B accumulator + the output).
     The xla backend keeps an exact sum in int64 words, so it needs jax_enable_x64: an exact Sum (or its tangent)
-    raises without it.  The one exception: reverse-mode cotangents of float32 broadcast operands, which tallymap
-    makes itself, are added in float32 there without x64 (exact with it).  docs/float_semantics.md item 4.
+    raises without it.  Reverse-mode cotangents of float32 broadcast operands, which tallymap makes itself, are exact
+    there without x64 too (int32 words of 8-bit digits, the same bits).  docs/float_semantics.md item 4.
 
     fixed_point=True with another dtype accumulates round(v * scale) in int64 fixed point: bitwise
     order-independent, each value rounded to a multiple of 1/scale (needs jax_enable_x64 on the xla backend).
@@ -205,9 +205,10 @@ class TSpec:
                            # units of 2^-149), rounded once to f32 at readout; no scale, no floor, no cap.  A user's
                            # Sum(fixed_point=True) of dtype float32, its jvp / jacfwd tangents, and the reverse
                            # program's cotangent tallies (vjp_prog).  The kernel backend keeps DENSE_WORDS int64 words
-                           # per bin, the xla backend EXACT_WORDS int64 words (needs jax_enable_x64).
-    x64_fallback: bool = False   # an exact tally the xla backend adds in float32 without jax_enable_x64 (the reverse
-                                 # cotangents: the one documented exception); any other exact tally raises there
+                           # per bin, the xla backend EXACT_WORDS int64 words (needs jax_enable_x64; a cotangent
+                           # tally keeps EXACT_WORDS32 int32 words without it: xla._xfmt)
+    x64_fallback: bool = False   # an exact tally the xla backend keeps in int32 words without jax_enable_x64 (the
+                                 # reverse cotangents); any other exact tally raises there
     slots: bool = False    # indexed by the recording primal's queue slot (ItemProgram.rec): under a sharded jit it is
                            # renumbered across devices like the queue ring (_primitive._global_ring), not summed
 
