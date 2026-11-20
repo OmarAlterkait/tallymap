@@ -86,6 +86,20 @@ def scan_counts(params):
     return len(c), len(k)
 
 
+def scan_reshaped(params, n_add, keep):
+    """scan params for the operands [n_add new consts] + [consts] + [carry] + [the scanned inputs whose `keep` is
+    True] (the body's invars rearranged to match by the caller)."""
+    if params.get("num_consts") is not None:
+        nc, nk = params["num_consts"], params["num_carry"]
+        lin = list(params["linear"])
+        return dict(params, num_consts=nc + n_add,
+                    linear=tuple([False] * n_add + lin[:nc + nk] + [x for x, k in zip(lin[nc + nk:], keep) if k]))
+    import sys
+    ft = sys.modules[type(params["ft_in"]).__module__]     # (jax._src.flattree: the flat-tree form's own module)
+    c, k, _ = params["ft_in"].unpack()
+    return dict(params, ft_in=ft.pack((ft.nones(len(c) + n_add), k, ft.nones(sum(map(bool, keep))))))
+
+
 def scan_parts(eqn):
     p = eqn.params
     nc, nk = scan_counts(p)

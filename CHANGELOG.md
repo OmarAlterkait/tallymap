@@ -39,6 +39,20 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Fixed
 
+- Reverse mode with JAX 0.6.2 - 0.11 through a while loop that reads a table (any broadcast operand) inside ONE
+  branch of a `lax.switch` / `lax.cond` (lumen SBND: a facet table read in one outcome branch): the checkpointed loop
+  keeps its body consts as residuals, and JAX's cond partial eval returns each branch's residuals as cond outputs
+  (a filler in the branches without them), so the table became a per-item cond output: the kernel backend raised
+  "per-item array of shape (257, 65) is too large for a local array" (smaller tables silently became per-thread
+  local copies: 1105 / 4160 floats for 17 x 65 / 64 x 65), the xla backend held items x table.  The same for a
+  perturbed table, for a JAX op's own residual (the product in `dot(tab, f(w))` in one branch), through nested
+  conds, the single-loop adjoint's sweep cond and a `lax.scan` (there stacked per iteration).  The adjoint's
+  dead-code pass (`_reverse._dce`) now proves GUARDED aliases (a value equals the table whenever given switch
+  indices take given branches) and reads the table itself wherever the guards hold; every other read is unchanged,
+  so the values are the same.  JAX 0.12 forwards such residuals itself, and there the pass leaves the program
+  unchanged (checked).  lumen SBND `jax.grad` on the kernel backend now runs.  tests/reverse.py "table ... kept as
+  a residual in ONE branch of a lax.switch" (top, nested, cond2, scan, jaxop; a negative control below 0.12), "a
+  USER cond returning the table or zeros".
 - Reverse mode (grad, vjp, jacrev) through more than one gated `t.append` per item outside a
   loop, or more than one per loop step: the transpose of each `lax.cond` returned the output's whole
   cotangent (capacity-sized for `Records`) as a cond output and chained it into the previous one, a per-item array of

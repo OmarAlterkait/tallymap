@@ -25,6 +25,7 @@ from jax import lax
 import tallymap as tm
 from tallymap import _diagnostics as _D
 from tallymap import _reverse
+from tallymap._jaxpr import subjaxprs
 
 if os.environ.get("TX_UNFUSED") == "1":                 # run_all --unfused: the two-node jvp design
     from tallymap import _primitive as _P0
@@ -629,6 +630,232 @@ for which in ("cond", "switch", "while", "scan", "while-in-cond", "never read"):
                 raise Fail(f"vs finite differences: grad.dt {float(g @ dt):.6g} jvp {float(j):.6g} fd {fd:.6g} "
                            f"(rel {eg / scale:.2g}, {ej / scale:.2g} > {ftol:g} + noise floor {noise:.2g})")
             return msg + f"; fd rel {eg / scale:.1e}/{ej / scale:.1e} ({'sparse' if sparse else 'dense'})"
+
+
+# ------------------------------------------------- toy 3d: a table kept by a checkpointed loop inside a lax.switch
+def make_switch_loop(R, CC, kind):
+    """the lumen SBND defect: a while loop reading a (R, CC) table inside ONE branch of a lax.switch, at the item's top
+    level ("top"), in the body of the item's loop ("nested"), in a branch of a cond inside that branch ("cond2": nested
+    conds, as in lumen), or in a lax.scan's body ("scan": the residual is then stacked per iteration); "jaxop": no
+    loop, a JAX op in the branch keeps the whole table as ITS residual (dot(tab, sin(w u)): a per-item (R,) result;
+    the dot's linearization keeps tab).  The checkpointed loop keeps its body consts (the table) as custom_vjp
+    residuals; JAX 0.6.2-0.11's cond partial eval returns a branch's residuals as cond outputs (a filler in the
+    branches that have none), so the table became a per-item cond output (kernel: a local array, "too large" from
+    2^14 elements).  item: real while loops; padded: masked fori_loop / scan (the reference)."""
+    u = jnp.linspace(0.5, 1.5, CC).astype(F)
+
+    def inner(w, i, tab, real):
+        def body(k, w, j):
+            v = tab[j, k % CC]
+            return w * (0.9 + 0.1 * jnp.cos(v * w)), (j * 7 + 3) % R
+        n = 2 + i % 4
+        if real:
+            return lax.while_loop(lambda c: c[0] < n, lambda c: (c[0] + 1, *body(*c)), (0, w, i))[1]
+
+        def pb(k, c):
+            w2, j2 = body(k, *c)
+            return jnp.where(k < n, w2, c[0]), jnp.where(k < n, j2, c[1])
+        return lax.fori_loop(0, 6, pb, (w, i))[0]
+
+    def step(k, w, key, tab, th, real):
+        bits = kb(key, k)
+        i = (bits % jnp.uint32(R)).astype(jnp.int32)
+        br = ((bits >> 8) % jnp.uint32(3)).astype(jnp.int32)
+        if kind == "cond2":
+            b0 = lambda: lax.cond(i % 2 == 0, lambda: inner(w, i, tab, real), lambda: 0.95 * w)        # noqa: E731
+        elif kind == "jaxop":
+            b0 = lambda: w * (1.0 + 1e-4 * jnp.sum(jnp.dot(tab, jnp.sin(w * u))))                         # noqa: E731
+        else:
+            b0 = lambda: inner(w, i, tab, real)                                                         # noqa: E731
+        w2 = lax.switch(br, [b0, lambda: w * th[0], lambda: w * (1 + 0.1 * th[1])])
+        return w2, i % 8
+
+    def make(real):
+        def item(t, x, key, tab, th):
+            if kind in ("top", "cond2", "jaxop"):
+                w, q = step(0, x, key, tab, th, real)
+                return t.add("Q", q, w), w
+            if real and kind == "nested":
+                def body(c):
+                    k, w, t = c
+                    w2, q = step(k, w, key, tab, th, real)
+                    return k + 1, w2, t.add("Q", q, w2)
+                _, w, t = lax.while_loop(lambda c: c[0] < 5, body, (0, x, t))
+                return t, w
+
+            def sb(c, k):
+                w, t = c
+                w2, q = step(k, w, key, tab, th, real)
+                return (w2, t.add("Q", q, w2)), None
+            (w, t), _ = lax.scan(sb, (x, t), jnp.arange(5))
+            return t, w
+        return item
+    return make(True), make(False)
+
+
+def _walk_eqns(jaxpr):
+    for e in jaxpr.eqns:
+        yield e
+        for s in subjaxprs(e):
+            yield from _walk_eqns(s.jaxpr)
+
+
+def _table_values(cjs, tab):
+    """the equation outputs of the table's shape and dtype (or a stack of them) anywhere in the captured item VJP
+    programs: per-item copies of the table (the sparse path's int32 iota of its shape is a constant)"""
+    return [f"{e.primitive.name} -> {o.aval}" for cj in cjs for e in _walk_eqns(cj.jaxpr) for o in e.outvars
+            if tuple(getattr(o.aval, "shape", ()))[-tab.ndim:] == tab.shape and o.aval.dtype == tab.dtype]
+
+
+def _kernel_locals():
+    """the element counts of every per-thread array the last kernels declare (from their cached sources)"""
+    import re
+    n = []
+    for k in tm.diagnostics()["kernels"]:
+        n += [int(m) for m in re.findall(r"\b\w+ [a-z]+\d+\[(\d+)\];", open(k["source"]).read())]
+    return n
+
+
+def _capture_vjp(cjs):
+    from tallymap import _primitive as P
+    vp = P.vjp_prog
+
+    def cap(*a, **k):
+        q = vp(*a, **k)
+        cjs.append(q.cj)
+        return q
+    return patched(P, vjp_prog=cap)
+
+
+def switch_loop_case(b, R, CC, kind):
+    item, padded = make_switch_loop(R, CC, kind)
+    xs, keys = inputs(8)[:2]
+    tab = (1 + 0.5 * jnp.sin(jnp.arange(R * CC) * 0.37)).reshape(R, CC).astype(F)
+    th = jnp.array([0.9, 0.3], F)
+    out, AX = {"Q": tm.Sum((8,), F)}, (0, 0, None, None)
+    f = tm.vmap(item, outputs=out, in_axes=AX, backend=b)
+    r = reference(padded, outputs=out, in_axes=AX)
+    wq = jnp.arange(1, 9).astype(F)
+
+    def loss(fn):
+        def L(x, tab, th):
+            o = fn(x, keys, tab, th)
+            return jnp.sum(o.outputs["Q"] * wq) + jnp.sum(o.per_item ** 2)
+        return L
+    return f, r, loss, xs, keys, tab, th
+
+
+JAX012 = tuple(int(c) for c in jax.__version__.split(".")[:2]) >= (0, 12)   # (its cond partial eval forwards residuals)
+
+for kind in ("top", "nested", "cond2", "scan", "jaxop"):
+    for R, CC in ((17, 65), (64, 65), (257, 65)):
+        pert = kind != "jaxop"        # (jaxop reads the whole table densely: a perturbed one is the dense path)
+        @case(f"table ({R},{CC}) kept as a residual in ONE branch of a lax.switch ({kind}): grad"
+              + (" (table perturbed and not)" if pert else "") + " / vjp / jacrev == reference and finite "
+              "differences; no per-item copy of the table; _dce's guarded aliases: needed below JAX 0.12, a no-op "
+              "from 0.12")
+        def _(b, R=R, CC=CC, kind=kind, pert=pert):
+            f, r, loss, xs, keys, tab, th = switch_loop_case(b, R, CC, kind)
+            cjs, cju = [], []
+            if b != "xla":
+                _D.KERNELS.clear()
+            Q = lambda fn: lambda t: fn(xs, keys, tab, t).outputs["Q"]        # noqa: E731
+            ct = jnp.cos(jnp.arange(8)).astype(F)
+            with _capture_vjp(cju):
+                gu = jax.jit(jax.grad(loss(f), argnums=(0, 2)))(xs, tab, th)       # the table not differentiated
+            with _capture_vjp(cjs):
+                g = jax.jit(jax.grad(loss(f), argnums=(0, 1, 2)))(xs, tab, th) if pert else None
+                v = jax.jit(lambda t: jax.vjp(Q(f), t)[1](ct)[0])(th)
+                jr = jax.jit(jax.jacrev(Q(f)))(th)
+            if not cjs or not cju:
+                raise Fail("instrument: no item VJP program was built")
+            bad = _table_values(cjs + cju, tab)
+            if bad:
+                raise Fail(f"a per-item copy of the table in the item VJP: {bad[:4]}")
+            loc = max(_kernel_locals(), default=0) if b != "xla" else 0
+            if loc >= R * CC:
+                raise Fail(f"a kernel declares a per-thread array of {loc} elements (the table: {R * CC})")
+            gr = jax.jit(jax.grad(loss(r), argnums=(0, 1, 2)))(xs, tab, th)
+            vr = jax.jit(lambda t: jax.vjp(Q(r), t)[1](ct)[0])(th)
+            jf = jax.jit(jax.jacfwd(Q(r)))(th)
+            got = dict(x_u=gu[0], th_u=gu[1], vjp=v, jacrev=jr)
+            want = dict(x_u=gr[0], th_u=gr[2], vjp=vr, jacrev=jf)
+            if pert:
+                got.update(x=g[0], tab=g[1], th=g[2])
+                want.update(x=gr[0], tab=gr[1], th=gr[2])
+            msg = close(got, want, "vs reference")
+            # finite differences along the table (perturbed) or th
+            ftol = 1e-6 if X64 else 2e-3
+            if pert:
+                d = jnp.cos(jnp.arange(R * CC) * 0.11).reshape(R, CC).astype(F)
+                L, p0, gd = jax.jit(lambda t: loss(f)(xs, t, th)), tab, g[1]
+            else:
+                d = jnp.array([1.0, -0.5], F)
+                L, p0, gd = jax.jit(lambda t: loss(f)(xs, tab, t)), th, gu[1]
+            fd, noise = _fd(L, p0, d)
+            scale = max(abs(fd), float(jnp.sum(jnp.abs(gd * d))), 1e-30)
+            eg = abs(float(jnp.vdot(gd, d)) - fd)
+            if not eg <= ftol * scale + noise:
+                raise Fail(f"vs finite differences: grad.d {float(jnp.vdot(gd, d)):.6g} fd {fd:.6g} "
+                           f"(rel {eg / scale:.2g} > {ftol:g} + noise floor {noise:.2g})")
+            msg += f"; fd rel {eg / scale:.1e}; max kernel local {loc}"
+            if b == "xla":            # the same program with the guarded aliases off (a fresh tm.vmap: no cache)
+                f0, _, loss0, *_ = switch_loop_case(b, R, CC, kind)
+                cj0 = []
+                with _capture_vjp(cj0), patched(_reverse, GUARDED=False):
+                    jax.jit(jax.grad(loss0(f0), argnums=(0, 2)))(xs, tab, th)
+                same = [str(a) for a in cj0] == [str(a) for a in cju]
+                bad0 = _table_values(cj0, tab)
+                if JAX012 and not same:
+                    raise Fail(f"JAX {jax.__version__}: the guarded aliases changed the program (expected a no-op)")
+                if not JAX012 and not bad0:
+                    raise Fail(f"NEGATIVE CONTROL: JAX {jax.__version__} with the guarded aliases off has no "
+                               "per-item copy of the table (the test does not exercise the defect)")
+                msg += ("; aliases a no-op (program identical)" if same else
+                        f"; aliases off: {bad0[0] if bad0 else 'no copy'}")
+            return msg
+
+
+@case("a USER cond returning the table or zeros, read in its zero branches and by a cond on another index: the "
+      "aliases do not apply there (forward, grad == reference)")
+def _(b):
+    # _dce's guarded aliases see z == tab under (br in {0}); z's reads in branch 1 of a cond on br (the zeros) and in
+    # a cond on br2 must keep reading z.  A wrong alias gives sum(tab) for sum(z) there.
+    R, CC = 64, 65
+
+    def make(real):
+        def item(t, x, key, tab, th):
+            bits = kb(key, 0)
+            br = (bits % jnp.uint32(3)).astype(jnp.int32)
+            br2 = ((bits >> 8) % jnp.uint32(2)).astype(jnp.int32)
+            i = ((bits >> 16) % jnp.uint32(R)).astype(jnp.int32)
+            z = lax.switch(br, [lambda: tab, lambda: jnp.zeros_like(tab), lambda: jnp.zeros_like(tab)])
+            n = 2 + i % 3
+            w = x
+            if real:
+                w = lax.while_loop(lambda c: c[0] < n, lambda c: (c[0] + 1, c[1] * jnp.cos(z[i, c[0]] * th[0])),
+                                   (0, w))[1]
+            else:
+                w = lax.fori_loop(0, 5, lambda k, w: jnp.where(k < n, w * jnp.cos(z[i, k] * th[0]), w), w)
+            v = lax.switch(br, [lambda: w * z[i, 1], lambda: w + 1e-3 * jnp.sum(z) + 1.0, lambda: w * th[1]])
+            u = lax.cond(br2 == 1, lambda: v + 1e-4 * jnp.sum(z * z), lambda: v)
+            return t.add("Q", i % 8, u), u
+        return item
+    xs, keys = inputs(8)[:2]
+    tab = (1 + 0.5 * jnp.sin(jnp.arange(R * CC) * 0.37)).reshape(R, CC).astype(F)
+    th = jnp.array([0.9, 0.3], F)
+    out, AX = {"Q": tm.Sum((8,), F)}, (0, 0, None, None)
+    f = tm.vmap(make(True), outputs=out, in_axes=AX, backend=b)
+    r = reference(make(False), outputs=out, in_axes=AX)
+
+    def L(fn):
+        return lambda x, tab, th: jnp.sum(fn(x, keys, tab, th).outputs["Q"] * jnp.arange(1, 9)) + jnp.sum(
+            fn(x, keys, tab, th).per_item ** 2)
+    fv, rv = f(xs, keys, tab, th), r(xs, keys, tab, th)
+    g = jax.jit(jax.grad(L(f), argnums=(0, 1, 2)))(xs, tab, th)
+    gr = jax.jit(jax.grad(L(r), argnums=(0, 1, 2)))(xs, tab, th)
+    return close(dict(fwd=fv.per_item, x=g[0], tab=g[1], th=g[2]), dict(fwd=rv.per_item, x=gr[0], tab=gr[1], th=gr[2]),
+                 "vs reference")
 
 
 # ----------------------------------------------------------------------------------------- toy 4: ints, keys, closures

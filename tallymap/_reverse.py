@@ -49,7 +49,7 @@ from jax.interpreters import mlir as _mlir
 
 from ._api import ItemProgram, TSpec, _mk, _sds
 from ._diagnostics import record_reverse
-from ._jaxpr import bind, contains, is_dropvar, lit, subjaxprs, while_parts
+from ._jaxpr import bind, contains, is_dropvar, lit, scan_counts, scan_reshaped, subjaxprs, while_parts
 from ._rewrite import TallyError, _walk_eqn, check_tallies, isfloat, retrace
 from ._tally import emit_p
 
@@ -742,21 +742,42 @@ def checkpointed_while_single(cfn, bfn, cc, bc, init, kinds, opts=None, bflags=N
 
 def _dce(cj):
     """ClosedJaxpr -> the same with its dead code removed (all inputs and outputs kept), INCLUDING inside while
-    bodies and cond branches (no tested JAX has a dce rule for while).  T3: the fold's cond carries every tally, and
-    the transpose of a cond returns each tally input's pass-through cotangent as a cond OUTPUT, unused but
-    materialised per item by the cuda emitter (lumen SK: an (88768,) local array, "too large")."""
+    bodies and cond branches (no tested JAX has a dce rule for while), and with every use of a value that provably
+    EQUALS another one where it is read (an alias, below) reading that one instead.
+
+    Why the aliases: the backends hold every value of the item program per item (cuda: a per-thread local array, "too
+    large" from 2^14 elements; xla: items x the value).  Two kinds of per-item copies arise in a reverse program:
+      * the transpose of a cond (or of a jitted helper) passes each tally's cotangent through unchanged (emit is
+        additive): an output-sized cotangent (a Records output: the capacity) returned as an output, chained into
+        the next transposed cond (T3's fold too: lumen SK, an (88768,) local array);
+      * RESIDUALS of an item-invariant value: JAX's cond partial eval (0.6.2-0.11; 0.12 forwards them itself)
+        returns each branch's residuals as cond outputs, a zero where a branch has none.  A table that a
+        checkpointed loop keeps as its body const (a broadcast operand, never per item) in ONE branch of a
+        lax.switch becomes a per-item array of the table's size; through nested conds, scans and the single-loop
+        adjoint's sweep cond (lumen SBND: (257, 65), "too large").
+    The analysis (_alias) records GUARDED aliases v == X if every guard (index variable i, branches S) has i in S,
+    and replaces a read of v by X where the guards provably hold: inside branch b of a cond whose index is i (b in
+    S), with the guards carried into branches and calls through their operands (X added as an operand when the
+    branch does not have it) and across a scan pair (the residual stacked by the forward scan, read by the
+    transposed one).  Everything else keeps reading v; the dead copies then go.
+    INVARIANT: a read of v is replaced by X only at a program point where every guard of the alias (v == X if i in
+    S) is implied by the enclosing branch choices (or there is no guard), so each replaced read sees the value it
+    read before, whatever JAX put in v elsewhere.  It does not depend on how the program was produced.  Where JAX
+    forwards the residual itself (0.12) no guarded alias arises and the program is unchanged."""
     from jax._src.interpreters import partial_eval as pe
 
-    def closed(c):
+    def closed(c, seed=None, info=None):
         # consts -> leading invars (kept: instantiate=True), DCE, then the same leading invars back as constvars with
         # the same consts.  Only convert_constvars_jaxpr / dce_jaxpr / replace / ClosedJaxpr(jaxpr, consts), which
         # every tested JAX has (convert_invars_to_constvars is gone in 0.11).
         nc = len(c.consts)
-        jd = deep(pe.convert_constvars_jaxpr(c.jaxpr))
+        jd = deep(pe.convert_constvars_jaxpr(c.jaxpr), seed, info)
         return ClosedJaxpr(jd.replace(constvars=list(jd.invars[:nc]), invars=list(jd.invars[nc:])), list(c.consts))
 
-    def deep(jaxpr):
-        eqns, fw = [], {}                     # fw: forwarded outputs (var -> the operand it always equals)
+    def deep(jaxpr, seed=None, info=None):
+        eqns, fw, al, stk = [], {}, {}, {}    # fw: exact aliases (var -> var); al: guarded ones (var -> (X, guards))
+        for v, (x, g) in (seed or {}).items():
+            (al.__setitem__(v, (x, g)) if g else fw.__setitem__(v, x))
         sub = lambda v: v if isinstance(v, Literal) else fw.get(v, v)                    # noqa: E731
         for e in jaxpr.eqns:
             e = e.replace(invars=[sub(v) for v in e.invars])
@@ -765,41 +786,201 @@ def _dce(cj):
                 e = e.replace(params=dict(e.params, body_jaxpr=closed(e.params["body_jaxpr"]),
                                           cond_jaxpr=closed(e.params["cond_jaxpr"])))
             elif nm == "cond":
-                brs = tuple(closed(b) for b in e.params["branches"])
-                e = e.replace(params=dict(e.params, branches=brs))
-                _forward(e, [b.jaxpr for b in brs], e.invars[1:], fw)
+                e = branches(e, list(e.params["branches"]), e.invars[0], e.invars[1:], al, fw)
+            elif nm == "scan":
+                e = scan(e, stk)
             elif isinstance(e.params.get(_FWD_CALLS.get(nm)), ClosedJaxpr):
-                c = closed(e.params[_FWD_CALLS[nm]])
-                e = e.replace(params={**e.params, _FWD_CALLS[nm]: c})
-                _forward(e, [c.jaxpr], e.invars, fw)
+                e = branches(e, [e.params[_FWD_CALLS[nm]]], None, e.invars, al, fw)
             eqns.append(e)
         jaxpr = jaxpr.replace(eqns=eqns, outvars=[sub(v) for v in jaxpr.outvars])
+        if info is not None:
+            info["al"] = al
         return pe.dce_jaxpr(jaxpr, [True] * len(jaxpr.outvars), instantiate=True)[0]
+
+    def branches(e, brs, idx, ops, al, fw):
+        """a cond (idx: its index, brs: its branches) or a call (idx None, brs: [its jaxpr]) with operands ops:
+        carry the aliases of its operands into each sub-jaxpr, DCE it, then record its outputs' aliases (_alias)."""
+        pos = {}
+        for p, v in enumerate(ops):
+            if not isinstance(v, Literal):
+                pos.setdefault(v, p)
+        extra = []                            # alias targets the branches read but do not receive: new operands
+        if GUARDED and idx is not None:       # (a cond only: a call's parameters are sized by its operands)
+            for v in ops:
+                a = None if isinstance(v, Literal) else al.get(v)
+                if a is not None and a[0] not in pos and a[0] not in extra:
+                    extra.append(a[0])
+        new, infos, evs = [], [], []
+        for b, br in enumerate(brs):
+            inv = list(br.jaxpr.invars)
+            ev = [type(x)(x.aval) for x in extra]
+            seed = {}
+            for p, v in enumerate(ops):
+                a = None if isinstance(v, Literal) else al.get(v)
+                g = None if a is None else _enter(a[1], idx, b, pos, inv)
+                if g is not None and (a[0] in pos or a[0] in extra):
+                    x = a[0]
+                    seed[inv[p]] = (inv[pos[x]] if x in pos else ev[extra.index(x)], g)
+            info = {}
+            new.append(closed(br, seed, info))
+            infos.append(info)
+            evs.append(ev)
+        keep = [i for i in range(len(extra)) if any(_reads(n.jaxpr, ev[i]) for n, ev in zip(new, evs))]
+        if keep:
+            new = [ClosedJaxpr(_with_invars(n.jaxpr, list(n.jaxpr.invars) + [ev[i] for i in keep]), n.consts)
+                   for n, ev in zip(new, evs)]
+            ops = list(ops) + [extra[i] for i in keep]
+        if idx is None:
+            nm = _FWD_CALLS[e.primitive.name]
+            e = e.replace(invars=list(ops), params={**e.params, nm: new[0]})
+        else:
+            e = e.replace(invars=[idx] + list(ops), params=dict(e.params, branches=tuple(new)))
+        _alias(e, [n.jaxpr for n in new], [i.get("al", {}) for i in infos], idx, list(ops), al, fw)
+        return e
+
+    def scan(e, stk):
+        """a scan, DCE'd inside, with guarded aliases carried ACROSS a scan pair: the linearization of a scan stacks
+        a cond's residual (an alias of a scan CONST X, every iteration's same value) as a per-iteration output
+        ys[k], next to its guards' index variables, also stacked; the transposed scan slices them and reads the
+        slice of ys[k] (cuda: a local array of length x the table).  Producer: record in stk the outputs that stack
+        an alias of a const ('full': the body returns X itself, no guards).  Consumer: a scanned input in stk whose
+        guards' stacks are scanned inputs of the same scan seeds its slice as an alias of a new const X (guards:
+        the slices), and the scanned input goes when nothing reads it any more."""
+        p = e.params
+        body, (nc, nk) = p["jaxpr"], scan_counts(p)
+        ops, bin_ = list(e.invars), list(body.jaxpr.invars)
+        nx = len(ops) - nc - nk
+        xs = {v: a for a, v in enumerate(ops[nc + nk:]) if not isinstance(v, Literal)}
+        seed, moves = {}, []                  # moves: (scanned position a, X, its const variable in the body)
+        for a, v in enumerate(ops[nc + nk:]):
+            r = None if isinstance(v, Literal) else stk.get(v)
+            s = bin_[nc + nk + a]
+            if r is None or not GUARDED:
+                continue
+            x, g = r
+            if not g:
+                moves.append((a, x, s))       # every slice IS x: the slice variable becomes the const
+            elif all(w in xs for w, _ in g):
+                nv = type(s)(s.aval)
+                seed[s] = (nv, frozenset((bin_[nc + nk + xs[w]], S) for w, S in g))
+                moves.append((a, x, nv))
+        info = {}
+        body = closed(body, seed, info)
+        bj = body.jaxpr
+        if moves:
+            drop = {a for a, _, v in moves if v is bin_[nc + nk + a] or not _reads(bj, bin_[nc + nk + a])}
+            add = [(x, v) for a, x, v in moves if v is bin_[nc + nk + a] or _reads(bj, v)]
+            keep = [a for a in range(nx) if a not in drop]
+            bj = _with_invars(bj, [v for _, v in add] + list(bj.invars[:nc + nk])
+                              + [bj.invars[nc + nk + a] for a in keep])
+            body = ClosedJaxpr(bj, list(body.consts))
+            ops = [x for x, _ in add] + ops[:nc + nk] + [ops[nc + nk + a] for a in keep]
+            p = scan_reshaped(p, len(add), [a not in drop for a in range(nx)])
+            nc += len(add)
+        e = e.replace(invars=ops, params=dict(p, jaxpr=body))
+        cin = {v: i for i, v in enumerate(bj.invars[:nc])}
+        ys = {v: k for k, v in enumerate(bj.outvars[nk:]) if not isinstance(v, Literal)}
+        bal = info.get("al", {})
+        for v, o in zip(bj.outvars[nk:], e.outvars[nk:]):
+            if isinstance(v, Literal) or is_dropvar(o):
+                continue
+            if v in cin:
+                stk[o] = (ops[cin[v]], frozenset())
+            elif v in bal and bal[v][0] in cin and all(w in ys and not is_dropvar(e.outvars[nk + ys[w]])
+                                                       for w, _ in bal[v][1]):
+                stk[o] = (ops[cin[bal[v][0]]], frozenset((e.outvars[nk + ys[w]], S) for w, S in bal[v][1]))
+        return e
     return closed(cj)
 
+
+GUARDED = True       # _dce's guarded aliases (tests/reverse.py turns them off as a NEGATIVE CONTROL: exact ones only)
 
 # call-like equations whose sub-jaxpr maps its invars / outvars 1:1 onto the equation's (_dce forwards through them)
 _FWD_CALLS = {"pjit": "jaxpr", "jit": "jaxpr", "closed_call": "call_jaxpr"}
 
 
-def _forward(e, subs, ops, fw):
-    """_dce: an output of a cond (subs: its branches) or of a call (subs: its jaxpr) that is, in EVERY sub-jaxpr, the
-    sub-jaxpr's input i is the equation's operand ops[i]: record it in fw, so its uses read the operand and the output
-    goes dead.  The transpose of a cond (or of a jitted helper) passes each tally's cotangent through unchanged (emit is
-    additive): a whole output-sized cotangent (a Records output: the capacity) returned as an output and chained into
-    the next transposed cond, i.e. a per-item array of the output's size in the backends (xla: items x capacity; cuda:
-    a local array, "too large")."""
+def _enter(g, idx, b, pos, inv):
+    """the guards g of an operand's alias inside branch b of a cond with index idx (None: a call), or None when they
+    cannot hold there (a guard on idx without b) or cannot be expressed there (a guard variable it does not receive)"""
+    out = set()
+    for w, S in g:
+        if idx is not None and w is idx:
+            if b not in S:
+                return None
+        elif w in pos:
+            out.add((inv[pos[w]], S))
+        else:
+            return None
+    return frozenset(out)
+
+
+def _alias(e, subs, als, idx, ops, al, fw):
+    """record the aliases of the outputs of a cond (subs: its branches, idx: its index) or a call (subs: [its jaxpr],
+    idx None) with operands ops.  A sub-jaxpr's output k is X if it returns its input r (X = operand ops[r]), or an
+    alias (X, guards) of its own (als: X an input; each guard variable an input, or an index variable it also
+    RETURNS, so the guard moves onto that output: lumen's nested conds).  When the branches that give such an X
+    all give the SAME (X, guards), output k is an alias of X with those guards, plus (idx, those branches) when some
+    branch gives something else -- whatever it returns (JAX's cond partial eval fills a residual slot a branch does
+    not have with a zero, 0.11 with an uninitialised value): the guard excludes it.  No guard at all: exact (fw)."""
+    maps = [({v: r for r, v in enumerate(j.invars)},
+             {v: q for q, v in enumerate(j.outvars) if not isinstance(v, Literal)}) for j in subs]
     for k, o in enumerate(e.outvars):
         if is_dropvar(o):
             continue
-        idx = set()
-        for j in subs:
-            v = j.outvars[k]
-            idx.add(None if isinstance(v, Literal) else next((i for i, x in enumerate(j.invars) if x is v), None))
-        if len(idx) == 1 and None not in idx:
-            x = ops[idx.pop()]
-            if not isinstance(x, Literal) and x.aval == o.aval:
-                fw[o] = x
+        cand = {}
+        for b, j in enumerate(subs):
+            u = j.outvars[k]
+            inv, outs = maps[b]
+            r = None
+            if isinstance(u, Literal):
+                pass
+            elif u in inv:
+                r = (ops[inv[u]], frozenset())
+            elif GUARDED and u in als[b] and als[b][u][0] in inv:
+                x, g = als[b][u]
+                gg = set()
+                for w, S in g:
+                    if w in inv and not isinstance(ops[inv[w]], Literal):
+                        gg.add((ops[inv[w]], S))
+                    elif w in outs and not is_dropvar(e.outvars[outs[w]]):
+                        gg.add((e.outvars[outs[w]], S))
+                    else:
+                        gg = None
+                        break
+                r = None if gg is None else (ops[inv[x]], frozenset(gg))
+            if r is not None and not isinstance(r[0], Literal) and r[0].aval == o.aval:
+                cand.setdefault(r, []).append(b)
+        if len(cand) != 1:
+            continue
+        (x, g), live = cand.popitem()
+        if len(live) < len(subs):
+            if not GUARDED or idx is None:
+                continue
+            if isinstance(idx, Literal):              # a static branch: it returns x or not
+                if int(np.asarray(idx.val)) not in live:
+                    continue
+            else:
+                g = g | {(idx, frozenset(live))}
+        if g:
+            al[o] = (x, g)
+        else:
+            fw[o] = x
+
+
+def _reads(jaxpr, v):
+    """does the jaxpr read its variable v (an equation operand or an output)?"""
+    return any(v is u for u in jaxpr.outvars) or any(v is u for q in jaxpr.eqns for u in q.invars)
+
+
+def _with_invars(jaxpr, invars):
+    """jaxpr with new invars (the debug info's argument names follow them; a new one is unnamed)"""
+    d = jaxpr.debug_info
+    names = getattr(d, "arg_names", None)
+    if names is not None and len(names) == len(jaxpr.invars):
+        nm = dict(zip(jaxpr.invars, names))
+        d = d._replace(arg_names=tuple(nm.get(v, "") for v in invars))
+        return jaxpr.replace(invars=invars, debug_info=d)
+    return jaxpr.replace(invars=invars)
 
 
 # ------------------------------------------------------------------------------------------- table reads
