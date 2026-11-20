@@ -434,16 +434,69 @@ def _with_toks(ctx, tids, fn, n):
         saved = ctx["toks"]
         for t, v in zip(tids, c2[n:]):
             _set_tok(ctx, t, v)
+        inner = ctx["toks"]
         out = list(fn(c_, list(c2[:n])))
+        _check_toks(ctx, inner, tids)
         new = [ctx["toks"][t] for t in tids]
         ctx["toks"] = saved
         return out + new
     return g
 
 
-def _tids(ctx, tags):
-    """the threaded tokens a sub-computation needs: the table tokens of the tables it reads."""
-    return sorted({t for t in tags if t is not None}) if ctx.get("tread") else []
+def _tids(ctx, jaxprs, tags):
+    """the threaded tokens a sub-computation (sub-jaxprs `jaxprs`, invars tagged `tags`) needs: the tokens of the
+    tables it READS (a tread somewhere inside), not of every table among its operands.  A token threaded through a
+    loop / cond / scan that never reads it is a pass-through output: JAX forwards it out of the cond (lax.cond's
+    partial eval), leaving the cond's token operand unused, so its cotangent is a zero that the transpose adds to the
+    forwarded one -- an add_any reading a cotangent tally, refused by check_slots (lumen SK RAYLEIGH, 60 knots, as an
+    operand of a jitted helper inside a cond whose branches do not read it)."""
+    if not ctx.get("tread") or all(t is None for t in tags):
+        return []
+    memo = ctx.setdefault("reads", {})
+    return sorted(set().union(*(_reads(j, tags, memo) for j in jaxprs)))
+
+
+def _reads(jaxpr, tags, memo):
+    """the token indices of the tagged invars of `jaxpr` that the re-tracer (_interp with tread on) rewrites into a
+    tread somewhere inside: the same dispatch as _interp -- a select reading only the table; a while loop's BODY
+    consts (its predicate is not read-rewritten, _notread); a cond's operands in any branch; a scan's consts; a
+    call-like equation's operands (not custom_jvp / custom_vjp: those are dense uses).  Tags enter sub-jaxprs only by
+    position, so this is exact; _check_toks asserts it at trace time."""
+    key = (id(jaxpr), tuple(tags))
+    if key in memo:
+        return memo[key][1]
+    tg = {v: t for v, t in zip(jaxpr.invars, tags) if t is not None}
+    out = set()
+    for eqn in jaxpr.eqns if tg else ():
+        it = [None if isinstance(v, Literal) else tg.get(v) for v in eqn.invars]
+        if all(t is None for t in it):
+            continue
+        name = eqn.primitive.name
+        if name in SELECT:
+            if it[0] is not None and all(t is None for t in it[1:]):
+                out.add(it[0])
+        elif name == "while":
+            w = while_parts(eqn)
+            out |= _reads(w.body.jaxpr, it[w.nc:w.nc + w.nb] + [None] * (len(it) - w.nc - w.nb), memo)
+        elif name == "cond":
+            for b in cond_branches(eqn):
+                out |= _reads(b.jaxpr, it[1:], memo)
+        elif name == "scan":
+            nc = scan_parts(eqn).nconsts
+            out |= _reads(scan_parts(eqn).body.jaxpr, it[:nc] + [None] * (len(it) - nc), memo)
+        elif name not in _CUSTOM and call_jaxpr(eqn) is not None:
+            out |= _reads(call_jaxpr(eqn).jaxpr, it, memo)
+    memo[key] = (jaxpr, out)          # (the jaxpr is kept alive so its id is not reused within this trace)
+    return out
+
+
+def _check_toks(ctx, saved, tids):
+    """after tracing a sub-computation: no token outside `tids` was advanced (a tread _reads did not predict would
+    leak the outer trace's token into the sub-trace)."""
+    bad = [t for t, (a, b) in enumerate(zip(saved, ctx["toks"])) if t not in tids and a is not b]
+    if bad:
+        raise AssertionError(f"tallymap internal error: table token(s) {bad} read in a sub-computation that was not "
+                             f"predicted to read them (_rewrite._reads)")
 
 
 def _while(eqn, ins, fin, ctx, cap, rev, top, itags=None):
@@ -476,12 +529,20 @@ def _while(eqn, ins, fin, ctx, cap, rev, top, itags=None):
         return lax.while_loop(lambda c: cfn(cc, c), lambda c: bfn(bc, c), list(init)), tflags
     loop = rev.loop(top)              # checkpointed_while, or (T3: the fold_post item's top-level loop) the single one
     cfn = _notread(ctx, cfn)
-    tids = _tids(ctx, btags)
+    tids = _tids(ctx, [w.body.jaxpr], btags + [None] * len(init))
     bfl = list(fin[nc:nc + nb])
     live = _live_carries(w, nc, nb, len(init))
     big = rev.big(w.body.jaxpr)
     if not tids:
-        return loop(cfn, bfn, list(cc), list(bc), list(init), tflags, rev, bfl, live=live, big=big), tflags
+        if ctx.get("tread"):
+            bfn0 = bfn
+
+            def bfn(bc_, c):
+                inner = ctx["toks"]
+                out = bfn0(bc_, c)
+                _check_toks(ctx, inner, ())
+                return out
+        return loop(cfn, bfn,list(cc), list(bc), list(init), tflags, rev, bfl, live=live, big=big), tflags
     n = len(init)
     out = loop(lambda cc_, c2: cfn(cc_, c2[:n]), _with_toks(ctx, tids, bfn, n), list(cc), list(bc),
                list(init) + [ctx["toks"][t] for t in tids], list(tflags) + ["w"] * len(tids),
@@ -515,7 +576,7 @@ def _cond(eqn, ins, fin, ctx, cap, rev, top, itags=None):
     otags = (itags or [None] * len(ins))[1:]
     track = cap is not None
     fns = [_sub_fn(b, fin[1:], ctx, cap, rev, top, track_trunc=track, tags=otags) for b in brs]
-    tids = _tids(ctx, otags)
+    tids = _tids(ctx, [b.jaxpr for b in brs], otags)
     nops = len(ops)
 
     def wrap(f):
@@ -523,7 +584,9 @@ def _cond(eqn, ins, fin, ctx, cap, rev, top, itags=None):
             saved = ctx["toks"]
             for t, v in zip(tids, o2[nops:]):
                 _set_tok(ctx, t, v)
+            inner = ctx["toks"]
             r = f(*o2[:nops])
+            _check_toks(ctx, inner, tids)
             outs, tr = r if track else (r, jnp.bool_(False))
             new = tuple(ctx["toks"][t] for t in tids)
             ctx["toks"] = saved
@@ -544,14 +607,16 @@ def _scan(eqn, ins, fin, ctx, cap, rev, itags=None):
     itags = itags or [None] * len(ins)
     ctx["dense"].update(t for t in itags[nc:] if t is not None)  # a table as a scan carry / scanned input: dense
     body = _sub_fn(sc.body, fin, ctx, cap, rev, False, tags=itags[:nc] + [None] * (len(ins) - nc))
-    tids = _tids(ctx, itags[:nc])
+    tids = _tids(ctx, [sc.body.jaxpr], itags[:nc] + [None] * (len(ins) - nc))
 
     def f(carry, x):
         c, tk = carry
         saved = ctx["toks"]
         for t, v in zip(tids, tk):
             _set_tok(ctx, t, v)
+        inner = ctx["toks"]
         o = body(*consts, *c, *x)
+        _check_toks(ctx, inner, tids)
         new = [ctx["toks"][t] for t in tids]
         ctx["toks"] = saved
         return (list(o[:nk]), new), list(o[nk:])
