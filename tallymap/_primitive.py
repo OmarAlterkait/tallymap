@@ -101,11 +101,10 @@ class Node:
             p = self.prog
             k = (digest(p.cj.jaxpr), tuple(id(c) for c in p.cj.consts),
                  tuple(id(c) for c in host_callbacks(p.cj.jaxpr)),
-                 tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.fixed_point, s.scale, s.kind, s.exact,
-                        s.x64_fallback)
+                 tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.fixed_point, s.scale, s.kind, s.exact)
                        for s in p.tallies),
                  p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), p.nact, p.rec, p.app,
-                 self.backend, self.opts)
+                 self.backend, self.opts, bool(jax.config.jax_enable_x64))
             object.__setattr__(self, "_key", k)
         return k
 
@@ -267,7 +266,7 @@ def _global_slots(t, stats, axes):
     """a tally indexed by this device's queue slots (TSpec.slots) -> indexed by the call's slots (the devices'
     children packed in device order, as _global_ring packs the ring)"""
     cnt = lax.all_gather(stats[ST["spawned"]], axes)
-    off = jnp.cumsum(cnt) - cnt
+    off = jnp.cumsum(cnt, dtype=jnp.int32) - cnt
     Q = t.shape[-1]
     dest = jnp.where(jnp.arange(Q)[None] < cnt[:, None], off[:, None] + jnp.arange(Q)[None], Q).reshape(-1)
     return jnp.zeros_like(t).at[..., dest].set(lax.all_gather(t, axes, axis=t.ndim - 1, tiled=True), mode="drop")
@@ -278,7 +277,7 @@ def _global_ring(p, ring, stats, axes, n):
     parents renumbered (a child slot -> its global slot, a root -> -1 - its global index; n roots per device)"""
     d = lax.axis_index(axes)
     cnt = lax.all_gather(stats[ST["spawned"]], axes)
-    off = jnp.cumsum(cnt) - cnt
+    off = jnp.cumsum(cnt, dtype=jnp.int32) - cnt
     par = ring[p.rec + 1]
     ring = list(ring)
     ring[p.rec + 1] = jnp.where(par >= 0, off[d] + par, par - d * n).astype(par.dtype)

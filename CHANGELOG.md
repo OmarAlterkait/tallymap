@@ -31,13 +31,29 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Fixed
 
+- xla backend without `jax_enable_x64`: an exact `Sum` (`Sum(fixed_point=True)` of float32) and its tangents no
+  longer raise: they keep the same integer in 19 int32 words of 16-bit digits (80 B per bin with a per-bin count),
+  bitwise the x64 result and the kernel backend's (overflow and NaN poisoning identical). Cost against x64 (2080
+  Ti): forward 1.9-2.7x, jvp 2.2-2.9x, grad 1.1-1.25x, compiled temporaries 1.25-1.4x.
+  `fixed_point=True` of float16, bfloat16 and (u)int8/16/32 with a power-of-two `scale` works there too (8 int32
+  words; the float64 readout reproduced exactly); another scale or dtype still raises without x64. tests/edge.py "exact Sum without x64", "fixed_point=True float16 / bfloat16 /
+  integer outputs without x64".
+- With `jax_enable_x64`, `spawn` with `Records` (count-then-fill) raised "while_loop carry types differ": the tree
+  order's loop summed an int32 mask with `jnp.sum`, which widens to int64 under x64. `stats['n_truncated']` was
+  int64 under x64 for the same reason; it is int32 always. tests/records.py "spawn + Records ... x64 toggled".
+- Kernel backend: `lax.max` / `lax.min` with a signed-zero tie returned the first operand; XLA (every platform, f32
+  and f64) returns +0 for max(-0, +0) and -0 for min(+0, -0), as the kernel does now (seen as tests/edge.py "float
+  facts min / max" failing under x64). tests/edge.py "signed-zero ties and NaN of lax.max / lax.min".
+- xla backend with `jax_enable_x64` on a CPU: an exact `Sum` whose total is subnormal read 0 (XLA:CPU flushes the
+  float64 -> float32 conversion); its bits are now taken from the integer, as without x64.
+- tests/invariants.py [tdep] CG under x64: the tolerance (1e-10) was below plain JAX's own jacfwd vs stacked-jvp
+  difference for this CG (1.1e-7 in f64); now 1e-6.
 - xla backend without `jax_enable_x64`: reverse-mode cotangents of f32 broadcast operands (a parameter's or a
   table's gradient) were added in f32 by a scatter-add, which is an atomic on a GPU, so `grad`, `jacrev` and
   `hessian` changed in their last bits from run to run (seen as the Records cell "one pass == count-then-fill
-  BITWISE" failing at random on GPU). They are now the exact sum there too, kept as 8-bit digits in 37 int32 words
-  and rounded like the int64 format: bitwise the same in any order, run to run, with or without x64 and on both
-  backends. An exact `Sum` itself still needs x64 on the xla backend. `docs/float_semantics.md` item 4;
-  tests/edge.py "exact f32 reverse cotangents", tests/records.py "derivatives BITWISE run to run".
+  BITWISE" failing at random on GPU). They are now the exact sum there too, kept in int32 words and rounded like
+  the int64 format: bitwise the same in any order, run to run, with or without x64 and on both backends.
+  `docs/float_semantics.md` item 4; tests/edge.py "exact f32 reverse cotangents", tests/records.py "derivatives BITWISE run to run".
 
 - Subnormal f32 values were flushed to zero by `Sum` (fixed_point=False) and therefore by `Records` float fields,
   contradicting "a float field stores each value exactly": lumen's record readout lost every deposit whose q

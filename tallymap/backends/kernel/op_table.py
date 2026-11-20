@@ -142,26 +142,13 @@ def b_rem(em, a, ts, t, p, vals):
 
 
 def _fminmax(op, a, t, vals):
-    """lax.max / min of floats: NaN-propagating sj_fmax / sj_fmin; where both operands are proven non-NaN (float
-    facts) the comparison alone (sj_fmaxn: no NaN test); and for f32 where also the signed-zero tie cannot occur
-    (FMNMX gives +0 for max(-0, +0) and -0 for min(+0, -0); lax gives its first operand), one FMNMX.  Same values."""
+    """lax.max / min of floats: NaN-propagating sj_fmax / sj_fmin (a signed-zero tie gives +0 / -0, as XLA); where
+    both operands are proven non-NaN (float facts) sj_fmaxn / sj_fminn: no NaN test (f32 on the device one FMNMX,
+    which breaks the zero tie the same way).  Same values."""
     if len(vals) == 2 and all(getattr(v, "dtype", None) is not None for v in vals):
-        fa, fb = vff(vals[0]), vff(vals[1])
-        if fa[0] and fb[0]:
-            za, zb = _zeros(vals[0]), _zeros(vals[1])
-            tie = ("-" in za and "+" in zb) if op == "max" else ("+" in za and "-" in zb)
-            if t == "float" and not tie:
-                return f"sj_f{op}z({a[0]}, {a[1]})"
+        if vff(vals[0])[0] and vff(vals[1])[0]:
             return f"sj_f{op}n({a[0]}, {a[1]})"
     return f"sj_f{op}({a[0]}, {a[1]})"
-
-
-def _zeros(v):
-    """the signed zeros the float value v may be: a literal's own, else both."""
-    if v.cval is None:
-        return "+-"
-    x = float(v.cval)
-    return "" if x != 0.0 else ("-" if np.signbit(x) else "+")
 
 
 def b_max(em, a, ts, t, p, vals):

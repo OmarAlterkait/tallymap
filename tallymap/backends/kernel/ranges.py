@@ -378,7 +378,7 @@ def scan_ranges(eqn, rs, carries=False):
 
 # ----------------------------------------------------------------------------- float facts
 # (nonnan, finite): every element is not NaN / is finite.  A min / max of two non-NaN operands needs no NaN test
-# (op_table.b_max / b_min), and is one FMNMX when the signed-zero tie it breaks differently cannot occur.  Facts flow
+# (op_table.b_max / b_min; f32 on the device one FMNMX).  Facts flow
 # from literals, integer -> float conversions, selects, sign / rounding / abs / neg, min / max, the bounded
 # functions, the NaN guards jnp.where(x != x, c, x) / jnp.where(isfinite(x), x, c), and finite + finite (never NaN,
 # though it may overflow).  Loop carries carry none (unknown).

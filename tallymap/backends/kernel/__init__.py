@@ -53,8 +53,7 @@ def _const_sig(c):
 def _key(p, opts):
     # the structural part is _jaxpr.digest (was str(p.cj.jaxpr): JAX's pretty-printer, 95 s per build on DTRAX)
     return (digest(p.cj.jaxpr), tuple(_const_sig(c) for c in p.cj.consts),
-            tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.fixed_point, s.scale, s.kind, s.exact,
-                   s.x64_fallback)
+            tuple((s.S, str(np.dtype(s.dtype)), tuple(s.lead), s.fixed_point, s.scale, s.kind, s.exact)
                   for s in p.tallies),
             p.nP, p.nB, p.trunc, None if p.spawn is None else int(p.spawn.capacity), p.nact, p.rec,
             tuple(sorted(opts.items())),

@@ -252,12 +252,13 @@ reverse mode accumulate in different orders, so their derivatives agree only to 
 can be 1e-4 relative on a large tree and varies from run to run on a GPU. With `fixed_point=True` a float32 sum is
 EXACT: each bin is the correctly rounded f32 of the exact sum of every finite value emitted into it, with no scale,
 floor or cap, bitwise the same in any order, on both backends, in every AD mode (its tangents are exact too: a
-tangent far below its primal is not rounded away). It costs 44 bytes of device memory per bin (the xla backend
-needs `jax_enable_x64`; it raises without it). A non-finite emit makes its bin NaN and is counted in
+tangent far below its primal is not rounded away). It costs 44 bytes of device memory per bin on the kernel
+backend; the xla backend keeps it in int64 words with `jax_enable_x64` and in int32 words without (the same bits). A non-finite emit makes its bin NaN and is counted in
 `stats['fixed_point_overflow']`. A bin is exact or NaN, never silently wrong (docs/float_semantics.md, item 4). For
 other dtypes `fixed_point=True` is int64 fixed point (each value
 rounded to a multiple of `1/scale`): bitwise order-independent, identical across backends and schedules (the xla
-backend needs `jax_enable_x64` for it). Unrepresentable values
+backend keeps it in int32 words without `jax_enable_x64` for a power-of-two `scale` and a float16, bfloat16 or
+<= 32-bit integer dtype, and raises for other scales there). Unrepresentable values
 are dropped and counted in `stats['fixed_point_overflow']`, and the bin they were emitted to is NaN. A bin's total
 is not limited to int64: each bin carries a signed high word, so it is exact beyond `2^63 / scale` (a total that does
 not fit the output dtype is counted there too, and NaN in a float bin). Each kernel

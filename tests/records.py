@@ -747,6 +747,38 @@ def _(b):
         raise Fail(f"gradient of a mismatched spawning call {g}")
 
 
+@case("spawn + Records (count-then-fill) and one-pass Records with jax_enable_x64 toggled on in-process: the same "
+      "records, sums, stats and gradient bit for bit as with it off (the tree order's while carry stays int32)")
+def _(b):
+    f32 = {"root": jnp.int32, "gen": jnp.int32, "code": jnp.int32, "j": jnp.int32, "val": jnp.float32}
+    roots = [np.asarray(r).astype(np.int32 if i < 3 else np.float32) for i, r in enumerate(ROOTS)]
+    th = np.float32(0.9)
+
+    def run():
+        sv = tm.vmap(sitem, outputs={"S": tm.Sum((4,), jnp.float32, fixed_point=True),
+                                     "rec": tm.Records(f32, capacity=SCAP)},
+                     in_axes=(0, 0, 0, 0, None), spawn=tm.Queue(QCAP), backend=b)
+        one = tm.vmap(lambda t, x: t.append("r", {"x": x, "k": jnp.int32(1)}, when=x > 1.0), backend=b,
+                      outputs={"r": tm.Records({"x": jnp.float32, "k": jnp.int32}, capacity=64)})
+        r = sv(*roots, th)
+        g = jax.grad(lambda th: jnp.sum(sv(*roots, th).outputs["rec"]["val"]))(th)
+        o = one(roots[3])
+        return (r.outputs, r.stats["appended"], r.stats["spawned"], r.stats["n_truncated"], g, o.outputs,
+                o.stats["appended"])
+    x0 = jax.config.jax_enable_x64
+    res = []
+    try:
+        for on in (False, True):
+            jax.config.update("jax_enable_x64", on)
+            res.append([np.asarray(v) for v in jax.tree_util.tree_leaves(run())])
+    finally:
+        jax.config.update("jax_enable_x64", x0)
+    for k, (a, c) in enumerate(zip(*res)):
+        if a.dtype != c.dtype or a.tobytes() != c.tobytes():
+            raise Fail(f"leaf {k}: x64 off {a.dtype} {a.ravel()[:6]} != on {c.dtype} {c.ravel()[:6]}")
+    return f"{len(res[0])} leaves bitwise (records, sums, stats, grad; spawn and one pass)"
+
+
 @case("big tally: grad of an emit inside lax.cond in a loop, and of Records, with 2^17 bins / slots")
 def _(b):
     S = 1 << 17

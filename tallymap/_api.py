@@ -62,12 +62,13 @@ class Sum:
     float32's maximum) and a total beyond float32's range each make it NaN, counted in
     stats['fixed_point_overflow'].  Its jvp / jacfwd tangents, and reverse-mode cotangents of float32 broadcast
     operands, are exact too.  Device memory on the kernel backend: 44 B per bin (a 40 B accumulator + the output).
-    The xla backend keeps an exact sum in int64 words, so it needs jax_enable_x64: an exact Sum (or its tangent)
-    raises without it.  Reverse-mode cotangents of float32 broadcast operands, which tallymap makes itself, are exact
-    there without x64 too (int32 words of 8-bit digits, the same bits).  docs/float_semantics.md item 4.
+    The xla backend keeps an exact sum in int64 words with jax_enable_x64 and in int32 words of 16-bit digits without
+    it: the same integer and the same bits either way (and the kernel backend's).  docs/float_semantics.md item 4.
 
     fixed_point=True with another dtype accumulates round(v * scale) in int64 fixed point: bitwise
-    order-independent, each value rounded to a multiple of 1/scale (needs jax_enable_x64 on the xla backend).
+    order-independent, each value rounded to a multiple of 1/scale.  Without jax_enable_x64 the xla backend keeps the
+    same integers in int32 words (bitwise the x64 result) for a power-of-two scale in [2^-600, 2^600] and a float16,
+    bfloat16 or <= 32-bit integer dtype; another scale or dtype raises there (enable x64, or the kernel backend).
     |v * scale| >= 9.2e18 cannot be represented: such an emit is dropped, counted in
     Result.stats['fixed_point_overflow'], and the BIN it was emitted to becomes NaN (every kernel flags its own bins: a
     primal bin by the primal's emits, a jvp / jacfwd tangent bin by that tangent's emits, on every path).  A BIN's sum
@@ -205,10 +206,8 @@ class TSpec:
                            # units of 2^-149), rounded once to f32 at readout; no scale, no floor, no cap.  A user's
                            # Sum(fixed_point=True) of dtype float32, its jvp / jacfwd tangents, and the reverse
                            # program's cotangent tallies (vjp_prog).  The kernel backend keeps DENSE_WORDS int64 words
-                           # per bin, the xla backend EXACT_WORDS int64 words (needs jax_enable_x64; a cotangent
-                           # tally keeps EXACT_WORDS32 int32 words without it: xla._xfmt)
-    x64_fallback: bool = False   # an exact tally the xla backend keeps in int32 words without jax_enable_x64 (the
-                                 # reverse cotangents); any other exact tally raises there
+                           # per bin, the xla backend EXACT_WORDS int64 words with jax_enable_x64, EXACT_WORDS32 int32
+                           # words without it (xla._xfmt)
     slots: bool = False    # indexed by the recording primal's queue slot (ItemProgram.rec): under a sharded jit it is
                            # renumbered across devices like the queue ring (_primitive._global_ring), not summed
 
@@ -679,7 +678,7 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
             ys = ys[:-1]
         else:
             trunc = jnp.zeros((N,), bool)
-        stats["n_truncated"] = jnp.sum(trunc.astype(jnp.int32))
+        stats["n_truncated"] = jnp.sum(trunc, dtype=jnp.int32)
         # (a truncated call: the derived kernels poison their own tangents / cotangents, so the primal's poison
         # has an identity tangent; the tree adjoint (spawn) keeps the poison that differentiates)
         res_out = (_poison if spawn is not None else _poison_primal)(res_out, _limits(stats, st, spawn, max_steps))
@@ -719,7 +718,7 @@ def _records_one(build, call, sspecs, shapes, names, rnames, rspec, pi, bc, max_
     ys = ys[:len(ys) - R]
     tv = {s.name: v for s, v in zip([fspecs[k] for k in prog.out_tallies], tvals)}
     stats = {n: st[ST[n]] for n in ("fixed_point_overflow", "dropped_emits")}
-    stats["n_truncated"] = jnp.sum(trunc.astype(jnp.int32))
+    stats["n_truncated"] = jnp.sum(trunc, dtype=jnp.int32)
     totals = {r: jnp.sum(c, dtype=jnp.int32) for r, c in zip(rnames, counts)}
     stats["appended"] = totals
     stats["records_dropped"] = {r: jnp.maximum(totals[r] - caps[r], 0) for r in rnames}
@@ -780,7 +779,7 @@ def _tree_order(N, Q, par, ordn, gen, spawned):
         i1 = jnp.argsort(jnp.where(m, ordn, 0), stable=True)
         i2 = i1[jnp.argsort(pc[i1], stable=True)]
         rank = jnp.zeros((Q,), jnp.int32).at[i2].set(slot)
-        n = jnp.sum(m.astype(jnp.int32))
+        n = jnp.sum(m, dtype=jnp.int32)                 # (int32 under x64 too: jnp.sum widens int32 to int64)
         return g + 1, base + n, jnp.where(m, base + rank, cs), n
     c = lax.while_loop(lambda c: c[3] > 0, body,
                        (jnp.int32(1), jnp.int32(N), jnp.full((Q,), -1, jnp.int32), jnp.int32(1)))
@@ -851,7 +850,7 @@ def _records(build, call, sspecs, shapes, names, rnames, rspec, pi, bc, max_step
     stats = {n: st[ST[n]] for n in ("fixed_point_overflow", "dropped_emits")}
     if spawn is not None:
         stats.update((n, st[ST[n]]) for n in ("spawned", "children_dropped", "children_truncated"))
-    stats["n_truncated"] = jnp.sum(trunc.astype(jnp.int32))
+    stats["n_truncated"] = jnp.sum(trunc, dtype=jnp.int32)
     stats["appended"] = totals
     stats["records_dropped"] = {r: jnp.maximum(totals[r] - caps[r], 0) for r in rnames}
     stats["records_mismatch"] = {r: tv[MISMATCH][j] for j, r in enumerate(rnames)}

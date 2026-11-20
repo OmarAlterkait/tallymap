@@ -959,8 +959,7 @@ def vjp_prog(p, pert_pi, pert_bc, opts=None):
           # a broadcast operand's cotangent sums one contribution per item (or per table read) into one bin: exact
           # (TSpec.exact), since float32 atomics drop each add's part below the bin's ulp, one-signed, in a different
           # order each run (lumen WCTE BSSkin, 524288 photons: -1.1e-3 against jvp)
-          + tuple(TSpec(f"ct{i}", size(i), bav[i].dtype, exact=np.dtype(bav[i].dtype) == np.float32,
-                        x64_fallback=True) for i in ib)
+          + tuple(TSpec(f"ct{i}", size(i), bav[i].dtype, exact=np.dtype(bav[i].dtype) == np.float32) for i in ib)
           + tuple(TSpec(f"tok{i}", size(i), bav[i].dtype, kind="discard") for i in big))
     check_slots(cj, tl, p.tag + "+vjp")             # the cotangent tallies are threaded linearly (or raise)
     return ItemProgram(cj, tl, nP + len(yf), nB + len(tf), len(ip) if p.trunc is not None else None, None,

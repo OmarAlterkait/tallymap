@@ -421,13 +421,11 @@ def _(b):
     close(jax.vmap(lambda s: f1(xs * s, idx).outputs["Q"])(ss),
           jax.vmap(lambda s: r1(xs * s, idx).outputs["Q"])(ss), what="vmap")
     msg = f"{want} of {2 * N} emits dropped"
-    if b == "auto" or jax.config.jax_enable_x64:                   # fixed_point=True needs x64 on the xla backend
-        E = tm.vmap(mk(1), outputs={"Q": tm.Sum((NB,), F, fixed_point=True, scale=2.0 ** 20)}, backend=b)(xs, idx)
-        if int(E.stats["dropped_emits"]) != want or int(E.stats["fixed_point_overflow"]) != 0:
-            raise Fail(f"fixed-point tally: dropped_emits {int(E.stats['dropped_emits'])} (want {want}), overflow "
-                       f"{int(E.stats['fixed_point_overflow'])}")
-        msg += "; fixed-point tally too"
-    return msg
+    E = tm.vmap(mk(1), outputs={"Q": tm.Sum((NB,), F, fixed_point=True, scale=2.0 ** 20)}, backend=b)(xs, idx)
+    if int(E.stats["dropped_emits"]) != want or int(E.stats["fixed_point_overflow"]) != 0:
+        raise Fail(f"fixed-point tally: dropped_emits {int(E.stats['dropped_emits'])} (want {want}), overflow "
+                   f"{int(E.stats['fixed_point_overflow'])}")
+    return msg + "; fixed-point tally too"
 
 
 @case("dual lanes: the lane guard decides T on the unbatched program; a refused T-lane program is never built",
@@ -792,10 +790,6 @@ def _f32_bins(b, x2, k2):
 @case("fixed_point=True: order-independent, run-to-run bitwise; overflow counted, poisons its own bin "
       "(primal and tangent)")
 def _(b):
-    if b == "xla" and not jax.config.jax_enable_x64:
-        raises(NotImplementedError, lambda: tm.vmap(walk, outputs={"Q": tm.Sum((NB,), F, fixed_point=True)}, in_axes=AX,
-                                                      backend=b)(xs, keys, tab, TH), "x64")
-        return "needs x64 on xla (raises clearly)"
     out = {"Q": tm.Sum((NB,), F, fixed_point=True, scale=2.0 ** 20)}
     n = 4096
     x2 = jnp.linspace(0.1, 3.0, n).astype(F)
@@ -830,8 +824,6 @@ def _(b):
 
 @case("fixed_point: cuda == xla bitwise; jvp == jacfwd column bitwise", ["auto"])
 def _(b):
-    if not jax.config.jax_enable_x64:
-        return "skipped (needs x64 for the xla side)"
     out = {"Q": tm.Sum((NB,), F, fixed_point=True, scale=2.0 ** 24)}
     fc = tm.vmap(walk, outputs=out, in_axes=AX, backend="auto")
     fx = tm.vmap(walk, outputs=out, in_axes=AX, backend="xla")
@@ -843,6 +835,8 @@ def _(b):
         raise Fail(f"fixed-point cuda != xla in {int((a != c).sum())}/{NB} bins")
     if not np.array_equal(np.asarray(jv), np.asarray(J[:, NB])):
         raise Fail("fixed-point: jvp != jacfwd column bitwise")
+    if not jax.config.jax_enable_x64:
+        return f"cuda==xla bitwise {NB}/{NB} bins; jvp==jacfwd column bitwise"
     # int64 tallies (u64 atomics): per-item values above 2^32 exercise the high word
     big = (jnp.arange(N, dtype=jnp.int64) + 1) * (1 << 33)
     q = tm.vmap(lambda t, v: t.add("I", (v >> 33) % NB, v), outputs={"I": tm.Sum((NB,), jnp.int64)},
@@ -867,8 +861,6 @@ def _exact_bins(qs, idx, nbins, scale, dt):
 @case("fixed_point: the carry word -- a bin past 2^31 at scale 2^32 is exact (primal, jvp, linearize; privatised "
       "and global bins), deterministic; non-carrying bins as before; a total beyond the output type is counted")
 def _(b):
-    if b == "xla" and not jax.config.jax_enable_x64:
-        return "skipped (fixed_point needs x64 on xla)"
     n, sc, GB = 4096, 2.0 ** 32, 1024           # GB bins: over PRIV_BYTES, so G is a global (not privatised) tally
     rng = np.random.default_rng(7)
     mag = rng.uniform(1e6, 2e8, n)
@@ -1871,13 +1863,9 @@ def _(b):
 
 
 @case("fixed_point=True float32 is exact: 65536 x 1e-11 into one bin -- primal, a jvp tangent beside an O(1) primal "
-      "(Q32 rounded both to 0), a reverse cotangent; the xla backend without x64 raises")
+      "(Q32 rounded both to 0), a reverse cotangent")
 def _(b):
     out = {"s": tm.Sum((1,), jnp.float32, fixed_point=True)}
-    if b == "xla" and not jax.config.jax_enable_x64:
-        raises(NotImplementedError, lambda: tm.vmap(lambda t, x: t.add("s", 0, x), outputs=out, backend=b)(
-            jnp.ones(4, jnp.float32)), "x64")
-        return "needs x64 on xla (raises: never a silent float sum)"
     n = 65536
     xs = jnp.full((n,), 1e-11, jnp.float32)
     want = _f32_round(sum(_units(xs)))
@@ -1897,8 +1885,6 @@ def _(b):
       "crossing zero, cancellation to 0 and to a subnormal; bitwise the host reference in any item order, run to run, "
       "for the primal and the jvp tangent, privatised and global bins")
 def _(b):
-    if b == "xla" and not jax.config.jax_enable_x64:
-        return "skipped (needs x64 on xla; the raise is checked above)"
     rng = np.random.default_rng(11)
     GB = 1024                                  # over PRIV_BYTES: a global tally; Q (NB bins) is privatised
     # pairs +v / -v of the same bin (they cancel exactly, in a random order: the running total crosses zero, borrows
@@ -1949,7 +1935,7 @@ def _(b):
     chk("jvp tangent", t)
     if b == "xla":                             # the carry normalisation (xla._xnorm), run many times in the call
         from tallymap.backends import xla as X
-        with patched(X, XNORM=64):
+        with patched(X, XNORM=64, XNORM32=64):
             chk("primal, normalised every 64 pieces", tm.vmap(
                 lambda t, x, i, j, s: t.add("Q", i, x * s).add("G", j, x * s), outputs=out, in_axes=(0, 0, 0, None),
                 backend=b, xla_batch_size=4096)(x, i, j, one).outputs)
@@ -2002,6 +1988,184 @@ def _(b):
             raise Fail(f"{nm}: table bins {d.tolist()[:8]} got {gt[d[:8]].tolist()} want {want[d[:8]].tolist()}; "
                        f"param {gp.tolist()} want {want2.tolist()}")
     return f"{len(vals)} contributions: {TB} table + 2 parameter cotangents bitwise the reference in {len(runs)} runs"
+
+
+def _x64_both(fn):
+    """fn() with jax_enable_x64 off, then on -> (its leaves as numpy, off; on); the setting is restored."""
+    x0 = jax.config.jax_enable_x64
+    out = []
+    try:
+        for on in (False, True):
+            jax.config.update("jax_enable_x64", on)
+            out.append([np.asarray(v) for v in jax.tree_util.tree_leaves(fn())])
+    finally:
+        jax.config.update("jax_enable_x64", x0)
+    return out
+
+
+def _same_bits(a, b_):
+    """the same values bit for bit (NaN: NaN in both, any payload)."""
+    a, b_ = np.asarray(a), np.asarray(b_)
+    if a.shape != b_.shape or a.dtype != b_.dtype:
+        return False
+    if np.issubdtype(a.dtype, np.floating) or a.dtype == jnp.bfloat16:
+        na, nb = np.isnan(a.astype(np.float32)), np.isnan(b_.astype(np.float32))
+        u = {2: np.uint16, 4: np.uint32, 8: np.uint64}[a.dtype.itemsize]
+        return bool(np.array_equal(na, nb) and np.array_equal(a[~na].view(u), b_[~nb].view(u)))
+    return bool(np.array_equal(a, b_))
+
+
+@case("exact Sum without x64 on the xla backend: bitwise the x64 result, the kernel backend's and the host reference "
+      "-- primal, jvp tangent, grad and a Records field; carries, cancellation, subnormals, a non-finite emit and a "
+      "total past FLT_MAX (NaN, counted the same)", ["xla"])
+def _(b):
+    rng = np.random.default_rng(21)
+    m = 1 << 12
+    e = rng.choice(np.r_[np.arange(0, 30), np.arange(100, 140), np.arange(200, 255)], m)
+    bits_ = (e.astype(np.uint32) << 23) | rng.integers(0, 1 << 23, m).astype(np.uint32)
+    pv = (bits_ | (rng.integers(0, 2, m).astype(np.uint32) << 31)).view(np.float32)
+    pb = rng.integers(0, NB - 3, m)
+    rv = (rng.uniform(0.5, 1.0, m) * 2.0 ** rng.integers(-40, 40, m) * rng.choice([-1.0, 1.0], m)).astype(np.float32)
+    # bin NB-3: 2^100 - 2^100 + 2^-149 (the smallest subnormal); NB-2: an inf emit; NB-1: 3 x 3e38 (past FLT_MAX)
+    sv = np.array([2.0 ** 100, -(2.0 ** 100), 2.0 ** -149, np.inf, 3e38, 3e38, 3e38], np.float32)
+    sb = np.array([NB - 3] * 3 + [NB - 2] + [NB - 1] * 3)
+    fv, fb = np.r_[pv, -pv, rv, sv[:3]], np.r_[pb, pb, rng.integers(0, NB - 3, m), sb[:3]]     # (finite bins only)
+    vals, bins = np.r_[fv, sv[3:]], np.r_[fb, sb[3:]]
+    perm = rng.permutation(len(vals))
+    vals, bins = vals[perm], bins[perm].astype(np.int32)
+    out = {"Q": tm.Sum((NB,), jnp.float32, fixed_point=True)}
+    want = _exact_ref(fv, fb, NB)
+    want[NB - 2:] = np.nan
+    # XLA:CPU flushes subnormal operands in its arithmetic (x * th): the reference of an item that multiplies
+    ftz = not GPU
+    fz = lambda v: np.where(np.abs(v) < np.float32(2.0 ** -126), np.float32(0.0), v) if ftz else v   # noqa: E731
+    wantz = _exact_ref(fz(fv), fb, NB)
+    wantz[NB - 2:] = np.nan
+    prim = lambda bk, **kw: tm.vmap(lambda t, x, i: t.add("Q", i, x), outputs=out, backend=bk, **kw)  # noqa: E731
+    run = lambda bk, **kw: (lambda r: (r.outputs["Q"], r.stats["fixed_point_overflow"]))(  # noqa: E731
+        prim(bk, **kw)(vals, bins))
+    g = tm.vmap(lambda t, x, i, th: t.add("Q", i, x * th), outputs=out, in_axes=(0, 0, None), backend=b)
+    one = np.float32(1.0)
+    w = np.r_[np.ones(NB - 2, np.float32), np.zeros(2, np.float32)]
+    fin = np.isfinite(vals)
+    gx, gi = vals[np.abs(vals) < 1e38], bins[np.abs(vals) < 1e38]             # (grad: no inf * 0)
+    rec = tm.vmap(lambda t, x, th: t.append("r", {"q": x * th}), in_axes=(0, None),
+                  outputs={"r": tm.Records({"q": jnp.float32}, capacity=1 << 14)}, backend=b)
+    sel = (np.arange(1 << 14) < fin.sum()).astype(np.float32)
+    off, on = _x64_both(lambda: (
+        run(b), run(b, xla_batch_size=1000),
+        jax.jvp(lambda th: g(vals, bins, th).outputs["Q"], (one,), (one,)),
+        jax.grad(lambda th: jnp.sum(g(gx, gi, th).outputs["Q"] * w))(one),
+        jax.jvp(lambda th: rec(vals[fin], th).outputs["r"]["q"], (one,), (one,)),
+        jax.grad(lambda th: jnp.sum(rec(vals[fin], th).outputs["r"]["q"] * sel))(one)))
+    names = ["primal", "overflow count", "primal, batches of 1000", "its count", "jvp primal", "jvp tangent", "grad",
+             "Records q", "Records q tangent", "Records grad"]
+    for nm, x, y in zip(names, off, on):
+        if not _same_bits(x, y):
+            raise Fail(f"{nm}: x64 off {x.ravel()[:8]} != on {y.ravel()[:8]}")
+    if not (_same_bits(off[0], want) and int(off[1]) == 2):
+        raise Fail(f"primal {off[0]} != the exact sums {want}, or overflow count {int(off[1])} != 2")
+    if not (_same_bits(off[5], wantz) or _same_bits(off[5], want)):
+        raise Fail(f"jvp tangent {off[5]} != the exact sums {want}")
+    gw = _exact_ref(fz(gx[gi < NB - 2]), np.zeros(int((gi < NB - 2).sum()), int), 1)[0]
+    if not _same_bits(off[6], np.float32(gw)):
+        raise Fail(f"grad {off[6]!r} != the exact sum {gw!r}")
+    from tallymap.backends import xla as X
+    for pb in (1 << 30, 0):                           # the carry step fused / a word row at a time (xla.FUSED_WORDS)
+        with patched(X, XNORM32=64, FUSED_WORDS=pb):
+            z = _x64_both(lambda: run(b, xla_batch_size=2048))[0]
+        if not (_same_bits(z[0], want) and int(z[1]) == 2):
+            raise Fail(f"normalised every 64 values (FUSED_WORDS {pb}): {z[0]} != {want}")
+    msg = "x64 off == on bitwise (primal, 2 batchings, jvp, grad, Records q / tangent / grad), == the host reference"
+    if "auto" in BACKENDS:
+        k = [np.asarray(v) for v in run("auto")]
+        if not (_same_bits(k[0], off[0]) and int(k[1]) == int(off[1])):
+            raise Fail(f"kernel backend {k[0]} != xla without x64 {off[0]}")
+        msg += ", == the kernel backend"
+    return msg
+
+
+@case("fixed_point=True float16 / bfloat16 / integer outputs without x64 on the xla backend: bitwise the x64 result "
+      "(values, NaN bins, stats; double rounding, carries, dropped emits, totals past the type) and the kernel "
+      "backend's; a scale that is not a power of two raises without x64", ["xla"])
+def _(b):
+    rng = np.random.default_rng(22)
+    n = 4096
+    fl = lambda lo, hi: (rng.uniform(-1, 1, n) * 2.0 ** rng.integers(lo, hi, n))   # noqa: E731
+    cases = [(jnp.float16, 2.0 ** 20, fl(-30, 16)), (jnp.float16, 2.0 ** 40, fl(-10, 16)),
+             (jnp.bfloat16, 2.0 ** 10, np.r_[fl(-60, 52)[:-8], [1e30, -1e30, 3e38, 2.0 ** 52] * 2]),
+             (jnp.bfloat16, 2.0 ** -3, fl(-20, 30)), (jnp.int32, 1.0, rng.integers(-2 ** 31, 2 ** 31, n)),
+             (jnp.int32, 2.0 ** 30, rng.integers(-2 ** 31, 2 ** 31, n)),
+             (jnp.int32, 2.0 ** 4, rng.integers(-99, 99, n)),
+             (jnp.int16, 2.0 ** -2, rng.integers(-2 ** 15, 2 ** 15, n)), (jnp.uint32, 1.0, rng.integers(0, 2 ** 32, n)),
+             (jnp.uint32, 2.0 ** -1, rng.integers(0, 2 ** 20, n)), (jnp.int8, 1.0, rng.integers(-128, 128, n))]
+    done = []
+    for dt, sc, v in cases:
+        x = np.asarray(v).astype(dt)
+        i = rng.integers(0, NB, n).astype(np.int32)
+        i[: n // 2] = 0                                # (bin 0: half the emits: totals past the type, carries)
+        f = tm.vmap(lambda t, x, i: t.add("Q", i, x), outputs={"Q": tm.Sum((NB,), dt, fixed_point=True, scale=sc)},
+                    backend=b)
+        r = lambda f=f, x=x, i=i: (lambda o: (o.outputs["Q"], o.stats["fixed_point_overflow"]))(f(x, i))  # noqa
+        off, on = _x64_both(r)
+        nm = f"{np.dtype(dt).name} scale 2^{int(np.log2(sc))}"
+        if not (_same_bits(off[0], on[0]) and int(off[1]) == int(on[1])):
+            d = np.flatnonzero(off[0] != on[0])
+            raise Fail(f"{nm}: x64 off {off[0][d]} != on {on[0][d]} (bins {d.tolist()}), overflow {int(off[1])} "
+                       f"vs {int(on[1])}")
+        fk = None
+        if "auto" in BACKENDS:
+            try:
+                fk = tm.vmap(lambda t, x, i: t.add("Q", i, x), backend="auto",
+                             outputs={"Q": tm.Sum((NB,), dt, fixed_point=True, scale=sc)})(x, i)
+            except Exception as e:                    # (float16 / bfloat16: not kernel dtypes)
+                if "not supported by the kernel backend" not in str(e):
+                    raise
+        if fk is not None:
+            # an integer bin whose total does not fit the type is counted on both backends, its value unspecified
+            # (xla saturates, the kernel's double -> int conversion does not): compare the bins that fit
+            m = np.ones(NB, bool)
+            if np.issubdtype(np.dtype(dt), np.integer):
+                q = np.round(np.asarray(x, np.float64) * sc)              # (exact: a power-of-two scale)
+                tot = [sum(int(u) for u in q[i == k]) / sc for k in range(NB)]
+                ii = np.iinfo(dt)
+                m = np.array([ii.min <= s < ii.max + 1 for s in tot])
+            ko = np.asarray(fk.outputs["Q"])
+            if not (_same_bits(ko[m], off[0][m]) and int(fk.stats["fixed_point_overflow"]) == int(off[1])):
+                raise Fail(f"{nm}: kernel {np.asarray(fk.outputs['Q'])} != xla {off[0]}, overflow "
+                           f"{int(fk.stats['fixed_point_overflow'])} vs {int(off[1])}")
+        done.append(f"{nm} ({int(off[1])} counted{'' if fk is not None else ', no kernel'})")
+    x0 = jax.config.jax_enable_x64
+    try:
+        jax.config.update("jax_enable_x64", False)
+        raises(NotImplementedError, lambda: tm.vmap(lambda t, x: t.add("Q", 0, x), backend=b, outputs={
+            "Q": tm.Sum((1,), jnp.float16, fixed_point=True, scale=1000.0)})(np.ones(4, np.float16)), "power-of-two")
+    finally:
+        jax.config.update("jax_enable_x64", x0)
+    return "x64 off == on" + (" == kernel" if "auto" in BACKENDS else "") + ": " + ", ".join(done)
+
+
+@case("signed-zero ties and NaN of lax.max / lax.min (f32; f64 under x64), operands unknown or proven non-NaN: bitwise "
+      "XLA's own jnp.maximum / jnp.minimum (+0 for max(-0, +0), -0 for min(+0, -0), NaN propagates)")
+def _(b):
+    done = []
+    for dt in [jnp.float32] + ([jnp.float64] if jax.config.jax_enable_x64 else []):
+        a = np.array([-0.0, 0.0, -0.0, 0.0, np.nan, 1.0, np.nan, -0.0, 3.0], dt)
+        c = np.array([0.0, -0.0, -0.0, 0.0, 1.0, np.nan, np.nan, 2.0, 3.0], dt)
+
+        def ops(x, y, dt=dt):
+            gx, gy = jnp.where(x != x, dt(0), x), jnp.where(y != y, dt(0), y)     # NaN guards: proven non-NaN
+            return (jnp.maximum(x, y), jnp.minimum(x, y), jnp.maximum(gx, gy), jnp.minimum(gx, gy),
+                    jnp.maximum(gx, dt(-0.0)), jnp.minimum(dt(0.0), gy), jnp.maximum(dt(-0.0), gy))
+        got = tm.vmap(lambda t, x, y: (t.add("Q", 0, dt(1)), ops(x, y)), outputs={"Q": tm.Sum((1,), dt)},
+                      backend=b)(a, c).per_item
+        want = jax.jit(jax.vmap(ops))(a, c)
+        for k, (g, w) in enumerate(zip(got, want)):
+            if not _same_bits(g, w):
+                raise Fail(f"{np.dtype(dt).name} op {k}: {np.asarray(g)} != XLA {np.asarray(w)} (signbits "
+                           f"{np.signbit(np.asarray(g)).astype(int)} vs {np.signbit(np.asarray(w)).astype(int)})")
+        done.append(np.dtype(dt).name)
+    return f"{', '.join(done)}: 7 max / min forms x 9 operand pairs bitwise XLA"
 
 
 @case("exact f32 sum: device memory per bin on the kernel backend is 40 B of accumulator + 1 flag bit + the output",
@@ -2767,8 +2931,6 @@ def _(b):
     done = []
     for S in (NB, 2048):                              # NB: privatised (shared memory, then the global flush); 2048
         for fp in (False, True):
-            if fp and b == "xla" and not jax.config.jax_enable_x64:
-                continue
             f = tm.vmap(lambda t, x, i: t.add("s", i, x), outputs={"s": tm.Sum((S,), jnp.float32, fixed_point=fp)},
                         backend=b)
             got = np.asarray(f(_SUBN_X, _SUBN_I).outputs["s"])[:NB]
@@ -2803,8 +2965,6 @@ def _(b):
     done = []
     for S in (NB, 2048):
         for fp in (False, True):
-            if fp and b == "xla" and not jax.config.jax_enable_x64:
-                continue
             f = tm.vmap(lambda t, x, i, th: t.add("s", i, x * th), in_axes=(0, 0, None),
                         outputs={"s": tm.Sum((S,), jnp.float32, fixed_point=fp)}, backend=b)
             p, tg = jax.jvp(lambda th: f(_SUBN_X, _SUBN_I, th).outputs["s"][:NB], (jnp.float32(1.0),),

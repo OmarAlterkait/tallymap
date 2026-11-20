@@ -66,7 +66,7 @@ def reference(fn, *, outputs, in_axes=0, max_steps=None):
         nr = len(rnames)
         ny = len(outs) - len(names) - len(fk) - nr
         y = jax.tree_util.tree_unflatten(meta["tree"], outs[len(names):len(names) + ny])
-        nt = jnp.sum(tr.astype(jnp.int32))
+        nt = jnp.sum(tr, dtype=jnp.int32)
         stats = {"n_truncated": nt}
         bad = (nt > 0) if max_steps is not None else None
         if rnames:
@@ -78,7 +78,7 @@ def reference(fn, *, outputs, in_axes=0, max_steps=None):
                 c = kk[r]
                 tot = jnp.sum(c, dtype=jnp.int32)
                 C = rspec[r].capacity or 1 << max(0, (int(tot) - 1).bit_length())
-                off = jnp.cumsum(c) - c
+                off = jnp.cumsum(c, dtype=jnp.int32) - c
                 # slot of item i's record k: off[i] + k for k < its count (the plain meaning: concatenation)
                 kidx = jnp.arange(K[r])[None, :]
                 dest = jnp.where(kidx < c[:, None], off[:, None] + kidx, C).reshape(-1)

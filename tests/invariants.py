@@ -73,8 +73,8 @@ F = jnp.float64 if X64 else jnp.float32
 GPU = jax.default_backend() == "gpu"
 BACKENDS = os.environ.get("BACKENDS", "xla,auto").split(",")
 ONLY = os.environ.get("ONLY", "")
-# fixed_point=True outputs: the xla backend accumulates them in int64, so it needs jax_enable_x64 (edge.py).
-FIXED = {"xla": X64, "auto": True}
+# fixed_point=True outputs: both backends, with or without jax_enable_x64 (the xla backend keeps int32 words without).
+FIXED = {"xla": True, "auto": True}
 # FT: a float tally is a SUM whose order the schedule decides (atomics on cuda, block / lane order on xla), so
 # two schedules agree only up to reassociation.  The sums here have at most a few hundred positive terms of similar
 # size: reassociation moves a bin by a few ulps of the bin, 1e-5 (f32) leaves 2 orders of margin, and a LOGIC error
@@ -369,13 +369,13 @@ def _(b):
 @case("[sched] xla == cuda (fixed-point/int bitwise, float to tol)", ["auto"])
 def _(b):
     th = th_of(3)
-    A = walk_fn("auto", fixed_point=X64)(XS, KEYS, TAB, th)        # (the xla fixed-point tally needs x64)
-    B = walk_fn("xla", fixed_point=X64)(XS, KEYS, TAB, th)
+    A = walk_fn("auto")(XS, KEYS, TAB, th)
+    B = walk_fn("xla")(XS, KEYS, TAB, th)
     # Two compilers (NVRTC vs XLA:GPU).  The item uses only IEEE +, * without contraction (cuda: -fmad=false), so the
     # per-item floats are expected to agree to the last bit; held to 1e-6 rather than bitwise because XLA is free to
     # pick its own (exactly rounded, but differently associated) evaluation of a fused expression.
     m = agree(A, B, "cuda vs xla", per_item="tol", pi_tol=1e-12 if X64 else 1e-6)
-    return m + ("; fixed-point E bitwise" if X64 else "; (no fixed-point tally: the xla backend needs x64 for it)")
+    return m + "; fixed-point E bitwise"
 
 
 @case("[sched] permuted items: fixed-point/int tallies bitwise, per-item permuted bitwise")
@@ -924,14 +924,17 @@ def _(b):
         raise Fail("instrument: jacfwd did not build a dual-lanes program")
     J = jax.jit(jax.jacfwd(g))(th0)
     ref_y = jax.jit(jax.jacfwd(lambda th: jax.vmap(lambda x: cg_item(_NoTally(), x, th)[1])(xs)))(th0)
-    m1 = near(J[1], ref_y, 1e-10 if X64 else 2e-4, "per-item jacfwd vs jax.jacfwd of plain JAX")
-    m2 = near(J[0], jnp.sum(ref_y, axis=0), 1e-10 if X64 else 2e-4, "Q jacfwd vs jax.jacfwd of plain JAX")
+    # the CG stops at a relative residual of 1e-5 after more iterations than its size (rounding-driven), so two
+    # correct evaluations that associate a dot product differently differ far above epsilon: plain JAX's own jacfwd
+    # and stacked jvp differ by 1.51e-5 in f32 (CPU, JAX 0.6.2) and 1.1e-7 in f64 (2080 Ti, JAX 0.12: round9 x64
+    # job 46083362); the bounds sit about 10x above those floors
+    tol = 1e-6 if X64 else 2e-4
+    m1 = near(J[1], ref_y, tol, "per-item jacfwd vs jax.jacfwd of plain JAX")
+    m2 = near(J[0], jnp.sum(ref_y, axis=0), tol, "Q jacfwd vs jax.jacfwd of plain JAX")
     jv = jax.jit(lambda th, v: jax.jvp(g, (th,), (v,))[1])
     cols = [jv(th0, jnp.zeros((CG_T,), F).at[j].set(1)) for j in range(CG_T)]
     S = jax.tree_util.tree_map(lambda *c: jnp.stack(c, -1), *cols)
-    # f32: plain JAX's own jacfwd and stacked jvp differ by 1.51e-5 here (CPU, JAX 0.6.2; cond(A) ~ 1e3),
-    # so the bound sits above that floor rather than at f32 epsilon.
-    m3 = near(J, S, 1e-12 if X64 else 1e-4, "jacfwd (lanes) vs stacked jvp columns")
+    m3 = near(J, S, 1e-6 if X64 else 1e-4, "jacfwd (lanes) vs stacked jvp columns")
     return (f"lane trip counts item 0 {sorted(set(tk[0].tolist()))}; vs plain JAX: per-item {m1}, Q {m2}; "
             f"vs stacked jvp {m3}")
 

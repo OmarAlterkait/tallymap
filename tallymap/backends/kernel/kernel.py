@@ -75,19 +75,19 @@ template <class T> __device__ __forceinline__ T sj_ld(const T* p) { return __ldg
 template <> __device__ __forceinline__ bool sj_ld<bool>(const bool* p) { return __ldg((const u8*)p) != 0; }
 // a table staged in shared memory (kernel._stage_tables): a plain load, never __ldg (global only)
 template <class T> __device__ __forceinline__ T sj_lds(const T* p) { return *p; }
-// lax.max/min: NaN-propagating
-template <class T> __device__ __forceinline__ T sj_fmax(T a, T b) { return (a >= b || a != a) ? a : b; }
-template <class T> __device__ __forceinline__ T sj_fmin(T a, T b) { return (a <= b || a != a) ? a : b; }
-// the same where both operands are proven non-NaN (ranges.float_facts): no NaN test; and, f32 with no signed-zero tie
-// the two forms break differently (fmaxf(-0, +0) = +0 where sj_fmax gives -0), one FMNMX on the device
-template <class T> __device__ __forceinline__ T sj_fmaxn(T a, T b) { return a >= b ? a : b; }
-template <class T> __device__ __forceinline__ T sj_fminn(T a, T b) { return a <= b ? a : b; }
+// lax.max/min: NaN-propagating, and a signed-zero tie gives +0 (max) / -0 (min) as XLA does on every platform (the
+// IEEE 754-2019 maximum / minimum; tests/edge.py "signed-zero ties"); a + b / -(-a - b) of two zeros is that zero
+template <class T> __device__ __forceinline__ T sj_fmax(T a, T b) {
+  return (a > b || a != a) ? a : ((b > a || b != b) ? b : (a == (T)0 ? a + b : a)); }
+template <class T> __device__ __forceinline__ T sj_fmin(T a, T b) {
+  return (a < b || a != a) ? a : ((b < a || b != b) ? b : (a == (T)0 ? -(-a - b) : a)); }
+// the same where both operands are proven non-NaN (ranges.float_facts): no NaN test; f32 on the device one FMNMX
+// (fmaxf / fminf break the zero tie the same way)
+template <class T> __device__ __forceinline__ T sj_fmaxn(T a, T b) { return a > b ? a : (b > a ? b : (a == (T)0 ? a + b : a)); }
+template <class T> __device__ __forceinline__ T sj_fminn(T a, T b) { return a < b ? a : (b < a ? b : (a == (T)0 ? -(-a - b) : a)); }
 #ifdef __CUDA_ARCH__
-__device__ __forceinline__ float sj_fmaxz(float a, float b) { return fmaxf(a, b); }
-__device__ __forceinline__ float sj_fminz(float a, float b) { return fminf(a, b); }
-#else
-__device__ __forceinline__ float sj_fmaxz(float a, float b) { return a >= b ? a : b; }
-__device__ __forceinline__ float sj_fminz(float a, float b) { return a <= b ? a : b; }
+template <> __device__ __forceinline__ float sj_fmaxn<float>(float a, float b) { return fmaxf(a, b); }
+template <> __device__ __forceinline__ float sj_fminn<float>(float a, float b) { return fminf(a, b); }
 #endif
 template <class T> __device__ __forceinline__ T sj_imax(T a, T b) { return a > b ? a : b; }
 template <class T> __device__ __forceinline__ T sj_imin(T a, T b) { return a < b ? a : b; }

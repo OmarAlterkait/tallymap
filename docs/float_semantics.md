@@ -32,15 +32,16 @@ math modes, schedules and JAX versions.
      in the same way) and rounds it the same way, so the two backends agree bitwise.  A non-finite emit makes its
      bin NaN, and a total beyond f32's range makes its bin NaN; all of these are counted in
      `stats['fixed_point_overflow']`.
-     **The x64 rule.**  The xla backend needs `jax_enable_x64` for an exact `Sum`: an exact `Sum` or its tangent
-     raises without it.  The reverse-mode cotangents of f32 broadcast operands below, which tallymap makes itself,
-     are exact either way: without x64 the xla backend keeps the same integer as 8-bit digits in 37 int32 words
-     (carry-normalised before 2^22 pieces can have reached one; the top word is flagged at 2^30, the same threshold
-     as the int64 format's) and rounds it the same way, so the bits do not depend on x64.  The kernel backend is
-     always exact.
+     **Without `jax_enable_x64`** the xla backend keeps the same integer as 16-bit digits in 19 int32 words
+     (80 bytes per bin with a per-bin count: a bin's words are carry-normalised before 2^15 values can have reached
+     it; the top word is flagged at 2^30, the same threshold as the int64 format's) and rounds it the same way: an exact `Sum`, its tangents and the reverse cotangents
+     below are the same bits with or without x64, on both backends.  (Earlier versions raised for an exact `Sum` on
+     the xla backend without x64.)
    - **other dtypes: fixed point.**  Each value is rounded to int64 fixed point (`round(v * scale)`) before an
-     integer add: bitwise results across schedules, `vmap`, and the two backends.  On the xla backend it needs
-     `jax_enable_x64`.  Unrepresentable values are dropped and counted (`stats['fixed_point_overflow']`), and the
+     integer add: bitwise results across schedules, `vmap`, and the two backends.  Without `jax_enable_x64` the xla
+     backend keeps the same integers as 16-bit digits in 8 int32 words and reproduces the float64 readout below
+     exactly (bitwise the x64 result), for a power-of-two `scale` in [2^-600, 2^600] and a float16, bfloat16 or
+     (u)int8/16/32 dtype; another scale or dtype raises there (enable x64, or use the kernel backend).  Unrepresentable values are dropped and counted (`stats['fixed_point_overflow']`), and the
      bin each was emitted to is NaN (primal and tangent bins each by their own emits).  A bin's running sum does
      not wrap: each bin keeps the net signed carry out of its int64 word as a high word (from the old value of each
      atomic add, so it is a sum of +-1 and order-independent), and the readout is the exact 128-bit total rounded
