@@ -8,6 +8,14 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Added
 
+- `tm.output_memory(output, backend, derivative, cells=, platform=, x64=)` -> `(per_cell, fixed)` (peak memory of an
+  output at most `per_cell * cells + fixed`), `tm.call_memory(outputs, ...)` (a call's outputs, launch counted once),
+  `tm.cell_bytes(output, backend, derivative, cells=, platform=, x64=)` and `tm.max_cells(output, backend,
+  derivative, memory=)`: the device memory one cell of an output holds while a call runs (accumulator, the copies
+  XLA keeps in its loops, the readout) for a `Sum` (exact, fixed point, plain) or `Records`, forward / jvp / vjp /
+  grad, per backend and platform, and the largest cell count that fits a budget. Upper bounds of measured peak
+  memory (tests/cellbytes.py, GPU and CPU). A `Sum` of more than 2^31 - 1 cells now raises at `tm.vmap` (cells are
+  int32-indexed on every backend).
 - `min_blocks_per_sm=N` (kernel backend on a CUDA GPU, opt-in): the kernel's `__launch_bounds__(block, N)`, so ptxas caps
   registers for N resident blocks per SM (more warps to hide latency; it may spill to local memory). The default
   source is unchanged; N is part of the kernel and cubin cache keys; outputs are bitwise those of the default (a
@@ -39,6 +47,14 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   jit) output that each branch passes through unchanged to its operand, so the cotangent is read in place: Records
   grad / vjp memory equals the forward's (2^22 slots, 2080 Ti: kernel 84 MB grad vs 67 MB forward compiled; xla
   152 vs 151 MB). tests/records.py "large capacity (2^22)", "memory: Records grad / vjp".
+- xla backend: an exact (or, without x64, fixed-point) `Sum` above 2^31 / 19 cells raised `OverflowError` (its flat
+  word index W * S passed int32), and the f32 and x64 fixed-point paths wrapped above 2^30 cells; every scatter now
+  indexes (word or row, cell) with two int32 indices. Checked to 2^31 - 1 cells on both backends (the kernel backend
+  already indexed with int64).
+- xla backend memory of an exact `Sum` (x64 off, RTX 2080 Ti, per cell at 2^24 cells): forward 151 -> 92 B, jvp 290
+  -> 180, vjp 155 -> 96 (x64 on: 196 -> 101, 298 -> 179). The readout runs `READ_CHUNK` (2^20) cells at a time, and a
+  large tally's carry step is a loop of row updates in place: the `lax.cond` it replaces copied the accumulator
+  (under jvp two accumulators per tally were held). Results are bitwise unchanged.
 - xla backend without `jax_enable_x64`: an exact `Sum` (`Sum(fixed_point=True)` of float32) and its tangents no
   longer raise: they keep the same integer in 19 int32 words of 16-bit digits (80 B per bin with a per-bin count),
   bitwise the x64 result and the kernel backend's (overflow and NaN poisoning identical). Cost against x64 (2080

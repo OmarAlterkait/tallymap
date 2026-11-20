@@ -6,6 +6,8 @@ active items.  Unlike jax.vmap, tallies are never per-item: an emit is a masked 
 accumulator, so memory is O(P * state + outputs), not O(P * outputs).  Items are processed in batches of P
 (xla_batch_size); with spawn, children are queued in a ring buffer and run in later batches (children first).
 """
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -267,32 +269,23 @@ def _xemit(v):
 XNORM = 1 << 29
 
 
-FUSED_WORDS = 1 << 20                                 # int32 words: a tally this small takes its carry step fused
+FUSED_WORDS = 1 << 20     # words: a digit-word tally this small takes its carry step fused (in a lax.cond), a larger
+                          # one in place (_xnorm_loop)
 
 
 def _xnorm(a, S, s=None):
-    """a digit-word tally's words [*lead, W * S] -> (the same integers, words 0..W-2 below 2^D (int64 words) or within
-    [-2^15, 2^16 + 2^15) (int32 words), the bins whose top word is at or past the flag threshold (_xfmt)).
-    int64 words (bin-major: bin i's words at i W ..): the full carry chain.  int32 words (word-major: word j of every
-    bin at j S ..): one carry step in place, a word at a time from the top (word j keeps its low 16 bits and takes
-    word j-1's signed high part, below 2^15 in magnitude): enough for the headroom (XNORM32), with no temporary beyond
-    a word row; the readout (_xscan) runs the full chain."""
+    """a SMALL digit-word tally's words [*lead, W * S] (at most FUSED_WORDS: a larger one takes _xnorm_loop, in place)
+    -> (the same integers, words 0..W-2 below 2^D (int64 words) or within [-2^15, 2^16 + 2^15) (int32 words), the bins
+    whose top word is at or past the flag threshold (_xfmt)).  int64 words (bin-major: bin i's words at i W ..): the
+    full carry chain.  int32 words (word-major: word j of every bin at j S ..): one carry step (word j keeps its low 16
+    bits and takes word j-1's signed high part, below 2^15 in magnitude): enough for the headroom (XNORM32); the
+    readout (_xscan) runs the full chain."""
     W, D, dt, _, _, lim = _xfmt(s)
     if dt == jnp.int32:
         m = dt((1 << D) - 1)
         w = a.reshape(a.shape[:-1] + (W, S))
-
-        def step(i, w):
-            j = W - 1 - i
-            cur = lax.dynamic_index_in_dim(w, j, axis=-2, keepdims=False)
-            prev = lax.dynamic_index_in_dim(w, j - 1, axis=-2, keepdims=False)
-            return lax.dynamic_update_index_in_dim(w, jnp.where(j == W - 1, cur, cur & m) + (prev >> D), j, axis=-2)
-        if w.size <= FUSED_WORDS:                     # (a small tally: one fused pass, no loop launches)
-            hi = jnp.concatenate([jnp.zeros_like(w[..., :1, :]), w[..., :W - 1, :] >> D], -2)
-            w = jnp.concatenate([w[..., :W - 1, :] & m, w[..., W - 1:, :]], -2) + hi
-        else:
-            w = lax.fori_loop(0, W - 1, step, w)
-            w = w.at[..., 0, :].set(w[..., 0, :] & m)
+        hi = jnp.concatenate([jnp.zeros_like(w[..., :1, :]), w[..., :W - 1, :] >> D], -2)
+        w = jnp.concatenate([w[..., :W - 1, :] & m, w[..., W - 1:, :]], -2) + hi
         top = w[..., W - 1, :]
         return w.reshape(a.shape), (top >= lim) | (top <= -lim)
     w = a.reshape(a.shape[:-1] + (S, W))
@@ -305,6 +298,47 @@ def _xnorm(a, S, s=None):
     top = w[..., W - 1] + c
     out.append(top)
     return jnp.stack(out, axis=-1).reshape(a.shape), (top >= lim) | (top <= -lim)
+
+
+def _xnorm_loop(big, a, bad, ovf, n, fresh, S, s):
+    """_xnorm when `big`, in place, for a large tally: -> (a, bad, ovf, n) as the lax.cond(big, carry step, identity)
+    of the small-tally path gives them, but as ONE loop of W iterations (0 when not big) that updates a word row per
+    iteration.  (XLA copies the operands of a lax.cond whose branch returns them unchanged: the accumulator, each
+    time the cond is taken that way; measured 2 accumulators per tally held under jvp, round9/cellbytes NOTES.)
+    int32 words: one carry step from the top word down (word j keeps its low 16 bits -- the top word all of them --
+    plus word j-1's signed high part; word 0 takes none): _xnorm's step.  int64 words: the full carry chain from word 0
+    up (the carry is loop state).  The top word's flag (the threshold of _xfmt) is taken at the iteration that writes
+    its final value; the value count n becomes fresh(n) at the first iteration."""
+    W, D, dt, _, _, lim = _xfmt(s)
+    m = dt((1 << D) - 1)
+    lead = a.shape[:-1]
+    i32 = dt == jnp.int32
+    w = a.reshape(lead + ((W, S) if i32 else (S, W)))
+    ax = w.ndim - (2 if i32 else 1)
+
+    def row(w, j):
+        return lax.dynamic_index_in_dim(w, j, axis=ax, keepdims=False)
+
+    def body(i, c):
+        w, bad, ovf, n, cy = c
+        if i32:                                       # top down: row j from rows j and j - 1 (both not yet updated)
+            j = W - 1 - i
+            cur, prev = row(w, j), jnp.where(j > 0, row(w, jnp.maximum(j - 1, 0)), dt(0))
+            new = jnp.where(j == W - 1, cur, cur & m) + (prev >> D)
+            fin = i == 0                              # (the top word's final value)
+        else:                                         # bottom up with the carry cy
+            j = i
+            t = row(w, j) + cy
+            new = jnp.where(j == W - 1, t, t & m)
+            cy = t >> D
+            fin = i == W - 1
+        w = lax.dynamic_update_index_in_dim(w, new, j, axis=ax)
+        f = fin & ((new >= lim) | (new <= -lim)) & ~bad
+        return (w, bad | f, ovf + jnp.sum(f.astype(jnp.int32), dtype=jnp.int32),
+                jnp.where(i == 0, fresh(n), n), cy)
+    cy0 = jnp.zeros(() if i32 else lead + (S,), dt)
+    w, bad, ovf, n, _ = lax.fori_loop(0, jnp.where(big, W, 0), body, (w, bad, ovf, n, cy0))
+    return w.reshape(a.shape), bad, ovf, n
 
 
 def _xread(a, s):
@@ -561,30 +595,39 @@ def _emit(st, t, idx, val):
             if M2 == 0:
                 continue
             if _perbin(spec):                         # per bin: the counts after this chunk, and the largest
-                cnt = st.nadd[k].at[fc].add(1, mode="drop")
+                old = st.nadd[k]
+                cnt = old.at[fc].add(1, mode="drop")
                 big = jnp.max(jnp.where(fc < S, cnt[jnp.clip(fc, 0, S - 1)], 0)) > XN
-                fresh = lambda n_, fc=fc: jnp.zeros_like(n_).at[fc].add(1, mode="drop")      # noqa: E731
+                fresh = lambda n_, old=old: n_ - old                                        # noqa: E731
             else:
                 cnt = st.nadd[k] + M2
                 big = cnt > XN
                 fresh = lambda n_, M2=M2: jnp.asarray(M2, n_.dtype)                        # noqa: E731
+            if a.size > FUSED_WORDS:      # in place: a loop of W carry-step rows, run 0 times when not needed
+                a, st.bad[k], st.ovf, st.nadd[k] = _xnorm_loop(big, a, st.bad[k], st.ovf, cnt, fresh, S, spec)
+            else:                         # (a small tally: lax.cond, whose identity branch copies its operands)
 
-            def norm(op, fresh=fresh):
-                a_, bad_, ovf_, n_ = op
-                a_, top = _xnorm(a_, S, spec)
-                return a_, bad_ | top, ovf_ + jnp.sum((top & ~bad_).astype(jnp.int32), dtype=jnp.int32), fresh(n_)
-            a, st.bad[k], st.ovf, st.nadd[k] = lax.cond(big, norm, lambda op: op, (a, st.bad[k], st.ovf, cnt))
+                def norm(op, fresh=fresh):
+                    a_, bad_, ovf_, n_ = op
+                    a_, top = _xnorm(a_, S, spec)
+                    return (a_, bad_ | top, ovf_ + jnp.sum((top & ~bad_).astype(jnp.int32), dtype=jnp.int32),
+                            fresh(n_))
+                a, st.bad[k], st.ovf, st.nadd[k] = lax.cond(big, norm, lambda op: op, (a, st.bad[k], st.ovf, cnt))
             jo, q, ok = _xemit(vc) if _exact(spec) else _femit(vc, spec)    # [*L, K P*I] x2, [*L, P*I]
             live = jnp.broadcast_to(fc < S, ok.shape)
             st.ovf = st.ovf + jnp.sum((~ok & live).astype(jnp.int32), dtype=jnp.int32)
             st.bad[k] = st.bad[k].at[..., fc].max(~ok, mode="drop")
             fK = jnp.concatenate([fc] * K)
-            wi = jo * S + fK if dt32 else fK * W + jo         # (int32 words word-major, int64 bin-major)
-            ix = jnp.where(jnp.concatenate([ok] * K, axis=-1) & (fK < S), wi, W * S)          # (dropped: out of range)
-            a2 = a.reshape(-1, W * S)
-            n = a2.shape[0]
-            ix, q = ix.reshape(n, -1), q.reshape(n, -1)
-            a = a2.at[jnp.arange(n)[:, None], ix].add(q, mode="drop").reshape(a.shape)
+            fb = jnp.where(jnp.concatenate([ok] * K, axis=-1) & (fK < S), fK, S)     # (dropped: bin S, out of range)
+            # (word, bin) as two indices into the [W, S] (int32 words, word-major) or [S, W] (int64, bin-major) view:
+            # no flat index W * S, which passes int32 (and jax's int32 index arithmetic) above 2^31 / W bins
+            n = int(np.prod(a.shape[:-1], dtype=np.int64))
+            fb, jo, q = fb.reshape(n, -1), jo.reshape(n, -1), q.reshape(n, -1)
+            r = jnp.arange(n, dtype=jnp.int32)[:, None]
+            if dt32:
+                a = a.reshape(n, W, S).at[r, jo, fb].add(q, mode="drop").reshape(a.shape)
+            else:
+                a = a.reshape(n, S, W).at[r, fb, jo].add(q, mode="drop").reshape(a.shape)
         st.accs[k] = a
         return t
     if spec.fixed_point:
@@ -592,23 +635,26 @@ def _emit(st, t, idx, val):
         live = jnp.broadcast_to(f < S, ok.shape)
         st.ovf = st.ovf + jnp.sum((~ok & live).astype(jnp.int32), dtype=jnp.int32)
         st.bad[t.slot] = st.bad[t.slot].at[..., f].max(~ok, mode="drop")        # a bin that dropped an emit
-        # the wide accumulator (_wide): the low 32 bits of each value into [0, S), the signed high 32 into [S, 2S)
-        fl, fh = jnp.where(f < S, f, 2 * S), jnp.where(f < S, f + S, 2 * S)
-        st.accs[t.slot] = a.at[..., jnp.concatenate([fl, fh])].add(
-            jnp.concatenate([v & jnp.int64(0xFFFFFFFF), v >> 32], axis=-1), mode="drop")
+        # the wide accumulator (_wide): the low 32 bits of each value into row 0 of its [2, S] view, the signed high
+        # 32 into row 1 (two indices: no flat index past 2S, which passes int32 above 2^30 bins)
+        hl = jnp.concatenate([jnp.zeros(f.shape, jnp.int32), jnp.ones(f.shape, jnp.int32)])
+        st.accs[t.slot] = a.reshape(tuple(L) + (2, S)).at[..., hl, jnp.concatenate([f, f])].add(
+            jnp.concatenate([v & jnp.int64(0xFFFFFFFF), v >> 32], axis=-1), mode="drop").reshape(a.shape)
         return t
     v = v.astype(a.dtype)
     if _low(spec):                                    # SPLIT: a small value goes, scaled, into the LOW row
         RS = R * S
         small = jnp.abs(v) < SPLIT                    # (NaN: False)
-        ix = jnp.where(f < RS, jnp.where(small, RS + f % S, f), RS + S)     # [*L, P*I] (dropped: out of range)
+        # (row, bin) into the [R + 1, S] view (row R: LOW): no flat index past R S + S, which passes int32 above
+        # 2^30 bins (R = 1 there).  Dropped: bin S, out of range.  (f < RS: R S <= ROWS_ELEMS when R > 1)
+        row = jnp.where(small, R, f // S) if R > 1 else jnp.where(small, 1, 0).astype(jnp.int32)
+        col = jnp.broadcast_to(jnp.where(f < RS, f % S if R > 1 else f, S), small.shape)     # ([*L, P*I])
+        row = jnp.broadcast_to(row, small.shape)
         q = jnp.where(small, v * LOW, v)
-        if nl == 0:
-            st.accs[t.slot] = a.at[ix].add(q, mode="drop")
-        else:
-            a2, n = a.reshape(-1, a.shape[-1]), int(np.prod(L, dtype=np.int64))
-            st.accs[t.slot] = a2.at[jnp.arange(n)[:, None], ix.reshape(n, -1)].add(
-                q.reshape(n, -1), mode="drop").reshape(a.shape)
+        n = int(np.prod(L, dtype=np.int64))
+        r = jnp.arange(n, dtype=jnp.int32)[:, None]
+        st.accs[t.slot] = a.reshape(n, R + 1, S).at[r, row.reshape(n, -1), col.reshape(n, -1)].add(
+            q.reshape(n, -1), mode="drop").reshape(a.shape)
         return t
     st.accs[t.slot] = a.at[..., f].add(v, mode="drop")
     return t
@@ -959,6 +1005,41 @@ def _lm(m, x):
     return m.reshape(m.shape + (1,) * (x.ndim - 1))
 
 
+# the readout of a digit-word or fixed-point tally (_xread, _fread32, _wide) holds per-bin temporaries (the carry
+# chain's digit rows and per-bin state: about 70 B per bin for the int32 words, more for the int64 ones), on top of the
+# accumulator: a tally above READ_CHUNK bins is read READ_CHUNK bins at a time (a loop; each bin's readout depends on
+# its own words only, so the result is the same bits), so they are O(READ_CHUNK), not O(bins)
+READ_CHUNK = 1 << 20
+
+
+def _chunked(read, a, s):
+    """read(a, s) -> (out [*lead, S], flags [*lead, S]) of the accumulator a [*lead, w * S] (w words per bin: word-major
+    [w, S] for the int32 digit words and the int64 wide pair, bin-major [S, w] for the int64 digit words), READ_CHUNK
+    bins at a time (the last chunk overlaps the one before it: its bins are read twice, to the same bits)."""
+    S, CH = s.S, READ_CHUNK
+    if S <= CH:
+        return read(a, s)
+    lead = a.shape[:-1]
+    w = a.shape[-1] // S
+    bin_major = _words(s) and not _perbin(s)          # (x64 exact: _xread's [S, W] layout)
+    v = a.reshape(lead + ((S, w) if bin_major else (w, S)))
+    sc = dataclasses.replace(s, S=CH)
+
+    def piece(i):
+        st = jnp.minimum(i * CH, S - CH)
+        x = lax.dynamic_slice_in_dim(v, st, CH, axis=v.ndim - (2 if bin_major else 1))
+        return st, read(x.reshape(lead + (w * CH,)), sc)
+    o_av, f_av = jax.eval_shape(lambda x: read(x, sc), jax.ShapeDtypeStruct(lead + (w * CH,), a.dtype))
+
+    def body(i, c):
+        o, f = c
+        st, (oc, fc) = piece(i)
+        return (lax.dynamic_update_slice_in_dim(o, oc, st, axis=o.ndim - 1),
+                lax.dynamic_update_slice_in_dim(f, fc, st, axis=f.ndim - 1))
+    init = (jnp.zeros(lead + (S,), o_av.dtype), jnp.zeros(lead + (S,), f_av.dtype))
+    return lax.fori_loop(0, -(-S // CH), body, init)
+
+
 def _finish(p, accs, sp, ys, st):
     out = []
     for k, s in enumerate(p.tallies):
@@ -972,7 +1053,8 @@ def _finish(p, accs, sp, ys, st):
             elif R > 1:
                 a = jnp.sum(a.reshape(tuple(s.lead) + (R, s.S)), axis=-2)
             if s.fixed_point or _exact(s):          # a bin that dropped an emit is NaN (as on cuda)
-                a, big = _xread(a, s) if _exact(s) else _fread32(a, s) if _fixed32(s) else _wide(a, s)
+                rd = _xread if _exact(s) else _fread32 if _fixed32(s) else _wide
+                a, big = _chunked(rd, a, s)
                 st.ovf = st.ovf + jnp.sum((big & ~st.bad[k]).astype(jnp.int32), dtype=jnp.int32)
                 if jnp.issubdtype(s.dtype, jnp.floating):
                     a = jnp.where(st.bad[k] | big, jnp.asarray(np.nan, s.dtype), a)

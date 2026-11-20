@@ -61,7 +61,8 @@ class Sum:
     exact or NaN: a non-finite emit, a running sum past the accumulator's top word (about 2^166: 2^38 emits near
     float32's maximum) and a total beyond float32's range each make it NaN, counted in
     stats['fixed_point_overflow'].  Its jvp / jacfwd tangents, and reverse-mode cotangents of float32 broadcast
-    operands, are exact too.  Device memory on the kernel backend: 44 B per bin (a 40 B accumulator + the output).
+    operands, are exact too.  Device memory on the kernel backend: 44 B per bin (a 40 B accumulator + the output);
+    tallymap.cell_bytes gives it for every backend, platform and derivative.
     The xla backend keeps an exact sum in int64 words with jax_enable_x64 and in int32 words of 16-bit digits without
     it: the same integer and the same bits either way (and the kernel backend's).  docs/float_semantics.md item 4.
 
@@ -534,6 +535,10 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                              "your keys)")
         shapes = {n: (outs_spec[n].shape,) if isinstance(outs_spec[n].shape, int) else tuple(outs_spec[n].shape)
                   for n in names}
+        for n in names:                        # (cells are indexed with int32 on every backend: _memory.MAX_CELLS)
+            if int(np.prod(shapes[n], dtype=np.int64)) > MAX_ITEMS:
+                raise ValueError(f"tallymap: output {n!r} has {int(np.prod(shapes[n], dtype=np.int64))} cells, more "
+                                 "than 2^31 - 1 (tallymap.max_cells): split it over several outputs or calls")
         # a fixed_point float32 Sum is the exact sum (TSpec.exact); fixed point at `scale` for the other dtypes
         ex = {n: bool(outs_spec[n].fixed_point) and np.dtype(outs_spec[n].dtype) == np.float32 for n in names}
         sspecs = [TSpec(n, int(np.prod(shapes[n], dtype=np.int64)), np.dtype(outs_spec[n].dtype), (),

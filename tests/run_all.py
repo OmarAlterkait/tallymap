@@ -31,7 +31,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SUITES = ["edge", "transforms", "reverse", "reverse_spawn", "invariants", "dice", "ops", "mulchain", "sharding",
-          "records", "examples"]
+          "records", "cellbytes", "examples"]
 EXAMPLES = ["quickstart", "photon_toy", "shower_toy", "ensemble_toy", "walk_on_spheres",
             "ode_ensemble", "gillespie", "interacting_particles", "particle_filter", "gradient_pitfall"]
 

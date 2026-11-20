@@ -16,6 +16,7 @@ from ._api import Queue, Records, Result, Sum, UnsupportedError, vmap
 from ._compare import reference
 from ._compat import TESTED_JAX, _check_jax_version
 from ._diagnostics import diagnostics, history
+from ._memory import OutputMemory, call_memory, cell_bytes, max_cells, output_memory
 from ._rewrite import TallyError
 from ._tally import Tally
 
@@ -31,4 +32,5 @@ def supported_primitives():
 __version__ = "0.7.1"
 _check_jax_version()       # one warning at import, only when JAX is newer than the newest tested version
 __all__ = ["vmap", "Sum", "Queue", "Records", "Result", "Tally", "reference", "diagnostics", "history",
-           "supported_primitives", "TallyError", "UnsupportedError", "TESTED_JAX"]
+           "supported_primitives", "TallyError", "UnsupportedError", "TESTED_JAX", "cell_bytes", "max_cells",
+           "output_memory", "OutputMemory", "call_memory"]

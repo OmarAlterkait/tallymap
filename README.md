@@ -252,7 +252,7 @@ reverse mode accumulate in different orders, so their derivatives agree only to 
 can be 1e-4 relative on a large tree and varies from run to run on a GPU. With `fixed_point=True` a float32 sum is
 EXACT: each bin is the correctly rounded f32 of the exact sum of every finite value emitted into it, with no scale,
 floor or cap, bitwise the same in any order, on both backends, in every AD mode (its tangents are exact too: a
-tangent far below its primal is not rounded away). It costs 44 bytes of device memory per bin on the kernel
+tangent far below its primal is not rounded away). It costs 44 bytes of device memory per bin on the kernel (`tm.cell_bytes`)
 backend; the xla backend keeps it in int64 words with `jax_enable_x64` and in int32 words without (the same bits). A non-finite emit makes its bin NaN and is counted in
 `stats['fixed_point_overflow']`. A bin is exact or NaN, never silently wrong (docs/float_semantics.md, item 4). For
 other dtypes `fixed_point=True` is int64 fixed point (each value
@@ -265,6 +265,22 @@ not fit the output dtype is counted there too, and NaN in a float bin). Each ker
 flags its own bins, so a tangent overflow makes that tangent bin NaN on every jvp / jacfwd / linearize path and
 leaves the primal finite. Use `fixed_point=True` when derivatives of very large sums must agree tightly, or when you
 need run-to-run reproducibility on a GPU.
+
+### Memory per output cell
+
+`tm.output_memory(output, backend, derivative)` returns `(per_cell, fixed)`: the device memory an output holds while a
+call runs is at most `per_cell * cells + fixed` (the fixed term: the readout's chunk, partial rows, the launch's own
+buffers); `tm.call_memory(outputs, backend, derivative)` sums a call's `outputs=` dict (readouts and the launch counted
+once). `tm.cell_bytes(output, backend, derivative)` is the same per cell at the output's size (bytes
+per cell: the accumulator, the copies XLA keeps in its loops, the readout's temporaries), and `tm.max_cells(output,
+backend, derivative, memory=bytes)` the largest cell count that fits a budget (at most 2^31 - 1: cells are indexed
+with int32 on every backend, and a larger `Sum` raises). They take a `tm.Sum` (exact, fixed point or plain, any
+dtype) or a `tm.Records`, `derivative` None, `'jvp'`, `'vjp'` or `'grad'`, and `platform` / `x64` (default: the
+current ones). Size outputs from them rather than from a constant: an exact float32 `Sum` holds 44.125 B per cell on
+the kernel backend (88.25 under `jvp`), and about 90 B on the xla backend on a GPU without x64 (173 under `jvp`). The
+numbers are upper bounds of measured peak memory (`tests/cellbytes.py`, GPU and CPU, up to 2^28 cells; lumen SK: 40.7M
+cells, 1.81 GB measured forward on the kernel backend); the items' own memory (inputs, per-item state) comes on
+top.
 
 ### Sizing the spawn Queue
 
