@@ -39,15 +39,17 @@ def call_jaxpr(eqn):
     return closed(eqn.params[p])
 
 
-HI_EXPANSIONS = weakref.WeakKeyDictionary()
-
-
 def hi_jaxpr(prim):
-    """a hijax primitive's expansion into ordinary primitives (its `expand`), traced once per primitive instance."""
-    if prim not in HI_EXPANSIONS:
-        HI_EXPANSIONS[prim] = jax.make_jaxpr(lambda *a: tree_leaves(prim.expand(*tree_unflatten(prim.in_tree, a))))(
-            *prim.in_avals_flat)
-    return HI_EXPANSIONS[prim]
+    """a hijax primitive's expansion into ordinary primitives (its `expand`), traced once per primitive INSTANCE and
+    kept on it.  Not in a mapping keyed by the primitive: HiPrim's __eq__ / __hash__ compare only its params, not its
+    avals, so two searchsorted of different table sizes are equal keys, and the first one's expansion (its table length
+    baked in as the search's upper bound) was reused for the other: a wrong interpolation bin, silently, on JAX >= 0.12
+    (jnp.interp on a 32-knot table, then on a 60-knot one; tests/reverse.py "unread table operand")."""
+    j = prim.__dict__.get("_tallymap_expansion")
+    if j is None:
+        j = jax.make_jaxpr(lambda *a: tree_leaves(prim.expand(*tree_unflatten(prim.in_tree, a))))(*prim.in_avals_flat)
+        prim.__dict__["_tallymap_expansion"] = j
+    return j
 
 
 class While(NamedTuple):
@@ -235,6 +237,8 @@ def _d_param(h, x):
         _d_const(h, x)
     else:
         h.update(b"|r" + repr(x).encode())
+        if hasattr(x, "in_avals_flat") and hasattr(x, "expand"):   # a hijax primitive: its repr shows only params
+            _d_param(h, hi_jaxpr(x))
 
 
 def _d_jaxpr(jaxpr):
