@@ -120,7 +120,7 @@ def _exact(s):
 # m << p, m < 2^24: m << (p % 8) < 2^31 is cut into 4 byte pieces at words p / 8 .. p / 8 + 3 <= 34).  Word 36 has
 # weight 2^288 and is flagged at 2^30: the same threshold (2^318 units) as the int64 format's top word (2^256 x 2^62).
 EXACT_WORDS32 = 37
-XNORM32 = 1 << 21
+XNORM32 = 1 << 22
 
 
 def _xfmt():
@@ -157,10 +157,10 @@ def _xemit(v):
 
 
 # an exact tally's words take pieces below 2^D (_xemit) by scatter-add, which cannot carry: they are carry-normalised
-# (_xnorm) before XNORM (int64 words; XNORM32 for int32) more pieces could have reached one word since the last time,
-# so every word but the top stays below 2^D + XNORM 2^D (2^62; 2^30) and none wraps; the top word only grows with the
-# total, and one at or past the flag threshold (_xfmt) flags its bin (as a carry out of the top word does on the kernel
-# backend): a bin is exact or NaN, never wrong
+# (_xnorm) before XNORM (int64 words; XNORM32 for int32) more pieces could have reached one word since the last time
+# (a value adds at most one piece to a word), so every word but the top stays below 2^D + XNORM 2^D (2^62; 2^30 + 2^8)
+# and none wraps; the top word only grows with the total, and one at or past the flag threshold (_xfmt) flags its bin
+# (as a carry out of the top word does on the kernel backend): a bin is exact or NaN, never wrong
 XNORM = 1 << 29
 
 
@@ -229,7 +229,7 @@ def _xread32(a, s):
     """_xread for the int32 format (no x64): 8-bit digits, the same integer and the same rounding."""
     W, ND = EXACT_WORDS32, EXACT_WORDS32 + 3             # (3 more digits take the top word's high bits: sign c)
     w = a.reshape(a.shape[:-1] + (s.S, W))
-    bad = jnp.any((w >= (1 << 30)) | (w <= -(1 << 30)), axis=-1)
+    bad = (w[..., W - 1] >= (1 << 30)) | (w[..., W - 1] <= -(1 << 30))      # (the others stay below 2^30 + 2^8)
     d, c = [], jnp.zeros(w.shape[:-1], jnp.int32)
     for j in range(ND):
         t = (w[..., j] if j < W else 0) + c
@@ -329,12 +329,12 @@ def _emit(st, t, idx, val):
         W, _, _, K, XN, _ = _xfmt()
         k = t.slot
         M = int(f.shape[-1])
-        CH = max(1, XN // K)                          # (an emit of more values runs in chunks, normalised between)
+        CH = XN                                       # (an emit of more values runs in chunks, normalised between)
         for c0 in range(0, max(M, 1), CH):
             fc, vc = f[c0:c0 + CH], v[..., c0:c0 + CH]
-            # this chunk adds at most K M pieces into one word (a value's K pieces go to K words; a word takes low
+            # this chunk adds at most M pieces into one word (a value's K pieces go to K words; a word takes low
             # pieces of some values and high pieces of others): normalise first if XN could be passed
-            M2 = K * int(fc.shape[-1])
+            M2 = int(fc.shape[-1])
             cnt = st.nadd[k] + M2
 
             def norm(op, M2=M2):

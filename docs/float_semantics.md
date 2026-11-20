@@ -35,7 +35,7 @@ math modes, schedules and JAX versions.
      **The x64 rule.**  The xla backend needs `jax_enable_x64` for an exact `Sum`: an exact `Sum` or its tangent
      raises without it.  The reverse-mode cotangents of f32 broadcast operands below, which tallymap makes itself,
      are exact either way: without x64 the xla backend keeps the same integer as 8-bit digits in 37 int32 words
-     (carry-normalised before 2^21 pieces can have reached one; the top word is flagged at 2^30, the same threshold
+     (carry-normalised before 2^22 pieces can have reached one; the top word is flagged at 2^30, the same threshold
      as the int64 format's) and rounds it the same way, so the bits do not depend on x64.  The kernel backend is
      always exact.
    - **other dtypes: fixed point.**  Each value is rounded to int64 fixed point (`round(v * scale)`) before an
