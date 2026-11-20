@@ -592,9 +592,12 @@ def make_unread(K, which):
 
 
 def _fd(L, tab, dt):
-    """central finite difference of L along dt (the two evaluations differenced in float64)."""
+    """central finite difference of L along dt (the two evaluations differenced in float64), and its rounding-noise
+    floor: the forward's sum is not bitwise run to run on every backend (the CPU kernel's threads), so a few ulps of L
+    over the step are not a derivative (a table that is never read gave fd ~ -0.08 there, f32)."""
     eps = 1e-6 if X64 else 1e-3
-    return (float(L(tab + eps * dt)) - float(L(tab - eps * dt))) / (2 * eps)
+    lo, hi = float(L(tab - eps * dt)), float(L(tab + eps * dt))
+    return (hi - lo) / (2 * eps), 16 * float(jnp.finfo(F).eps) * max(abs(lo), abs(hi)) / eps
 
 
 for which in ("cond", "switch", "while", "scan", "while-in-cond", "never read"):
@@ -618,14 +621,14 @@ for which in ("cond", "switch", "while", "scan", "while-in-cond", "never read"):
             gr = jax.jit(jax.grad(Lr))(tab)
             jr = jax.jit(lambda t: jax.jvp(Lr, (t,), (dt,))[1])(tab)
             msg = close(dict(grad=g, jvp=j), dict(grad=gr, jvp=jr), "vs reference")
-            fd = _fd(L, tab, dt)
+            fd, noise = _fd(L, tab, dt)
             ftol = 1e-6 if X64 else 2e-3
             scale = max(abs(fd), float(jnp.sum(jnp.abs(g * dt))), 1e-30)
-            eg, ej = abs(float(g @ dt) - fd) / scale, abs(float(j) - fd) / scale
-            if not (eg <= ftol and ej <= ftol):
+            eg, ej = abs(float(g @ dt) - fd), abs(float(j) - fd)
+            if not (eg <= ftol * scale + noise and ej <= ftol * scale + noise):
                 raise Fail(f"vs finite differences: grad.dt {float(g @ dt):.6g} jvp {float(j):.6g} fd {fd:.6g} "
-                           f"(rel {eg:.2g}, {ej:.2g} > {ftol:g})")
-            return msg + f"; fd rel {eg:.1e}/{ej:.1e} ({'sparse' if sparse else 'dense'})"
+                           f"(rel {eg / scale:.2g}, {ej / scale:.2g} > {ftol:g} + noise floor {noise:.2g})")
+            return msg + f"; fd rel {eg / scale:.1e}/{ej / scale:.1e} ({'sparse' if sparse else 'dense'})"
 
 
 # ----------------------------------------------------------------------------------------- toy 4: ints, keys, closures
