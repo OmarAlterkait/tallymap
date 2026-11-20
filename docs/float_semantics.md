@@ -34,7 +34,7 @@ math modes, schedules and JAX versions.
      `stats['fixed_point_overflow']`.
      **Without `jax_enable_x64`** the xla backend keeps the same integer as 16-bit digits in 19 int32 words
      (80 bytes per bin with a per-bin count, about 82-92 held with the flags and the readout on a GPU:
-     `tallymap.cell_bytes`; a bin's words are carry-normalised before 2^15 values can have reached
+     `tallymap.output_memory`; a bin's words are carry-normalised before 2^15 values can have reached
      it; the top word is flagged at 2^30, the same threshold as the int64 format's) and rounds it the same way: an exact `Sum`, its tangents and the reverse cotangents
      below are the same bits with or without x64, on both backends.  (Earlier versions raised for an exact `Sum` on
      the xla backend without x64.)

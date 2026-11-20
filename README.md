@@ -252,7 +252,7 @@ reverse mode accumulate in different orders, so their derivatives agree only to 
 can be 1e-4 relative on a large tree and varies from run to run on a GPU. With `fixed_point=True` a float32 sum is
 EXACT: each bin is the correctly rounded f32 of the exact sum of every finite value emitted into it, with no scale,
 floor or cap, bitwise the same in any order, on both backends, in every AD mode (its tangents are exact too: a
-tangent far below its primal is not rounded away). It costs 44 bytes of device memory per bin on the kernel (`tm.cell_bytes`)
+tangent far below its primal is not rounded away). It costs 44 bytes of device memory per bin on the kernel (`tm.output_memory`)
 backend; the xla backend keeps it in int64 words with `jax_enable_x64` and in int32 words without (the same bits). A non-finite emit makes its bin NaN and is counted in
 `stats['fixed_point_overflow']`. A bin is exact or NaN, never silently wrong (docs/float_semantics.md, item 4). For
 other dtypes `fixed_point=True` is int64 fixed point (each value

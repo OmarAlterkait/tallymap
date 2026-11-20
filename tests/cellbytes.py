@@ -195,9 +195,13 @@ def _(b):
 @case("cell_bytes / max_cells: arguments, limits, monotone; a Sum past 2^31 - 1 cells raises", ["xla"])
 def _(b):
     ex = tm.Sum((1 << 20,), F32, fixed_point=True)
-    k = tm.cell_bytes(ex, "auto", platform="gpu")
-    if k != 44.125 or tm.cell_bytes(ex, "auto", "jvp", platform="cpu") != 88.25:
-        raise Fail(f"kernel exact {k}")
+    # the kernel backend's slope is structural (40 B words + 1/8 flag + 4 B out; x2 for jvp); cell_bytes adds the
+    # fixed term (the launch's own buffers) spread over the cells
+    for d, pl, want in ((None, "gpu", 44.125), ("jvp", "cpu", 88.25)):
+        om = tm.output_memory(ex, "auto", d, platform=pl)
+        k = tm.cell_bytes(ex, "auto", d, platform=pl)
+        if om.per_cell != want or not 0 < om.fixed <= 128 << 20 or k != om.total(1 << 20) / (1 << 20):
+            raise Fail(f"kernel exact {d} {pl}: per_cell {om.per_cell} fixed {om.fixed} cell_bytes {k}")
     for d in (None, "jvp", "vjp", "grad"):
         for be in ("auto", "xla"):
             for pl in ("gpu", "cpu"):
