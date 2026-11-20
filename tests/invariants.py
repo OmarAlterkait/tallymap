@@ -1349,6 +1349,80 @@ def _(b):
     return agree(A, res["item"], "n_active step vs item") + f"; tangent {m}; schedules {ran}"
 
 
+# =================================================================================================== [lbounds]
+# min_blocks_per_sm=N: the kernel's __launch_bounds__(block, N).  An item with NR live scalars in its loop carry needs
+# more registers than 8 blocks of 128 threads allow; with N = 8 ptxas must cap them.  Register allocation does not
+# change arithmetic: every output is bitwise the default's except a float tally's atomic summation order (FT).
+NR = 48
+
+
+def mk_reg(fixed_point):
+    def reg_item(t, x, th):
+        def body(c):
+            k, v, t = c[0], list(c[1:1 + NR]), c[-1]
+            nv = [v[i] * th[i % 3] + v[(i + 1) % NR] * 0.5 + v[(i + 7) % NR] * 0.25 for i in range(NR)]
+            s = nv[0]
+            for z in nv[1:]:
+                s = s + z * 0.125
+            t = t.add("Q", k % NB, s).add("C", k % NB, 1)
+            if fixed_point:
+                t = t.add("E", k % NB, s)
+            return (k + 1, *nv, t)
+        out = lax.while_loop(lambda c: c[0] < 6 + (c[1] > 1.0).astype(jnp.int32), body,
+                             (jnp.int32(0), *[x * (1.0 + 0.01 * i) for i in range(NR)], t))
+        return out[-1], (out[1], out[NR], out[0])
+    return reg_item
+
+
+def reg_fn(b, **opts):
+    o = outs1(b)
+    return tm.vmap(mk_reg("E" in o), outputs=o, in_axes=(0, None), backend=b, **opts)
+
+
+def _res_of_last():
+    ks = [k for k in tm.diagnostics()["kernels"] if k.get("target") == "cuda"]
+    return ks[-1].get("resources") if ks else None
+
+
+@case("[lbounds] min_blocks_per_sm=8: occupancy as requested, outputs bitwise", ["auto"])
+def _(b):
+    if jax.devices()[0].platform != "gpu":
+        raise Skip("the option is a CUDA launch bound (the CPU target ignores it)")
+    th = jnp.asarray([0.9, 0.95, 1.0], F)
+    _D.KERNELS.clear()
+    r0 = reg_fn(b)(XS, th)
+    jax.block_until_ready(r0)
+    d0 = _res_of_last()
+    _D.KERNELS.clear()
+    r8 = reg_fn(b, min_blocks_per_sm=8)(XS, th)
+    jax.block_until_ready(r8)
+    d8 = _res_of_last()
+    if d0 is None or d8 is None:
+        raise Fail(f"no kernel resources recorded ({d0}, {d8})")
+    if d0["blocks_per_sm"] >= 8:
+        raise Fail(f"instrument: the default kernel already fits 8 blocks ({d0})")
+    _check(d8["blocks_per_sm"] >= 8 and d8["regs"] <= 65536 // (8 * 128),
+           f"min_blocks_per_sm=8 gave {d8} (default {d0})")
+    m = agree(r8, r0, "min_blocks 8 vs default")
+    return f"default {d0['regs']} regs / {d0['blocks_per_sm']} blocks, N=8 {d8['regs']} regs / {d8['local_bytes']} B " \
+           f"local / {d8['blocks_per_sm']} blocks; {m}"
+
+
+@case("[lbounds] min_blocks_per_sm is a no-op where it does not apply, and is validated")
+def _(b):
+    th = jnp.asarray([0.9, 0.95, 1.0], F)
+    if b == "auto" and jax.devices()[0].platform == "gpu":
+        raise Skip("covered by the cuda cell")
+    m = agree(reg_fn(b, min_blocks_per_sm=4)(XS, th), reg_fn(b)(XS, th), f"{b}: min_blocks 4 vs default")
+    for bad in (0, 33, 2.0, True, "8"):
+        try:
+            reg_fn(b, min_blocks_per_sm=bad)
+        except ValueError:
+            continue
+        raise Fail(f"min_blocks_per_sm={bad!r} was accepted")
+    return m
+
+
 print("\n================ SUMMARY", jax.__version__, "x64" if X64 else "", jax.devices()[0].device_kind)
 for n, b, m in RES:
     print(f"{n:62s} {b:8s} {m[:220]}")

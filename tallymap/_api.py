@@ -407,6 +407,8 @@ _OPTS = {                  # the public options; measurement switches are test-o
     "cuda_math": "kernel backend on a CUDA GPU, f32 div/sqrt: 'approx' (default) | 'ieee' | 'fast' (opt-in: also FMA "
                  "contraction and fast division by a divisor kept from zero; statistical) (the CPU: IEEE)",
     "schedule": "kernel backend: 'item' (default: a thread runs whole items) | 'step' (refill per loop step)",
+    "min_blocks_per_sm": "kernel backend on a CUDA GPU: None (default) | N: __launch_bounds__(block, N), registers capped "
+                         "for N resident blocks per SM (may spill; outputs bitwise unchanged; ignored on CPU and xla)",
     "xla_batch_size": "xla backend: items per batch",
     "rev_checkpoints": "reverse mode: checkpoint buffer size C (default 'auto': from the loop state's size)",
     "rev_stats": "reverse through spawn: report the tree adjoint's stats to the host (costs jit's fast path)",
@@ -439,6 +441,12 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                                   item ends).  'step' needs an item with exactly one top-level while loop and
                                   raises UnsupportedError otherwise; derived kernels (jvp, lanes, an adjoint) use it
                                   wherever they split.  Which is faster depends on the workload: measure.
+               min_blocks_per_sm  cuda: None (default: __launch_bounds__(block) alone) | N (opt-in): the kernel's
+                                  __launch_bounds__(block, N): ptxas caps registers so N blocks fit one SM (more
+                                  resident warps to hide latency; it may spill to local memory).  Register
+                                  allocation does not change arithmetic: outputs are bitwise those of the default.
+                                  Ignored on the CPU target and the xla backend.  Measure: it helps latency-bound
+                                  kernels and can hurt when the spills land in the hot loop.
                xla_batch_size     xla backend: items per batch (default 2^18; bounds its memory).
                rev_checkpoints    reverse mode: states per checkpoint buffer C (default 'auto': 16 for a loop step
                                   of fewer than 1000 equations, else the largest of 4, 8, ..., 64 whose 3C+1
@@ -479,6 +487,9 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                          + ", ".join(_OPTS))
     if opts.get("schedule", "item") not in ("item", "step"):
         raise ValueError(f"tallymap: schedule must be 'item' or 'step', got {opts['schedule']!r}")
+    mb = opts.get("min_blocks_per_sm")
+    if mb is not None and (isinstance(mb, bool) or not isinstance(mb, (int, np.integer)) or not 1 <= int(mb) <= 32):
+        raise ValueError(f"tallymap: min_blocks_per_sm must be None or an integer in 1..32, got {mb!r}")
     if backend == "cuda":
         raise ValueError("tallymap: backend='cuda' was removed in 0.7: use backend='auto' (the default), which runs "
                          "the compiled kernel on the platform JAX places the computation on (a CUDA GPU or the CPU)")

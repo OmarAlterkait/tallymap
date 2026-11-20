@@ -70,14 +70,15 @@ MATH_OPTS = {"ieee": [], "approx": ["-DTALLYMAP_APPROX_DIVSQRT", "--prec-div=fal
 
 
 class Kernel:
-    def __init__(self, p, target="cuda", schedule="item", strict=False, math="approx"):
+    def __init__(self, p, target="cuda", schedule="item", strict=False, math="approx", min_blocks=None):
         self.block = BLOCK
         self.target = target
         if math not in MATH_OPTS:
             raise ValueError("tallymap: cuda_math must be 'approx', 'ieee' or 'fast'")
         try:
             self.src, self.L = build_source(p, schedule=schedule, strict=strict, target=target,
-                                            fast=target == "cuda" and math == "fast")
+                                            fast=target == "cuda" and math == "fast",
+                                            min_blocks=min_blocks if target == "cuda" else None)
         except CodegenError as e:
             raise UnsupportedError(str(e)) from None
         note = schedule_note(self.L)
@@ -132,7 +133,7 @@ def _phys_in(x):
     return jax.random.key_data(x) if is_key_dtype(x.dtype) else x
 
 
-def run(p, pi, bc, target="cuda", cuda_math="approx", schedule="item", ndev=1, **_):
+def run(p, pi, bc, target="cuda", cuda_math="approx", schedule="item", ndev=1, min_blocks_per_sm=None, **_):
     """schedule: 'item' (DEFAULT: a thread runs one whole item at a time) | 'step' (a thread is refilled with a new
     item at loop-STEP granularity: the item program must have exactly one top-level while loop, else
     UnsupportedError; a program derived from it (jvp, lanes, an adjoint) uses the step schedule
@@ -143,12 +144,16 @@ def run(p, pi, bc, target="cuda", cuda_math="approx", schedule="item", ndev=1, *
     docs/validation.md) |
     'ieee' (correctly rounded f32 div/sqrt: portable) |
     'fast' (opt-in, statistical: approx plus FMA contraction of every float multiply-add and div.approx for an f32
-    divisor proven |b| >= 2^-126; the CPU target ignores it)."""
+    divisor proven |b| >= 2^-126; the CPU target ignores it).
+    min_blocks_per_sm: None (DEFAULT: __launch_bounds__(block), the source unchanged) | N (opt-in, cuda only: the main
+    kernel's __launch_bounds__(block, N), so ptxas caps registers for N resident blocks per SM; it may spill to local
+    memory; outputs are bitwise those of the default: register allocation does not change arithmetic)."""
     math = cuda_math or "approx"
     if target == "cpu":
         math = "ieee"                       # (no approx PTX on the host: every operation is IEEE)
     # strict: the user's own item program (tag 'primal') must split under schedule='step'
-    kern = kernel(p, target=target, schedule=schedule, strict=schedule == "step" and p.tag == "primal", math=math)
+    mb = {} if min_blocks_per_sm is None or target != "cuda" else {"min_blocks": int(min_blocks_per_sm)}
+    kern = kernel(p, target=target, schedule=schedule, strict=schedule == "step" and p.tag == "primal", math=math, **mb)
     L = kern.L
     N = int(pi[0].shape[0])
     consts = []

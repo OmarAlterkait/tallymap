@@ -373,11 +373,12 @@ def _stage_tables(fdefs, tables, budget=None, tmax=None):
     return decl, copy
 
 
-def build_source(p, *, block=BLOCK, schedule="item", strict=False, target="cuda", fast=False):
+def build_source(p, *, block=BLOCK, schedule="item", strict=False, target="cuda", fast=False, min_blocks=None):
     """-> (CUDA source, Layout).  p: tallymap._api.ItemProgram.  Its jaxpr is first rewritten into the
     canonical primitives (canon.py).  schedule: 'item' (one whole item per thread at a time) | 'step' (the step
     schedule wherever the program splits, else 'item'; strict: raise when it does not split).  Layout.mode is the
-    schedule that ran; Layout.splittable says whether the program splits (error hints)."""
+    schedule that ran; Layout.splittable says whether the program splits (error hints).  min_blocks: the main
+    kernel's __launch_bounds__ minimum resident blocks per SM (None: the block size alone, the default source)."""
     import dataclasses
 
     from .canon import canonical
@@ -721,7 +722,8 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False, target="cuda"
         (f"        (({ctype(dt)}*)P.p[{L.r_ys[j]}])[t] = y{j};" if sh == () else
          f"        for (int e = 0; e < {_size(sh)}; ++e) (({ctype(dt)}*)P.p[{L.r_ys[j]}])[t * {_size(sh)} + e] = y{j}[e];")
         for j, (sh, dt, _) in enumerate(yav))
-    lb = f"__launch_bounds__({block})"
+    # min_blocks_per_sm (opt-in): ptxas caps registers so that many blocks fit one SM (it may spill to local memory)
+    lb = f"__launch_bounds__({block})" if min_blocks is None else f"__launch_bounds__({block}, {int(min_blocks)})"
     # ONE item per claim, warp-aggregated: the needy lanes of a warp take one contiguous run between them, so
     # the counter sees one atomic per warp instead of one per lane.  Claiming a RUN of items per lane was
     # measured and removed: it leaves the last claims holding several items each, which is a tail the other

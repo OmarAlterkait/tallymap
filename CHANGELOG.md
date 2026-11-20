@@ -8,6 +8,10 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Added
 
+- `min_blocks_per_sm=N` (kernel backend on a CUDA GPU, opt-in): the kernel's `__launch_bounds__(block, N)`, so ptxas caps
+  registers for N resident blocks per SM (more warps to hide latency; it may spill to local memory). The default
+  source is unchanged; N is part of the kernel and cubin cache keys; outputs are bitwise those of the default (a
+  float tally's atomic order aside); ignored on the CPU target and the xla backend. tests/invariants.py [lbounds].
 - `tm.Records(fields, capacity=None)` outputs and `t.append(name, {field: value}, when=...)`: a variable number of
   records per item, in the deterministic (item, append order) layout (with `spawn`: the spawn tree's nodes in
   breadth-first order, children by spawn ordinal). Implemented as count-then-fill inside `tm.vmap` (a count pass,
