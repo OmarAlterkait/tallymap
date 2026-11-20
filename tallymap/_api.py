@@ -407,8 +407,9 @@ _OPTS = {                  # the public options; measurement switches are test-o
     "cuda_math": "kernel backend on a CUDA GPU, f32 div/sqrt: 'approx' (default) | 'ieee' | 'fast' (opt-in: also FMA "
                  "contraction and fast division by a divisor kept from zero; statistical) (the CPU: IEEE)",
     "schedule": "kernel backend: 'item' (default: a thread runs whole items) | 'step' (refill per loop step)",
-    "min_blocks_per_sm": "kernel backend on a CUDA GPU: None (default) | N: __launch_bounds__(block, N), registers capped "
-                         "for N resident blocks per SM (may spill; outputs bitwise unchanged; ignored on CPU and xla)",
+    "min_blocks_per_sm": "kernel backend on a CUDA GPU: None (default) | N: __launch_bounds__(block, N), registers "
+                         "capped for N resident blocks per SM (may spill; outputs bitwise unchanged; ignored on CPU "
+                         "and xla)",
     "xla_batch_size": "xla backend: items per batch",
     "rev_checkpoints": "reverse mode: checkpoint buffer size C (default 'auto': from the loop state's size)",
     "rev_stats": "reverse through spawn: report the tree adjoint's stats to the host (costs jit's fast path)",
