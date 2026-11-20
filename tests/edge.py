@@ -1809,7 +1809,7 @@ def _(b):
         raise Fail(f"op-table names that are neither in jax.extend.core.primitives nor explained: {bad} "
                    "(a JAX rename?)")
     rows = tm.supported_primitives()
-    if {r["name"] for r in rows} != ours | {"tallymap_emit", "tallymap_spawn"}:
+    if {r["name"] for r in rows} != ours | {"tallymap_emit", "tallymap_spawn", "tallymap_claim"}:
         raise Fail("supported_primitives() does not list the op table")
     keys = {k for r in rows for k in r}
     if keys != {"name", "how"}:

@@ -151,6 +151,7 @@ primitive.
 | `stack` | canonicalised |
 | `stop_gradient` | canonicalised |
 | `sub` | rule |
+| `tallymap_claim` | tally |
 | `tallymap_emit` | tally |
 | `tallymap_spawn` | tally |
 | `tallymap_uninit` | rule |
