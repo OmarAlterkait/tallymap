@@ -541,6 +541,93 @@ for which in ("while-in-cond-in-scan", "cond-in-while", "scan-in-cond-in-while",
         return close(g, grads(loss_of(r, wq), (xs, keys, tab, th)), which) + (" (dense)" if dense else " (sparse)")
 
 
+# ------------------------------------------------------------- toy 3c: a table passed through control flow, unread
+def make_unread(K, which):
+    """the lumen SK defect: a table that is an OPERAND of a construct inside the top-level loop's body (through a
+    jitted helper given every operand) which does not read it, and is read (jnp.interp) elsewhere in the body.  At
+    K >= SPARSE_MIN its cotangent is a threaded token: threading it through the construct made a pass-through output
+    that JAX forwards out of a cond, and the transpose's add_any(ct, zeros) of the token was refused (check_slots).
+    item: real while loops; padded: the inner while as a fori_loop and the outer one as a scan (the reference)."""
+    E = jnp.linspace(1.0, 2.0, K).astype(F)
+    h = jax.jit(lambda tab, v: 0.9 * v + 0.05)               # receives the table, does not read it
+
+    def step(k, y, x, tab, real):
+        if which == "cond":
+            y = lax.cond(k > 0, lambda: y, lambda: 2.0 * x + 0.0 * h(tab, x))
+        elif which == "switch":
+            y = lax.switch(k % 3, [lambda: y, lambda: h(tab, y), lambda: 2.0 * x + 0.0 * h(tab, x)])
+        elif which == "while":
+            f = lambda m, v: h(tab, v)
+            y = (lax.while_loop(lambda c: c[0] < 2, lambda c: (c[0] + 1, f(c[0], c[1])), (0, y))[1] if real
+                 else lax.fori_loop(0, 2, f, y))
+        elif which == "scan":
+            y = lax.scan(lambda a, s: (h(tab, a), None), y, jnp.arange(2))[0]
+        elif which == "while-in-cond":
+            f = lambda m, v: h(tab, v)
+            inner = ((lambda v: lax.while_loop(lambda c: c[0] < 2, lambda c: (c[0] + 1, f(c[0], c[1])), (0, v))[1])
+                     if real else (lambda v: lax.fori_loop(0, 2, f, v)))
+            y = lax.cond(k > 0, lambda: inner(y), lambda: 2.0 * x)
+        elif which == "never read":                           # the table is only an unread cond operand
+            y = lax.cond(k > 0, lambda: y, lambda: 2.0 * x + 0.0 * h(tab, x))
+            return y, y * y
+        else:
+            raise ValueError(which)
+        f = jnp.interp(y, E, tab)                             # a read of the table
+        return y + 0.1 * f, f
+
+    def item(t, x, tab):
+        def body(c):
+            t, k, y = c
+            y2, f = step(k, y, x, tab, True)
+            return t.add("s", 0, f), k + 1, y2
+        return lax.while_loop(lambda c: c[1] < 4, body, (t, jnp.int32(0), jnp.zeros((), F)))[0]
+
+    def padded(t, x, tab):
+        def body(c, _):
+            t, k, y = c
+            y2, f = step(k, y, x, tab, False)
+            return (t.add("s", 0, f), k + 1, y2), None
+        return lax.scan(body, (t, jnp.int32(0), jnp.zeros((), F)), None, length=4)[0][0]
+    return item, padded
+
+
+def _fd(L, tab, dt):
+    """central finite difference of L along dt (the two evaluations differenced in float64)."""
+    eps = 1e-6 if X64 else 1e-3
+    return (float(L(tab + eps * dt)) - float(L(tab - eps * dt))) / (2 * eps)
+
+
+for which in ("cond", "switch", "while", "scan", "while-in-cond", "never read"):
+    for K in (31, 32, 33, 60):
+        @case(f"unread table operand of a {which} (K={K}): grad, jvp == reference and finite differences")
+        def _(b, which=which, K=K):
+            item, padded = make_unread(K, which)
+            xs = (0.5 + 0.4 * jax.random.uniform(jax.random.PRNGKey(0), (N,))).astype(F)
+            tab = jnp.linspace(0.5, 1.5, K).astype(F)
+            dt = (1.0 + jnp.cos(jnp.arange(K))).astype(F)
+            out = {"s": tm.Sum((1,), F)}
+            f = tm.vmap(item, outputs=out, in_axes=(0, None), backend=b)
+            r = reference(padded, outputs=out, in_axes=(0, None))
+            L = jax.jit(lambda t: jnp.sum(f(xs, t).outputs["s"]))
+            Lr = jax.jit(lambda t: jnp.sum(r(xs, t).outputs["s"]))
+            g = jax.jit(jax.grad(L))(tab)
+            sparse = [s for _, s in _D.REVERSE['build']["sparse"]]
+            if sparse != ([K] if K >= _reverse.SPARSE_MIN else []):
+                raise Fail(f"instrument: K={K} table path {_D.REVERSE['build']}")
+            j = jax.jit(lambda t: jax.jvp(L, (t,), (dt,))[1])(tab)
+            gr = jax.jit(jax.grad(Lr))(tab)
+            jr = jax.jit(lambda t: jax.jvp(Lr, (t,), (dt,))[1])(tab)
+            msg = close(dict(grad=g, jvp=j), dict(grad=gr, jvp=jr), "vs reference")
+            fd = _fd(L, tab, dt)
+            ftol = 1e-6 if X64 else 2e-3
+            scale = max(abs(fd), float(jnp.sum(jnp.abs(g * dt))), 1e-30)
+            eg, ej = abs(float(g @ dt) - fd) / scale, abs(float(j) - fd) / scale
+            if not (eg <= ftol and ej <= ftol):
+                raise Fail(f"vs finite differences: grad.dt {float(g @ dt):.6g} jvp {float(j):.6g} fd {fd:.6g} "
+                           f"(rel {eg:.2g}, {ej:.2g} > {ftol:g})")
+            return msg + f"; fd rel {eg:.1e}/{ej:.1e} ({'sparse' if sparse else 'dense'})"
+
+
 # ----------------------------------------------------------------------------------------- toy 4: ints, keys, closures
 @case("typed key carried + int per-item input + closed-over th (symbolic zeros)")
 def _(b):
