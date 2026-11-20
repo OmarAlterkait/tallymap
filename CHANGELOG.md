@@ -31,6 +31,14 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Fixed
 
+- Reverse mode (grad, vjp, jacrev) through more than one gated `t.append` (or `lax.cond`-gated `t.add`) per item
+  outside a loop, or more than one per loop step: the transpose of each `lax.cond` returned the output's whole
+  cotangent (capacity-sized for `Records`) as a cond output and chained it into the previous one, a per-item array of
+  the output's size: the xla backend allocated items x capacity (out of memory: 128 GiB for a 2^22-slot `Records`),
+  the kernel backend raised "per-item array ... too large" from 2^16 slots. The adjoint now forwards every cond (and
+  jit) output that each branch passes through unchanged to its operand, so the cotangent is read in place: Records
+  grad / vjp memory equals the forward's (2^22 slots, 2080 Ti: kernel 84 MB grad vs 67 MB forward compiled; xla
+  152 vs 151 MB). tests/records.py "large capacity (2^22)", "memory: Records grad / vjp".
 - xla backend without `jax_enable_x64`: an exact `Sum` (`Sum(fixed_point=True)` of float32) and its tangents no
   longer raise: they keep the same integer in 19 int32 words of 16-bit digits (80 B per bin with a per-bin count),
   bitwise the x64 result and the kernel backend's (overflow and NaN poisoning identical). Cost against x64 (2080

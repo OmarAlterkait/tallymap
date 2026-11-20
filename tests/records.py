@@ -807,6 +807,102 @@ def _(b):
     return f"grads {float(g['cond']):.6g} {float(g['records']):.6g}"
 
 
+def multi(t, i, key, mu_a, v, wcut):
+    """the walk (one append per loop step), then appends in straight-line code (a chain of gated appends at the
+    item's top level) and a loop of two appends per step: the reverse of every gated append passes the output's
+    cotangent on to the previous one, which must never become a per-item array of the capacity."""
+    t, (k, w) = walk(t, i, key, mu_a, v, wcut)
+    for j in range(3):
+        u = jax.random.uniform(jax.random.fold_in(key, 1000 + j), (), F)
+        t = t.append("hits", {"sensor": -1 - j, "t": u * v, "w": w * u / mu_a, "item": i, "k": k + j}, when=u > 0.25)
+
+    def body(c):
+        n, t = c
+        u = jax.random.uniform(jax.random.fold_in(key, 2000 + n), (2,), F)
+        for q in range(2):
+            t = t.append("hits", {"sensor": -10 - q, "t": u[q] / v, "w": w * mu_a * u[1 - q], "item": i, "k": n},
+                         when=u[q] > 0.4)
+        return n + 1, t
+    t = lax.while_loop(lambda c: c[0] < 3, body, (jnp.int32(0), t))[1]
+    return t, (k, w)
+
+
+BIGC, SMALLC, NB = 1 << 22, 4096, 128
+
+
+@case("large capacity (2^22): grad / vjp / jacrev of Records == capacity 4096 BITWISE, and vs central differences")
+def _(b):
+    ids, keys = IDS[:NB], KEYS[:NB]
+    wt = jax.random.uniform(jax.random.PRNGKey(5), (3, SMALLC), F)
+
+    def fields(cap):                  # th -> (t, w of the first SMALLC slots: the rest is padding), records appended
+        f = tm.vmap(multi, outputs=outs(cap), in_axes=AX, backend=b)
+
+        def run(th):
+            r = f(ids, keys, th[0], th[1], F(0.0))
+            h = r.outputs["hits"]
+            return {k: h[k][:SMALLC] for k in ("t", "w")}, r.stats["appended"]["hits"]
+        return run
+
+    def red(cap):
+        run = fields(cap)
+
+        def g(th):                    # 3 outputs
+            h = run(th)[0]
+            t, w = h["t"], h["w"]
+            return jnp.stack([jnp.sum(wt[0] * w * jnp.cos(0.3 * t)), jnp.sum(wt[1] * t * t), jnp.sum(wt[2] * w * t)])
+        return g
+    n = int(fields(SMALLC)(TH)[1])
+    if not 0 < n <= SMALLC:
+        raise Fail(f"{n} records: the small capacity must hold them all")
+    res = {}
+    for cap in (SMALLC, BIGC):
+        g, run = red(cap), fields(cap)
+        _, pull = jax.vjp(lambda th: run(th)[0], TH)
+        res[cap] = dict(grad=jax.grad(lambda th: jnp.sum(g(th)))(TH), vjp=pull({"t": wt[1], "w": wt[2]})[0],
+                        jacrev=jax.jacrev(g)(TH), jacfwd=jax.jacfwd(g)(TH))
+    for k in res[SMALLC]:
+        same(res[BIGC][k], res[SMALLC][k], f"{k}: capacity 2^22 vs 4096")
+    loss = lambda th: jnp.sum(red(SMALLC)(th))                                                 # noqa: E731
+    e = F(1e-2) if F == jnp.float32 else F(1e-5)
+    fd = np.array([(loss(TH + e * u) - loss(TH - e * u)) / (2 * e) for u in jnp.eye(2, dtype=F)])
+    close(res[BIGC]["grad"], fd, 2e-3, 1e-5, "grad vs FD")
+    close(res[BIGC]["jacrev"], res[BIGC]["jacfwd"], 1e-4, 1e-6, "jacrev vs jacfwd")
+    return f"{n} records; grad {np.asarray(res[BIGC]['grad'])} fd {fd}"
+
+
+@case("memory: Records grad / vjp scale like the forward, linear in the capacity (compiled memory analysis)")
+def _(b):
+    ids, keys = IDS[:NB], KEYS[:NB]
+
+    def mem(cap, deriv):
+        f = tm.vmap(multi, outputs=outs(cap), in_axes=AX, backend=b)
+        wt = jnp.ones((cap,), F)
+        fw = lambda th: f(ids, keys, th[0], th[1], F(0.0)).outputs["hits"]["w"]                # noqa: E731
+        if deriv == "fwd":
+            fn = fw
+        elif deriv == "grad":
+            fn = jax.grad(lambda th: jnp.sum(fw(th) * wt))
+        else:
+            fn = lambda th: jax.vjp(fw, th)[1](wt)[0]                                          # noqa: E731
+        ma = jax.jit(fn).lower(TH).compile().memory_analysis()
+        if ma is None:
+            return None
+        return ma.temp_size_in_bytes + ma.argument_size_in_bytes + ma.output_size_in_bytes - ma.alias_size_in_bytes
+    caps = (1 << 18, 1 << 20, 1 << 22)
+    m = {d: [mem(c, d) for c in caps] for d in ("fwd", "grad", "vjp")}
+    if any(x is None for v in m.values() for x in v):
+        return "SKIP: no memory analysis on this platform"
+    sl = {d: [(v[i + 1] - v[i]) / (caps[i + 1] - caps[i]) for i in range(2)] for d, v in m.items()}
+    for d in ("grad", "vjp"):
+        if not sl[d][1] <= 2 * sl["fwd"][1] + 8:
+            raise Fail(f"{d}: {sl[d][1]:.1f} B per slot vs the forward's {sl['fwd'][1]:.1f}")
+        if not abs(sl[d][1] - sl[d][0]) <= 0.1 * sl[d][1] + 1:
+            raise Fail(f"{d}: not linear in the capacity: {sl[d][0]:.1f} then {sl[d][1]:.1f} B per slot")
+    return "B/slot " + ", ".join(f"{d} {v[1]:.1f}" for d, v in sl.items()) + f"; MB at 2^22 " + \
+        ", ".join(f"{d} {v[2] / 1e6:.0f}" for d, v in m.items())
+
+
 print("\n================ SUMMARY", jax.__version__, "x64" if jax.config.jax_enable_x64 else "",
       jax.devices()[0].device_kind)
 for n, b, m in RES:

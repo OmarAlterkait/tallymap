@@ -42,7 +42,7 @@ import numpy as np
 from jax import lax
 from jax.core import ShapedArray as _SA
 from jax.custom_derivatives import SymbolicZero
-from jax.extend.core import Primitive
+from jax.extend.core import ClosedJaxpr, Literal, Primitive
 from jax.interpreters import ad as _jad
 from jax.interpreters import batching as _batching
 from jax.interpreters import mlir as _mlir
@@ -746,7 +746,6 @@ def _dce(cj):
     the transpose of a cond returns each tally input's pass-through cotangent as a cond OUTPUT, unused but
     materialised per item by the cuda emitter (lumen SK: an (88768,) local array, "too large")."""
     from jax._src.interpreters import partial_eval as pe
-    from jax.extend.core import ClosedJaxpr
 
     def closed(c):
         # consts -> leading invars (kept: instantiate=True), DCE, then the same leading invars back as constvars with
@@ -757,16 +756,50 @@ def _dce(cj):
         return ClosedJaxpr(jd.replace(constvars=list(jd.invars[:nc]), invars=list(jd.invars[nc:])), list(c.consts))
 
     def deep(jaxpr):
-        eqns = []
+        eqns, fw = [], {}                     # fw: forwarded outputs (var -> the operand it always equals)
+        sub = lambda v: v if isinstance(v, Literal) else fw.get(v, v)                    # noqa: E731
         for e in jaxpr.eqns:
-            if e.primitive.name == "while":
+            e = e.replace(invars=[sub(v) for v in e.invars])
+            nm = e.primitive.name
+            if nm == "while":
                 e = e.replace(params=dict(e.params, body_jaxpr=closed(e.params["body_jaxpr"]),
                                           cond_jaxpr=closed(e.params["cond_jaxpr"])))
-            elif e.primitive.name == "cond":
-                e = e.replace(params=dict(e.params, branches=tuple(closed(b) for b in e.params["branches"])))
+            elif nm == "cond":
+                brs = tuple(closed(b) for b in e.params["branches"])
+                e = e.replace(params=dict(e.params, branches=brs))
+                _forward(e, [b.jaxpr for b in brs], e.invars[1:], fw)
+            elif isinstance(e.params.get(_FWD_CALLS.get(nm)), ClosedJaxpr):
+                c = closed(e.params[_FWD_CALLS[nm]])
+                e = e.replace(params={**e.params, _FWD_CALLS[nm]: c})
+                _forward(e, [c.jaxpr], e.invars, fw)
             eqns.append(e)
-        return pe.dce_jaxpr(jaxpr.replace(eqns=eqns), [True] * len(jaxpr.outvars), instantiate=True)[0]
+        jaxpr = jaxpr.replace(eqns=eqns, outvars=[sub(v) for v in jaxpr.outvars])
+        return pe.dce_jaxpr(jaxpr, [True] * len(jaxpr.outvars), instantiate=True)[0]
     return closed(cj)
+
+
+# call-like equations whose sub-jaxpr maps its invars / outvars 1:1 onto the equation's (_dce forwards through them)
+_FWD_CALLS = {"pjit": "jaxpr", "jit": "jaxpr", "closed_call": "call_jaxpr"}
+
+
+def _forward(e, subs, ops, fw):
+    """_dce: an output of a cond (subs: its branches) or of a call (subs: its jaxpr) that is, in EVERY sub-jaxpr, the
+    sub-jaxpr's input i is the equation's operand ops[i]: record it in fw, so its uses read the operand and the output
+    goes dead.  The transpose of a cond (or of a jitted helper) passes each tally's cotangent through unchanged (emit is
+    additive): a whole output-sized cotangent (a Records output: the capacity) returned as an output and chained into
+    the next transposed cond, i.e. a per-item array of the output's size in the backends (xla: items x capacity; cuda:
+    a local array, "too large")."""
+    for k, o in enumerate(e.outvars):
+        if is_dropvar(o):
+            continue
+        idx = set()
+        for j in subs:
+            v = j.outvars[k]
+            idx.add(None if isinstance(v, Literal) else next((i for i, x in enumerate(j.invars) if x is v), None))
+        if len(idx) == 1 and None not in idx:
+            x = ops[idx.pop()]
+            if not isinstance(x, Literal) and x.aval == o.aval:
+                fw[o] = x
 
 
 # ------------------------------------------------------------------------------------------- table reads
