@@ -10,6 +10,7 @@ Every transformation is a rule of that primitive that builds a new ItemProgram b
 jax.vmap to an ITEM function (jvp_prog here, vjp_prog in _reverse.py, the rest in _primitive.py), so the rules
 compose to any order.
 """
+import collections
 import dataclasses
 import os
 import sys
@@ -23,7 +24,7 @@ from jax.core import Tracer
 from jax.extend.core import ClosedJaxpr, jaxpr_as_fun
 
 from . import _diagnostics, _errors
-from ._jaxpr import item_name, located, subjaxprs
+from ._jaxpr import digest, host_callbacks, item_name, located, subjaxprs
 from ._rewrite import check_tallies, isfloat, retrace
 from ._tally import KI, KK, LANED, RSEP, Tally, emit_p, rkey
 
@@ -351,6 +352,53 @@ def _poison_tally(t, bad):
 
 
 # ------------------------------------------------------------------------------------------- dispatch
+# Item programs already built, least recently used first: (structure of the user's traced item, the identity of its
+# constants and host callbacks, the build's static configuration) -> (that traced item, its ItemProgram).  An eager
+# call still traces the user's function (only that trace sees the values it closes over now), but a trace equal to
+# an earlier one reuses that ItemProgram: no re-trace of the rewrite, and every cache downstream (the eager jit, the
+# kernel, JAX's own) sees the same program object instead of a fresh copy per call.  Equal means the same structural
+# digest (literals by their bytes, nested constants by their bytes), the same host-callback objects, and constants
+# that are the same objects or small arrays of the same dtype, shape and BYTES (an array made inside the item is a
+# new object at every trace).  A program closing over a live trace's values is never cached.
+_PROGS = collections.OrderedDict()
+PROG_CACHE = 64
+
+
+def _spec_key(s):
+    return tuple(getattr(s, f.name) for f in dataclasses.fields(s))
+
+
+def _prog_key(cj, tspecs, mode, caps, M, max_steps, spawn, split, nact, where):
+    return (digest(cj.jaxpr), len(cj.consts),
+            tuple(_spec_key(s) for s in tspecs), mode, None if caps is None else tuple(sorted(caps.items())), M,
+            max_steps, None if spawn is None else int(spawn.capacity), split, nact, where,
+            bool(jax.config.jax_enable_x64))
+
+
+PROG_CONST_BYTES = 1 << 16    # constants up to this size are compared by value; larger ones only by identity
+
+
+def _same_const(x, y):
+    if x is y:
+        return True
+    try:
+        if (type(x) is not type(y) or tuple(x.shape) != tuple(y.shape) or x.dtype != y.dtype
+                or not isinstance(x.dtype, np.dtype) or x.dtype == np.dtype(object)
+                or x.size * x.dtype.itemsize > PROG_CONST_BYTES):
+            return False
+        return np.asarray(x).tobytes() == np.asarray(y).tobytes()
+    except Exception:                   # (an opaque constant: identity only)
+        return False
+
+
+def _same_objects(a, b):
+    """the cached trace `a` can stand for the new trace `b` (equal digests): the same host-callback objects, and
+    each constant the same object or an equal small array."""
+    ca, cb = host_callbacks(a.jaxpr), host_callbacks(b.jaxpr)
+    return (len(a.consts) == len(b.consts) and all(_same_const(x, y) for x, y in zip(a.consts, b.consts))
+            and len(ca) == len(cb) and all(x is y for x, y in zip(ca, cb)))
+
+
 _WARNED = set()
 
 
@@ -555,6 +603,15 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
             check_tallies(cj, [s.kind for s in tspecs], name=f"item function {where}")
             # hoist closed-over tracers (outer jit/grad/jvp/vmap values) as explicit broadcast operands
             hidx = [k for k, c in enumerate(cj.consts) if isinstance(c, Tracer)]
+            ckey = None
+            if not hidx:                    # (a program closing over a live trace's values is never reused)
+                ckey = _prog_key(cj, tspecs, mode, caps, M, max_steps, spawn, (nmp, nh, nb0, nbx),
+                                 n_active is not None, where)
+                hit = _PROGS.get(ckey)
+                if hit is not None and _same_objects(hit[0], cj):
+                    _PROGS.move_to_end(ckey)
+                    _diagnostics.record_program(hit[1])
+                    return hit[1], []
             hoisted = [cj.consts[k] for k in hidx]
             npi, nbt = nmp + nh, nb0 + nbx
             cap1 = int(max_steps is not None)
@@ -579,6 +636,10 @@ def vmap(fn=None, *, outputs, in_axes=0, max_steps=None, spawn=None, backend="au
                 app = (nmp, tuple((r, caps[r], nyc + j) for j, r in enumerate(rnames)))
             prog = ItemProgram(cj2, tuple(tspecs), npi, nbt + len(hoisted), trunc, spawn, where=where,
                                nact=nb0 - 1 if n_active is not None else None, app=app)
+            if ckey is not None:
+                _PROGS[ckey] = (cj, prog)
+                while len(_PROGS) > PROG_CACHE:
+                    _PROGS.popitem(last=False)
             _diagnostics.record_program(prog)
             return prog, hoisted
 

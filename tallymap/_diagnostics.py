@@ -85,6 +85,7 @@ def record_reverse(kind, rec):
         REVERSE["build"].setdefault("loops", []).append(rec)
     elif kind == "tree":
         REVERSE["tree"].append(rec)
+        del REVERSE["tree"][:-HISTORY]          # (only the last is read: bounded)
     else:
         REVERSE[kind].clear()
         REVERSE[kind].update(rec)

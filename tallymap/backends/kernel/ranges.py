@@ -15,6 +15,8 @@ arithmetic wraps in the emitted code, so a result whose interval leaves its dtyp
 Two entry points share the per-primitive rules: `eqn_ranges` (one equation, from its operands' ranges: the
 emitter's path, Val.rng) and `jaxpr_ranges` (a whole jaxpr without emitting anything: loop invariants).
 """
+import weakref
+
 import numpy as np
 from jax.extend.core import Literal
 
@@ -250,19 +252,16 @@ def _vrange(v, env):
     return env.get(v)
 
 
-_MEMO = {}           # (id(jaxpr), input ranges) -> (jaxpr, output ranges): nested loops are analysed once per fact set
+# Jaxpr -> {(input ranges, constant ranges, ENABLE): output ranges}: nested loops are analysed once per fact set.
+# Weak on the Jaxpr (an entry dies with its jaxpr; a hit is always the same object), and the constants' ranges are
+# part of the fact set: two ClosedJaxprs may share one Jaxpr with different constants.
+_MEMO = weakref.WeakKeyDictionary()
+_MEMO_FACTS = 64     # fact sets kept per jaxpr (a bound; a jaxpr is analysed under very few)
 
 
 def jaxpr_ranges(cj, rs, env_out=None):
     """the ranges of a (closed) jaxpr's outputs from its inputs' ranges, nothing emitted."""
     j = getattr(cj, "jaxpr", cj)
-    key = (id(j), tuple(rs), ENABLE)
-    if env_out is None:
-        hit = _MEMO.get(key)
-        if hit is not None and hit[0] is j:
-            return list(hit[1])
-        if len(_MEMO) > 1 << 16:
-            _MEMO.clear()
     consts = getattr(cj, "consts", [])
     env = {}
     for v, c in zip(j.constvars, consts):
@@ -271,6 +270,12 @@ def jaxpr_ranges(cj, rs, env_out=None):
                 env[v] = lit_range(np.asarray(c), v.aval.dtype)
             except Exception:
                 pass
+    key = (tuple(rs), tuple(env.get(v) for v in j.constvars), ENABLE)
+    if env_out is None:
+        memo = _MEMO.get(j)
+        hit = None if memo is None else memo.get(key)
+        if hit is not None:
+            return list(hit)
     for v, r in zip(j.invars, rs):
         if _is_int(v.aval.dtype):
             env[v] = clip(full(r, v.aval.dtype), v.aval.dtype)
@@ -288,7 +293,10 @@ def jaxpr_ranges(cj, rs, env_out=None):
         env_out.update(env)
     out = [_vrange(v, env) for v in j.outvars]
     if env_out is None:
-        _MEMO[key] = (j, tuple(out))
+        memo = _MEMO.setdefault(j, {})
+        if len(memo) >= _MEMO_FACTS:
+            memo.clear()
+        memo[key] = tuple(out)
     return out
 
 

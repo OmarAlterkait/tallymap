@@ -14,6 +14,7 @@ functions; cuda_math is ignored.
 run(prog, pi, bc, target=, cuda_math=, schedule=) -> [sum tallies] + [stats i32[5]] + [per-item results]
 Unsupported constructs raise tallymap.UnsupportedError on both targets (backend='xla' runs them).
 """
+import collections
 import hashlib
 import os
 
@@ -30,7 +31,13 @@ from . import kernel as _kernel_mod  # (the module: this package's `kernel` is t
 from .codegen import CodegenError, is_key_dtype
 from .kernel import BLOCK, build_source
 
-_KERNELS = {}
+# structural key -> built Kernel, least recently used first.  Bounded: an entry holds its program (the canonical
+# jaxprs and their constants), and a process that builds many distinct programs (a constant that changes per call)
+# must not keep them all.  An evicted program is rebuilt on its next launch (its cubin / shared object comes from the
+# disk cache; registering an already registered kernel id is a no-op).
+_KERNELS = collections.OrderedDict()
+KERNEL_CACHE = 256
+BUILDS = [0]         # Kernels built in this process (tests: "no new kernel" checks read this, not len(_KERNELS))
 
 
 def _const_sig(c):
@@ -98,9 +105,14 @@ def schedule_note(L):
 
 def kernel(p, **opts):
     k = _key(p, opts)
-    if k not in _KERNELS:
-        _KERNELS[k] = Kernel(p, **opts)
-    kern = _KERNELS[k]
+    kern = _KERNELS.get(k)
+    if kern is None:
+        kern = _KERNELS[k] = Kernel(p, **opts)
+        BUILDS[0] += 1
+        while len(_KERNELS) > KERNEL_CACHE:
+            _KERNELS.popitem(last=False)
+    else:
+        _KERNELS.move_to_end(k)
     from ..._diagnostics import record_kernel
     rec = dict(tag=p.tag, target=kern.target, schedule=kern.L.mode, hash=kern.info["hash"],
                cached=kern.info["cached"], kid=kern.kid, compile_s=round(kern.info["seconds"], 1),

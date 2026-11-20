@@ -18,10 +18,12 @@ def patched(mod, **values):
     """Set test-only module constants of `mod` for the block and restore them after.  A constant is read when a
     program is traced (lanes, folding, the reverse program) or lowered (the cuda emitter), so everything the arm
     traces, lowers and runs belongs inside the block.  The eager-call cache (_primitive._EAGER) is keyed on the
-    program, not on these constants, so it is cleared on entry and on exit."""
-    from tallymap import _primitive
+    program, not on these constants, so it (and the item-program cache, _api._PROGS) is cleared on entry and on
+    exit."""
+    from tallymap import _api, _primitive
     old = {k: getattr(mod, k) for k in values}
     _primitive._EAGER.clear()
+    _api._PROGS.clear()
     for k, v in values.items():
         setattr(mod, k, v)
     try:
@@ -30,6 +32,7 @@ def patched(mod, **values):
         for k, v in old.items():
             setattr(mod, k, v)
         _primitive._EAGER.clear()
+        _api._PROGS.clear()
 
 
 def artifacts(fn, *args, **kwargs):

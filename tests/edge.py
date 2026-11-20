@@ -608,11 +608,11 @@ def _(b):
         raise Fail("non-finite")
     if b == "auto":
         from tallymap.backends import kernel as CB
-        n0 = len(CB._KERNELS)
+        n0, b0 = len(CB._KERNELS), CB.BUILDS[0]
         for n in (5, 9, 33):
             f(xs[:n], keys[:n], tab, TH).outputs["Q"].block_until_ready()
-        if len(CB._KERNELS) != n0:
-            raise Fail(f"{len(CB._KERNELS) - n0} new kernels for new N (N must be a runtime argument)")
+        if CB.BUILDS[0] != b0:
+            raise Fail(f"{CB.BUILDS[0] - b0} new kernels for new N (N must be a runtime argument)")
         return f"{n0} kernels, 0 new for 3 new N"
 
 
@@ -2781,6 +2781,166 @@ def _(b):
         raise Fail(f"Records: primal {np.asarray(p)[:len(_SUBN)]}, tangent {np.asarray(tg)[:len(_SUBN)]} (want "
                    f"{wantq[:len(_SUBN)]}); grad {float(g)!r} (want {float(rg)!r})")
     return f"{', '.join(done)}, Records: primal, tangent and cotangent bitwise"
+
+
+# ------------------------------------------------------------------------------------------- memory: module caches
+def _gc():
+    import gc
+    jax.clear_caches()
+    gc.collect()
+
+
+@case("[mem] canon cache: weak on the jaxpr, bounded across fresh jaxprs, never another object's entry", ["xla"])
+def _(b):
+    import weakref
+
+    from jax.extend.core import ClosedJaxpr, jaxpr_as_fun
+
+    from tallymap.backends.kernel import canon
+    x = jnp.arange(3, dtype=F)
+
+    def mk(v):
+        a = jnp.full((3,), v, F)
+        return jax.make_jaxpr(lambda x: x ** 2 + a)(x)          # integer_pow: sugar, canonicalised
+    _gc()
+    n0 = len(canon._CACHE)
+    refs = []
+    for i in range(40):
+        cj = mk(float(i))
+        out = canon.canonical(cj)
+        if any(e.primitive.name == "integer_pow" for e in out.jaxpr.eqns):
+            raise Fail("integer_pow survived canonicalisation")
+        if not _bitwise(jaxpr_as_fun(out)(x)[0], x ** 2 + F(i)):
+            raise Fail(f"canonical form of jaxpr {i} computes the wrong values")
+        refs.append(weakref.ref(cj.jaxpr))
+        del cj, out
+    _gc()
+    alive, grown = sum(r() is not None for r in refs), len(canon._CACHE) - n0
+    if alive or grown > 0:
+        raise Fail(f"after 40 fresh jaxprs: {alive} still alive, cache grew by {grown} (an unbounded strong cache)")
+    # one Jaxpr, two constant sets: each gets a form with its OWN constants
+    cj = mk(1.0)
+    c5 = jnp.full((3,), 5.0, F)
+    o1, o2 = canon.canonical(cj), canon.canonical(ClosedJaxpr(cj.jaxpr, [c5]))
+    if not all(p is q for p, q in zip(o1.consts, cj.consts)) or not all(
+            p is q for p, q in zip(canon.canonical(cj).consts, cj.consts)):
+        raise Fail("a repeated canonicalisation does not carry its own constants")
+    if o2.consts[0] is not c5 or not _bitwise(jaxpr_as_fun(o2)(x)[0], x ** 2 + 5):
+        raise Fail("canonical() returned the constants of another ClosedJaxpr sharing the Jaxpr")
+    if not _bitwise(jaxpr_as_fun(canon.canonical(cj))(x)[0], x ** 2 + 1):
+        raise Fail("canonical() of the first ClosedJaxpr changed after a second constant set")
+    # an id reused by a new jaxpr after the old one died: never the old entry
+    hits = 0
+    for i in range(20):
+        cj = mk(float(i))
+        k = id(cj.jaxpr)
+        del cj
+        _gc()
+        cj2 = mk(float(i + 1000))
+        hits += id(cj2.jaxpr) == k
+        if not _bitwise(jaxpr_as_fun(canon.canonical(cj2))(x)[0], x ** 2 + F(i + 1000)):
+            raise Fail(f"a new jaxpr (id reused: {id(cj2.jaxpr) == k}) got a stale canonical form")
+        del cj2
+    return f"40 fresh jaxprs: 0 alive, cache +0; own constants per ClosedJaxpr; {hits}/20 id reuses, all fresh"
+
+
+@case("[mem] ranges memo: weak on the jaxpr, the constants' ranges are part of the fact set", ["xla"])
+def _(b):
+    import weakref
+
+    from jax.extend.core import ClosedJaxpr
+
+    from tallymap.backends.kernel import ranges
+    j = jax.make_jaxpr(lambda k: k + jnp.int32(1))(jnp.int32(0)).jaxpr
+    j = j.replace(constvars=list(j.invars), invars=[])          # k: an int32 scalar constant
+    c3 = ClosedJaxpr(j, [np.int32(3)])
+    r3 = ranges.jaxpr_ranges(c3, [])
+    r100 = ranges.jaxpr_ranges(ClosedJaxpr(j, [np.int32(100)]), [])
+    if tuple(r3[0]) != (4, 4) or tuple(r100[0]) != (101, 101):
+        raise Fail(f"ranges of k + 1: k = 3 -> {r3}, k = 100 -> {r100} (want (4, 4), (101, 101)): a memo keyed on "
+                   "the jaxpr alone returns another constant set's facts")
+    wr = weakref.ref(c3.jaxpr)       # (the memo's key: the Jaxpr; on JAX >= 0.12 a ClosedJaxpr is a Jaxpr: c3 itself)
+    n0 = len(ranges._MEMO)
+    del j, c3
+    _gc()
+    if wr() is not None or len(ranges._MEMO) >= n0:
+        raise Fail("the ranges memo keeps a dead jaxpr alive")
+    return "k = 3 -> (4, 4), k = 100 -> (101, 101); entry gone with its jaxpr"
+
+
+@case("[mem] repeated eager launches reuse the item program (no rewrite re-trace); a changed closure is seen")
+def _(b):
+    from tallymap import _api
+    n = [0]
+    real = _api.retrace
+
+    def counting(*a, **k):
+        n[0] += 1
+        return real(*a, **k)
+    xs = jnp.arange(16, dtype=F)
+    tab = [jnp.arange(NB, dtype=F)]
+
+    def item(t, x):
+        c = jnp.asarray([1.0, 2.0, 3.0], F)                     # a small array made at every trace (a new object)
+        def body(s):
+            i, t = s
+            return i + 1, t.add("Q", i % NB, x * c[i % 3] + tab[0][i % NB])
+        return lax.while_loop(lambda s: s[0] < 3, body, (jnp.int32(0), t))[1]
+
+    def rec_item(t, x):
+        return t.append("r", {"v": x * 2}, when=x > 3)
+    fs = dict(sum=V(item, b), one=tm.vmap(rec_item, outputs={"r": tm.Records({"v": F}, capacity=32)}, backend=b),
+              ctf=tm.vmap(rec_item, outputs={"r": tm.Records({"v": F}, capacity=None)}, backend=b))
+    get = dict(sum=lambda r: r.outputs["Q"], one=lambda r: r.outputs["r"]["v"], ctf=lambda r: r.outputs["r"]["v"])
+    _api.retrace = counting
+    try:
+        out = []
+        for k, f in fs.items():
+            first = np.asarray(get[k](f(xs)))
+            n0 = n[0]
+            for _ in range(5):
+                if not _bitwise(get[k](f(xs)), first):
+                    raise Fail(f"{k}: a repeated launch differs")
+            if n[0] != n0:
+                raise Fail(f"{k}: {n[0] - n0} rewrite re-traces over 5 repeated launches (want 0)")
+            out.append(k)
+        # the closure now holds another table: the next launch must use it (never a stale program)
+        want = np.asarray(fs["sum"](xs).outputs["Q"])
+        tab[0] = tab[0] + 100
+        got = np.asarray(fs["sum"](xs).outputs["Q"])
+        ref = want + 100 * np.bincount(np.arange(3) % NB, minlength=NB)[:NB] * len(xs)
+        if not np.allclose(got, ref, rtol=1e-6):
+            raise Fail(f"a changed closed-over table was not seen: {got} vs {ref}")
+    finally:
+        _api.retrace = real
+    return f"{', '.join(out)}: 0 re-traces over 5 launches, bitwise; a changed closure is seen"
+
+
+@case("[mem] fresh closures: the program and kernel caches stay bounded; an evicted kernel rebuilds", ["auto"])
+def _(b):
+    from tallymap import _api
+    from tallymap.backends import kernel as CB
+    xs = jnp.arange(8, dtype=F)
+    saved = CB.KERNEL_CACHE
+    CB.KERNEL_CACHE = 3
+
+    def f(i):                                    # a new literal: a new program and a new kernel per i
+        return V(lambda t, x: t.add("Q", 0, x * x + F(i)), b)(xs).outputs["Q"]
+    try:
+        first = np.asarray(f(0))
+        b0 = CB.BUILDS[0]
+        for i in range(1, 7):
+            f(i)
+        if len(CB._KERNELS) > 3 or len(_api._PROGS) > _api.PROG_CACHE:
+            raise Fail(f"kernels {len(CB._KERNELS)} (bound 3), programs {len(_api._PROGS)}")
+        from tallymap import _primitive as _P
+        _P._EAGER.clear()                        # (its compiled launches would not ask for the kernel again)
+        again = np.asarray(f(0))                 # evicted: rebuilt (from the disk cache), same bits
+        if not _bitwise(again, first) or CB.BUILDS[0] - b0 != 7:
+            raise Fail(f"evicted kernel: builds {CB.BUILDS[0] - b0} (want 7), bitwise {_bitwise(again, first)}")
+    finally:
+        CB.KERNEL_CACHE = saved
+    return f"7 programs: {len(CB._KERNELS)} kernels kept (bound 3); the evicted one rebuilt bitwise"
 
 
 print("\n================ SUMMARY", jax.__version__, "x64" if jax.config.jax_enable_x64 else "",

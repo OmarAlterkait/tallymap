@@ -14,6 +14,8 @@ The re-traced jaxpr keeps the original constants first, in order (the kernel's h
 by position), and nested jaxprs (while / cond / scan / call bodies) are canonicalised recursively.  One pass is
 enough: no canonical form contains sugar.
 """
+import weakref
+
 import jax
 import numpy as np
 from jax import lax
@@ -135,7 +137,7 @@ def _expand(eqn, ins):
 
 
 _NAMES = tuple(SUGAR)
-_CACHE = {}
+_CACHE = weakref.WeakKeyDictionary()     # Jaxpr -> its canonical ClosedJaxpr (see canonical)
 
 
 def _param(v):
@@ -177,19 +179,28 @@ def _eval(jaxpr, consts, args):
 
 
 def canonical(cj):
-    """the canonical form of a ClosedJaxpr (the same object when it contains no sugar)."""
+    """the canonical form of a ClosedJaxpr (the same object when it contains no sugar).
+
+    Memoised WEAKLY on the Jaxpr object (_CACHE): an entry dies with its jaxpr, so nothing is kept alive, and a hit is
+    always for the very same object (a weak dictionary compares keys by identity; a dead key's entry is gone before
+    its id can be reused).  The canonical structure depends only on the Jaxpr (constants enter by aval); the cached
+    ClosedJaxpr is returned when it carries the same constant objects, else one is made for these constants."""
     if not contains(cj.jaxpr, _NAMES):
         return cj
-    k = id(cj)
-    hit = _CACHE.get(k)
-    if hit is not None and hit[0] is cj:
-        return hit[1]
     nc = len(cj.consts)
+    hit = _CACHE.get(cj.jaxpr)
+    if hit is not None:
+        if all(a is b for a, b in zip(hit.consts[:nc], cj.consts)):
+            return hit
+        out = ClosedJaxpr(hit.jaxpr, list(cj.consts) + list(hit.consts[nc:]))
+        _CACHE[cj.jaxpr] = out
+        return out
     sds = lambda v: jax.ShapeDtypeStruct(v.aval.shape, v.aval.dtype, weak_type=getattr(v.aval, "weak_type", False))
-    new = jax.make_jaxpr(lambda *a: _eval(cj.jaxpr, a[:nc], a[nc:]))(
-        *[sds(v) for v in list(cj.jaxpr.constvars) + list(cj.jaxpr.invars)])
+    jx = cj.jaxpr
+    new = jax.make_jaxpr(lambda *a: _eval(jx, a[:nc], a[nc:]))(
+        *[sds(v) for v in list(jx.constvars) + list(jx.invars)])
     j = new.jaxpr
     j = j.replace(constvars=list(j.invars[:nc]) + list(j.constvars), invars=list(j.invars[nc:]))
     out = ClosedJaxpr(j, list(cj.consts) + list(new.consts))
-    _CACHE[k] = (cj, out)
+    _CACHE[jx] = out          # (the value holds the constants and the canonical jaxpr, never the key jaxpr)
     return out

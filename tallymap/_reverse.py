@@ -770,12 +770,14 @@ def _dce(cj):
 
 
 # ------------------------------------------------------------------------------------------- table reads
-_IOTA = {}
+_IOTA = {}           # shape -> iota table (bounded: cleared past 64 shapes)
 
 
 def _iota(shape):
     k = tuple(shape)
     if k not in _IOTA:
+        if len(_IOTA) >= 64:
+            _IOTA.clear()
         _IOTA[k] = np.arange(int(np.prod(k, dtype=np.int64)), dtype=np.int32).reshape(k)
     return _IOTA[k]
 
