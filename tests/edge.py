@@ -930,6 +930,33 @@ def _(b):
             f"{NB} privatised + {GB} global bins), order- and run-independent; out-of-type totals counted")
 
 
+@case("fixed point (not exact) with x64: 2^31 + 2^17 emits of 2^32 - 1 into ONE bin (the low-word sums pass 2^63) "
+      "are exact or NaN, never wrapped; 2^30 emits exact")
+def _(b):
+    """the xla backend's x64 fixed-point format sums each value's low 32 bits per bin in an int64; its guard
+    (xla._wnorm) flags a bin before that word could wrap.  v = 2^32 - 1 (scale 1) into one bin: 2^30 emits are exact
+    (low word below 2^62); 2^31 + 2^17 emits (past 2^63) are exact (the kernel backend's carry word) or NaN with
+    stats['fixed_point_overflow'] > 0 (xla), never a wrapped value.  Without x64 the format is int32 words with their
+    own counts: skipped."""
+    if not jax.config.jax_enable_x64:
+        return "skipped: x64 only"
+    I = 2048
+
+    def item(t, x):
+        return t.add("A", jnp.zeros((I,), jnp.int32), jnp.full((I,), float(2 ** 32 - 1), jnp.float64) * x)
+    msg = []
+    for n_it, must in ((1 << 19, True), ((1 << 20) + 64, False)):
+        r = tm.vmap(item, outputs={"A": tm.Sum((1,), jnp.float64, fixed_point=True, scale=1.0)}, backend=b,
+                    **({"xla_batch_size": 1 << 12} if b == "xla" else {}))(jnp.ones((n_it,), jnp.float64))
+        got, want = float(np.asarray(r.outputs["A"])[0]), float(n_it * I * (2 ** 32 - 1))
+        ovf = int(r.stats["fixed_point_overflow"])
+        exact = got == want and ovf == 0
+        if not (exact or (not must and np.isnan(got) and ovf > 0)):
+            raise Fail(f"{n_it * I} emits: {got!r}, want {want!r}{'' if must else ' or NaN'} (overflow {ovf})")
+        msg.append(f"{n_it * I}: {'exact' if exact else 'NaN, flagged'}")
+    return "; ".join(msg)
+
+
 @case("spawn: cascade counts, overflow counted, children truncated, jvp")
 def _(b):
     def item(t, gen, x):
@@ -1709,6 +1736,39 @@ def _(b):
                 raise Fail("control: a cond that keeps the floor lost the div.approx (the floor did not flow)")
             msg.append(f"{'subnormal' if sc else 'kept'}: {n} div.approx")
     return "values == approx == xla" + ("; " + ", ".join(msg) if msg else "")
+
+
+@case("float facts: max / min of a proven non-NaN +0 / -0 pair, both operand orders (the FMNMX zero tie) == xla "
+      "(value and sign)", ["auto"])
+def _(b):
+    """sj_fmaxn / sj_fminn (fmaxf / fminf on the device: one FMNMX) must give max(+0, -0) = max(-0, +0) = +0 and
+    min = -0 in either order, as XLA does.  The operands are xi * 0 for integer-valued xi (non-NaN by the facts:
+    finite * finite), so the zero sign follows xi's sign."""
+    f32 = jnp.float32
+
+    def item(t, x):
+        xi = (x % 7 - 3).astype(f32)
+        a = xi * f32(0)                     # -0 for xi < 0, +0 otherwise
+        c = -a
+        r = (jnp.maximum(a, c), jnp.maximum(c, a), jnp.minimum(a, c), jnp.minimum(c, a), jnp.maximum(a, a),
+             jnp.minimum(c, c))
+        return t.add("Q", 0, f32(1)), r
+    ii = jnp.arange(64, dtype=jnp.int32)
+    out = {"Q": tm.Sum((1,), f32)}
+    ra, rx = V(item, "auto", outputs=out)(ii).per_item, V(item, "xla", outputs=out)(ii).per_item
+    for j, (p, q) in enumerate(zip(ra, rx)):
+        p, q = np.asarray(p), np.asarray(q)
+        if not (np.array_equal(p, q) and np.array_equal(np.signbit(p), np.signbit(q))):
+            raise Fail(f"result {j}: signs {np.signbit(p)[:8].astype(int)} vs xla {np.signbit(q)[:8].astype(int)}")
+    nsrc = ""
+    if GPU:
+        d = tm.diagnostics(lambda a: V(item, "auto", outputs=out)(a).per_item, ii)["kernels"]
+        srcs = [open(k["source"]).read() for k in d if k.get("source") and os.path.exists(k["source"])]
+        n = sum(len(re.findall(r"sj_f(?:max|min)n\((?!T a)", s)) for s in srcs)     # (calls, not the prelude)
+        if srcs and n == 0:
+            raise Fail("no sj_fmaxn / sj_fminn in the kernel source: the facts did not fire (test is vacuous)")
+        nsrc = f"; {n} sj_fmaxn/sj_fminn calls"
+    return f"zero ties equal to xla on {jax.devices()[0].device_kind}" + nsrc
 
 
 @case("staged tables: small broadcast / constant tables read from shared memory == SHARED_TABLES off == xla "

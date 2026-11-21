@@ -131,8 +131,8 @@ def _perbin(s):
 # m << p, m < 2^24: m << (p % 16) < 2^39 is cut into 3 pieces below 2^16 at words p / 16 .. p / 16 + 2 <= 17).  Word 18
 # has weight 2^288 and takes only carries; it is flagged at 2^30: the same threshold (2^318 units) as the int64 format's
 # top word (2^256 x 2^62).  A fixed-point tally's integers (|q| < 9.2e18 < 2^63: 3 pieces at words <= 5) take
-# FIXED_WORDS32 words; its top word (weight 2^112) is flagged at 2^30, far past where the x64 format's int64 low-word
-# sums wrap (2^31 emits into a bin).  A word below the top stays within 2^16 + 2^15 + XNORM32 2^16 < 2^31 in
+# FIXED_WORDS32 words; its top word (weight 2^112) is flagged at 2^30 (the x64 format's pair flags a
+# word at 2^62, _wnorm).  A word below the top stays within 2^16 + 2^15 + XNORM32 2^16 < 2^31 in
 # magnitude: each bin counts the values added into it since the last carry step (_St.nadd: a value adds one piece to a
 # word at most), and the tally takes a carry step (_xnorm) before a bin could pass XNORM32 (per bin: a bin's count,
 # not the tally's, so a large tally whose bins each take few values takes one rarely, if ever).  20 x 4 B per bin
@@ -524,10 +524,32 @@ def _fread32(a, s):
     return vu.astype(dt), bad | big
 
 
+PAIR_LIM = 1 << 62      # a fixed-point pair's high word at or past this flags its bin (no wrap: a chunk adds < 2^61)
+
+
+def _wnorm(a, bad, ovf, f, S, lead):
+    """the wrap guard of a fixed-point pair accumulator a [*lead, 2S] (_wide) at the bins f a chunk is about to add
+    into (f [M]: bin indices, S = dropped), -> (bad, ovf).  A chunk adds at most XNORM values, each below 2^32 to a
+    low word and below 2^31 in magnitude to a high word, so a word below PAIR_LIM = 2^62 before the chunk cannot wrap
+    in it; a touched bin with a word at or past PAIR_LIM is flagged (NaN; ovf counts the chunk's values into a newly
+    flagged bin).  So a bin is exact or NaN, never wrapped: exact up to at least 2^30 emits (2^62 / 2^32), NaN past
+    where its low word reaches 2^62.  The bins are only read (a gather of M values per row), never written: a carry
+    step that writes them back before the add held a copy of the accumulator under jvp (68 B per cell against 38 at
+    2^23 cells, x64, 46202160; this guard 42, 46202877)."""
+    w = a.reshape(tuple(lead) + (2, S))
+    ok = f < S
+    fi = jnp.clip(f, 0, S - 1)
+    lo, hi = jnp.take(w[..., 0, :], fi, axis=-1), jnp.take(w[..., 1, :], fi, axis=-1)
+    top = ((lo >= PAIR_LIM) | (hi >= PAIR_LIM) | (hi <= -PAIR_LIM)) & ok
+    ovf = ovf + jnp.sum((top & ~jnp.take(bad, fi, axis=-1)).astype(jnp.int32), dtype=jnp.int32)
+    return bad.at[..., jnp.where(ok, f, S)].max(top, mode="drop"), ovf
+
+
 def _wide(a, s):
     """a fixed-point tally's accumulator [*lead, 2S] (the sums of the values' low 32 bits, unsigned, and of their
     high 32 bits, signed) -> (its output: the exact total / scale, in s.dtype; the bins that do not fit s.dtype).
-    The kernel backend's carry word made explicit: no int64 bin wraps (the low sums hold 2^31 values per bin).
+    The kernel backend's carry word made explicit, and no int64 word wraps (_wnorm flags a bin whose word could
+    pass 2^63 in the next chunk of at most XNORM values: exact up to at least 2^30 emits per bin, then NaN).
     A total that fits int64 converts as before; a larger one is hi * 2^32 + lo rounded once (|hi| < 2^53)."""
     S = s.S
     lo, hi = a[..., :S], a[..., S:]
@@ -636,10 +658,17 @@ def _emit(st, t, idx, val):
         st.ovf = st.ovf + jnp.sum((~ok & live).astype(jnp.int32), dtype=jnp.int32)
         st.bad[t.slot] = st.bad[t.slot].at[..., f].max(~ok, mode="drop")        # a bin that dropped an emit
         # the wide accumulator (_wide): the low 32 bits of each value into row 0 of its [2, S] view, the signed high
-        # 32 into row 1 (two indices: no flat index past 2S, which passes int32 above 2^30 bins)
-        hl = jnp.concatenate([jnp.zeros(f.shape, jnp.int32), jnp.ones(f.shape, jnp.int32)])
-        st.accs[t.slot] = a.reshape(tuple(L) + (2, S)).at[..., hl, jnp.concatenate([f, f])].add(
-            jnp.concatenate([v & jnp.int64(0xFFFFFFFF), v >> 32], axis=-1), mode="drop").reshape(a.shape)
+        # 32 into row 1 (two indices: no flat index past 2S, which passes int32 above 2^30 bins), in chunks of at
+        # most XNORM values, each chunk's bins checked first (_wnorm): a word that could wrap flags its bin
+        k = t.slot
+        M = int(f.shape[-1])
+        for c0 in range(0, M, XNORM):
+            fc, vc = f[c0:c0 + XNORM], v[..., c0:c0 + XNORM]
+            st.bad[k], st.ovf = _wnorm(a, st.bad[k], st.ovf, fc, S, L)
+            hl = jnp.concatenate([jnp.zeros(fc.shape, jnp.int32), jnp.ones(fc.shape, jnp.int32)])
+            a = a.reshape(tuple(L) + (2, S)).at[..., hl, jnp.concatenate([fc, fc])].add(
+                jnp.concatenate([vc & jnp.int64(0xFFFFFFFF), vc >> 32], axis=-1), mode="drop").reshape(a.shape)
+        st.accs[k] = a
         return t
     v = v.astype(a.dtype)
     if _low(spec):                                    # SPLIT: a small value goes, scaled, into the LOW row

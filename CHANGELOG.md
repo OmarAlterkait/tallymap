@@ -63,6 +63,13 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   the tree adjoint already did: one rule, `_limits.queue_lost`, for every path that reads the tree from the ring
   (`spawned > capacity` or a dropped child) and for the forward (a dropped child). tests/records.py "spawn: Records
   with more children in all than the Queue holds".
+- xla backend with `jax_enable_x64`: a fixed-point (not float32) `Sum` bin that took more than about 2^31 emits
+  wrapped silently (its int64 sum of the values' low 32-bit words passed 2^63: 2^31 + 2^17 emits of 2^32 - 1 gave
+  -9.2e18 for 9.2e18). Before each chunk of at most 2^29 values, a bin about to take values whose low or high word
+  is at or past 2^62 is now flagged (NaN, counted in `fixed_point_overflow`), so no word can wrap: exact up to at
+  least 2^30 emits per bin, NaN past that, never wrong (the kernel backend, with its carry word, stays exact
+  there). A carry step that wrote the words back cost a copy of the accumulator under jvp (68 against 38 B per
+  cell), so the guard only reads. tests/edge.py "fixed point (not exact) with x64: 2^31 + 2^17 emits".
 - Reverse mode with JAX 0.6.2 - 0.11 through a while loop that reads a table (any broadcast operand) inside ONE
   branch of a `lax.switch` / `lax.cond` (lumen SBND: a facet table read in one outcome branch): the checkpointed loop
   keeps its body consts as residuals, and JAX's cond partial eval returns each branch's residuals as cond outputs
