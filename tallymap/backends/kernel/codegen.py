@@ -883,7 +883,7 @@ class Emitter:
                     outs = [outs]
                 rr = eqn_ranges(eqn, [vrng(x) for x in ins], [getattr(x, "dtype", None) for x in ins], nested=False)
                 ff = (ranges.float_facts(eqn.primitive.name, [vff(x) for x in ins], ins,
-                                         getattr(eqn.outvars[0].aval, "dtype", None))
+                                         getattr(eqn.outvars[0].aval, "dtype", None), eqn)
                       if len(eqn.outvars) == 1 and guard is None else None)
                 ml = (ranges.mag_floor(eqn.primitive.name, [vml(x) for x in ins], ins, self.same_value)
                       if self.fast and len(eqn.outvars) == 1 and guard is None else None)

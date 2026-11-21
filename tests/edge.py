@@ -1570,6 +1570,37 @@ def _ssa_variants(th):
     return {"dus": dus, "scatter": scatter, "cond destination": cond, "while carry": carry}
 
 
+@case("float facts: a max / min over an EMPTY axis is -inf / +inf, not finite (their sum is NaN) == jax",
+      ["auto", "xla"])
+def _(b):
+    """ranges.float_facts passes a reduction's facts through from its operand; an empty reduce_max is -inf and an
+    empty reduce_min +inf, so a finite operand (here an integer conversion) does not make them finite.  Then
+    finite + finite is NOT proven non-NaN, and maximum(xi, max + min) must give NaN as jax does.  Variants: a
+    whole empty array (scalar result) and an empty trailing axis of a (3, 0) array (per-row results)."""
+    xs = jnp.linspace(0.1, 1.0, N).astype(F)
+
+    def whole(x):
+        xi = (x * 10).astype(jnp.int32)
+        a = (jnp.arange(0, dtype=jnp.int32) + xi).astype(F)               # finite (integer conversion), empty
+        return jnp.maximum(xi.astype(F), lax.reduce_max(a, (0,)) + lax.reduce_min(a, (0,)))
+
+    def rows(x):
+        xi = (x * 10).astype(jnp.int32)
+        a = (jnp.zeros((3, 0), jnp.int32) + xi).astype(F)
+        return jnp.minimum(xi.astype(F), lax.reduce_max(a, (1,)) + lax.reduce_min(a, (1,)))
+    bad = []
+    for nm, g in (("whole", whole), ("rows", rows)):
+        def item(t, x, g=g):
+            return t.add("Q", 0, x), g(x)
+        got = np.asarray(V(item, b)(xs).per_item)
+        ref = np.asarray(jax.jit(jax.vmap(g))(xs))
+        if not np.array_equal(got, ref, equal_nan=True):
+            bad.append(f"{nm} ({int(np.isnan(ref).sum())} NaN in jax, {int(np.isnan(got).sum())} here)")
+    if bad:
+        raise Fail("differs from jax: " + "; ".join(bad))
+    return "== jax.vmap (NaN everywhere, as jax)"
+
+
 @case("facts per SSA value: a NaN guard on a value updated in place since is no guard (dus, scatter, cond dest, "
       "while carry) == jax", ["auto", "xla"])
 def _(b):

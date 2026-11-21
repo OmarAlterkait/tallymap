@@ -381,7 +381,10 @@ def scan_ranges(eqn, rs, carries=False):
 # (op_table.b_max / b_min; f32 on the device one FMNMX).  Facts flow
 # from literals, integer -> float conversions, selects, sign / rounding / abs / neg, min / max, the bounded
 # functions, the NaN guards jnp.where(x != x, c, x) / jnp.where(isfinite(x), x, c), and finite + finite (never NaN,
-# though it may overflow).  Loop carries carry none (unknown).
+# though it may overflow).  Loop carries carry none (unknown).  A value's facts hold for EVERY element it has, so
+# an op whose elements come from operand elements keeps them (_FF_SAME); one that can make an element from nothing
+# does not: a max / min over an empty axis is its identity -inf / +inf (non-NaN, not finite), and a narrowing
+# conversion or reduce_precision may overflow to inf.
 FF_NONE = (False, False)
 
 
@@ -401,15 +404,25 @@ def _and(*fs):
     return (all(f[0] for f in fs), all(f[1] for f in fs))
 
 
-_FF_SAME = {"neg", "abs", "floor", "ceil", "round", "reduce_max", "reduce_min", "broadcast_in_dim", "reshape",
-            "transpose", "slice", "rev", "squeeze", "expand_dims", "dynamic_slice", "copy", "copy_p", "cummax",
-            "cummin", "reduce_precision", "real", "imag"}
+# every element of the result is an operand element (or a sign / rounding of one: finite stays finite)
+_FF_SAME = {"neg", "abs", "floor", "ceil", "round", "broadcast_in_dim", "reshape", "transpose", "slice", "rev",
+            "squeeze", "expand_dims", "dynamic_slice", "copy", "copy_p", "cummax", "cummin", "real", "imag"}
+_FF_REDUCE = ("reduce_max", "reduce_min")      # the max / min of the reduced elements, or the identity -inf / +inf
 
 
-def float_facts(name, ffs, ins, out_dt):
+def _empty_reduction(eqn):
+    """does the reduction `eqn` reduce an axis of extent 0 (None / unknown: assume it may)?"""
+    try:
+        return any(int(eqn.invars[0].aval.shape[a]) == 0 for a in eqn.params["axes"])
+    except Exception:
+        return True
+
+
+def float_facts(name, ffs, ins, out_dt, eqn=None):
     """(nonnan, finite) of an equation's (first) float result from its operands' facts `ffs` and values `ins`
     (Val.origin = (primitive, operands) of a computed operand: the NaN-guard patterns; `is` compares SSA values,
-    codegen.new_version), or None (not a float)."""
+    codegen.new_version); eqn: the equation (shapes and params: a reduced extent, a reduce_precision format; None:
+    assume the worst), or None (not a float)."""
     if not ENABLE or not _is_float(out_dt):
         return None
     try:
@@ -418,10 +431,17 @@ def float_facts(name, ffs, ins, out_dt):
             if _is_int(src):
                 return (True, True)
             if _is_float(src):
-                return (ffs[0][0], ffs[0][1] and _np(out_dt).itemsize >= _np(src).itemsize)
+                return (ffs[0][0], ffs[0][1] and bool(np.finfo(_np(out_dt)).max >= np.finfo(_np(src)).max))
             return FF_NONE
         if name in _FF_SAME:
             return ffs[0]
+        if name in _FF_REDUCE:
+            return (ffs[0][0], ffs[0][1] and eqn is not None and not _empty_reduction(eqn))
+        if name == "reduce_precision":       # (a narrower format may round a finite value to inf)
+            fi = np.finfo(_np(out_dt))
+            same = eqn is not None and (int(eqn.params["exponent_bits"]), int(eqn.params["mantissa_bits"])) == (
+                int(fi.nexp), int(fi.nmant))
+            return (ffs[0][0], ffs[0][1] and same)
         if name == "sign":
             return (ffs[0][0], ffs[0][0])
         if name == "iota":

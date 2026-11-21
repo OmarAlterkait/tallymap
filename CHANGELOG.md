@@ -39,6 +39,11 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Fixed
 
+- Kernel backend: a `reduce_max` / `reduce_min` over an axis of extent 0 (-inf / +inf) was taken for finite when its
+  operand was, so the sum of an empty max and an empty min (NaN) was taken for non-NaN and a later `maximum` /
+  `minimum` dropped the NaN (default options; tests/edge.py "float facts: a max / min over an EMPTY axis").  A max /
+  min is finite only when no reduced extent is 0; a `reduce_precision` or float conversion is finite only when it
+  cannot overflow (the same format, or a range at least the source's).
 - Kernel backend: value facts (integer ranges, NaN / finite, magnitude floors) were attributes of a Python object
   that in-place writes reused for a NEW value (an in-place `dynamic_update_slice` / scatter, a while / scan carry in
   its initial value's storage, a cond destination), so a NaN guard `where(x != x, c, x2)` on a value `x2` written
