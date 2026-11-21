@@ -1586,6 +1586,8 @@ def _cond(em, eqn, ins, **p):
         x.rng = r
         fs = [vff(bd[1][j]) for bd in bodies]
         x.ff = (all(f[0] for f in fs), all(f[1] for f in fs))
+        ms = [vml(bd[1][j]) for bd in bodies]           # the magnitude floor every branch proves (cuda_math='fast')
+        x.mlo = min(ms) if all(ms) else None
     return res
 
 

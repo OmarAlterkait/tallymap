@@ -47,6 +47,10 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   is one SSA value with its own facts; facts are no longer cleared by primitive name (a cond destination kept the
   operand's magnitude floor under `cuda_math='fast'`), and the magnitude-floor pattern compares values, not
   rendered text.  Aliasing and destination decisions ask one function, `Emitter.storages_read`.
+- Kernel backend, `cuda_math='fast'`: a `lax.cond` output (a new value since the entry above) took no magnitude
+  floor, so a division by a guarded divisor that passed through a cond lost its div.approx; it now takes the floor
+  every branch proves (none when a branch may make it subnormal, e.g. a destination scaled by 2^-130 in one
+  branch: IEEE division there). tests/edge.py "cuda_math='fast': a guarded divisor overwritten in place by a cond".
 - Reverse mode with JAX 0.6.2 - 0.11 through a while loop that reads a table (any broadcast operand) inside ONE
   branch of a `lax.switch` / `lax.cond` (lumen SBND: a facet table read in one outcome branch): the checkpointed loop
   keeps its body consts as residuals, and JAX's cond partial eval returns each branch's residuals as cond outputs

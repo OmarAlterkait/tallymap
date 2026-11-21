@@ -1636,6 +1636,50 @@ def _(b):
     return "close (CPU: the mode is ignored)"
 
 
+@case("cuda_math='fast': a guarded divisor overwritten in place by a cond (a destination output) keeps only the "
+      "floor the branches prove: no div.approx by a divisor a branch makes subnormal", ["auto"])
+def _(b):
+    """d = where(|u| < eps, eps, u) has the magnitude floor eps (fast division by it is div.approx); a lax.cond whose
+    branch scales it into the subnormals writes its result into d's storage (destination passing), so d's floor
+    after the cond is the branches' (here none above 2^-126) and the division by it is IEEE.  Control: a branch
+    that keeps the floor (d * 2) keeps the div.approx.  The values agree with 'approx' and xla either way
+    (measured: a 2080 Ti's div.approx divides by these subnormals correctly, round9/recovf 46172698)."""
+    f32 = jnp.float32
+
+    def mk(sc):
+        def item(t, x):
+            u = jnp.stack([x - f32(0.5), x + f32(0.25)])
+            d = jnp.where(jnp.abs(u) < f32(1e-3), f32(1e-3), u)
+            s = d[0] * d[1] + d[0] - d[1]
+            e = jnp.where(x > f32(0.75), f32(2.0 ** -148), f32(2.0 ** -130)) if sc else f32(2)
+            d = lax.cond(x > f32(0.5), lambda d: d * e, lambda d: d, d)
+            q = f32(2.0 ** -30) / d
+            return t.add("Q", 0, s), (q, s)
+        return item
+    x = jnp.linspace(0.0, 1.0, 64).astype(f32)
+    out = {"Q": tm.Sum((1,), f32)}
+    msg = []
+    for sc in (True, False):
+        item = mk(sc)
+        run = lambda bk, **o: np.asarray(V(item, bk, outputs=out, **o)(x).per_item[0])     # noqa: E731
+        ref, fast, xr = run("auto"), run("auto", cuda_math="fast"), run("xla")
+        ok = np.isclose(fast, ref, rtol=1e-4, atol=0) | (fast == ref)
+        if not np.all(ok):
+            k = int(np.flatnonzero(~ok.reshape(-1))[0])
+            raise Fail(f"fast {fast.reshape(-1)[k]!r} vs approx {ref.reshape(-1)[k]!r} (xla {xr.reshape(-1)[k]!r})")
+        close(ref, xr, rtol=1e-6, what="approx vs xla")
+        if GPU:
+            d = tm.diagnostics(lambda a: V(item, "auto", outputs=out, cuda_math="fast")(a).per_item, x)["kernels"]
+            srcs = [open(k["source"]).read() for k in d if k.get("source") and os.path.exists(k["source"])]
+            n = sum(len(re.findall(r"sj_div_approx[(](?!float a)", s)) for s in srcs)
+            if srcs and sc and n:
+                raise Fail(f"{n} div.approx by the cond's destination, which a branch makes subnormal (stale floor)")
+            if srcs and not sc and not n:
+                raise Fail("control: a cond that keeps the floor lost the div.approx (the floor did not flow)")
+            msg.append(f"{'subnormal' if sc else 'kept'}: {n} div.approx")
+    return "values == approx == xla" + ("; " + ", ".join(msg) if msg else "")
+
+
 @case("staged tables: small broadcast / constant tables read from shared memory == SHARED_TABLES off == xla "
       "(bitwise)", ["auto"])
 def _(b):
