@@ -63,6 +63,15 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   the tree adjoint already did: one rule, `_limits.queue_lost`, for every path that reads the tree from the ring
   (`spawned > capacity` or a dropped child) and for the forward (a dropped child). tests/records.py "spawn: Records
   with more children in all than the Queue holds".
+- `Records` counts past 2^31 appends: the totals and offsets were int32 sums, so a call that appended more wrapped
+  with no flag (2^32 + 2^15 appends into capacity 2^16: `appended` 32768, `records_dropped` 0, not poisoned, records
+  at wrapped offsets). Totals are now exact two-word sums and decide the overflow on every path (one pass,
+  count-then-fill, the canonicalisation and its sharded offsets, the fill twin's tables), offsets are clipped at the
+  capacity, and the reported counts never wrap: with `jax_enable_x64` `stats['appended']` and
+  `stats['records_dropped']` are int64 and exact; without it int32, exact up to 2^31 - 1 and saturated there (such a
+  call is always poisoned). One helper, `_limits.limit`, for the Records capacity and the spawn Queue's record rule
+  (which now also reads a `spawned` counter past 2^31 as exceeding the Queue). `capacity=None` past 2^30 records
+  raises. tests/records.py "counts past 2^31", "a real call with 2^32 + 2^15 appends".
 - xla backend with `jax_enable_x64`: a fixed-point (not float32) `Sum` bin that took more than about 2^31 emits
   wrapped silently (its int64 sum of the values' low 32-bit words passed 2^63: 2^31 + 2^17 emits of 2^32 - 1 gave
   -9.2e18 for 9.2e18). Before each chunk of at most 2^29 values, a bin about to take values whose low or high word

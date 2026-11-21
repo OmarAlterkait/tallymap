@@ -324,9 +324,12 @@ res.stats["appended"]["dep"]       # how many records there are (the rest of the
   a full Queue: every float output of the call is NaN, every integer record field is -1, and
   `stats['records_dropped']` says how many did not fit. Overflow is deterministic (decided by the true total; the
   poisoned outputs do not depend on which records reached the buffer). `stats['appended']` is exact also on
-  overflow, so a caller that sizes the capacity from memory can rerun at the next power of two above it; it is an
-  int32 scalar computed in the same launch (a sum of the per-item counts), and reading it on the host is one
-  device-to-host copy of 4 bytes. `capacity=None` sizes the output from the eager call's own count (rounded up to
+  overflow, so a caller that sizes the capacity from memory can rerun at the next power of two above it; it is a
+  scalar computed in the same launch (a sum of the per-item counts), and reading it on the host is one small
+  device-to-host copy. It never wraps: with `jax_enable_x64` it and `records_dropped` are int64 and exact; without
+  it they are int32, exact up to 2^31 - 1 and saturated there (a call at 2^31 - 1 has more records than any
+  capacity holds, and is poisoned). A Records call with `spawn` also needs a Queue capacity of at least the call's
+  total number of children (a larger tree poisons it, as reverse mode through spawn does). `capacity=None` sizes the output from the eager call's own count (rounded up to
   a power of two; this runs count-then-fill, below); under `jax.jit` or a `jax.vmap` of the call pass an int.
 - **Derivatives.** Float fields carry the pathwise derivative of each record's value (jvp, grad, jacfwd, jacrev,
   `jax.checkpoint`, reverse through spawn). Whether a record exists is a discrete decision and has no derivative,

@@ -24,6 +24,7 @@ from jax.core import Tracer
 from jax.extend.core import ClosedJaxpr, jaxpr_as_fun
 
 from . import _diagnostics, _errors
+from . import _limits as _lim
 from ._jaxpr import digest, host_callbacks, item_name, located, subjaxprs
 from ._limits import queue_lost
 from ._rewrite import check_tallies, isfloat, retrace
@@ -122,8 +123,11 @@ class Records:
     sums) is NaN, every integer record field is -1, and stats['records_dropped'][name] counts the records that did
     not fit.  Overflow is deterministic: it is decided by the true total, and the poisoned outputs do not depend on
     which records reached the buffer.  Sizing: stats['appended'][name] is exact also on overflow (the sum of the
-    per-item counts of the same launch, an int32 scalar on the device), so a caller can rerun at the next power of
-    two above it.
+    per-item counts of the same launch, a scalar on the device), so a caller can rerun at the next power of two above
+    it.  The counts never wrap: with jax_enable_x64 stats['appended'] and stats['records_dropped'] are int64 and
+    exact; without it they are int32, exact up to 2^31 - 1 and SATURATED there (2^31 - 1 reads "at least that many":
+    more than any capacity, so such a call is always poisoned).  The overflow decision uses the exact total either
+    way (_limits).
 
     Implementation.  ONE PASS (the default, with a capacity and without spawn; _records.py): each append takes the
     next slot of a raw buffer (one atomic counter per output) and writes its fields and its key (item, k) there; the
@@ -707,6 +711,17 @@ def _sg(x):
     return lax.stop_gradient(x) if isfloat(x.dtype) else x
 
 
+def _record_limits(counts, caps):
+    """{output: per-item (per-node) int32 counts}, {output: capacity} -> (overflowed: a traced bool, stats
+    'appended', stats 'records_dropped'), by the one resource-limit rule (_limits.limit: exact totals, int64 with
+    x64, saturated int32 without)."""
+    ovf, app, drop = jnp.bool_(False), {}, {}
+    for r, c in counts.items():
+        o, app[r], drop[r] = _lim.limit(_lim.total(c), caps[r])
+        ovf = ovf | o
+    return ovf, app, drop
+
+
 def _records_one(build, call, sspecs, shapes, names, rnames, rspec, pi, bc, max_steps, meta, N):
     """a call with Records outputs in ONE pass (see Records): one launch of the one-pass program, canonicalised by
     the primitive itself (_records.canon), so its outputs, and every derivative's, are in the count-then-fill
@@ -727,14 +742,9 @@ def _records_one(build, call, sspecs, shapes, names, rnames, rspec, pi, bc, max_
     tv = {s.name: v for s, v in zip([fspecs[k] for k in prog.out_tallies], tvals)}
     stats = {n: st[ST[n]] for n in ("fixed_point_overflow", "dropped_emits")}
     stats["n_truncated"] = jnp.sum(trunc, dtype=jnp.int32)
-    totals = {r: jnp.sum(c, dtype=jnp.int32) for r, c in zip(rnames, counts)}
-    stats["appended"] = totals
-    stats["records_dropped"] = {r: jnp.maximum(totals[r] - caps[r], 0) for r in rnames}
+    ovf, stats["appended"], stats["records_dropped"] = _record_limits(dict(zip(rnames, counts)), caps)
     stats["records_mismatch"] = {r: jnp.int32(0) for r in rnames}
     lim = stats["n_truncated"] > 0 if max_steps is not None else None
-    ovf = jnp.bool_(False)              # (a multiply that carries the poison into derivatives)
-    for r in rnames:
-        ovf = ovf | (totals[r] > caps[r])
     out = {n: tv[n].reshape(shapes[n]) for n in names}
     out.update((s.name, tv[s.name]) for s in rspecs)
     out = _poison(_poison_primal(out, lim), ovf)
@@ -829,20 +839,24 @@ def _records(build, call, sspecs, shapes, names, rnames, rspec, pi, bc, max_step
         tabs0 = [first]
     if _COUNTS_HOOK is not None:
         counts = {r: _COUNTS_HOOK(r, c) for r, c in counts.items()}
-    totals = {r: jnp.sum(c, dtype=jnp.int32) for r, c in counts.items()}
     caps = {}
     for r in rnames:
         C = rspec[r].capacity
         if C is None:
             try:
-                tot = int(totals[r])
+                tot = int(_lim.report(_lim.total(counts[r])))
             except (jax.errors.ConcretizationTypeError, jax.errors.TracerIntegerConversionError):
                 raise ValueError(f"tallymap: Records output {r!r} has no capacity, and this call is traced (jax.jit, "
                                  "a jax.vmap of the call, ...), so its number of records is not known when the "
                                  "outputs' shape is fixed: pass tallymap.Records(fields, capacity=...)") from None
             C = 1 << max(0, (tot - 1).bit_length())
+            if C > MAX_ITEMS:
+                raise ValueError(f"tallymap: Records output {r!r} has no capacity and its call appended {tot} "
+                                 f"records{' or more' if tot == _lim.I32MAX else ''}: more than the largest "
+                                 "capacity (2^30 as a power of two; 2^31 - 1 slots): split the call")
         caps[r] = C
-    offs = {r: (jnp.cumsum(c, dtype=jnp.int32) - c).astype(jnp.int32) for r, c in counts.items()}
+    ovf, appended, dropped = _record_limits(counts, caps)   # (from the count pass: the poison that differentiates)
+    offs = {r: _lim.offsets(c, caps[r]) for r, c in counts.items()}
     # 2. fill: the Sums, one Sum of the capacity per Records field (written once per slot: 0 + v = v), the mismatch
     # counter; hidden operands: the node id (roots: the item index), [first child,] offset and count tables
     rspecs = [TSpec(rkey(r, f), caps[r], dt) for r in rnames for f, dt in rspec[r].fields]
@@ -860,15 +874,11 @@ def _records(build, call, sspecs, shapes, names, rnames, rspec, pi, bc, max_step
     if spawn is not None:
         stats.update((n, st[ST[n]]) for n in ("spawned", "children_dropped", "children_truncated"))
     stats["n_truncated"] = jnp.sum(trunc, dtype=jnp.int32)
-    stats["appended"] = totals
-    stats["records_dropped"] = {r: jnp.maximum(totals[r] - caps[r], 0) for r in rnames}
+    stats["appended"], stats["records_dropped"] = appended, dropped
     stats["records_mismatch"] = {r: tv[MISMATCH][j] for j, r in enumerate(rnames)}
     lim = jnp.any(tv[MISMATCH] > 0)     # poisoned by the derived kernels themselves too (ItemProgram.trunc)
     if max_steps is not None:
         lim = lim | (stats["n_truncated"] > 0)
-    ovf = jnp.bool_(False)              # from the count pass: a multiply that carries the poison into derivatives
-    for r in rnames:
-        ovf = ovf | (totals[r] > caps[r])
     if spawn is not None:               # (as a spawning call without Records: the poison that differentiates)
         ovf = ovf | lim | lost | queue_lost(st, int(spawn.capacity), record=False)
         if max_steps is not None:

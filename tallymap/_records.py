@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from . import _limits as _lim
 from ._rewrite import retrace
 from ._tally import KI, KK, rkey
 
@@ -44,13 +45,13 @@ def canon(p, outs, axes=(), cid0=0):
         ki, kk = names.index(rkey(r, KI)), names.index(rkey(r, KK))
         cid, k = outs[ki], outs[kk]
         cnt = cnt.astype(jnp.int32)
-        tot = jnp.sum(cnt, dtype=jnp.int32)
-        off = jnp.cumsum(cnt, dtype=jnp.int32) - cnt
+        n = _lim.clip(_lim.total(cnt), C)             # (the counts' exact sum and prefix sums, clipped at C: a slot
+        off = _lim.sub(_lim.prefix(cnt), _lim.count(cnt))     # at or past C holds no record, and nothing wraps)
         if axes:                                     # (this device's records after the earlier devices')
-            tots = lax.all_gather(tot, axes)
-            off = off + (jnp.cumsum(tots) - tots)[lax.axis_index(axes)].astype(jnp.int32)
+            dev = _lim.offsets(lax.all_gather(n, axes), C)[lax.axis_index(axes)]
+            off = _lim.add(off, _lim.count(dev))
+        off = _lim.clip(off, C)
         j = jnp.arange(C, dtype=jnp.int32)
-        n = jnp.minimum(tot, C)
         pos = jnp.where(j < n, off[jnp.clip(cid - cid0, 0, cnt.shape[0] - 1)] + k, C)
         for i, nm in enumerate(names):
             if nm.startswith(pre):
@@ -64,11 +65,11 @@ def tables(p, outs):
     one-pass program).  _api._COUNTS_HOOK (test-only) alters the counts handed over (the mismatch negative control)."""
     from . import _api
     res = []
-    for (r, _, _), c in zip(p.app[1], _counts(p, outs)):
+    for (r, C, _), c in zip(p.app[1], _counts(p, outs)):
         c = c.astype(jnp.int32)
         if _api._COUNTS_HOOK is not None:
             c = _api._COUNTS_HOOK(r, c)
-        res += [(jnp.cumsum(c, axis=-1, dtype=jnp.int32) - c).astype(jnp.int32), c]
+        res += [_lim.offsets(c, C), c]           # (clipped at the capacity: no slot past it is written)
     return res
 
 

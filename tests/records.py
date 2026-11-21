@@ -554,6 +554,69 @@ def _(b):
     return f"appended {a} at capacity 64 -> rerun at {C}"
 
 
+@case("counts past 2^31: the exact two-word totals, the overflow decision, the clipped offsets and the reported "
+      "(int64 with x64, saturated int32 without) counts at and around 2^31 - 1 and past 2^32", ["xla"])
+def _(b):
+    """_limits (the one rule every Records path uses: one pass, count-then-fill, canon, its fill twin's tables,
+    sharded canon; and the spawn Queue's record rule) on per-item counts that sum near the int32 limits: a naive
+    int32 sum wraps, and a two-word sum that drops a carry fails the 2^32 + 1 case."""
+    from tallymap import _limits as L
+    M = (1 << 31) - 1
+    x64 = jax.config.jax_enable_x64
+    rep = lambda v: v if x64 else min(v, M)                                               # noqa: E731
+    cases = [([M - 1, 1], M), ([M], M), ([M, 1], 1 << 31), ([M, M, 3], (1 << 32) + 1), ([0, M, M, M, 0, 7], 3 * M + 7)]
+    for cnt, want in cases:
+        c = jnp.asarray(np.asarray(cnt, np.int64).astype(np.uint32).view(np.int32))
+        n = L.total(c)
+        got = int(np.asarray(n.hi, np.uint64)) << 32 | int(np.asarray(n.lo, np.uint64))
+        if got != want:
+            raise Fail(f"total {cnt}: {got} != {want}")
+        for cap in (16, M - 1, M):
+            ovf, app, drop = _api._record_limits({"r": c}, {"r": cap})
+            if bool(ovf) != (want > cap) or int(app["r"]) != rep(want) or int(drop["r"]) != rep(max(want - cap, 0)):
+                raise Fail(f"{cnt} capacity {cap}: overflow {bool(ovf)}, appended {int(app['r'])} (want "
+                           f"{rep(want)}), dropped {int(drop['r'])} (want {rep(max(want - cap, 0))})")
+            if (app["r"].dtype, drop["r"].dtype) != ((np.int64,) * 2 if x64 else (np.int32,) * 2):
+                raise Fail(f"stats dtypes {app['r'].dtype} {drop['r'].dtype} (x64 {x64})")
+            pre = np.concatenate([[0], np.cumsum(np.asarray(cnt, np.int64))[:-1]])
+            if not np.array_equal(np.asarray(L.offsets(c, cap)), np.minimum(pre, cap)):
+                raise Fail(f"offsets {cnt} cap {cap}: {np.asarray(L.offsets(c, cap))} != {np.minimum(pre, cap)}")
+    big = jnp.full((1 << 20,), 1 << 12, jnp.int32)                     # 2^32 exactly: lo word 0, hi word 1
+    ovf, app, _ = _api._record_limits({"r": big}, {"r": 1 << 20})
+    if not bool(ovf) or int(app["r"]) != rep(1 << 32):
+        raise Fail(f"2^20 x 2^12: overflow {bool(ovf)} appended {int(app['r'])}")
+    st = jnp.zeros((len(_api.STATS),), jnp.int32).at[_api.ST["spawned"]].set(jnp.int32(-5))   # a wrapped counter
+    if not bool(L.queue_lost(st, 1 << 20, record=True)) or bool(L.queue_lost(st, 1 << 20, record=False)):
+        raise Fail("a spawned counter past 2^31 (wrapped int32) did not exceed the Queue for a record path")
+    return f"{len(cases)} sums x 3 capacities, 2^32, a wrapped spawn counter (x64 {x64})"
+
+
+@case("a real call with 2^32 + 2^15 appends into capacity 2^16 poisons (an int32 total wraps to 2^15) and reports "
+      "the count saturated (int64 with x64); count-then-fill too", ["auto"])
+def _(b):
+    if jax.default_backend() != "gpu":
+        return "skipped: GPU only (2^32 appends)"
+    n_it, K, C = (1 << 17) + 1, 1 << 15, 1 << 16
+
+    def item(t, x):
+        t = lax.fori_loop(0, K, lambda k, t: t.append("rec", {"v": x + k.astype(jnp.float32)}, when=True), t)
+        return t.add("S", 0, x)
+    want = n_it * K if jax.config.jax_enable_x64 else (1 << 31) - 1
+    msg = []
+    outs = {"S": tm.Sum((1,), jnp.float32), "rec": tm.Records({"v": jnp.float32}, capacity=C)}
+    for one in (True, False):
+        with patched(_api, ONE_PASS=one):
+            r = tm.vmap(item, outputs=outs, backend=b)(jnp.ones((n_it,), jnp.float32))
+            v = np.asarray(r.outputs["rec"]["v"])
+            app, drop = int(r.stats["appended"]["rec"]), int(r.stats["records_dropped"]["rec"])
+        if not (np.all(np.isnan(v)) and np.all(np.isnan(np.asarray(r.outputs["S"])))):
+            raise Fail(f"{'one pass' if one else 'count-then-fill'}: not poisoned (appended {app}, dropped {drop})")
+        if app != want or drop != (want - C if jax.config.jax_enable_x64 else want):
+            raise Fail(f"{'one pass' if one else 'count-then-fill'}: appended {app} (want {want}), dropped {drop}")
+        msg.append(f"{'one' if one else 'ctf'}: appended {app} dropped {drop}")
+    return "; ".join(msg)
+
+
 def burst(t, i, key, mu_a, v, wcut):
     """every item appends 1 + i % 7 records back to back: all lanes contend for the slot counter at once."""
     def body(c):
@@ -821,8 +884,12 @@ def _(b):
         r = sv(*roots, th)
         g = jax.grad(lambda th: jnp.sum(sv(*roots, th).outputs["rec"]["val"]))(th)
         o = one(roots[3])
-        return (r.outputs, r.stats["appended"], r.stats["spawned"], r.stats["n_truncated"], g, o.outputs,
-                o.stats["appended"])
+        cnt = [r.stats["appended"]["rec"], o.stats["appended"]["r"]]   # (int64 with x64, int32 without: _limits)
+        want = np.int64 if jax.config.jax_enable_x64 else np.int32
+        if any(np.asarray(c).dtype != want for c in cnt):
+            raise Fail(f"stats['appended'] dtypes {[np.asarray(c).dtype for c in cnt]}, want {np.dtype(want)}")
+        return (r.outputs, [np.asarray(c).astype(np.int64) for c in cnt], r.stats["spawned"], r.stats["n_truncated"],
+                g, o.outputs)
     x0 = jax.config.jax_enable_x64
     res = []
     try:
