@@ -4,6 +4,32 @@ All notable changes. Versions follow [SemVer](https://semver.org/) 0.x: until 1.
 API, and only after one minor release in which the old form still works and warns. Patch releases never change
 the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
+## Unreleased
+
+### Fixed
+
+- Kernel backend: a `reduce_max` / `reduce_min` over an axis of extent 0 (-inf / +inf) was taken for finite when its
+  operand was, so the sum of an empty max and an empty min (NaN) was taken for non-NaN and a later `maximum` /
+  `minimum` dropped the NaN (default options; tests/edge.py "float facts: a max / min over an EMPTY axis").  A max /
+  min is finite only when no reduced extent is 0; a `reduce_precision` or float conversion is finite only when it
+  cannot overflow (the same format, or a range at least the source's).
+- `Records` counts past 2^31 appends: the totals and offsets were int32 sums, so a call that appended more wrapped
+  with no flag (2^32 + 2^15 appends into capacity 2^16: `appended` 32768, `records_dropped` 0, not poisoned, records
+  at wrapped offsets). Totals are now exact two-word sums and decide the overflow on every path (one pass,
+  count-then-fill, the canonicalisation and its sharded offsets, the fill twin's tables), offsets are clipped at the
+  capacity, and the reported counts never wrap: with `jax_enable_x64` `stats['appended']` and
+  `stats['records_dropped']` are int64 and exact; without it int32, exact up to 2^31 - 1 and saturated there (such a
+  call is always poisoned). One helper, `_limits.limit`, for the Records capacity and the spawn Queue's record rule
+  (which now also reads a `spawned` counter past 2^31 as exceeding the Queue). `capacity=None` past 2^30 records
+  raises. tests/records.py "counts past 2^31", "a real call with 2^32 + 2^15 appends".
+- xla backend with `jax_enable_x64`: a fixed-point (not float32) `Sum` bin that took more than about 2^31 emits
+  wrapped silently (its int64 sum of the values' low 32-bit words passed 2^63: 2^31 + 2^17 emits of 2^32 - 1 gave
+  -9.2e18 for 9.2e18). Before each chunk of at most 2^29 values, a bin about to take values whose low or high word
+  is at or past 2^62 is now flagged (NaN, counted in `fixed_point_overflow`), so no word can wrap: exact up to at
+  least 2^30 emits per bin, NaN past that, never wrong (the kernel backend, with its carry word, stays exact
+  there). A carry step that wrote the words back cost a copy of the accumulator under jvp (68 against 38 B per
+  cell), so the guard only reads. tests/edge.py "fixed point (not exact) with x64: 2^31 + 2^17 emits".
+
 ## 0.8.0 - 2026-11-20
 
 ### Added
@@ -39,11 +65,6 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Fixed
 
-- Kernel backend: a `reduce_max` / `reduce_min` over an axis of extent 0 (-inf / +inf) was taken for finite when its
-  operand was, so the sum of an empty max and an empty min (NaN) was taken for non-NaN and a later `maximum` /
-  `minimum` dropped the NaN (default options; tests/edge.py "float facts: a max / min over an EMPTY axis").  A max /
-  min is finite only when no reduced extent is 0; a `reduce_precision` or float conversion is finite only when it
-  cannot overflow (the same format, or a range at least the source's).
 - Kernel backend: value facts (integer ranges, NaN / finite, magnitude floors) were attributes of a Python object
   that in-place writes reused for a NEW value (an in-place `dynamic_update_slice` / scatter, a while / scan carry in
   its initial value's storage, a cond destination), so a NaN guard `where(x != x, c, x2)` on a value `x2` written
@@ -63,22 +84,6 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   the tree adjoint already did: one rule, `_limits.queue_lost`, for every path that reads the tree from the ring
   (`spawned > capacity` or a dropped child) and for the forward (a dropped child). tests/records.py "spawn: Records
   with more children in all than the Queue holds".
-- `Records` counts past 2^31 appends: the totals and offsets were int32 sums, so a call that appended more wrapped
-  with no flag (2^32 + 2^15 appends into capacity 2^16: `appended` 32768, `records_dropped` 0, not poisoned, records
-  at wrapped offsets). Totals are now exact two-word sums and decide the overflow on every path (one pass,
-  count-then-fill, the canonicalisation and its sharded offsets, the fill twin's tables), offsets are clipped at the
-  capacity, and the reported counts never wrap: with `jax_enable_x64` `stats['appended']` and
-  `stats['records_dropped']` are int64 and exact; without it int32, exact up to 2^31 - 1 and saturated there (such a
-  call is always poisoned). One helper, `_limits.limit`, for the Records capacity and the spawn Queue's record rule
-  (which now also reads a `spawned` counter past 2^31 as exceeding the Queue). `capacity=None` past 2^30 records
-  raises. tests/records.py "counts past 2^31", "a real call with 2^32 + 2^15 appends".
-- xla backend with `jax_enable_x64`: a fixed-point (not float32) `Sum` bin that took more than about 2^31 emits
-  wrapped silently (its int64 sum of the values' low 32-bit words passed 2^63: 2^31 + 2^17 emits of 2^32 - 1 gave
-  -9.2e18 for 9.2e18). Before each chunk of at most 2^29 values, a bin about to take values whose low or high word
-  is at or past 2^62 is now flagged (NaN, counted in `fixed_point_overflow`), so no word can wrap: exact up to at
-  least 2^30 emits per bin, NaN past that, never wrong (the kernel backend, with its carry word, stays exact
-  there). A carry step that wrote the words back cost a copy of the accumulator under jvp (68 against 38 B per
-  cell), so the guard only reads. tests/edge.py "fixed point (not exact) with x64: 2^31 + 2^17 emits".
 - Reverse mode with JAX 0.6.2 - 0.11 through a while loop that reads a table (any broadcast operand) inside ONE
   branch of a `lax.switch` / `lax.cond` (lumen SBND: a facet table read in one outcome branch): the checkpointed loop
   keeps its body consts as residuals, and JAX's cond partial eval returns each branch's residuals as cond outputs
