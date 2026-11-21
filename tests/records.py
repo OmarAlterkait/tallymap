@@ -955,7 +955,8 @@ def multi(t, i, key, mu_a, v, wcut):
 BIGC, SMALLC, NB = 1 << 22, 4096, 128
 
 
-@case("large capacity (2^22): grad / vjp / jacrev of Records == capacity 4096 BITWISE, and vs central differences")
+@case("large capacity (2^22): grad / vjp / jacrev of Records == capacity 4096 BITWISE (f64 reverse: to 1e-13), and vs "
+      "central differences")
 def _(b):
     ids, keys = IDS[:NB], KEYS[:NB]
     wt = jax.random.uniform(jax.random.PRNGKey(5), (3, SMALLC), F)
@@ -987,7 +988,15 @@ def _(b):
         res[cap] = dict(grad=jax.grad(lambda th: jnp.sum(g(th)))(TH), vjp=pull({"t": wt[1], "w": wt[2]})[0],
                         jacrev=jax.jacrev(g)(TH), jacfwd=jax.jacfwd(g)(TH))
     for k in res[SMALLC]:
-        same(res[BIGC][k], res[SMALLC][k], f"{k}: capacity 2^22 vs 4096")
+        # the reverse modes sum each item's contribution to the broadcast operands' cotangents: exactly (so bitwise,
+        # whatever the order) for float32, in the operand's own dtype otherwise (docs/float_semantics.md item 4), and
+        # the kernel backend's f64 atomic adds are then in schedule order: a few ulp from run to run at ANY capacity
+        # (round9/recovf 46215731: vjp 2-3 of 8 runs distinct at 2^16 .. 2^22, jacrev at 2^18 / 2^20)
+        if k == "jacfwd" or np.dtype(F) == np.float32:
+            same(res[BIGC][k], res[SMALLC][k], f"{k}: capacity 2^22 vs 4096")
+        elif not np.allclose(np.asarray(res[BIGC][k]), np.asarray(res[SMALLC][k]), rtol=1e-13, atol=0):
+            raise Fail(f"{k}: capacity 2^22 vs 4096 beyond 1e-13 relative: {np.asarray(res[BIGC][k]).ravel()} vs "
+                       f"{np.asarray(res[SMALLC][k]).ravel()}")
     loss = lambda th: jnp.sum(red(SMALLC)(th))                                                 # noqa: E731
     e = F(1e-2) if F == jnp.float32 else F(1e-5)
     fd = np.array([(loss(TH + e * u) - loss(TH - e * u)) / (2 * e) for u in jnp.eye(2, dtype=F)])
