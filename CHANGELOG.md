@@ -39,6 +39,14 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Fixed
 
+- Kernel backend: value facts (integer ranges, NaN / finite, magnitude floors) were attributes of a Python object
+  that in-place writes reused for a NEW value (an in-place `dynamic_update_slice` / scatter, a while / scan carry in
+  its initial value's storage, a cond destination), so a NaN guard `where(x != x, c, x2)` on a value `x2` written
+  into `x`'s storage since was taken for a guard and a later `maximum` / `minimum` dropped the NaN (default options;
+  tests/edge.py "facts per SSA value").  Every write into an existing storage now returns a new value, so one object
+  is one SSA value with its own facts; facts are no longer cleared by primitive name (a cond destination kept the
+  operand's magnitude floor under `cuda_math='fast'`), and the magnitude-floor pattern compares values, not
+  rendered text.  Aliasing and destination decisions ask one function, `Emitter.storages_read`.
 - Reverse mode with JAX 0.6.2 - 0.11 through a while loop that reads a table (any broadcast operand) inside ONE
   branch of a `lax.switch` / `lax.cond` (lumen SBND: a facet table read in one outcome branch): the checkpointed loop
   keeps its body consts as residuals, and JAX's cond partial eval returns each branch's residuals as cond outputs

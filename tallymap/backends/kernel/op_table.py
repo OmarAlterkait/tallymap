@@ -36,6 +36,7 @@ from .codegen import (
     is_key_dtype,
     lazy_cost,
     lit,
+    new_version,
     ravel,
     unravel,
     vff,
@@ -700,7 +701,7 @@ def _dus(em, eqn, ins, **p):
     st += [0] * (len(src.shape) - len(st))
     # in place when the operand's storage may be overwritten: the update and the indices are read while the
     # update is written element by element (x = dus(x, x[k-1:k+2], k) must copy)
-    out = src if _may_overwrite(em, src, [(src, ins)]) else em.mat_copy(src)
+    out = new_version(src) if _may_overwrite(em, src, [(src, ins)]) else em.mat_copy(src)
 
     def body(idx):
         em.line(f"{out.name}[{ravel([ia(s, i) for s, i in zip(st, idx)], src.shape)}] = {elem(upd, idx)};")
@@ -1181,7 +1182,7 @@ def _scatter(em, eqn, ins, dimension_numbers, mode=None, **p):
     # in place when the operand is dead (the dynamic_update_slice rule).  x.at[i].set(v) with a traced i is a
     # scatter, not a dynamic_update_slice; copying it every time cost DTRAX's g0102 item 17 copies of its
     # float64[34,23] step carry (106 KB of its 178 KB frame; the private engine line has done this since 6f5d0cf)
-    out = op if _may_overwrite(em, op, [(op, ins)]) else em.mat_copy(op)
+    out = new_version(op) if _may_overwrite(em, op, [(op, ins)]) else em.mat_copy(op)
     t = ctype(op.dtype)
     usd = [d for d in range(len(upd.shape)) if d not in uwd]
     wdims = [d for d in range(len(op.shape)) if d not in iwd]
@@ -1244,25 +1245,14 @@ TALLY_AWARE = {"while", "cond", "scan", "pjit", "jit", "closed_call", "core_call
 #     whole-array jnp.where(p, a, x)): it is evaluated into the storage, element by element; and a loop body result of
 #     that kind is written straight back into its carry.  Placement only: every element's expression is unchanged.
 def _refs(em, x, name):
-    """does the C text value x reads mention storage `name`?  (Local: by name; anything else: rendered)"""
-    import re
-    if isinstance(x, VTally) or x is None:
-        return False
-    if isinstance(x, Local):
-        return x.name == name
-    saved = (em.lines, em.ind, em.uid)
-    try:
-        em.lines = []
-        t = elem(x, [f"_q{k}" for k in range(len(x.shape))])
-    except Exception:
-        return True
-    finally:
-        em.lines, em.ind, em.uid = saved
-    return re.search(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])", t) is not None
+    """may the value x read storage `name` (Emitter.storages_read; unknown: yes)?"""
+    s = em.storages_read(x)
+    return s is None or name in s
 
 
 def _src_locals(x, out=None, d=0):
-    """the per-item Local arrays a lazy value's elements are built from (through View.src / Lazy.origin)."""
+    """candidate destinations for a lazy value: the per-item Local arrays its elements are built from (through
+    View.src / Lazy.origin; _may_overwrite decides)."""
     out = {} if out is None else out
     if x is None or d > 12:
         return out
@@ -1314,9 +1304,9 @@ def _carry_vars(em, inits, pass_through, dest=None):
         if X is not None:                       # (v3 / v5) buffer assignment: this storage IS the carry
             if X is not v:
                 em.assign(X, v)
-                X.key_impl = v.key_impl
-            X.undef = False                     # (the loop update writes it: inside the body it is defined)
-            cars.append(X)
+            c = new_version(X)                  # (a new value in it: the carry, not the initial value)
+            c.key_impl = v.key_impl
+            cars.append(c)
             continue
         if v.shape == ():
             n = em.fresh("c")
@@ -1331,11 +1321,13 @@ def _carry_vars(em, inits, pass_through, dest=None):
 
 
 def _carry_val(c):
+    """the value a carry (or cond output) storage holds at this point: a new Val each call (new_version), so the
+    loop's entry value, its body's value and its result each have their own facts."""
     if isinstance(c, Local) and c.shape == ():
         s = Scalar(c.name, c.dtype)
         s.key_impl = c.key_impl
         return s
-    return c
+    return new_version(c) if isinstance(c, Local) else c
 
 
 def _update_carries(em, cars, outs, pass_through, start=None):
@@ -1434,7 +1426,6 @@ def _while(em, eqn, ins, **p):
     # integer ranges of the carries (ranges.while_ranges): the loop invariant, and inside the body the invariant
     # narrowed by a `carry < bound` predicate
     body_r, inv_r = ranges.while_ranges(eqn, [vrng(v) for v in ins])
-    _set_carry_ranges(cars, pt, inv_r)
     vals = [_carry_val(c) if not p_ else c for c, p_ in zip(cars, pt)]
     _set_carry_ranges(vals, pt, inv_r)
     em.freeze(cc + bc + [c for c, p_ in zip(cars, pt) if p_])     # re-read every iteration: never in place
@@ -1454,13 +1445,13 @@ def _while(em, eqn, ins, **p):
     em.close()
     em.unfreeze()
     _pingpong_exit(em, pp)
-    _set_carry_ranges(cars, pt, inv_r)
-    return vals
+    res = [_carry_val(c) if not p_ else c for c, p_ in zip(cars, pt)]      # the loop results: new values
+    _set_carry_ranges(res, pt, inv_r)
+    return res
 
 
 def _set_carry_ranges(vals, pt, rs):
-    """the carries' (or their values') integer ranges: rs (None = unknown, which also clears a range an initial
-    value's storage carried in: v3 makes that storage the carry, and the loop overwrites it)."""
+    """the integer ranges of a loop's carry values (new Vals: _carry_val): rs (None = unknown); no float facts."""
     for v, p_, r in zip(vals, pt, rs):
         if not p_ and not isinstance(v, VTally):
             v.rng = r
@@ -1583,9 +1574,10 @@ def _cond(em, eqn, ins, **p):
             if isinstance(o, tuple) and not (isinstance(r, Local) and r.name == o[1].name):
                 em.assign(o[1], r)
     em.close()
-    res = [o[1] if isinstance(o, tuple) else (o if isinstance(o, VTally) else _carry_val(o)) for o in outs]
-    for j, (o, x) in enumerate(zip(outs, res)):       # the hull of the branches' results (a destination too:
-        if isinstance(x, VTally):                       # its storage now holds them)
+    # each output is a NEW value (a destination too: its storage now holds the branch result, not the operand)
+    res = [o if isinstance(o, VTally) else _carry_val(o[1] if isinstance(o, tuple) else o) for o in outs]
+    for j, x in enumerate(res):                         # the hull of the branches' results
+        if isinstance(x, VTally):
             continue
         r = None
         for k, bd in enumerate(bodies):
@@ -1594,9 +1586,6 @@ def _cond(em, eqn, ins, **p):
         x.rng = r
         fs = [vff(bd[1][j]) for bd in bodies]
         x.ff = (all(f[0] for f in fs), all(f[1] for f in fs))
-        if isinstance(o, Local):
-            o.rng, o.ff = r, x.ff
-            o.mlo = None
     return res
 
 
@@ -1610,7 +1599,6 @@ def _scan(em, eqn, ins, **p):
     pt = _pass_through(jaxpr.jaxpr, num_consts, num_carry)
     cars = _carry_vars(em, init, pt)
     inv_r = ranges.scan_ranges(eqn, [vrng(v) for v in ins], carries=True)
-    _set_carry_ranges(cars, pt, inv_r)
     vals = [_carry_val(c) if not p_ else c for c, p_ in zip(cars, pt)]
     _set_carry_ranges(vals, pt, inv_r)
     # an inert discard tally may be a scanned input / stacked output (a reverse-mode residual): it stays virtual
@@ -1652,8 +1640,9 @@ def _scan(em, eqn, ins, **p):
     pp = _update_carries(em, cars, outs[:num_carry], pt, start)
     em.close()
     _pingpong_exit(em, pp, length)
-    _set_carry_ranges(cars, pt, inv_r)
-    return vals + ys
+    res = [_carry_val(c) if not p_ else c for c, p_ in zip(cars, pt)]      # the loop results: new values
+    _set_carry_ranges(res, pt, inv_r)
+    return res + ys
 
 
 @rule("platform_index")

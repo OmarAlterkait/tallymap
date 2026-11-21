@@ -207,6 +207,19 @@ class Local(Val):
         self.name, self.shape, self.dtype = name, tuple(shape), np.dtype(dtype)
 
 
+# VALUES vs STORAGES.  A Val object is ONE SSA value: its facts (cval, rng, ff, mlo, origin -- ranges.py) are
+# attributes of that object, one record per value, and `a is b` means the same value.  A Local's `name` is its
+# STORAGE (a C array), which several values may occupy one after another: a rule that writes into an existing storage
+# (an in-place dynamic_update_slice / scatter, a loop carry, a cond destination) returns a NEW Val over it
+# (new_version), never the operand object, so no fact of the old value reaches the new one.  Only aliasing and
+# destination decisions look at storages, and only through Emitter.storages_read.
+def new_version(x):
+    """a new value held in the storage of the Local x (written by the caller), with no facts of x's value."""
+    v = Local(x.name, x.shape, x.dtype)
+    v.key_impl = x.key_impl
+    return v
+
+
 class Table(Val):
     """Global buffer window: elem(idx) = ptr[off + sum(idx*strides)]."""
 
@@ -336,11 +349,6 @@ def elem(v, idx):
 # 1, 4 or 8 links the compile is 0.2 s at depth 16, 24 and 48; every 12 it is 2.2 s; every 16 it is 125.6 s;
 # identical SASS (928 == 928 instructions).
 MULCHAIN_K = 8
-
-# primitives whose rule may return its operand array updated in place (op_table._may_overwrite)
-_INPLACE_PRIMS = frozenset({"dynamic_update_slice", "scatter", "scatter-add", "scatter_add", "scatter-mul",
-                            "scatter_mul", "scatter-min", "scatter_min", "scatter-max", "scatter_max"})
-
 
 def _wide_mul(eqn):
     """1 if `eqn` is one link of a wide-multiply chain (an integer multiply with a >= 64-bit result)."""
@@ -691,24 +699,46 @@ class Emitter:
         return Table(f"((const {cast}*)SJ_CONST({j}))", a.shape, a.dtype)
 
     # ------------------------------------------------------------ jaxpr evaluation
+    OWN = "@own"      # storages_read(x, own=dst): x reads dst's storage at the element being written
+
+    def storages_read(self, v, own=None):
+        """THE storage question (aliasing and destination decisions ask nothing else): the storages whose current
+        contents the value v reads -- a frozenset of names (a Local: its own; a View / Lazy: every name its element
+        expression mentions; a Table / VTally / None: none) -- or None when that cannot be known (an unrenderable
+        expression: it may read anything).  own=dst (a Local): reads of dst at the element being written (dst[i]
+        in the expression of element i) are reported as the name OWN instead of dst's."""
+        if v is None or isinstance(v, (Table, VTally)):
+            return frozenset()
+        if isinstance(v, Local) and own is None:
+            return frozenset((v.name,))
+        sym = [f"_q{k}" for k in range(len(v.shape))]
+        saved = (self.lines, self.ind, self.uid)
+        try:
+            self.lines = []
+            t = elem(v, sym)
+            mine = elem(own, sym) if own is not None else None
+        except Exception:
+            return None
+        finally:
+            self.lines, self.ind, self.uid = saved
+        names = set()
+        if mine is not None and mine in t:
+            names.add(self.OWN)
+            t = t.replace(mine, "")
+        names.update(re.findall(r"[A-Za-z0-9_]+", t))
+        return frozenset(names)
+
     def freeze(self, vals):
         """push a frame of never-mutable storages (loop consts / pass-through carries / function params): every
-        Local array a value of `vals` reads -- the value itself, or, for a lazy value, the storages its elements read
-        (a loop constant that is a View of a per-item array is re-read every iteration: so is that array).  Kept as
-        the C text each value reads ("*": unrenderable, everything is frozen)."""
-        frame = []
+        storage a value of `vals` reads (storages_read: a loop constant that is a View of a per-item array is re-read
+        every iteration, so is that array; None: unknown, everything is frozen)."""
+        frame = set()
         for v in vals:
-            if isinstance(v, Local):
-                frame.append(v.name)
-            elif not isinstance(v, (Table, VTally)) and v is not None:
-                saved = (self.lines, self.ind, self.uid)
-                try:
-                    self.lines = []
-                    frame.append(elem(v, [f"_q{k}" for k in range(len(v.shape))]))
-                except Exception:
-                    frame.append("*")
-                finally:
-                    self.lines, self.ind, self.uid = saved
+            s = self.storages_read(v)
+            if s is None:
+                frame = None
+                break
+            frame |= s
         self._frozen.append(frame)
 
     def unfreeze(self):
@@ -721,9 +751,7 @@ class Emitter:
         caller's (op_table._may_overwrite)."""
         if not self.inplace or not self._scopes or not isinstance(val, Local) or val.shape == ():
             return False
-        import re
-        pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(val.name) + r"(?![A-Za-z0-9_])")
-        if any(t == "*" or pat.search(t) for f in self._frozen for t in f):
+        if any(f is None or val.name in f for f in self._frozen):
             return False
         env = self._scopes[-1][0]          # the current scope's bindings (a captured reader is rebound there)
         readers = []                       # live lazy values of THIS scope whose elements read val's storage
@@ -731,19 +759,12 @@ class Emitter:
             for v, x in env_.items():
                 if rem_.get(v, 0) <= 0 or isinstance(x, (Table, VTally)):
                     continue
-                if isinstance(x, Local):
-                    if x.name == val.name:
-                        return False
-                    continue
-                try:
-                    saved = (self.lines, self.ind, self.uid)
-                    self.lines = []
-                    t = elem(x, [f"_q{k}" for k in range(len(x.shape))])
-                    self.lines, self.ind, self.uid = saved
-                except Exception:
-                    self.lines, self.ind, self.uid = saved
+                s = self.storages_read(x)
+                if s is None:
                     return False
-                if pat.search(t):
+                if val.name in s:
+                    if isinstance(x, Local):
+                        return False
                     if depth != len(self._scopes) - 1:
                         return False       # (a value of an enclosing scope: its C scope is not this one)
                     readers.append((v, x))
@@ -766,19 +787,8 @@ class Emitter:
         if (isinstance(x, (Table, VTally, Local)) or x is None or not isinstance(dst, Local)
                 or tuple(getattr(x, "shape", ())) != tuple(dst.shape) or np.dtype(x.dtype) != np.dtype(dst.dtype)):
             return False
-        sym = [f"_q{k}" for k in range(len(dst.shape))]
-        saved = (self.lines, self.ind, self.uid)
-        try:
-            self.lines = []
-            t, own = elem(x, sym), elem(dst, sym)
-        except Exception:
-            return False
-        finally:
-            self.lines, self.ind, self.uid = saved
-        if own not in t:
-            return False
-        import re
-        return re.search(r"(?<![A-Za-z0-9_])" + re.escape(dst.name) + r"(?![A-Za-z0-9_])", t.replace(own, "")) is None
+        s = self.storages_read(x, own=dst)
+        return s is not None and self.OWN in s and dst.name not in s
 
     def run_top(self, cj, args, fn, mutable=()):
         """Run a top-level ClosedJaxpr: concrete scalar consts become literals, every other const (arrays, and
@@ -882,33 +892,38 @@ class Emitter:
                     if not is_dropvar(v):
                         x = self.brk(x) if v in cuts else self.mat_multi(x, uses.get(v, 0))
                         if not isinstance(x, VTally):
-                            # an operand updated in place (scatter / dynamic_update_slice) gets r, even None; one
-                            # returned unchanged (a folded select) keeps its own, tighter fact; a new value gets r
-                            if any(x is i for i in ins) and eqn.primitive.name in _INPLACE_PRIMS:
-                                x.rng = r
-                            elif r is not None:
-                                x.rng = ranges.meet(getattr(x, "rng", None), r) if any(x is i for i in ins) else r
-                            if any(x is i for i in ins) and (eqn.primitive.name in _INPLACE_PRIMS or guard is not None):
-                                x.ff = None                 # (updated in place: its float facts are stale)
-                            elif ff is not None:
-                                old = getattr(x, "ff", None) if any(x is i for i in ins) else None
+                            # x's facts are facts about ITS value (new_version): a result that IS an operand is the
+                            # same value (a folded select, a pass-through), so both facts hold and meet; any other
+                            # result gets this equation's (a call / loop result keeps what its body gave it)
+                            same = any(x is i for i in ins)
+                            if r is not None:
+                                x.rng = ranges.meet(getattr(x, "rng", None), r) if same else r
+                            if ff is not None:
+                                old = getattr(x, "ff", None) if same else None
                                 x.ff = (ff[0] or old[0], ff[1] or old[1]) if old else ff
-                            if not any(x is i for i in ins):
-                                if ml is not None:
-                                    x.mlo = ml
-                            elif eqn.primitive.name in _INPLACE_PRIMS or guard is not None:
-                                x.mlo = None                # (updated in place)
+                            if ml is not None and not same:
+                                x.mlo = ml
                         env[v] = x
             return [read(a) for a in jaxpr.outvars]
         finally:
             self._scopes.pop()
 
     def same_value(self, a, b):
-        """are a and b the same value: one object, or the same C text for every element (pure expressions)."""
+        """are a and b the same value: one object (one SSA value), or two reads of one value at the same elements
+        (jnp indexes d[a] afresh for each use): Views of the SAME source value, or windows of the read-only tables,
+        rendering the same C text.  Equal text alone is not enough: two versions of one storage render the same."""
         if a is b:
             return True
-        if (tuple(getattr(a, "shape", ())) != tuple(getattr(b, "shape", ())) or isinstance(a, VTally)
-                or isinstance(b, VTally)):
+
+        def root(v):
+            while isinstance(v, View):
+                v = v.src
+            return v
+        if (tuple(getattr(a, "shape", ())) != tuple(getattr(b, "shape", ())) or not isinstance(a, (View, Table))
+                or not isinstance(b, (View, Table))):
+            return False
+        ra, rb = root(a), root(b)
+        if not (ra is rb or (isinstance(ra, Table) and isinstance(rb, Table))):
             return False
         saved = (self.lines, self.ind, self.uid)
         try:

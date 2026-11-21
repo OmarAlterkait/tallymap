@@ -408,7 +408,8 @@ _FF_SAME = {"neg", "abs", "floor", "ceil", "round", "reduce_max", "reduce_min", 
 
 def float_facts(name, ffs, ins, out_dt):
     """(nonnan, finite) of an equation's (first) float result from its operands' facts `ffs` and values `ins`
-    (Val.origin = (primitive, operands) of a computed operand: the NaN-guard patterns), or None (not a float)."""
+    (Val.origin = (primitive, operands) of a computed operand: the NaN-guard patterns; `is` compares SSA values,
+    codegen.new_version), or None (not a float)."""
     if not ENABLE or not _is_float(out_dt):
         return None
     try:

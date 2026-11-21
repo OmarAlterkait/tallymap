@@ -1530,6 +1530,72 @@ def _(b):
     return "bits equal to the facts-off cubin (which differs); values, NaN and zero signs equal to xla"
 
 
+def _ssa_variants(th):
+    """value facts across an in-place write: in each, p = a NaN test of the per-item array a (computed into its own
+    array), then a is updated IN PLACE (a is dead after it) to a2 with a NaN in it, then the NaN guard pattern is
+    applied to p and a2 -- which is NOT a guard of a2 (p tested the old a), so the NaN must survive the max.  A fact
+    keyed on the storage instead of the value claims a2's select non-NaN and the max drops the NaN (1 instead of
+    NaN).  The in-place writers: dynamic_update_slice / scatter, a cond destination, a while carry (nested: an item's
+    single top-level while runs as step functions)."""
+    nan = F(np.nan)
+    arr = lambda x: jnp.sin(x * th[0] * jnp.arange(1, 9, dtype=F)) + x * th[1]     # 8 elements: its own array
+
+    def dus(x):
+        a = arr(x)
+        p = a != a
+        a2 = lax.dynamic_update_slice(a, jnp.full((1,), nan, F), (0,))
+        return jnp.maximum(F(1), jnp.where(p, F(0), a2))           # where(x != x, c, x) shape, on a stale x
+
+    def scatter(x):
+        a = arr(x)
+        p = jnp.isfinite(a)
+        a2 = a.at[(x * 7).astype(jnp.int32) % 8].set(nan)
+        return jnp.maximum(F(1), jnp.where(p, a2, F(0)))           # where(isfinite(x), x, c) shape
+
+    def cond(x):
+        a = arr(x)
+        p = a != a
+        a2 = lax.cond(x > 0.3, lambda u: u.at[2].set(nan), lambda u: u * th[1], a)
+        return jnp.maximum(F(1), jnp.where(p, F(0), a2))
+
+    def carry(x):
+        def outer(c):
+            m, acc = c
+            a = arr(x + m.astype(F))
+            p = a != a
+            a2 = lax.while_loop(lambda d: d[0] < 2, lambda d: (d[0] + 1, d[1].at[d[0] + 3].set(nan)),
+                                (jnp.int32(0), a))[1]
+            return m + 1, acc + jnp.maximum(F(1), jnp.where(p, F(0), a2))
+        return lax.while_loop(lambda c: c[0] < 1, outer, (jnp.int32(0), jnp.zeros(8, F)))[1]
+    return {"dus": dus, "scatter": scatter, "cond destination": cond, "while carry": carry}
+
+
+@case("facts per SSA value: a NaN guard on a value updated in place since is no guard (dus, scatter, cond dest, "
+      "while carry) == jax", ["auto", "xla"])
+def _(b):
+    """float facts (ranges.float_facts) must be facts about a VALUE.  Each variant (_ssa_variants) tests the old
+    contents of an array, updates the array in place with a NaN and applies the guard pattern to the new value:
+    nothing proves it non-NaN, so maximum(1, .) must give NaN where plain JAX does.  Default options."""
+    xs = jnp.linspace(0.1, 1.0, N).astype(F)
+    th = jnp.array([0.9, 1.3], F)
+    bad = []
+    for nm, g in _ssa_variants(th).items():
+        def item(t, x, g=g):
+            return t.add("Q", 0, x), g(x)
+        got = np.asarray(V(item, b)(xs).per_item)
+        if b == "auto":                     # instrument: the write was in place (the copying kernel differs)
+            from tallymap.backends.kernel import codegen as CG
+            assert_arms_differ(V(item, b), V(item, b), xs, patch_b=(CG, {"INPLACE": False}))
+        ref = np.asarray(jax.jit(jax.vmap(g))(xs))
+        if not np.array_equal(np.isnan(got), np.isnan(ref)):
+            bad.append(f"{nm} ({int(np.isnan(ref).sum())} NaN in jax, {int(np.isnan(got).sum())} here)")
+        else:
+            close(np.nan_to_num(got), np.nan_to_num(ref), what=nm)
+    if bad:
+        raise Fail("NaN positions differ from jax: " + "; ".join(bad))
+    return "all four variants == jax.vmap (NaN positions exactly)"
+
+
 @case("cuda_math='fast' (opt-in): a different, FMA-contracted kernel; results close to 'approx' and xla", ["auto"])
 def _(b):
     """the fast mode compiles its own kernel (multiply-adds contracted, the guarded reciprocal 1 / where(|d| < eps,
