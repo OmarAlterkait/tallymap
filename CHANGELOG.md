@@ -51,6 +51,13 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   floor, so a division by a guarded divisor that passed through a cond lost its div.approx; it now takes the floor
   every branch proves (none when a branch may make it subnormal, e.g. a destination scaled by 2^-130 in one
   branch: IEEE division there). tests/edge.py "cuda_math='fast': a guarded divisor overwritten in place by a cond".
+- `Records` with `spawn`: a call with more children in all than the `Queue` capacity, none dropped (the ring reused
+  slots: at most `capacity` were pending at once), gave silently wrong records. The count pass reads the spawn tree
+  back from the ring, which had lost nodes, so their children took node id 0 and added into root 0's slots (3 chains
+  of 9 children, `Queue(4)`: `appended` 3 of 30, slot 0 the sum of every record, not poisoned). It now poisons, as
+  the tree adjoint already did: one rule, `_limits.queue_lost`, for every path that reads the tree from the ring
+  (`spawned > capacity` or a dropped child) and for the forward (a dropped child). tests/records.py "spawn: Records
+  with more children in all than the Queue holds".
 - Reverse mode with JAX 0.6.2 - 0.11 through a while loop that reads a table (any broadcast operand) inside ONE
   branch of a `lax.switch` / `lax.cond` (lumen SBND: a facet table read in one outcome branch): the checkpointed loop
   keeps its body consts as residuals, and JAX's cond partial eval returns each branch's residuals as cond outputs

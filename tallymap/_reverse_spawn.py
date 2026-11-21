@@ -49,6 +49,7 @@ from jax import lax
 
 from ._api import ST, ItemProgram, TSpec, _mk, _sds
 from ._diagnostics import record_reverse
+from ._limits import queue_lost
 from ._reverse import check_slots, vjp_prog
 from ._rewrite import isfloat, retrace
 from ._tally import emit_p, spawn_p
@@ -255,8 +256,7 @@ def tree_vjp(node, base, pi, bc, U_pi, U_bc, cts, N, ring):
     stats, leaves = ring[0], ring[1:1 + nP]
     par, ordn, gen = ring[2 + nP:5 + nP]
     total = stats[ST["spawned"]]
-    # a slot reused or a child dropped: the record is incomplete
-    drop_risk = (total > Q) | (stats[ST["children_dropped"]] > 0)
+    drop_risk = queue_lost(stats, Q, record=True)   # a slot reused or a child dropped: the record is incomplete
     slot = jnp.arange(Q, dtype=jnp.int32)
     valid = slot < total
     gk = jnp.where(valid, gen, Q + 1)

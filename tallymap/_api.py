@@ -25,6 +25,7 @@ from jax.extend.core import ClosedJaxpr, jaxpr_as_fun
 
 from . import _diagnostics, _errors
 from ._jaxpr import digest, host_callbacks, item_name, located, subjaxprs
+from ._limits import queue_lost
 from ._rewrite import check_tallies, isfloat, retrace
 from ._tally import KI, KK, LANED, RSEP, Tally, emit_p, rkey
 
@@ -87,8 +88,10 @@ class Queue:
     """Spawn queue of `capacity` pending children (ring buffer).  A child that does not fit is dropped and counted
     in stats['children_dropped'].  The capacity is a tallymap resource limit, so a dropped child makes every float
     tally of the call NaN (never a silently truncated shower; integer tallies cannot be NaN, so they are left as they
-    are: check stats['children_dropped']).  Reverse mode (the tree adjoint) records every child of the call, so it
-    needs capacity >= the TOTAL number of children; a larger tree gives a NaN gradient (never a wrong one).
+    are: check stats['children_dropped']).  Reverse mode (the tree adjoint) and Records outputs read the spawn tree
+    back from the ring, so they need capacity >= the TOTAL number of children: a larger tree (stats['spawned'] >
+    capacity, even with none dropped) gives a NaN gradient, and with Records every float output NaN and every integer
+    record field -1 (never a wrong one).
     Sizing: README.md, "Sizing the Queue"."""
     capacity: int
 
@@ -806,7 +809,7 @@ def _records(build, call, sspecs, shapes, names, rnames, rspec, pi, bc, max_step
                       {r: 0 for r in rnames})
     psg, bsg = [_sg(x) for x in pi], [_sg(x) for x in bc + ch]
     if spawn is None:
-        M, tabs0 = N, []
+        M, tabs0, lost = N, [], None
         cflat = call(cprog, psg, bsg)
         cys = cflat[len(cprog.out_tallies) + 1:]
         counts = {r: cys[j] for j, r in enumerate(rnames)}
@@ -817,6 +820,7 @@ def _records(build, call, sspecs, shapes, names, rnames, rspec, pi, bc, max_step
         cflat = call(rp, psg + [jnp.zeros((N,), jnp.int32)] * 4, bsg)
         nt = len(rp.out_tallies)
         ring = cflat[nt + 1 + rp.nY:]
+        lost = queue_lost(cflat[nt], Q, record=True)     # the count pass reads the tree from its ring
         cs, first = _tree_order(N, Q, ring[rp.rec + 1], ring[rp.rec + 2], ring[rp.rec + 3],
                                 cflat[nt][ST["spawned"]])
         dest = jnp.where(cs >= 0, cs, M)
@@ -866,7 +870,7 @@ def _records(build, call, sspecs, shapes, names, rnames, rspec, pi, bc, max_step
     for r in rnames:
         ovf = ovf | (totals[r] > caps[r])
     if spawn is not None:               # (as a spawning call without Records: the poison that differentiates)
-        ovf = ovf | lim | (stats["children_dropped"] > 0)
+        ovf = ovf | lim | lost | queue_lost(st, int(spawn.capacity), record=False)
         if max_steps is not None:
             ovf = ovf | (stats["children_truncated"] > 0)
     out = {n: tv[n].reshape(shapes[n]) for n in names}
@@ -886,7 +890,7 @@ def _limits(stats, st, spawn, max_steps):
     for a child, or an item (or a spawned child) hit max_steps."""
     flags = []
     if spawn is not None:
-        flags.append(st[ST["children_dropped"]] > 0)       # a child that did not fit the Queue
+        flags.append(queue_lost(st, int(spawn.capacity), record=False))    # a child that did not fit
     if max_steps is not None:
         flags.append(stats["n_truncated"] > 0)             # an item hit max_steps
         if spawn is not None:

@@ -747,6 +747,64 @@ def _(b):
         raise Fail(f"gradient of a mismatched spawning call {g}")
 
 
+CN, CDEPTH, CQ = 3, 9, 4         # 3 chains of 9 children each: 27 children in all, at most 3 pending in a Queue of 4
+
+
+def chain(t, root, gen, x, th):
+    t = t.append("rec", {"root": root, "gen": gen, "val": x}, when=True)
+    t = t.spawn((root, gen + 1, x * th), when=gen < CDEPTH)
+    return t.add("S", root % 4, x)
+
+
+def chain_plain(t, root, gen, x, th):
+    return t.spawn((root, gen + 1, x * th), when=gen < CDEPTH).add("S", root % 4, x)
+
+
+@case("spawn: Records with more children in all than the Queue holds (none dropped: each item spawns at most one) "
+      "poison; the same Queue without Records is exact")
+def _(b):
+    """Records + spawn reads the spawn tree from the count pass's queue ring (_tree_order), which holds every child
+    only when the call has at most Q children in all; a ring that reused a slot has lost a node.  Without Records the
+    forward Queue bounds only the PENDING children (here at most CN), so the plain call is exact."""
+    roots = (jnp.arange(CN, dtype=jnp.int32), jnp.zeros(CN, jnp.int32), jnp.linspace(1.0, 2.0, CN).astype(F))
+    th = F(0.5)
+    fl = {"root": jnp.int32, "gen": jnp.int32, "val": F}
+    rv = tm.vmap(chain, outputs={"S": tm.Sum((4,), F), "rec": tm.Records(fl, capacity=64)},
+                 in_axes=(0, 0, 0, None), spawn=tm.Queue(CQ), backend=b)
+    res = rv(*roots, th)
+    x0 = np.asarray(roots[2], np.float64)
+    want = [(r, g, x0[r] * 0.5 ** g) for g in range(CDEPTH + 1) for r in range(CN)]    # breadth-first order
+    plain = tm.vmap(chain_plain, outputs={"S": tm.Sum((4,), F)}, in_axes=(0, 0, 0, None), spawn=tm.Queue(CQ),
+                    backend=b)(*roots, th)
+    sw = np.zeros(4)
+    for r, g, v in want:
+        sw[r % 4] += v
+    close(plain.outputs["S"], sw, 1e-5, 1e-6, "plain call (no Records) with total children > Q")
+    if int(plain.stats["children_dropped"]) != 0:
+        raise Fail(f"the toy dropped children: {int(plain.stats['children_dropped'])} (its pending count must fit)")
+    h = res.outputs["rec"]
+    val, root, gen = np.asarray(h["val"]), np.asarray(h["root"]), np.asarray(h["gen"])
+    nsp, ndr, app = int(res.stats["spawned"]), int(res.stats["children_dropped"]), int(res.stats["appended"]["rec"])
+    poisoned = (np.all(np.isnan(val)) and np.all(root == -1) and np.all(gen == -1)
+                and np.all(np.isnan(np.asarray(res.outputs["S"]))))
+    if not poisoned:
+        n = len(want)
+        ok = (app == n and [(int(a), int(c)) for a, c in zip(root[:n], gen[:n])] == [w[:2] for w in want]
+              and np.allclose(val[:n], [w[2] for w in want], rtol=1e-5) and np.all(val[n:] == 0))
+        if not ok:
+            bad = [k for k in range(64) if (k < n and ((int(root[k]), int(gen[k])) != want[k][:2]
+                                                       or not np.isclose(val[k], want[k][2], rtol=1e-5)))
+                   or (k >= n and val[k] != 0)]
+            raise Fail(f"silently wrong, not poisoned: spawned {nsp} > Q {CQ}, dropped {ndr}, appended {app} (want "
+                       f"{n}); {len(bad)} wrong slots, first {bad[:4]}: (root, gen, val) "
+                       f"{[(int(root[k]), int(gen[k]), float(val[k])) for k in bad[:4]]}")
+        return f"exact although spawned {nsp} > Q {CQ}"
+    g = jax.grad(lambda th: jnp.sum(rv(*roots, th).outputs["rec"]["val"]))(th)
+    if not np.isnan(float(g)):
+        raise Fail(f"the gradient of a call whose ring reused slots is {float(g)}, not NaN")
+    return f"poisoned (spawned {nsp} > Q {CQ}, dropped {ndr}); gradient NaN; plain call exact"
+
+
 @case("spawn + Records (count-then-fill) and one-pass Records with jax_enable_x64 toggled on in-process: the same "
       "records, sums, stats and gradient bit for bit as with it off (the tree order's while carry stays int32)")
 def _(b):
