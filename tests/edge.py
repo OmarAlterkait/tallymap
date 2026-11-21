@@ -972,18 +972,35 @@ def _(b):
     close(A.outputs["Q"], want, what="cascade")
     if int(A.stats["spawned"]) != N * (2 + 4 + 8) or int(A.stats["children_dropped"]) != 0:
         raise Fail(f"spawned {int(A.stats['spawned'])} dropped {int(A.stats['children_dropped'])}")
-    Bq = tm.vmap(item, outputs=out, spawn=tm.Queue(16), backend=b)(g0, xs)
-    tot = int(Bq.stats["spawned"]) + int(Bq.stats["children_dropped"])
-    if int(Bq.stats["children_dropped"]) == 0:
-        raise Fail("tiny queue dropped nothing")
-    if not np.all(np.isnan(np.asarray(Bq.outputs["Q"]))):
-        raise Fail(f"dropped children did not NaN-poison the float tally: {np.asarray(Bq.outputs['Q'])}")
     if not np.all(np.isfinite(np.asarray(A.outputs["Q"]))):
         raise Fail("a call that dropped nothing is poisoned")
-    jb = jax.jvp(lambda s: tm.vmap(item, outputs=out, spawn=tm.Queue(16), backend=b)(g0, xs * s).outputs["Q"],
-                 (F(1),), (F(1),))[1]
-    if not np.all(np.isnan(np.asarray(jb))):
-        raise Fail("dropped children did not poison the jvp tangent")
+
+    # A Queue of 16 bounds the PENDING children, so whether this tree drops one depends on the schedule (how many
+    # are pending at once).  What the queue rule guarantees in every order: each attempted push is spawned or
+    # dropped once (a dropped child's descendants are never attempted, so spawned + dropped <= the tree's total, and
+    # == it when none dropped); a call that dropped a child is NaN, primal and jvp tangent; one that dropped none is
+    # exact.
+    def tiny(v, x_):
+        sp, dr = int(v.stats["spawned"]), int(v.stats["children_dropped"])
+        q = np.asarray(v.outputs["Q"])
+        if sp + dr > N * 14 or (dr == 0 and sp != N * 14):
+            raise Fail(f"Queue(16): spawned {sp} + dropped {dr} vs the tree's {N * 14} children")
+        if dr > 0 and not np.all(np.isnan(q)):
+            raise Fail(f"dropped children did not NaN-poison the float tally: {q}")
+        if dr == 0:
+            close(q, x_, what="Queue(16), nothing dropped")
+        return dr
+    drops = []
+    for _ in range(3):
+        drops.append(tiny(tm.vmap(item, outputs=out, spawn=tm.Queue(16), backend=b)(g0, xs), want))
+        jb, jdr = jax.jvp(lambda s: (lambda r: (r.outputs["Q"], r.stats["children_dropped"]))(
+            tm.vmap(item, outputs=out, spawn=tm.Queue(16), backend=b)(g0, xs * s)), (F(1),), (F(1),), has_aux=True)[1:]
+        jdr = int(jdr)
+        if jdr > 0 and not np.all(np.isnan(np.asarray(jb))):
+            raise Fail("dropped children did not poison the jvp tangent")
+        if jdr == 0:
+            close(jb, want, what="Queue(16) jvp, nothing dropped")
+    tot = f"{sum(d > 0 for d in drops)} of 3 runs dropped"
     jt = jax.jvp(lambda s: tm.vmap(item, outputs=out, spawn=tm.Queue(1 << 12), backend=b)(g0, xs * s).outputs["Q"],
                  (F(1),), (F(1),))[1]
     close(jt, want, what="jvp")
@@ -996,7 +1013,7 @@ def _(b):
         raise Fail(f"children_truncated {int(C.stats['children_truncated'])} n_truncated {int(C.stats['n_truncated'])}")
     if not np.all(np.isnan(np.asarray(C.outputs["Q"]))):
         raise Fail("truncated items / children did not poison the float tally")
-    return f"small queue: spawned {int(Bq.stats['spawned'])}, dropped {int(Bq.stats['children_dropped'])} (of {tot})"
+    return f"Queue(16): {tot} (drops {drops}); every run consistent with the queue rule"
 
 
 @case("reverse with spawn (tree adjoint) == jacfwd; second order through it raises")
