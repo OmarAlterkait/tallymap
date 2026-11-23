@@ -79,7 +79,7 @@ class Scan(NamedTuple):
 
 
 def scan_counts(params):
-    """(num_consts, num_carry) of scan params (JAX >= 0.10 stores a flat-tree `ft_in` = (consts, carry, xs))."""
+    """(num_consts, num_carry) of scan params (JAX >= 0.11 stores a flat-tree `ft_in` = (consts, carry, xs))."""
     if params.get("num_consts") is not None:
         return params["num_consts"], params["num_carry"]
     c, k, _ = params["ft_in"].unpack()
@@ -88,12 +88,15 @@ def scan_counts(params):
 
 def scan_reshaped(params, n_add, keep):
     """scan params for the operands [n_add new consts] + [consts] + [carry] + [the scanned inputs whose `keep` is
-    True] (the body's invars rearranged to match by the caller)."""
+    True] (the body's invars rearranged to match by the caller).  Three forms: num_consts + linear (JAX <= 0.9),
+    num_consts without linear (0.10), the flat tree ft_in (>= 0.11)."""
     if params.get("num_consts") is not None:
         nc, nk = params["num_consts"], params["num_carry"]
-        lin = list(params["linear"])
-        return dict(params, num_consts=nc + n_add,
-                    linear=tuple([False] * n_add + lin[:nc + nk] + [x for x, k in zip(lin[nc + nk:], keep) if k]))
+        out = dict(params, num_consts=nc + n_add)
+        if "linear" in params:
+            lin = list(params["linear"])
+            out["linear"] = tuple([False] * n_add + lin[:nc + nk] + [x for x, k in zip(lin[nc + nk:], keep) if k])
+        return out
     import sys
     ft = sys.modules[type(params["ft_in"]).__module__]     # (jax._src.flattree: the flat-tree form's own module)
     c, k, _ = params["ft_in"].unpack()
