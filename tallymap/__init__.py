@@ -29,7 +29,7 @@ def supported_primitives():
     return f()
 
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 _check_jax_version()       # one warning at import, only when JAX is newer than the newest tested version
 __all__ = ["vmap", "Sum", "Queue", "Records", "Result", "Tally", "reference", "diagnostics", "history",
            "supported_primitives", "TallyError", "UnsupportedError", "TESTED_JAX", "cell_bytes", "max_cells",
