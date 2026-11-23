@@ -1037,14 +1037,17 @@ def _lm(m, x):
 # the readout of a digit-word or fixed-point tally (_xread, _fread32, _wide) holds per-bin temporaries (the carry
 # chain's digit rows and per-bin state: about 70 B per bin for the int32 words, more for the int64 ones), on top of the
 # accumulator: a tally above READ_CHUNK bins is read READ_CHUNK bins at a time (a loop; each bin's readout depends on
-# its own words only, so the result is the same bits), so they are O(READ_CHUNK), not O(bins)
+# its own words only, so the result is the same bits), so they are O(READ_CHUNK), not O(bins).  A plain float sum's
+# partial rows (+ LOW row) are read the same way: summed whole, XLA's fusion decides per version whether the row
+# slices are copied first (CPU, 2^23 bins, R = 2: jax 0.9 none, 0.11 2 S, 0.10 3 S f32; round9/weekly 46687049)
 READ_CHUNK = 1 << 20
 
 
 def _chunked(read, a, s):
-    """read(a, s) -> (out [*lead, S], flags [*lead, S]) of the accumulator a [*lead, w * S] (w words per bin: word-major
-    [w, S] for the int32 digit words and the int64 wide pair, bin-major [S, w] for the int64 digit words), READ_CHUNK
-    bins at a time (the last chunk overlaps the one before it: its bins are read twice, to the same bits)."""
+    """read(a, s) -> a tuple of arrays [*lead, S] (out, flags, ...) of the accumulator a [*lead, w * S] (w words per
+    bin: word-major [w, S] for the int32 digit words, the int64 wide pair and a sum's partial rows, bin-major [S, w]
+    for the int64 digit words), READ_CHUNK bins at a time (the last chunk overlaps the one before it: its bins are read
+    twice, to the same bits)."""
     S, CH = s.S, READ_CHUNK
     if S <= CH:
         return read(a, s)
@@ -1058,15 +1061,23 @@ def _chunked(read, a, s):
         st = jnp.minimum(i * CH, S - CH)
         x = lax.dynamic_slice_in_dim(v, st, CH, axis=v.ndim - (2 if bin_major else 1))
         return st, read(x.reshape(lead + (w * CH,)), sc)
-    o_av, f_av = jax.eval_shape(lambda x: read(x, sc), jax.ShapeDtypeStruct(lead + (w * CH,), a.dtype))
+    avs = jax.eval_shape(lambda x: read(x, sc), jax.ShapeDtypeStruct(lead + (w * CH,), a.dtype))
 
     def body(i, c):
-        o, f = c
-        st, (oc, fc) = piece(i)
-        return (lax.dynamic_update_slice_in_dim(o, oc, st, axis=o.ndim - 1),
-                lax.dynamic_update_slice_in_dim(f, fc, st, axis=f.ndim - 1))
-    init = (jnp.zeros(lead + (S,), o_av.dtype), jnp.zeros(lead + (S,), f_av.dtype))
+        st, pcs = piece(i)
+        return tuple(lax.dynamic_update_slice_in_dim(o, oc, st, axis=o.ndim - 1) for o, oc in zip(c, pcs))
+    init = tuple(jnp.zeros(lead + (S,), av.dtype) for av in avs)
     return lax.fori_loop(0, -(-S // CH), body, init)
+
+
+def _rowsum(R, low):
+    """the reader (for _chunked) of a plain float sum's R partial rows (+ the LOW row): the rows' sum + LOW * 2^-100
+    (exact: LOW holds multiples of 2^-49, so the product is a multiple of 2^-149)."""
+    def read(x, s):
+        x = x.reshape(x.shape[:-1] + (R + low, s.S))
+        r = jnp.sum(x[..., :R, :], axis=-2) if R > 1 else x[..., 0, :]
+        return (r + x[..., R, :] * UNLOW if low else r,)
+    return read
 
 
 def _finish(p, accs, sp, ys, st):
@@ -1075,12 +1086,9 @@ def _finish(p, accs, sp, ys, st):
         if s.kind == "sum":
             a = accs[k]
             R = _rows(s)
-            if _low(s):                             # the rows' sum + LOW * 2^-100 (exact: LOW holds multiples of
-                a = a.reshape(tuple(s.lead) + (R + 1, s.S))    # 2^-49, so the product is a multiple of 2^-149)
-                lo = a[..., R, :]
-                a = (jnp.sum(a[..., :R, :], axis=-2) if R > 1 else a[..., 0, :]) + lo * UNLOW
-            elif R > 1:
-                a = jnp.sum(a.reshape(tuple(s.lead) + (R, s.S)), axis=-2)
+            low = int(_low(s))
+            if R + low > 1:                         # the partial rows (+ LOW), READ_CHUNK bins at a time
+                a, = _chunked(_rowsum(R, low), a.reshape(tuple(s.lead) + ((R + low) * s.S,)), s)
             if s.fixed_point or _exact(s):          # a bin that dropped an emit is NaN (as on cuda)
                 rd = _xread if _exact(s) else _fread32 if _fixed32(s) else _wide
                 a, big = _chunked(rd, a, s)
