@@ -8,6 +8,13 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
 ### Fixed
 
+- JAX 0.10: reverse mode through a `lax.switch` / `lax.cond` branch that keeps a table as a residual inside a scan
+  raised `KeyError: 'linear'` (0.10's scan parameters have `num_consts` without `linear`; 0.9 and older have both,
+  0.11 and newer the flat tree `ft_in`). Every form is handled.
+- xla backend: a plain float32 `Sum`'s partial rows are read out `READ_CHUNK` bins at a time, as the digit-word
+  tallies already were. Read whole, XLA copied the row slices first on some JAX versions (CPU, 2^23 bins: 40 B per
+  cell on JAX 0.10, 24 on 0.11 and 0.12, against 16 on 0.6 - 0.9), past `tm.output_memory`'s bound on 0.10. Now 16
+  - 23 B on every tested version; outputs bitwise unchanged.
 - Kernel backend: a `reduce_max` / `reduce_min` over an axis of extent 0 (-inf / +inf) was taken for finite when its
   operand was, so the sum of an empty max and an empty min (NaN) was taken for non-NaN and a later `maximum` /
   `minimum` dropped the NaN (default options; tests/edge.py "float facts: a max / min over an EMPTY axis").  A max /
