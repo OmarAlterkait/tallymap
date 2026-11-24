@@ -177,13 +177,13 @@ def _run1(node, args, platform, ndev=1):
     opts = dict(node.opts)
     b = node.backend
     if b == "xla":
-        return list(XB.run(p, pi, bc, **opts))
+        return list(XB.run(p, pi, bc, target=platform, **opts))
     if b != "auto":
         raise ValueError(f"tallymap: unknown backend {b!r}")
     if platform not in KERNEL_PLATFORMS:
         _warn_once(f"tallymap: the kernel backend compiles for CUDA GPUs and CPUs, not for {platform!r}; running the "
                    "xla backend (plain JAX)", node.site)
-        return list(XB.run(p, pi, bc, **opts))
+        return list(XB.run(p, pi, bc, target=platform, **opts))
     try:
         return list(KB.run(p, pi, bc, target=platform, ndev=ndev, **opts))
     except UnsupportedError as e:

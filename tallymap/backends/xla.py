@@ -938,7 +938,7 @@ def _scan(st, e, ins):
 
 
 # ------------------------------------------------------------------------------------------- driver
-def run(p, pi, bc, xla_batch_size=None, **_):
+def run(p, pi, bc, xla_batch_size=None, target=None, **_):
     """-> [sum tally arrays] + [stats int32[5]] + [per-item results [N, ...]].  p.nact (n_active): items
     i >= bc[p.nact] are masked off like the padding of the last batch (no emits, per-item results zero)."""
     N = int(pi[0].shape[0])
@@ -963,6 +963,7 @@ def run(p, pi, bc, xla_batch_size=None, **_):
         queue = dict(leaves=[lax.full((Q,) + tuple(a.shape), 0, a.dtype) for a in pav], head=jnp.int32(0),
                      tail=jnp.int32(0), spawned=jnp.int32(0), dropped=jnp.int32(0))
     st = _St(p, P, accs, queue)
+    st.target = target
     lanes = jnp.arange(P, dtype=jnp.int32)
 
     def block_fn(ids, mask, lane_pi, ys, primary):
@@ -1039,7 +1040,9 @@ def _lm(m, x):
 # accumulator: a tally above READ_CHUNK bins is read READ_CHUNK bins at a time (a loop; each bin's readout depends on
 # its own words only, so the result is the same bits), so they are O(READ_CHUNK), not O(bins).  A plain float sum's
 # partial rows (+ LOW row) are read the same way: summed whole, XLA's fusion decides per version whether the row
-# slices are copied first (CPU, 2^23 bins, R = 2: jax 0.9 none, 0.11 2 S, 0.10 3 S f32; round9/weekly 46687049)
+# slices are copied first (CPU, 2^23 bins, R = 2: jax 0.9 none, 0.11 2 S, 0.10 3 S f32; round9/weekly 46687049).  On
+# CPU only: GPU reads the rows in place, and the loop's output and carry raised a Records call there (2^23 cells, grad,
+# jax 0.6.2: 571 -> 638 MB; jvp, jax 0.11: 403 -> 604 MB; round9/fmaxtie 46792134)
 READ_CHUNK = 1 << 20
 
 
@@ -1087,8 +1090,9 @@ def _finish(p, accs, sp, ys, st):
             a = accs[k]
             R = _rows(s)
             low = int(_low(s))
-            if R + low > 1:                         # the partial rows (+ LOW), READ_CHUNK bins at a time
-                a, = _chunked(_rowsum(R, low), a.reshape(tuple(s.lead) + ((R + low) * s.S,)), s)
+            if R + low > 1:                         # the partial rows (+ LOW); on CPU READ_CHUNK bins at a time
+                rd, x = _rowsum(R, low), a.reshape(tuple(s.lead) + ((R + low) * s.S,))
+                a, = _chunked(rd, x, s) if st.target == "cpu" else rd(x, s)
             if s.fixed_point or _exact(s):          # a bin that dropped an emit is NaN (as on cuda)
                 rd = _xread if _exact(s) else _fread32 if _fixed32(s) else _wide
                 a, big = _chunked(rd, a, s)

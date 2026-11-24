@@ -14,6 +14,9 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   gives, not the operand (its payload bits can differ from 0.8.1).
 - Reverse mode: a tally the step loop never adds to raised `fold_post built 1 top-level loops / [n] carries ...` with
   the single-loop adjoint (steps of 1000 equations and more). JAX drops the unchanged carry; it is now allowed for.
+- xla backend, GPU: a plain float32 `Sum` (so every float32 `Records` field) is read out whole again.  The chunked
+  readout of 0.8.1, needed on CPU only, raised the memory of a `Records` call on GPU (2^23 cells, JAX 0.6.2 grad: 76 B
+  per cell, past `tm.cell_bytes`; JAX 0.11 jvp: 72 B against 48).  Values unchanged.
 
 ## 0.8.1 - 2026-11-23
 
