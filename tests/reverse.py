@@ -1325,6 +1325,45 @@ def _(b):
     return "; ".join(out)
 
 
+@case("T3 forced: a Sum tally the step loop never adds to (untouched / added before the loop only / after it only), "
+      "float and fixed_point, with and without max_steps == the nested-loop adjoint")
+def _(b):
+    """JAX forwards a carry the loop passes through unchanged out of the folded loop; fold_post indexed its carries from
+    the front and raised 'fold_post built 1 top-level loops / [10] carries, want 1 / 11' (round9/ports 46780790)."""
+    xs, n = jnp.linspace(0.5, 1.5, 8, dtype=F), 0
+    for where in ("never", "pre", "post"):
+        for fx in (False, True):
+            for ms in (None, 64, 5):                              # 5: truncates (NaN cotangents, the same in both)
+                def item(t, x, mu, where=where):
+                    if where == "pre":
+                        t = t.add("z", 0, x * mu)
+
+                    def body(c):
+                        k, w, t = c
+                        w = w * jnp.exp(-mu * x * F(0.3))
+                        return k + 1, w, t.add("a", 0, w)
+                    k, w, t = lax.while_loop(lambda c: (c[1] > F(0.05)) & (c[0] < 40), body, (jnp.int32(0), F(1), t))
+                    if where == "post":
+                        t = t.add("z", 0, w)
+                    return t, w
+                f = tm.vmap(item, outputs={"a": tm.Sum((1,), F, fixed_point=fx), "z": tm.Sum((1,), F, fixed_point=fx)},
+                            in_axes=(0, None), backend=b, **({} if ms is None else {"max_steps": ms}))
+
+                def L(mu, x):
+                    r = f(x, mu)
+                    return jnp.sum(r.outputs["a"]) + 2 * jnp.sum(r.outputs["z"]) + jnp.sum(r.per_item)
+                gs = []
+                for mode in ("off", "force"):
+                    gs.append(_with_single(mode, lambda: jax.grad(L, (0, 1))(F(0.7), xs)))
+                    if _D.REVERSE['single'].get("used") != (mode == "force"):
+                        raise Fail(f"{where}: SINGLE={mode} but {_D.REVERSE['single']}")
+                for g, w in zip(gs[1], gs[0]):
+                    if not np.allclose(np.asarray(g), np.asarray(w), rtol=1e-6, equal_nan=True):
+                        raise Fail(f"{where} fixed_point={fx} max_steps={ms}: {g} != nested {w}")
+                n += 1
+    return f"{n} programs: T3 == nested"
+
+
 @case("T3 auto: a small step keeps the nested-loop adjoint (T3_MIN_EQNS)")
 def _(b):
     item, _ = make_walk(64, 10)

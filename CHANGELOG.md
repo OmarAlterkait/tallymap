@@ -12,6 +12,8 @@ the API. The release policy for JAX versions is in `docs/maintenance.md`.
   Since 0.8.0 (the signed-zero tie rule) they were a compare chain, which made max / min heavy kernels up to 1.6x
   slower (a photon transport kernel 1.3x). Same values; a NaN result is now the canonical quiet NaN, as XLA:GPU
   gives, not the operand (its payload bits can differ from 0.8.1).
+- Reverse mode: a tally the step loop never adds to raised `fold_post built 1 top-level loops / [n] carries ...` with
+  the single-loop adjoint (steps of 1000 equations and more). JAX drops the unchanged carry; it is now allowed for.
 
 ## 0.8.1 - 2026-11-23
 

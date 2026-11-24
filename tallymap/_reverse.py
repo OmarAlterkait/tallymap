@@ -551,7 +551,6 @@ def fold_post(p):
                 env[v] = x
         return rd
     nPi = nT + p.nP                              # position of the probe among the folded item's operands
-    meta = (nI + nE + len(yav), nI + nE + p.trunc if p.trunc is not None else -1)
     cond_f, body_f = jaxpr_as_fun(wp.cond), jaxpr_as_fun(wp.body)
 
     def item2(*a):
@@ -601,9 +600,17 @@ def fold_post(p):
     avs.insert(nPi, jax.ShapeDtypeStruct((1,), jnp.float32))
     cj2 = _mk(item2, avs)
     w2 = [e for e in cj2.jaxpr.eqns if e.primitive.name == "while"]
-    if len(w2) != 1 or len(w2[0].outvars) != meta[0] + 2:      # (meta indexes the folded loop's carries)
+    # JAX drops the carries the body passes through unchanged (loop-invariant forwarding): a tally that neither the
+    # step nor the post code adds to is one, so the carries are located from the END, which is always written
+    # (the per-item results, the probe and the done flag; the order is kept)
+    tail = yav + [jax.ShapeDtypeStruct((1,), jnp.float32), jax.ShapeDtypeStruct((), jnp.bool_)]
+    ov = w2[0].outvars if len(w2) == 1 else []
+    if len(ov) < len(tail) or any(v.aval.shape != t.shape or v.aval.dtype != t.dtype
+                                  for v, t in zip(ov[len(ov) - len(tail):], tail)):
         raise AssertionError(f"tallymap: fold_post built {len(w2)} top-level loops / "
-                             f"{[len(e.outvars) for e in w2]} carries, want 1 / {meta[0] + 2} (internal error)")
+                             f"{[len(e.outvars) for e in w2]} carries, want 1 ending in the {len(tail)} written ones "
+                             f"(internal error)")
+    meta = (len(ov) - 2, len(ov) - len(tail) + p.trunc if p.trunc is not None else -1)
     check_tallies(cj2, kinds, name=f"fold_post({p.where})")
     return dataclasses.replace(p, cj=cj2, nP=p.nP + 1, tag=p.tag + "+fold"), meta
 
