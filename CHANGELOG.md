@@ -4,7 +4,7 @@ All notable changes. Versions follow [SemVer](https://semver.org/) 0.x: until 1.
 API, and only after one minor release in which the old form still works and warns. Patch releases never change
 the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
-## Unreleased
+## 0.8.2 - 2026-11-24
 
 ### Fixed
 
