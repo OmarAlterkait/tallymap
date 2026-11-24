@@ -4,6 +4,15 @@ All notable changes. Versions follow [SemVer](https://semver.org/) 0.x: until 1.
 API, and only after one minor release in which the old form still works and warns. Patch releases never change
 the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
+## Unreleased
+
+### Fixed
+
+- Kernel backend, GPU: `lax.max` / `lax.min` of float32 operands not proven non-NaN are one FMNMX behind one NaN test.
+  Since 0.8.0 (the signed-zero tie rule) they were a compare chain, which made max / min heavy kernels up to 1.6x
+  slower (a photon transport kernel 1.3x). Same values; a NaN result is now the canonical quiet NaN, as XLA:GPU
+  gives, not the operand (its payload bits can differ from 0.8.1).
+
 ## 0.8.1 - 2026-11-23
 
 ### Fixed

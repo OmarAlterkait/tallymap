@@ -88,6 +88,10 @@ template <class T> __device__ __forceinline__ T sj_fminn(T a, T b) { return a < 
 #ifdef __CUDA_ARCH__
 template <> __device__ __forceinline__ float sj_fmaxn<float>(float a, float b) { return fmaxf(a, b); }
 template <> __device__ __forceinline__ float sj_fminn<float>(float a, float b) { return fminf(a, b); }
+// an unproven f32 pair on the device: the same FMNMX behind ONE unordered test (NaN: the canonical quiet NaN, as XLA:GPU;
+// a select per operand, keeping the NaN operand itself, costs lumen 1.25x: round9/fmaxtie 46777096, bitwise 46777094)
+template <> __device__ __forceinline__ float sj_fmax<float>(float a, float b) { return (a != a || b != b) ? __int_as_float(0x7fc00000) : fmaxf(a, b); }
+template <> __device__ __forceinline__ float sj_fmin<float>(float a, float b) { return (a != a || b != b) ? __int_as_float(0x7fc00000) : fminf(a, b); }
 #endif
 template <class T> __device__ __forceinline__ T sj_imax(T a, T b) { return a > b ? a : b; }
 template <class T> __device__ __forceinline__ T sj_imin(T a, T b) { return a < b ? a : b; }
