@@ -4,6 +4,17 @@ All notable changes. Versions follow [SemVer](https://semver.org/) 0.x: until 1.
 API, and only after one minor release in which the old form still works and warns. Patch releases never change
 the API. The release policy for JAX versions is in `docs/maintenance.md`.
 
+## Unreleased
+
+### Changed
+
+- Kernel backend, the step schedule (without a spawn queue): a warp's lanes take their steps together. A lane whose
+  item's loop ended left for a new item on its own, and the warp then ran its steps in groups. A lane now writes its
+  ended items and starts new ones until it has a step to take, and the warp waits for that: lumen 1.18x - 1.27x faster
+  (2080 Ti), the same outputs bit for bit. Items with a heavy-tailed step count and a costly end of item can be up to
+  1.1x slower. From PR #1 by César Jesús Valls, as passes of the one loop instead of a nested one (which was
+  far slower with an in-place array carry).
+
 ## 0.8.2 - 2026-11-24
 
 ### Fixed
