@@ -463,7 +463,7 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False, target="cuda"
     if sp is None and schedule == "step" and strict:
         raise CodegenError(f"schedule='step': {split_blocker(p.cj.jaxpr)}.  Pass schedule='item' (the default).")
     L.mode = "step" if sp is not None else "item"
-    decls = ""
+    decls, step_calls = "", None
     if sp is None:
         res, ospec = function("item", p.cj, [(None, v) for v in base_in])
         ys_names = [f"y{j}" for j in range(len(yav))]
@@ -565,6 +565,9 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False, target="cuda"
         advance = (f"sj_cond({', '.join(base_arg + cargs + ['sj_pr'])});\n"
                    f"      if (sj_pr) {{ sj_body({', '.join(base_arg + bargs + nargs)}); {' '.join(upd)} }}\n"
                    f"      else {{ sj_post({', '.join(base_arg + post_args + ys_names)}); done = true; }}")
+        step_calls = (f"sj_cond({', '.join(base_arg + cargs + ['sj_pr'])});",
+                      f"sj_body({', '.join(base_arg + bargs + nargs)}); {' '.join(upd)}",
+                      f"sj_post({', '.join(base_arg + post_args + ys_names)});")
     L.consts = list(em.consts)
     base_const = nP + nB
     nin = base_const + len(L.consts)
@@ -813,14 +816,8 @@ def build_source(p, *, block=BLOCK, schedule="item", strict=False, target="cuda"
         }}
         __threadfence();
         atomicSub(&SJ_Q(4), 1u);"""
-    main = f"""
-extern "C" __global__ void {lb} sj_main(const SjParams P, const i64 n_items) {{
-  u64* const sj_ctr = (u64*)P.p[{L.r_ctr}];
-  const int lane = threadIdx.x & 31;
-{chr(10).join(acc_decl)}
-{nlim}{decls}{xdecl}  u64 my_next = 0; u32 my_left = 0;
-  u64 t = 0; i64 item = 0; bool active = false, done = false, child = false; i32 n_ctr = 0;
-  while (true) {{
+    warp_decl = loop_decl = ""
+    loop = f"""  while (true) {{
     if (!active) {{
 {fetch}
       item = (i64)t;
@@ -835,7 +832,55 @@ extern "C" __global__ void {lb} sj_main(const SjParams P, const i64 n_items) {{
 {finish}
       active = false;
     }}
-  }}
+  }}"""
+    if step_calls is not None and spawn is None:
+        # The step schedule takes a warp's steps together: a lane whose item's loop ended writes it and starts new
+        # ones until it has a step to take (ready) or no item is left (out), and the warp waits for that before its
+        # step.  A lane that left for a new item on its own split the warp's steps into groups.  sj_warp is every lane of
+        # the warp (nothing has diverged at the kernel's entry) and the lanes leave the loop together, so each
+        # __all_sync is reached by all of them.  The refills are passes of the ONE loop: as a nested loop, an in-place
+        # array carry (STEP_INPLACE_MIN) was far slower (2080 Ti, 32 steps: 64 floats 0.6 -> 8.5 ms, 512 2.5 -> 157).
+        c_cond, c_body, c_post = step_calls
+        warp_decl = "  const unsigned sj_warp = __activemask();\n"
+        loop_decl = "  bool ready = false, out = false;\n"
+        skip = "" if p.nact is None else f"""else if (t >= (u64)sj_nlim) {{
+{yzero}
+        }} """
+        refill = f"""      if (!active) {{
+        {claim}
+        t = my_next; --my_left;
+        if (t >= (u64)n_items) out = true;
+        {skip}else {{
+          item = (i64)t;
+          {start}
+          active = true;
+        }}
+      }}
+      if (active) {{
+        {c_cond}
+        if (sj_pr) ready = true;
+        else {{
+          {c_post}
+{ywrite}
+          active = false;
+        }}
+      }}"""
+        loop = f"""  while (true) {{
+    if (!ready && !out) {{
+{refill}
+    }}
+    if (!__all_sync(sj_warp, ready || out)) continue;
+    if (__all_sync(sj_warp, out)) break;
+    if (ready) {{ {c_body} ready = false; }}
+  }}"""
+    main = f"""
+extern "C" __global__ void {lb} sj_main(const SjParams P, const i64 n_items) {{
+{warp_decl}  u64* const sj_ctr = (u64*)P.p[{L.r_ctr}];
+  const int lane = threadIdx.x & 31;
+{chr(10).join(acc_decl)}
+{nlim}{decls}{xdecl}  u64 my_next = 0; u32 my_left = 0;
+  u64 t = 0; i64 item = 0; bool active = false, done = false, child = false; i32 n_ctr = 0;
+{loop_decl}{loop}
   if (n_ctr) atomicAdd(&SJ_STATS[2], n_ctr);
 {chr(10).join(acc_flush)}
 }}

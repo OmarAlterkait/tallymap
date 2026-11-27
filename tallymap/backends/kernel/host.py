@@ -64,6 +64,7 @@ static inline void __threadfence() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 static inline void __nanosleep(unsigned) { sched_yield(); }      // the spawn queue's back-off: let another thread run
 static inline unsigned __activemask() { return 1u; }
 template <class T> static inline T __shfl_sync(unsigned, T v, int) { return v; }
+static inline int __all_sync(unsigned, int p) { return p; }
 static inline int __ffs(unsigned x) { return __builtin_ffs((int)x); }
 static inline int __popc(unsigned x) { return __builtin_popcount(x); }
 static inline int __popcll(unsigned long long x) { return __builtin_popcountll(x); }

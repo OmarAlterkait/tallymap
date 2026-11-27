@@ -297,6 +297,74 @@ def _(b):
     return agree(fs(XS, KEYS, TAB, th), fi(XS, KEYS, TAB, th), "step vs item")
 
 
+def zero_step_item(n_arr):
+    """zero-step items (2 of 5), unequal lengths, and a loop carry of n_arr floats (in place from 64 elements)"""
+    def item(t, x, key):
+        n = jnp.where(bits(key, 0) % 5 < 2, 0, bits(key, 1) % 17).astype(jnp.int32)
+
+        def body(c):
+            k, h, t = c
+            return k + 1, h.at[k % n_arr].add(x), t.add("C", (bits(key, k + 2) % NB).astype(jnp.int32), 1)
+        k, h, t = lax.while_loop(lambda c: c[0] < n, body, (jnp.int32(0), jnp.zeros((n_arr,), x.dtype), t))
+        return t, (k, h.sum())
+    return item
+
+
+@case("[sched] step == item: zero-step items, n_active, array carries (cuda)", ["auto"])
+def _(b):
+    n = 5000
+    xs, keys = jnp.linspace(0.5, 1.5, n).astype(F), jax.random.split(jax.random.PRNGKey(4), n)
+    for a in (8, 128):
+        for na in (0, 1, 1234, n):
+            R = {}
+            for s in ("step", "item"):
+                f = tm.vmap(zero_step_item(a), outputs={"C": tm.Sum((NB,), jnp.int32)}, backend=b, schedule=s)
+                R[s] = jax.jit(lambda m, f=f: f(xs, keys, n_active=m))(jnp.int32(na))
+            agree(R["step"], R["item"], f"carry {a}, n_active {na}")
+            if na == n and not bool((np.asarray(R["step"].per_item[0]) == 0).any()):
+                raise Fail("instrument: no zero-step item")
+    return "carries of 8 and 128 floats, n_active 0 / 1 / 1234 / all"
+
+
+@case("[sched] the generated step kernel has the warp's wait, the item kernel has not (cuda; text only)", ["auto"])
+def _(b):
+    if not GPU:
+        return "GPU only"
+    for s in ("step", "item"):
+        _D.KERNELS.clear()
+        f = tm.vmap(zero_step_item(8), outputs={"C": tm.Sum((NB,), jnp.int32)}, backend=b, schedule=s)
+        jax.block_until_ready(f(XS, KEYS))
+        src = open(list(_D.KERNELS)[-1]["source"]).read()
+        if (s == "step") != ("__all_sync(sj_warp, ready || out)" in src):
+            raise Fail(f"schedule {s}: the warp's wait is {'missing' if s == 'step' else 'present'}")
+    return "step: present; item: absent"
+
+
+@case("[sched] the step schedule's time for a 16 / 64 / 256 / 512 float carry, 32 steps: in place, not rebuilt (cuda)",
+      ["auto"])
+def _(b):
+    if not GPU:
+        return "GPU only"
+    # 2080 Ti, ms: 0.6 / 0.6 / 1.5 / 2.6; with the refills as a nested loop 0.6 / 8.5 / 38 / 321
+    n, ms = 1 << 18, {}
+    xs = jnp.linspace(0.5, 1.5, n).astype(F)
+    for m in (16, 64, 256, 512):
+        def item(x, m=m):
+            return lax.while_loop(lambda c: c[0] < 32, lambda c: (c[0] + 1, c[1].at[c[0] % m].add(x * c[0])),
+                                  (jnp.int32(0), jnp.zeros((m,), F)))[1].sum()
+        f = jax.jit(tm.vmap(lambda t, x, item=item: (t, item(x)), outputs={}, backend=b, schedule="step"))
+        jax.block_until_ready(f(xs))
+        ts = []
+        for _ in range(9):
+            t0 = time.perf_counter()
+            jax.block_until_ready(f(xs))
+            ts.append(time.perf_counter() - t0)
+        ms[m] = 1e3 * min(ts)
+    if ms[64] > 5 * ms[16] or ms[512] > 20 * ms[16]:
+        raise Fail(f"ms {ms}")
+    return "ms " + ", ".join(f"{m}: {v:.2f}" for m, v in ms.items())
+
+
 def two_loops(t, x, key, tab, th):
     """an item with TWO top-level while loops: the step schedule cannot split it"""
     k, t = lax.while_loop(lambda c: c[0] < 3, lambda c: (c[0] + 1, c[1].add("Q", c[0] % NB, x)), (jnp.int32(0), t))
